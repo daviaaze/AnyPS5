@@ -46,6 +46,40 @@ STACKS = "# samples=5 depth=64 truncated=1\n# module a.prx 0x1000 0x1\nntdll.dll
 
 
 class TraceDigestTests(unittest.TestCase):
+    def test_presentation_gate_checks_boundary_frames_and_threshold(self):
+        trace = trace_digest.Trace(EVENTS)
+        result = trace_digest.check_present_window(trace, SUMMARY, 5, 25, 20)
+        self.assertTrue(result["passed"])
+        self.assertEqual((result["first_present"], result["last_present"]), (600, 602))
+        self.assertEqual(result["max_gap_ms"], 20)
+        self.assertFalse(trace_digest.check_present_window(trace, SUMMARY, 5, 25, 19.999)["passed"])
+
+    def test_presentation_gate_rejects_incomplete_or_untrustworthy_capture(self):
+        trace = trace_digest.Trace(EVENTS)
+        for summary in (None, dict(SUMMARY, trace_dropped=True), {}):
+            with self.subTest(summary=summary), self.assertRaises(ValueError):
+                trace_digest.check_present_window(trace, summary, 0, 30, 33.3)
+        for start, end, limit in ((-1, 30, 33.3), (0, 31, 33.3), (0, 0, 33.3),
+                                  (0, 30, 0), (0, float("nan"), 33.3)):
+            with self.subTest(window=(start, end, limit)), self.assertRaises(ValueError):
+                trace_digest.check_present_window(trace, SUMMARY, start, end, limit)
+        for presents in ([], [(0, 1)], [(0, 1), (10000, 3)],
+                         [(0, 1), (0, 2)], [(0, 1), (float("inf"), 2)]):
+            trace.presents = presents
+            with self.subTest(presents=presents), self.assertRaises(ValueError):
+                trace_digest.check_present_window(trace, SUMMARY, 0, 10, 33.3)
+
+    def test_presentation_gate_cli_rejects_one_slow_frame_despite_fast_average(self):
+        events = [{"name": "present", "ph": "i", "ts": index * 10000 + (25000 if index >= 3000 else 0),
+                   "args": {"present": index}} for index in range(6002)]
+        with gzip.open(self.trace, "wt", encoding="utf-8") as handle:
+            json.dump({"traceEvents": events}, handle)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = trace_digest.main([str(self.trace), "--check-present-window", "0", "60000", "33.3"])
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(output.getvalue())["max_gap_ms"], 35)
+
     def test_cli_reports_unreadable_inputs_without_partial_output(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

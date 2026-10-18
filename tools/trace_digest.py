@@ -3,6 +3,7 @@ import bisect
 import collections
 import gzip
 import html
+import math
 import json
 import sys
 import zlib
@@ -104,6 +105,32 @@ def load_stacks(path):
             raise ValueError(f"{path}:{number}: expected nonempty frames and a positive sample count")
         stacks.append((frames.split(";"), weight))
     return stacks
+
+
+def check_present_window(trace, summary, start_ms, end_ms, max_gap_ms):
+    if (not all(math.isfinite(value) for value in (start_ms, end_ms, max_gap_ms))
+            or start_ms < 0 or end_ms <= start_ms or max_gap_ms <= 0):
+        raise ValueError("presentation window requires finite 0 <= start < end and a positive maximum gap")
+    if not summary or summary.get("trace_dropped") is not False:
+        raise ValueError("presentation verification requires a matching summary with no dropped events")
+    presents = trace.presents
+    if (len(presents) < 2 or any(not math.isfinite(ts) for ts, _ in presents)
+            or any(type(number) is not int for _, number in presents)):
+        raise ValueError("presentation verification requires finite timestamps and integer presentation IDs")
+    if any(right[0] <= left[0] or right[1] != left[1] + 1
+           for left, right in zip(presents, presents[1:])):
+        raise ValueError("presentation timestamps must increase and presentation IDs must be consecutive")
+    timestamps = [ts for ts, _ in presents]
+    first = bisect.bisect_right(timestamps, start_ms * 1000) - 1
+    last = bisect.bisect_left(timestamps, end_ms * 1000)
+    if first < 0 or last >= len(presents):
+        raise ValueError("recorded presentations do not cover both window boundaries")
+    maximum = max((timestamps[index + 1] - timestamps[index]) / 1000
+                  for index in range(first, last))
+    return {"passed": maximum <= max_gap_ms, "start_ms": start_ms, "end_ms": end_ms,
+            "duration_ms": end_ms - start_ms, "max_gap_ms": maximum,
+            "limit_ms": max_gap_ms, "first_present": presents[first][1],
+            "last_present": presents[last][1]}
 
 
 def digest(trace, summary=None, stacks=None, worst=5, top=10):
@@ -324,8 +351,13 @@ def main(arguments=None):
     parser.add_argument("--frames", type=nonnegative_integer, default=5, help="slowest frames to list (default 5)")
     parser.add_argument("--top", type=nonnegative_integer, default=10, help="entries per list (default 10)")
     parser.add_argument("--json", action="store_true", help="print the digest as JSON")
+    parser.add_argument("--check-present-window", type=float, nargs=3,
+                        metavar=("START_MS", "END_MS", "MAX_GAP_MS"),
+                        help="check every presentation gap covering a trace-relative window; requires a complete matching summary; scene identity must be verified separately")
     options = parser.parse_args(arguments)
     if options.trace.endswith(".jsonl"):
+        if options.check_present_window:
+            parser.error("--check-present-window requires a trace, not interval summaries")
         result = digest_intervals(load_intervals(options.trace))
         sys.stdout.write(json.dumps(result, indent=1) + "\n" if options.json else markdown_intervals(result))
         return 0
@@ -333,8 +365,13 @@ def main(arguments=None):
         stacks = load_stacks(options.stacks) if options.stacks else None
     except (OSError, ValueError) as error:
         parser.error(str(error))
-    result = digest(load_trace(options.trace), load_summary(options.summary, options.trace),
-                    stacks, options.frames, options.top)
+    trace = load_trace(options.trace)
+    summary = load_summary(options.summary, options.trace)
+    if options.check_present_window:
+        result = check_present_window(trace, summary, *options.check_present_window)
+        sys.stdout.write(json.dumps(result, indent=1) + "\n")
+        return 0 if result["passed"] else 1
+    result = digest(trace, summary, stacks, options.frames, options.top)
     sys.stdout.write(json.dumps(result, indent=1) + "\n" if options.json else markdown(result))
     return 0
 
