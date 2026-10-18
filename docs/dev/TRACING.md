@@ -66,7 +66,7 @@ See [Build](BUILD.md#performance-trace) for the trace format, summary fields and
 | `APS5_TRACE_FRAMES=<start>:<count>` | Records a window of presents by zero-based frame number. |
 | `APS5_TRACE_SECONDS=<start>:<length>` | Records a window of presents by elapsed seconds after the first present. Cannot be set with `APS5_TRACE_FRAMES`. |
 | `APS5_TRACE_SUMMARY_EVERY=<seconds>` | Writes periodic summary lines without recording trace events. Can be combined with either window switch. |
-| `APS5_TRACE_EVENTS=<count>` | Sets the per-thread event-buffer capacity for a frame or seconds window (1–4,194,304; default 262,144). |
+| `APS5_TRACE_EVENTS=<count>` | Sets each thread's event-buffer capacity and the GPU-range capacity for a frame or seconds window (1–4,194,304; default 262,144). |
 | `APS5_TRACE_DIR=<path>` | Writes performance capture and summary files to this directory instead of the working directory. |
 
 `python3 tools/trace_digest.py <trace.json.gz> --check-present-window 0 60000 33.3` checks every presentation gap covering a 60-second trace-relative window, including gaps crossing its boundaries. It exits 0 only when all gaps are at most 33.3 ms, 1 for a measured threshold failure, and 2 for invalid or incomplete evidence. A matching summary with no dropped events and consecutive presentation IDs is required. Window endpoints must be covered by recorded presentations; a summary's trailing duration is not a substitute. Select endpoints using independent scene evidence: this timing check cannot establish that the tutorial or any other scene is visible.

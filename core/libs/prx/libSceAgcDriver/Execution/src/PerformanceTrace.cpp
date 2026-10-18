@@ -25,7 +25,6 @@ namespace AgcDriver {
 namespace {
 
 using Clock = std::chrono::steady_clock;
-constexpr std::size_t GpuRangeCapacity = TraceThread::DefaultCapacity;
 
 struct Session {
     std::mutex mutex;
@@ -222,7 +221,7 @@ void PerformanceTrace::Present(std::uint32_t width, std::uint32_t height, const 
             std::lock_guard gpu(gpuMutex);
             gpuRanges.clear();
             gpuLost = 0;
-            gpuRanges.reserve(GpuRangeCapacity);
+            gpuRanges.reserve(TraceThread::ParseCapacity(std::getenv("APS5_TRACE_EVENTS")));
         }
         state.presents.push_back(now);
         presentCount.fetch_add(1, std::memory_order_relaxed);
