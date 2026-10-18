@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/SlowVulkanCallTiming.hpp"
 #include "prx/libSceAgcDriver/Execution/include/BdaFeatures.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DeviceFault.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FragmentBarycentric.hpp"
@@ -462,6 +463,7 @@ struct VulkanDevice::State {
     // The presentation present() submitted and QueuePresent has not handed to the swapchain.
     bool queuePending = false;
     std::uint32_t queueIndex = 0;
+    std::size_t queuedPresentInFlight = 0;
     int nextDumpIndex = 0;
     FrameDumpWriter dumpWriter;
 
@@ -3325,6 +3327,7 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
         state->presentCursor = (state->presentCursor + 1) % state->presentSlots.size();
         state->queuePending = true;
         state->queueIndex = index;
+        if (SlowVulkanCallTiming::Enabled()) state->queuedPresentInFlight = static_cast<std::size_t>(std::count_if(state->presentSlots.begin(), state->presentSlots.end(), [](const auto& presentSlot) { return presentSlot.inFlight; }));
         ++presentCounters.presents;
         if (auto* frame = PerformanceContext::Current()) {
             frame->NoteBlit(batchesAtBlit, lastSubmittedAt, submittedAt);
@@ -3424,7 +3427,18 @@ void VulkanDevice::QueuePresent() {
     present.swapchainCount = 1;
     present.pSwapchains = &state->swapchain;
     present.pImageIndices = &index;
-    const auto presented = state->DeviceFunction<PFN_vkQueuePresentKHR>("vkQueuePresentKHR")(state->queue, &present);
+    const auto presentFunction = state->DeviceFunction<PFN_vkQueuePresentKHR>("vkQueuePresentKHR");
+    VkResult presented;
+    if (SlowVulkanCallTiming::Enabled()) {
+        const auto presentSerial = state->lastPresentSerial;
+        const auto inFlight = static_cast<std::uint64_t>(state->queuedPresentInFlight);
+        const auto presentBegin = SlowVulkanCallTiming::Begin();
+        presented = presentFunction(state->queue, &present);
+        const auto presentEnd = SlowVulkanCallTiming::End();
+        SlowVulkanCallTiming::EmitIfSlow("vkQueuePresentKHR", presentBegin, presentEnd, reinterpret_cast<std::uintptr_t>(state->device), reinterpret_cast<std::uintptr_t>(state->queue), "image_index", index, "blit_batch_serial", presentSerial, static_cast<std::int32_t>(presented), inFlight, "present_slots_at_blit_submit");
+    } else {
+        presented = presentFunction(state->queue, &present);
+    }
     if (presented == VK_ERROR_OUT_OF_DATE_KHR || presented == VK_SUBOPTIMAL_KHR) state->extent = {0, 0};
     else check(presented, "vkQueuePresentKHR");
     timing.Mark("queue_present");

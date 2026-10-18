@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Graphics/shaders/SampleDumps_spv.h"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/SlowVulkanCallTiming.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4Opcodes.hpp"
 #include "prx/libc/include/CpuTopology.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -3339,7 +3340,17 @@ void Recorder::Submit() {
         submission.pSignalSemaphores = &timeline;
     }
     const auto submitStart = std::chrono::steady_clock::now();
-    const auto result = function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence);
+    const auto submitFunction = function(queueSubmit, "vkQueueSubmit");
+    VkResult result;
+    if (AgcDriver::SlowVulkanCallTiming::Enabled()) {
+        const auto inFlightBefore = static_cast<std::uint64_t>(inFlight.size());
+        const auto submitBegin = AgcDriver::SlowVulkanCallTiming::Begin();
+        result = submitFunction(context.queue, 1, &submission, batch->fence);
+        const auto submitEnd = AgcDriver::SlowVulkanCallTiming::End();
+        AgcDriver::SlowVulkanCallTiming::EmitIfSlow("vkQueueSubmit", submitBegin, submitEnd, reinterpret_cast<std::uintptr_t>(context.device), reinterpret_cast<std::uintptr_t>(context.queue), "submit_serial", serial, "command_buffer", reinterpret_cast<std::uintptr_t>(batch->commands), static_cast<std::int32_t>(result), inFlightBefore, "recorder_batches_before_submit");
+    } else {
+        result = submitFunction(context.queue, 1, &submission, batch->fence);
+    }
     if (result == VK_ERROR_DEVICE_LOST) {
         const auto idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
         if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST) std::terminate();
