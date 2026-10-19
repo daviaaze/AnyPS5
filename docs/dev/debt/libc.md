@@ -56,6 +56,8 @@
 
 - [_FSinh and _FCosh](../../../core/libs/prx/libc/src/Math.cpp) (libc) finite results are not verified bit for bit against the console: the scaled product uses the host's binary64 hyperbolic function before rounding to binary32, rather than the float rational and `_FExp` sequence in PRAGMATA's bundled `libc.prx`. NaN preference and payloads, signed zeros, infinite operands and the range-error thresholds follow that binary's instructions; the system `libSceLibcInternal` implementation and nondefault flush-to-zero modes are unverified.
 
+- [Guest image registration](../../../core/libs/prx/libc/src/GuestAllocations.cpp) waits for outstanding range leases before unregistering an image. That wait releases the registry mutex; concurrent unregisters erase by the copied image base rather than retaining an iterator across the wait. The deterministic Linux regression covers two pinned-image unregisters and registration afterward; it does not establish the cause of a title's memory corruption or verify gameplay.
+
 - [sscanf_s and vsscanf_s](../../../core/libs/prx/libc/src/Formatting.cpp) (libc) return `EOF` when a reached conversion has a null destination, stopping before further assignments, following C11 K.3.5.3.7 and K.3.5.3.14. Earlier assignments are retained. The constraint handler is not invoked, and console behaviour is unverified.
 - [memmem and memccpy](../../../core/libs/prx/libc/src/Strings.cpp) (libc) - `memmem` searches for needle occurrences in memory buffers and `memccpy` copies buffers until a character match, following FreeBSD and POSIX specifications; behavior is unverified on console.
 
