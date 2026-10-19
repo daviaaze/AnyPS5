@@ -82,6 +82,12 @@ For userspace-only `perf record` sampling, combine `-e cpu-clock:u --call-graph 
 
 When parsing `perf script --ns -F pid,tid,time,event,period`, allow leading whitespace before the PID: shorter process IDs are left-padded. Require nonzero samples for the verified target PID inside the enable/disable ACK window; a nonempty data file or successful recorder exit does not establish usable samples.
 
+### Kernel scheduler captures
+
+Task-scoped `sched:sched_switch` recordings need separate kernel permissions; userspace CPU sampling does not grant them. Pass an explicit unit to `perf record --max-size`, such as `32M` for a soft 32 MiB limit. A byte-count-only argument can be rejected by the CLI. Keep an independent deadline and report actual output bytes rather than claiming a hard file-size cap.
+
+Scheduler validation must recognize both raw `prev_pid`/`next_pid` fields and formatted `comm:pid [priority] state ==> comm:pid [priority]` records, while still requiring a matching target PID/TID header. A collector-requested, identity-verified `SIGINT` can finalize perf with return code `-SIGINT`; that result is usable only after checking the finalized data, target scheduler events, kernel callchains and lost-event count. Captured kernel addresses may remain unsymbolized even when blocked-thread `/proc` stacks expose function names. A successful synthetic kernel capture is not title root-cause or gameplay proof.
+
 ## Shader registers
 
 `APS5_TRACE_SHADER_REGS=all` prints register snapshots for every shader. Set it to a shader code address in hexadecimal to print one shader's registers.
