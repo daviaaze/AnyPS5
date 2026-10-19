@@ -40,6 +40,8 @@
 
 ### Functional
 
+- [Guest image registration](../../../core/libs/prx/libc/src/GuestAllocations.cpp) waits for outstanding range leases before unregistering an image. That wait releases the registry mutex; concurrent unregisters erase by the copied image base rather than retaining an iterator across the wait. The deterministic Linux regression covers two pinned-image unregisters and registration afterward; it does not establish the cause of a title's memory corruption or verify gameplay.
+
 - [sscanf_s and vsscanf_s](../../../core/libs/prx/libc/src/Formatting.cpp) (libc) return `EOF` when a reached conversion has a null destination, stopping before further assignments, following C11 K.3.5.3.7 and K.3.5.3.14. Earlier assignments are retained. The constraint handler is not invoked, and console behaviour is unverified.
 
 - [__isfinitel](../../../core/libs/prx/libc/src/Math.cpp) - classifies the x87 80-bit exponent without narrowing to double or performing floating-point comparisons, following [FreeBSD msun](https://github.com/freebsd/freebsd-src/blob/main/lib/msun/src/s_isfinite.c). The signature and classification follow FreeBSD; console behaviour is unmeasured. Requires little-endian x87 long double stored in 16 bytes, as the existing guest long-double ABI does.

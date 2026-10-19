@@ -327,7 +327,7 @@ void GuestAllocationsUnregisterImage_nid_postfix(void* mutation, const void* ima
     GuestAllocationsRequireUnpinned_nid_postfix(mutation, image, end - begin);
     recordChange(mutation, image, end - begin);
     std::erase_if(state.ranges, [&](const auto& entry) { return !entry.second->releasable && entry.second->allocationAddress >= begin && entry.second->allocationAddress < end; });
-    state.registeredImages.erase(found);
+    state.registeredImages.erase(begin);
 }
 
 void GuestAllocationsAdd_nid_postfix(void* mutation, void* pointer, std::size_t bytes, bool readable, bool writable, bool gpu) {
