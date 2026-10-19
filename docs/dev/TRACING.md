@@ -76,6 +76,12 @@ Slow-Vulkan wall intervals include only the resolved Vulkan entrypoint call, exc
 
 Slow-Vulkan output has two process-wide rate lanes: at most one record for calls taking at least 5 ms but less than 100 ms, and one at-least-100 ms stall record per monotonic second, shared across threads and the two APIs. Later windows remain eligible instead of exhausting a startup-only record limit. Each record includes cumulative rate-limited counts and maximum suppressed wall times; this is sparse diagnostic evidence, not a complete API-call trace. Present in-flight counts describe the slot snapshot at blit submission, while recorder counts describe batches before submission. Logging is opt-in; the disabled path adds no clock reads or sample initialization.
 
+### External Linux CPU sampling
+
+For userspace-only `perf record` sampling, combine `-e cpu-clock:u --call-graph dwarf,4096` with `--user-callchains`. The event's `:u` modifier excludes kernel execution, but does not itself set `exclude_callchain_kernel`; a recorder that still requests kernel callchains can fail with `EACCES` under `perf_event_paranoid=2`. Explicit userspace callchains avoid that request without changing host permissions. Kernel stack collection is separate and may still be unavailable.
+
+When parsing `perf script --ns -F pid,tid,time,event,period`, allow leading whitespace before the PID: shorter process IDs are left-padded. Require nonzero samples for the verified target PID inside the enable/disable ACK window; a nonempty data file or successful recorder exit does not establish usable samples.
+
 ## Shader registers
 
 `APS5_TRACE_SHADER_REGS=all` prints register snapshots for every shader. Set it to a shader code address in hexadecimal to print one shader's registers.
