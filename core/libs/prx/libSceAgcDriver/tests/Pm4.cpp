@@ -1621,25 +1621,6 @@ void testStallWatchdog() {
     check(std::any_of(lines.begin(), lines.end(), [](const std::string& line) { return line.find("+0x0000 WAIT_REG_MEM 00000013") != std::string::npos; }), "the stall dump does not decode the stalled submission");
 }
 
-void testStallWatchdogRewind() {
-    alignas(8) static std::uint32_t done = 0;
-    static std::vector<std::uint32_t> words;
-    words = joinPackets({makePacket(0x59, {0}), writeWord(done, 1)});
-    std::vector<std::string> lines;
-    {
-        CapturedStderr capture;
-        submitWords(words);
-        awaitRingLine(capture, stallPrefix("REWIND at", &words[1]), " for 1 s (APS5_STALL_WATCHDOG_SECS): 1 queue(s), up to 16 submissions each, oldest first",
-                      "a REWIND stalled past APS5_STALL_WATCHDOG_SECS did not dump the rings");
-        std::this_thread::sleep_for(std::chrono::milliseconds(1500));
-        check(std::atomic_ref<std::uint32_t>(done).load() == 0, "the tail of a REWIND ran before the title released it");
-        std::atomic_ref<std::uint32_t>(words[1]).store(0x80000000u);
-        AgcDriverWaitIdle_nid_postfix();
-        lines = capture.RingLines();
-    }
-    checkOneStallDump(lines, done);
-    check(std::any_of(lines.begin(), lines.end(), [](const std::string& line) { return line.find("+0x0000 REWIND 00000000") != std::string::npos; }), "the stall dump does not decode the stalled REWIND");
-}
 
 void testRewindTailTrace() {
     using AgcDriver::DriverDetail::DrawPipeline;
@@ -1726,6 +1707,102 @@ public:
 
     std::shared_ptr<RenderingGateState> state = std::make_shared<RenderingGateState>();
 };
+void testStallWatchdogRewind() {
+    alignas(8) static std::uint32_t before = 0, done = 0, reused = 0;
+    before = 0;
+    done = 0;
+    reused = 0;
+    auto output = std::make_shared<GatedOutput>();
+    auto rewindOutput = std::make_shared<GatedOutput>();
+    AgcDriverRegisterVideoOutput_nid_postfix(7, output);
+    AgcDriverRegisterVideoOutput_nid_postfix(8, rewindOutput);
+    struct GateRelease {
+        std::shared_ptr<RenderingGateState> first, second;
+        ~GateRelease() { first->Open(); second->Open(); }
+    } release{output->state, rewindOutput->state};
+    static std::vector<std::uint32_t> words;
+    const std::vector<std::uint32_t> wait{AgcDriver::RenderingWaitPacketHeader, 7, 0, 0};
+    const std::vector<std::uint32_t> rewindWait{AgcDriver::RenderingWaitPacketHeader, 8, 0, 0};
+    words = joinPackets({wait, writeWord(before, 0x29), rewindWait, makePacket(0x59, {0}), std::vector<std::uint32_t>(8, 0xffff1000u), writeWord(done, 1)});
+    std::vector<std::string> lines;
+    {
+        CapturedStderr capture;
+        submitWords(words);
+        {
+            std::unique_lock lock(output->state->mutex);
+            check(output->state->changed.wait_for(lock, std::chrono::seconds(5), [&] { return output->state->waiting; }), "queue 0 did not reach the snapshot gate");
+        }
+        words[8] = 99;
+        output->state->Open();
+        {
+            std::unique_lock lock(rewindOutput->state->mutex);
+            check(rewindOutput->state->changed.wait_for(lock, std::chrono::seconds(5), [&] { return rewindOutput->state->waiting; }), "queue 0 did not reach the REWIND gate");
+        }
+        words[13] = 0xffff1000u;
+        rewindOutput->state->Open();
+        awaitRingLine(capture, stallPrefix("REWIND at", &words[14]), " for 1 s (APS5_STALL_WATCHDOG_SECS): 1 queue(s), up to 16 submissions each, oldest first",
+                      "a REWIND stalled past APS5_STALL_WATCHDOG_SECS did not dump the rings");
+        std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+        check(done == 0, "the tail of a REWIND ran before the title released it");
+        std::atomic_ref<std::uint32_t>(words[14]).store(0x80000000u);
+        AgcDriverWaitIdle_nid_postfix();
+        check(before == 0x29 && done == 1, "the copied write and REWIND tail did not execute in order");
+        alignas(8) static std::uint32_t warmup = 0;
+        alignas(8) static std::uint64_t writePredicate = 1;
+        const auto predicatedWarmupWrite = makePacket(0x37, {0x00100200, low(&warmup), high(&warmup), 1}, 1);
+        auto warmupWords = joinPackets({wait, makePacket(0x20, {0x31100u, low(&writePredicate), high(&writePredicate)}), predicatedWarmupWrite});
+        {
+            std::lock_guard lock(output->state->mutex);
+            output->state->closed = true;
+            output->state->waiting = false;
+        }
+        submitWords(warmupWords);
+        {
+            std::unique_lock lock(output->state->mutex);
+            check(output->state->changed.wait_for(lock, std::chrono::seconds(5), [&] { return output->state->waiting; }), "queue 0 did not reach the first reuse gate");
+        }
+        output->state->Open();
+        AgcDriverWaitIdle_nid_postfix();
+        check(warmup == 1, "the predicated warmup WRITE_DATA did not execute");
+        AgcDriver::DriverDetail::ResetCommandStorageAcquisitionsForTesting();
+        check(AgcDriver::DriverDetail::CommandStorageAcquisitionsForTesting() == 0, "the command-storage acquisition counter did not reset");
+        {
+            std::lock_guard lock(output->state->mutex);
+            output->state->closed = true;
+            output->state->waiting = false;
+        }
+
+        auto reusedWords = joinPackets({wait, writeWord(reused, 2)});
+        submitWords(reusedWords);
+        {
+            std::unique_lock lock(output->state->mutex);
+            check(output->state->changed.wait_for(lock, std::chrono::seconds(5), [&] { return output->state->waiting; }), "queue 0 did not reach the reuse gate");
+        }
+        check(AgcDriver::DriverDetail::CommandStorageAcquisitionsForTesting() >= 1, "the second eligible submission did not acquire recycled command storage");
+        reusedWords[8] = 99;
+        output->state->Open();
+        AgcDriverWaitIdle_nid_postfix();
+        check(reused == 2, "the reused command storage observed mutated guest input");
+        AgcDriver::DriverDetail::DumpSubmissionRings("command storage reuse");
+        lines = capture.RingLines();
+    }
+    AgcDriverUnregisterVideoOutput_nid_postfix(7, output);
+    AgcDriverUnregisterVideoOutput_nid_postfix(8, rewindOutput);
+    checkOneStallDump(lines, done);
+    const auto recorded = std::find_if(lines.begin(), lines.end(), [](const std::string& line) { return line.starts_with("[pm4 ring] command storage reuse:"); });
+    check(recorded != lines.end(), "the command-storage ring snapshot was not recorded");
+    const std::vector<std::string> snapshot(recorded, lines.end());
+    check(recordedWrites(snapshot) == std::vector<std::string>{"0x0 #1 00000029", "0x0 #2 00000001", "0x0 #3 00000001", "0x0 #4 00000002"},
+          "the ring did not preserve copied command snapshots in submit/rewind/warmup/reuse order");
+    check(std::any_of(snapshot.begin(), snapshot.end(), [](const std::string& line) { return line.find("+0x000d REWIND 00000000") != std::string::npos; }),
+          "the recorded command snapshot observed a mutated REWIND header");
+    check(std::any_of(snapshot.begin(), snapshot.end(), [](const std::string& line) { return line.starts_with("[pm4 ring] queue 0x0 #2 serial 1 ") && line.find("(rewind tail)") != std::string::npos; }),
+          "the rewind tail was not recorded before the reused submission");
+    check(std::any_of(snapshot.begin(), snapshot.end(), [](const std::string& line) { return line.starts_with("[pm4 ring] queue 0x0 #3 serial 2 "); }),
+          "the warmup submission did not retain its serial");
+    check(std::any_of(snapshot.begin(), snapshot.end(), [](const std::string& line) { return line.starts_with("[pm4 ring] queue 0x0 #4 serial 3 "); }),
+          "the reused submission did not retain its next serial");
+}
 
 void testStallWatchdogOrder() {
     alignas(8) static std::uint32_t done = 0;
