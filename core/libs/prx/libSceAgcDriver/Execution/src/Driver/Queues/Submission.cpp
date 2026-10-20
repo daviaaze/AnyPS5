@@ -20,6 +20,9 @@ namespace AgcDriver::DriverDetail {
 
 namespace {
 
+inline constexpr std::size_t MaximumReusableCommandDwords = 16 * 1024;
+inline constexpr std::size_t MaximumReusableCommandBuffers = 8;
+inline constexpr std::size_t MaximumReusableCommandBytes = 512 * 1024;
 std::uint64_t captureTime() {
     return static_cast<std::uint64_t>(std::llround(TraceMs() * 1000.0));
 }
@@ -37,6 +40,14 @@ bool EopRelease(std::span<const std::uint32_t> words) {
     return words.size() >= 8 && (words[0] >> 30u) == 3u && Pm4::PacketWords(words[0]) == 8u && ((words[0] >> 8u) & 0xffu) == 0x49u && ((words[2] >> 24u) & 7u) == 2u;
 }
 
+}
+
+void ResetCommandStorageAcquisitionsForTesting() {
+    Driver::Get().ResetCommandStorageAcquisitionsForTesting();
+}
+
+std::uint64_t CommandStorageAcquisitionsForTesting() {
+    return Driver::Get().CommandStorageAcquisitionsForTesting();
 }
 
 std::deque<const std::uint32_t*>& Driver::releasedTails() {
@@ -63,6 +74,46 @@ void Driver::noteReleasedTails(const Submission& submission) {
         }
         tail = scratch.rewindTail;
         words = scratch.rewindWords;
+    }
+}
+
+void Driver::ResetCommandStorageAcquisitionsForTesting() {
+    std::lock_guard lock(mutex);
+    commandStorageAcquisitions = 0;
+}
+
+std::uint64_t Driver::CommandStorageAcquisitionsForTesting() {
+    std::lock_guard lock(mutex);
+    return commandStorageAcquisitions;
+}
+
+void Driver::acquireCommandStorage(Submission& submission, std::uint32_t queue) {
+    std::lock_guard lock(mutex);
+    const auto found = workers.find(queue);
+    if (found == workers.end()) return;
+    auto& worker = found->second;
+    for (auto& commands : worker.reusableCommands) {
+        if (commands.capacity() == 0) continue;
+        pooledCommandBytes -= commands.capacity() * sizeof(std::uint32_t);
+        --pooledCommandBuffers;
+        submission.commands.swap(commands);
+        ++commandStorageAcquisitions;
+        return;
+    }
+}
+
+void Driver::recycleCommandStorageLocked(QueueWorker& worker, std::vector<std::uint32_t>& commands) {
+    commands.clear();
+    const auto capacity = commands.capacity();
+    if (capacity == 0 || capacity > MaximumReusableCommandDwords) return;
+    const auto bytes = capacity * sizeof(std::uint32_t);
+    if (pooledCommandBuffers >= MaximumReusableCommandBuffers || bytes > MaximumReusableCommandBytes - pooledCommandBytes) return;
+    for (auto& reusable : worker.reusableCommands) {
+        if (reusable.capacity() != 0) continue;
+        reusable.swap(commands);
+        ++pooledCommandBuffers;
+        pooledCommandBytes += bytes;
+        return;
     }
 }
 
@@ -281,6 +332,7 @@ void Driver::executeRewindTail(const Submission& stalled) {
     }
     Submission tail{};
     tail.queue = stalled.queue;
+    acquireCommandStorage(tail, tail.queue);
     if (APS5_ENABLE_TIMING_LOG) tail.receivedAt = std::chrono::steady_clock::now();
     auto& released = releasedTails();
     if (!released.empty() && released.front() == stalled.rewindTail - 1) {
@@ -314,6 +366,10 @@ void Driver::executeRewindTail(const Submission& stalled) {
     if (APS5_ENABLE_TIMING_LOG) tail.enqueuedAt = tail.dequeuedAt = tail.orderedAt = std::chrono::steady_clock::now();
     timing.Finish();
     execute(tail);
+    if (!completionDeferred()) {
+        std::lock_guard lock(mutex);
+        recycleCommandStorageLocked(workers.at(tail.queue), tail.commands);
+    }
 }
 
 void Driver::Submit(const Packet* packet, std::uint32_t queue) {
@@ -334,6 +390,7 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue) {
     if (descriptor.dw_num != 0) {
         require(descriptor.dw_num <= std::numeric_limits<std::size_t>::max() / sizeof(std::uint32_t), "command size overflow");
         GuestMemory::CheckRange(descriptor.addr, static_cast<std::size_t>(descriptor.dw_num) * sizeof(std::uint32_t), alignof(std::uint32_t));
+        acquireCommandStorage(submission, queue);
         copyCommands(submission, descriptor.addr, descriptor.dw_num);
     }
     const auto copied = profile ? std::chrono::steady_clock::now() : start;

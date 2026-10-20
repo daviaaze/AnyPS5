@@ -669,6 +669,8 @@ private:
         bool behindCompletion = false;
     };
     void readGpuTiming(Batch& batch);
+    std::vector<std::uint64_t> gpuTimingStamps;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> gpuTimingIntervals;
     void beginSamples(Batch& batch);
     void readSamples(Batch& batch);
     bool gpuSampleCounter();

@@ -1140,6 +1140,13 @@ void batchStampTests(Recorder& recorder) {
     Require(recorder.Idle(), "batch stamps: the recorder is busy");
     double previousEnd = 0;
     for (int round = 0; round < 3; ++round) {
+        if (Recorder::GpuTimingEnabled()) {
+            for (std::uint64_t range = 0; range < 2; ++range) {
+                const auto timing = recorder.BeginGpuTiming(0x600000 + static_cast<std::uint64_t>(round * 2) + range);
+                Require(timing != Recorder::NoTiming, "batch stamps: a full-range timing query was not allocated");
+                recorder.EndGpuTiming(timing);
+            }
+        }
         recorder.NotePendingWrite(0x60000, 0x100);
         const auto serial = recorder.Submissions() + 1;
         recorder.Submit();
@@ -1374,6 +1381,7 @@ void keyProofTests(const Device& device, Recorder& recorder) {
     // A recorded write over the keys (noted and stamped as the driver's key stores are): the scans
     // are not kept until its batch signaled.
     recorder.NotePendingWrite(address, keyCount);
+    NoteKeysFillOnGpu(address, keyCount, DccKeys::Clear0001);
     MarkWritten(address, keyCount);
     before = KeyProofCounts();
     Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001 && proof.generation == 0, "(9) a scan under a pending write was kept");
@@ -1382,10 +1390,14 @@ void keyProofTests(const Device& device, Recorder& recorder) {
     Require(after.scanned == before.scanned + 2 && after.unstable == before.unstable + 2 && after.proved == before.proved, "(9) unstable scans were miscounted");
     recorder.Submit();
     device.WaitQueue();
-    Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001 && proof.generation != 0, "(9) a signaled write kept the scan unstable");
+    Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001 && proof.generation == 0, "(9) a signaled but in-flight write stored a proof");
     recorder.Sync();
     before = KeyProofCounts();
-    Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001 && KeyProofCounts().proved == before.proved + 1, "(9) the proof did not hold after the batch finished");
+    Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001 && proof.generation != 0, "(9) a reaped write did not store a proof");
+    after = KeyProofCounts();
+    Require(after.scanned == before.scanned + 1 && after.proved == before.proved, "(9) the first post-reap scan was not kept");
+    before = KeyProofCounts();
+    Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001 && KeyProofCounts().proved == before.proved + 1, "(9) the proof did not hold after the batch was reaped");
 }
 
 void targetKeyProofTests(const Device& device, Recorder& recorder) {
