@@ -102,6 +102,17 @@ With `CMAKE_OSX_ARCHITECTURES=x86_64` Apple silicon runs the tests through Roset
 
 On Windows MinGW frees `thread_local` objects before their destructors run, so the Tracy client is built without `thread_local` destructors and never destroys its event queue: a thread that emitted a zone and ended keeps its event blocks (2 MiB each) until the process exits.
 
+## Shader request replay
+
+Build `agc_shader_replay` to replay the serialized `shader_<address>.req` files saved by `APS5_DUMP_SHADERS=1`, without starting a title or creating a Vulkan device. `--materialize` runs prepared-shader creation, captured-resource reconstruction and materialization. Add `--spv` to write the final materialized module as `<request basename>.spv` in the current directory; output failures return a failing exit status.
+
+```sh
+cmake --build build --target agc_shader_replay
+ANYPS5_NO_SHADER_CACHE=1 build/core/libs/prx/libSceAgcDriver/agc_shader_replay --materialize --spv --profile shader_<address>.req
+```
+
+With `--materialize --profile`, the tool reports separate preparation, capture and materialization wall milliseconds. Capture includes invocation creation and the captured-memory view; output-file writes are outside these intervals. Run each comparison in a fresh process and separate output directory with the same request, target options and compiler configuration. Disabling the disk cache does not clear process-local caches, so repeating a request inside one invocation is not a fresh comparison. A saved request reproduces its serialized inputs, not necessarily a later run at the same shader address. Replay timings do not establish game FPS.
+
 ## Compute pipeline replay
 
 Build `agc_compute_pipeline_replay` in the full build with `-DANYPS5_ENABLE_SPIRV_TOOLS=ON`; replay validates the captured module before calling Vulkan. Set `APS5_DUMP_COMPUTE_PIPELINES` to a dedicated empty directory before starting a title to save each uncached compute pipeline's final SPIR-V, descriptor layouts, push constant ranges, specialization values, subgroup size and creation flags before compilation. Files are named `compute-<identity>/capture.aps5cp`; identical records are deduplicated. Capture stops with an error at 128 records, 256 MiB total or 36 MiB per record (at most 8,388,608 SPIR-V words, or 32 MiB of shader code). Capture files contain shader code and device metadata, but no guest buffers or textures; review them before sharing.

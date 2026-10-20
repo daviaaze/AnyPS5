@@ -13,11 +13,11 @@
 #include "spirv-tools/libspirv.hpp"
 #endif
 
+#include <chrono>
 #include <cstdio>
 #include <exception>
 #include <fstream>
 #include <sstream>
-#include <stdexcept>
 #include <string>
 
 namespace {
@@ -48,6 +48,12 @@ bool g_materialize = false;
 bool g_graph = false;
 bool g_maintenance8 = false;
 bool g_code = false;
+
+bool g_profile = false;
+
+double ElapsedMilliseconds(std::chrono::steady_clock::time_point start) {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+}
 
 bool Replay(const char* path) {
     auto request = ShaderRecompiler::RequestSerializer{}.Deserialize(ReadText(path));
@@ -123,19 +129,38 @@ bool Replay(const char* path) {
     if (g_prepare || g_materialize) {
         const char* phase = "prepare";
         try {
+            const auto prepareStarted = g_profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             const auto handle = ShaderRecompiler::PrepareShader(request.request);
+            const double prepareMilliseconds = g_profile ? ElapsedMilliseconds(prepareStarted) : 0.0;
             std::printf("  prepared: %zu SPIR-V words\n", ShaderRecompiler::GetPreparedArtifact(*handle).spirv.size());
             if (g_materialize) {
                 phase = "prepared invocation";
+                const auto captureStarted = g_profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 const auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(request.request, handle);
                 if (!invocation.has_value()) throw std::runtime_error("request does not match its prepared shader");
                 ShaderRecompiler::RequestMemoryView memory(request.request.context.memory);
                 const auto runtime = memory.MakeRuntime(request.request.context.userData, request.request.shader.codeAddress);
                 phase = "capture";
                 const auto capture = invocation->Capture(runtime);
+                const double captureMilliseconds = g_profile ? ElapsedMilliseconds(captureStarted) : 0.0;
+                const auto materializeStarted = g_profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 phase = "materialize";
                 const auto result = invocation->Materialize(*capture);
+                const double materializeMilliseconds = g_profile ? ElapsedMilliseconds(materializeStarted) : 0.0;
                 std::printf("  materialized: %zu SPIR-V words\n", result->spirv.size());
+                if (g_spirv) {
+                    std::string name(path);
+                    name = name.substr(name.find_last_of("/\\") + 1) + ".spv";
+                    std::ofstream file(name, std::ios::binary);
+                    file.write(reinterpret_cast<const char*>(result->spirv.data()), static_cast<std::streamsize>(result->spirv.size() * sizeof(result->spirv[0])));
+                    file.close();
+                    if (!file) {
+                        std::printf("  could not write %s\n", name.c_str());
+                        return false;
+                    }
+                    std::printf("  SPIR-V -> %s\n", name.c_str());
+                }
+                if (g_profile) std::printf("  profile: prepare_wall_ms=%.3f capture_wall_ms=%.3f materialize_wall_ms=%.3f\n", prepareMilliseconds, captureMilliseconds, materializeMilliseconds);
             }
             return true;
         } catch (const std::exception& error) {
@@ -182,7 +207,7 @@ bool Replay(const char* path) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--prepare] [--materialize] [--code] [--maintenance8] <shader.req>...\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set\n");
+        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--prepare] [--materialize] [--profile] [--code] [--maintenance8] <shader.req>...\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set\n");
         return 2;
     }
     int failures = 0;
@@ -213,6 +238,10 @@ int main(int argc, char** argv) {
         }
         if (std::string(argv[i]) == "--prepare") {
             g_prepare = true;
+            continue;
+        }
+        if (std::string(argv[i]) == "--profile") {
+            g_profile = true;
             continue;
         }
         if (std::string(argv[i]) == "--materialize") {
