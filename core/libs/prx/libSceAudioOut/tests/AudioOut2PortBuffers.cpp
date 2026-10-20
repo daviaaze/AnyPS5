@@ -229,6 +229,34 @@ void TestAdvanceBurstRetainsEveryGrain() {
     RequirePlayed(played, grains);
 }
 
+void TestAdvanceAfterPortReplacement() {
+    const auto first = Grain(0.01f);
+    const auto second = Grain(0.02f);
+    const auto third = Grain(0.03f);
+    const auto played = Play([&](AudioOut2ContextHandle context, AudioOut2PortHandle port) {
+        SetData(port, first.data());
+        Require(sceAudioOut2ContextAdvance(context) == 0);
+        Require(sceAudioOut2ContextPush(context, 1) == 0);
+        SetData(port, nullptr);
+        AudioOut2PortParam params{};
+        params.port_type = portTypeMain;
+        params.data_format = formatStereoFloat;
+        params.sampling_freq = frequency;
+        AudioOut2PortHandle replacement = 0;
+        Require(sceAudioOut2PortCreate(context, &params, &replacement) == 0);
+        SetData(replacement, second.data());
+        Require(sceAudioOut2ContextAdvance(context) == 0);
+        Require(sceAudioOut2ContextPush(context, 1) == 0);
+        Require(sceAudioOut2PortDestroy(replacement) == 0);
+        Require(sceAudioOut2PortCreate(context, &params, &replacement) == 0);
+        SetData(replacement, third.data());
+        Require(sceAudioOut2ContextAdvance(context) == 0);
+        Require(sceAudioOut2ContextPush(context, 1) == 0);
+        Require(sceAudioOut2PortDestroy(replacement) == 0);
+    }, true);
+    RequirePlayed(played, {&first, &second, &third});
+}
+
 void TestPushingThreadWaitsForAdvance() {
     const auto first = Grain(0.01f);
     const auto second = Grain(0.02f);
@@ -293,6 +321,7 @@ int main() {
     TestAdvanceRetainsRewrittenBuffer();
     TestAdvanceRetainsVolume();
     TestAdvanceBurstRetainsEveryGrain();
+    TestAdvanceAfterPortReplacement();
     TestPushingThreadWaitsForAdvance();
     TestBuffersSetBeforeOnePushPlayInOrder();
     TestBurstThenGapKeepsEveryBuffer();
