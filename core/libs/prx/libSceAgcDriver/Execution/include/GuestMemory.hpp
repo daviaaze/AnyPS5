@@ -26,6 +26,7 @@ struct Commitment {
     bool whole = false;
 };
 Commitment DescribeCommitted(std::uint64_t address, std::size_t bytes, bool writable = false);
+void CopyGuestBytes(void* destination, const void* source, std::size_t bytes);
 void Read(std::uint64_t address, std::span<std::byte> destination, std::size_t alignment = 1);
 // Variants for resources in heaps the guest commits on demand (partially resident textures, GPU
 // scratch heaps): uncommitted pages read as zeros, are not compared, and are never stored.
@@ -60,8 +61,13 @@ void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std
 // UnchangedSince is always false, so callers fall back to comparing bytes.
 bool WriteWatched();
 void Unwatch(std::uint64_t address, std::size_t bytes);
+void Rewatch(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
 bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function<bool()>& import, bool staysWatched = true);
 void SetUnwatchHook(void (*hook)(std::uint64_t address, std::size_t bytes));
+#ifdef _WIN32
+using FreshCollectHook = bool (*)(std::uintptr_t address, std::size_t bytes, void (*written)(void*, std::uintptr_t, std::uintptr_t), void* context);
+void SetFreshCollectHook(FreshCollectHook hook);
+#endif
 bool Watched(std::uint64_t address, std::size_t bytes);
 std::uint64_t CollectWrites(std::uint64_t address, std::size_t bytes);
 bool UnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
@@ -98,6 +104,7 @@ bool StoredAllSince_nid_no_patch(std::uint64_t address, std::size_t bytes, std::
 // for every collect: nothing is reused without an ordering point. APS5_PACKET_EPOCH=1 makes the
 // workers bump before every packet as before. CollectEpochBumps counts the bumps ([guestmem] line).
 void BumpCollectEpoch();
+void AdoptLatestCollectEpoch();
 std::uint64_t CollectEpoch();
 std::uint64_t CollectEpochBumps();
 std::uint64_t ThreadCollectEpoch();
@@ -193,6 +200,7 @@ unsigned long long CodeOffset(const void* address);
 // calls FlushGpuWrites itself.
 void SetFlushHook(void (*hook)(std::uint64_t address, std::size_t bytes));
 void SetReadGuard(void (*guard)(std::uint64_t address, std::size_t bytes));
+void GuardRead(std::uint64_t address, std::size_t bytes);
 void FlushGpuWrites(std::uint64_t address, std::size_t bytes);
 // Moves with every ForgetPages call (the libc invalidator: memory unmapped or re-registered): odd
 // while the call stores its page states, moved past it after, so a reader that loads an even

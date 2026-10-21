@@ -22,6 +22,7 @@ void ReadUserWords(const QueueState& queue, DrawProgram& program, bool staticAbi
     const auto userCount = ((resources >> 1u) & 0x1fu) | (((resources >> 27u) & 1u) << 5u);
     require(userCount <= 32, "graphics user SGPR count exceeds the register bank");
     program.userData.clear();
+    program.userData.reserve(userCount + 8u);
     for (std::uint32_t i = 0; i < userCount; ++i) {
         Graphics::NoteRegisterRead(Graphics::RegisterBank::Shader, program.userDataBase + i);
         program.userData.push_back(staticAbi ? ReadGraphicsRegister(queue.shader, program.userDataBase + i) : readUserData(queue.shader, program.userDataBase + i));
@@ -45,9 +46,32 @@ void InitializeMerged(const QueueState& queue, DrawProgram& program, std::uint32
     const auto address = static_cast<std::uint64_t>(low) | (static_cast<std::uint64_t>(high) << 32u);
     require(address != 0 || !pointerRequired, "merged shader user-data address is null");
     if (address == 0) return;
-    GuestMemory::CheckRange(reinterpret_cast<const void*>(address), 8, 4);
+    if (pointerRequired) GuestMemory::CheckRange(reinterpret_cast<const void*>(address), 8, 4);
     program.userData[0] = low;
     program.userData[1] = high;
+}
+
+void AppendProgramMemory(std::vector<ShaderRecompiler::MemoryRegion>& memory, const std::vector<DrawProgram>& programs) {
+    for (const auto& program : programs) {
+        for (const auto& region : program.memory) {
+            if (region.bytes.empty()) continue;
+            const bool listed = std::any_of(memory.begin(), memory.end(), [&](const ShaderRecompiler::MemoryRegion& known) { return known.guestAddress == region.guestAddress && known.bytes.data() == region.bytes.data() && known.bytes.size() == region.bytes.size(); });
+            if (!listed) memory.push_back(region);
+        }
+    }
+}
+
+std::vector<std::pair<std::size_t, std::size_t>> UserDataWords(const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, std::uint32_t location) {
+    using Role = ShaderRecompiler::ProgramRole;
+    require(roles.size() == programs.size(), "draw program roles are incomplete");
+    std::vector<std::pair<std::size_t, std::size_t>> words;
+    if (location == 0x280u) return words;
+    for (std::size_t i = 0; i < programs.size(); ++i) {
+        if (roles[i] == Role::Fragment || roles[i] == Role::GeometryBack || location < programs[i].userDataBase) continue;
+        const auto word = location - programs[i].userDataBase + (8u - programs[i].firstUserSgpr);
+        if (word < programs[i].userData.size()) words.emplace_back(i, static_cast<std::size_t>(word));
+    }
+    return words;
 }
 
 void DecodeGraphicsPrograms(DrawDecode& decoded, const QueueState& queue, const ShaderRegistry& registry, bool staticAbi, bool includeFragment) {
@@ -94,11 +118,21 @@ void DecodeGraphicsPrograms(DrawDecode& decoded, const QueueState& queue, const 
             programs.push_back(prepare(programAddress(base), type, stage, resources, users));
             roles.push_back(role);
         };
-        const auto& graphics = product->state;
+        auto& graphics = product->state;
         if (graphics.stages.path == Graphics::ShaderPath::Tessellation) {
-            if (!staticAbi || programAddress(0x148) != 0) append(0x148, 5, Stage::Local, 0x10b, 0x10c, Role::Local);
-            append(0x108, 7, Stage::TessellationControl, 0x10b, 0x10c, Role::Hull);
-            InitializeMerged(queue, programs.back(), 0x102, true, staticAbi);
+            const auto localAddress = programAddress(0x148);
+            const auto local = !staticAbi || localAddress != 0 ? ProgramSnapshot(registry, localAddress, {3, 5}) : nullptr;
+            const bool mergedHull = local != nullptr && !local->header.empty() && local->type == 3;
+            require(graphics.stages.tessellation.has_value(), "tessellation draw has no tessellation configuration");
+            graphics.stages.tessellation->mergedHull = mergedHull;
+            if (mergedHull) {
+                append(0x148, 3, Stage::Local, 0x10b, 0x10c, Role::Local);
+                append(0x148, 3, Stage::TessellationControl, 0x10b, 0x10c, Role::Hull);
+            } else {
+                if (local != nullptr) append(0x148, 5, Stage::Local, 0x10b, 0x10c, Role::Local);
+                append(0x108, 7, Stage::TessellationControl, 0x10b, 0x10c, Role::Hull);
+            }
+            InitializeMerged(queue, programs.back(), 0x102, !mergedHull, staticAbi);
             append(0x0c8, 2, Stage::TessellationEvaluation, 0x08b, 0x08c, Role::Domain);
         } else if (graphics.stages.path == Graphics::ShaderPath::Geometry) {
             const auto frontAddress = programAddress(0xc8);
@@ -121,17 +155,23 @@ void DecodeGraphicsPrograms(DrawDecode& decoded, const QueueState& queue, const 
     }
 }
 
-std::shared_ptr<DrawDecode> Driver::decodeDraw(const QueueState& queue, const Submission& submission) {
+std::shared_ptr<DrawDecode> Driver::decodeDraw(const QueueState& queue, const Submission& submission, const Graphics::Context& context) {
     auto product = std::make_shared<DrawDecode>();
     product->state = Graphics::DecodeState(queue, VertexWorkgroupRequired(queue, *submission.shaders));
     DecodeGraphicsPrograms(*product, queue, *submission.shaders, false, true);
     product->pixel = Graphics::DecodePixelStageInfo(queue.context, Graphics::ExportMappings(product->state), Graphics::PixelProgramSkipped(queue));
+    Graphics::NormalizeUnusedViewportDepth(product->state, product->pixel);
+    Graphics::ApplyDepthRemap(context, product->state);
     product->pixel.targetExportPacking = Graphics::ExportPackings(product->state);
     product->pixel.dualSourceBlend = product->state.dualSourceBlend;
     product->pixel.reversedBlend = product->state.reversedBlend;
     product->pixel.alphaToCoverage = product->state.alphaToCoverage;
     product->pixel.quadPixelMask = Graphics::QuadPixelMask(product->state);
-    product->pixel.quadSampleMask = Graphics::QuadSampleMasks(product->state);
+    if (product->state.sampleLocationGrid) {
+        const auto localDevice = device.Load();
+        if (localDevice != nullptr) product->pixel.sampleOrder = localDevice->HostSampleOrder(product->state);
+    }
+    product->pixel.quadSampleMask = Graphics::QuadSampleMasks(product->state, product->pixel.sampleOrder);
     if (product->pixel.stencilRefExportEnable && Graphics::StencilReferenceUnused(product->state)) {
         const auto localDevice = device.Load();
         const auto capabilities = localDevice == nullptr ? std::vector<std::uint32_t>{} : localDevice->Target().supportedCapabilities;
@@ -140,14 +180,16 @@ std::shared_ptr<DrawDecode> Driver::decodeDraw(const QueueState& queue, const Su
     if (product->pixel.ancillary) product->pixel.rasterPrimitive = Graphics::RasterPrimitiveOf(product->state);
     if (product->pixel.ancillary) product->pixel.layerExported = product->state.layerExports != 0;
     product->pixel.ditheredAlphaToCoverage = product->state.ditheredAlphaToCoverage;
+    product->pixel.iteratesSamples = product->state.perSampleShading;
+    product->pixel.sampleLocations = Graphics::PixelSampleLocations(product->state, product->pixel);
     return product;
 }
 
-void Driver::resolveDrawDecode(const QueueState& queue, const Submission& submission, std::shared_ptr<const DrawDecode>& decode, bool registerKey, std::uint64_t drawKey, bool profile) {
+void Driver::resolveDrawDecode(const QueueState& queue, const Submission& submission, const Graphics::Context& context, std::shared_ptr<const DrawDecode>& decode, bool registerKey, std::uint64_t drawKey, bool profile) {
     if (decode == nullptr || verifyDrawRecipe()) {
         std::vector<Graphics::RegisterRead> readLog;
         const Graphics::RegisterReadLogScope logScope(verifyDrawRecipe() && registerKey ? &readLog : nullptr);
-        auto fresh = decodeDraw(queue, submission);
+        auto fresh = decodeDraw(queue, submission, context);
         if (verifyDrawRecipe() && registerKey) {
             std::uint64_t facadeMismatches = 0;
             for (const auto read : readLog) {

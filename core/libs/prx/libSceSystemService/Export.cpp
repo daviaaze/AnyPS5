@@ -6,7 +6,6 @@
 #include <cstring>
 #include <cstdlib>
 #include <ctime>
-#include <charconv>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
@@ -16,6 +15,9 @@
 #if defined(_WIN32)
 #include <windows.h>
 #elif defined(__linux__)
+#include <unistd.h>
+#elif defined(__APPLE__)
+#include <mach-o/dyld.h>
 #include <unistd.h>
 #endif
 #include "prx/libc/include/Shutdown.hpp"
@@ -27,20 +29,6 @@
 #include "prx/libSceAgcDriver/Execution/include/HostHdr.hpp"
 
 namespace {
-
-int ConsoleLanguage() {
-    const char* configured = std::getenv("ANYPS5_LANGUAGE");
-    if (configured == nullptr || configured[0] == '\0') return SYSTEM_SERVICE_PARAM_LANG_ENGLISH_US;
-    const std::string_view text(configured);
-    int language = -1;
-    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), language);
-    if (error != std::errc{} || end != text.data() + text.size() || language < SYSTEM_SERVICE_PARAM_LANG_JAPANESE || language > SYSTEM_SERVICE_PARAM_LANG_UKRAINIAN) {
-        throw std::runtime_error("sceSystemServiceParamGetInt: ANYPS5_LANGUAGE must be a console language number from " +
-            std::to_string(SYSTEM_SERVICE_PARAM_LANG_JAPANESE) + " to " + std::to_string(SYSTEM_SERVICE_PARAM_LANG_UKRAINIAN) +
-            ", not \"" + std::string(text) + "\"");
-    }
-    return language;
-}
 
 struct ConsoleTimeZone {
     int minutes;
@@ -179,16 +167,30 @@ void StartHostExecutable(HostLaunch& launch) {
     CloseHandle(process.hThread);
     CloseHandle(process.hProcess);
 }
-#elif defined(__linux__)
+#elif defined(__linux__) || defined(__APPLE__)
 struct HostLaunch {
     std::string executable;
     std::vector<std::string> arguments;
 };
 
-HostLaunch PrepareLaunch(const char* path, const char* const* arguments) {
+std::filesystem::path OwnExecutable() {
     std::error_code error;
+#ifdef __APPLE__
+    std::uint32_t size = 0;
+    _NSGetExecutablePath(nullptr, &size);
+    std::vector<char> executable(size);
+    std::filesystem::path own;
+    if (_NSGetExecutablePath(executable.data(), &size) == 0) own = std::filesystem::canonical(executable.data(), error);
+    if (own.empty()) throw std::runtime_error("sceSystemServiceLoadExec: cannot locate the executable");
+#else
     const auto own = std::filesystem::read_symlink("/proc/self/exe", error);
     if (error) throw std::runtime_error("sceSystemServiceLoadExec: cannot read /proc/self/exe: " + error.message());
+#endif
+    return own;
+}
+
+HostLaunch PrepareLaunch(const char* path, const char* const* arguments) {
+    const auto own = OwnExecutable();
     HostLaunch launch;
     if (std::strcmp(path, MainExecutable) == 0) {
         const char* main = std::getenv(MainExecutableVariable);
@@ -237,7 +239,7 @@ int APS5_VABI sceSystemServiceLoadExec(const char* path, const char* const* argu
     if (!path || !*path) return SYSTEM_SERVICE_ERROR_PARAMETER;
     if (std::strcmp(path, "exit") == 0) LibcExitWithoutHandlers_nid_no_patch(0);
     auto launch = PrepareLaunch(path, arguments);
-#if defined(_WIN32) || defined(__linux__)
+#if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
     LoadConvertedExecutable_nid_no_patch(std::filesystem::path(launch.executable), arguments);
 #endif
     LibcStartExit_nid_postfix();
@@ -257,6 +259,10 @@ int APS5_VABI sceSystemServiceGetDisplaySafeAreaInfo(SystemServiceDisplaySafeAre
  }
  *info = SystemServiceDisplaySafeAreaInfo{};
  info->ratio = 1.0f;
+ return SYSTEM_SERVICE_OK;
+}
+
+int APS5_VABI sceSystemServiceShowDisplaySafeAreaSettings(void) {
  return SYSTEM_SERVICE_OK;
 }
 
@@ -298,7 +304,7 @@ int APS5_VABI sceSystemServiceParamGetInt(int paramId, int* value) {
  }
  switch (paramId) {
   case SYSTEM_SERVICE_PARAM_ID_LANG:
-  case SYSTEM_SERVICE_PARAM_ID_400: *value = ConsoleLanguage(); break;
+  case SYSTEM_SERVICE_PARAM_ID_400: *value = SystemServiceConsoleLanguage("sceSystemServiceParamGetInt"); break;
   case SYSTEM_SERVICE_PARAM_ID_DATE_FORMAT: *value = SYSTEM_SERVICE_PARAM_DATE_FORMAT_DDMMYYYY; break;
   case SYSTEM_SERVICE_PARAM_ID_TIME_FORMAT: *value = SYSTEM_SERVICE_PARAM_TIME_FORMAT_24HOUR; break;
   case SYSTEM_SERVICE_PARAM_ID_TIME_ZONE: *value = HostTimeZone().minutes; break;
@@ -311,16 +317,11 @@ int APS5_VABI sceSystemServiceParamGetInt(int paramId, int* value) {
 }
 
 int APS5_VABI sceSystemServiceParamGetString(int paramId, char* buf, size_t bufSize) {
- if (buf == nullptr || bufSize == 0) {
+ if (paramId != SYSTEM_SERVICE_PARAM_ID_SYSTEM_NAME || buf == nullptr || bufSize < SYSTEM_SERVICE_MAX_SYSTEM_NAME_LENGTH) {
   return SYSTEM_SERVICE_ERROR_PARAMETER;
  }
- if (paramId != SYSTEM_SERVICE_PARAM_ID_SYSTEM_NAME) {
-  NotImplemented_nid_no_patch("sceSystemServiceParamGetString: parameter other than the system name");
- }
- if (bufSize < SYSTEM_SERVICE_MAX_SYSTEM_NAME_LENGTH) {
-  NotImplemented_nid_no_patch("sceSystemServiceParamGetString: buffer shorter than 65 bytes");
- }
  constexpr char SystemName[] = "PS5";
+ std::memset(buf, 0, bufSize);
  std::memcpy(buf, SystemName, sizeof(SystemName));
  return SYSTEM_SERVICE_OK;
 }
@@ -345,9 +346,11 @@ int APS5_VABI sceSystemServiceSetNoticeScreenSkipFlag(void) {
  return SYSTEM_SERVICE_OK;
 }
 
-int APS5_VABI sceSystemServiceInitializePlayerDialogParam(void* param) {
- if (param == nullptr) return SYSTEM_SERVICE_ERROR_PARAMETER;
- return SYSTEM_SERVICE_OK;
+void APS5_VABI sceSystemServiceInitializePlayerDialogParam(SystemServicePlayerDialogParam* param) {
+ if (param == nullptr) APS5_INVALID_ARG_EX;
+ *param = SystemServicePlayerDialogParam{};
+ param->size = sizeof(SystemServicePlayerDialogParam);
+ param->user_id = -1;
 }
 
 int APS5_VABI sceSystemServiceDisableMediaPlay() {
@@ -386,6 +389,15 @@ int APS5_VABI sceSystemServiceOpenChallengeActivity(void) {
 }
 
 int APS5_VABI sceSystemServiceOpenTournamentOccurrence(void) {
+ return SYSTEM_SERVICE_OK;
+}
+
+int APS5_VABI sceSystemServiceAddLocalProcessForPsmKit(const char*, const char* const*, const void*) {
+ NotImplemented_nid_no_patch(__func__);
+ return 0;
+}
+
+int APS5_VABI sceSystemServiceKillLocalProcessForPsmKit(int) {
  NotImplemented_nid_no_patch(__func__);
  return 0;
 }
@@ -410,6 +422,413 @@ int APS5_VABI sceSystemServiceKillApp(int appId, int how, int reason, int coreDu
   NotImplemented_nid_no_patch("sceSystemServiceKillApp: arguments other than -1, 0 and 0");
  }
  LibcExit_nid_no_patch(0);
+}
+
+int APS5_VABI sceLncUtilKillApp(uint32_t appId) {
+ if (appId != static_cast<uint32_t>(SYSTEM_SERVICE_RUNNING_APP_ID)) {
+  NotImplemented_nid_no_patch("sceLncUtilKillApp: application other than the running title");
+ }
+ LibcExit_nid_no_patch(0);
+}
+
+int APS5_VABI sceLncUtilKillAppWithReason(uint32_t appId, int reason) {
+ if (appId != static_cast<uint32_t>(SYSTEM_SERVICE_RUNNING_APP_ID)) {
+  NotImplemented_nid_no_patch("sceLncUtilKillAppWithReason: application other than the running title");
+ }
+ if (reason != 0) {
+  NotImplemented_nid_no_patch("sceLncUtilKillAppWithReason: a reason other than 0");
+ }
+ LibcExit_nid_no_patch(0);
+}
+
+int APS5_VABI sceSystemServiceLaunchSystemDeeplink(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceShellCoreUtilLaunchByUriParamInit(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceSystemStateMgrTickVideoPlayback(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceSystemServiceTelemetrySetData2WithUserId(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceShellCoreUtilStartUmmDictation(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceSystemServiceGetSpotifyTitleId(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceSystemServiceGetAppStatusListContainsDaemon(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceSystemServiceSwitchToVRApp(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceSystemServiceSwitchToNonVRApp(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceLncUtilGetSpmemAllocatorConfigValue(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceCsbMgrInitialize(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceCsbMgrTerminate(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceCsbMgrCreateLocalSandbox(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceCsbMgrDestroyLocalSandbox(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceCsbMgrSwitchLocalSandbox(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceCsbMgrGetCurrentLocalSandboxId(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceCsbMgrGetLocalSandboxIdList(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceCsbMgrGetLocalSandboxInfo(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceCsbMgrSetLocalSandboxInfo(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceCsbMgrIssueStreamingSandboxInfo(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceReportSequenceHandlerRequestReport(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceReportSequenceHandlerCancelReport(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceReportSequenceHandlerExistsEvent(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceReportSequenceHandlerUpdateEventCache(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceReportSequenceHandlerGetEventCache(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceLncUtilRegisterCallEntries(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceLncUtilGetSpmemConfigJson(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceLncUtilExportSpmemConfigJson(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceLncUtilImportSpmemConfigJson(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceShellCoreUtilExitAppWithValue(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceShellCoreUtilNpDebugSpecialNotification(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceShellCoreUtilIsDddTemperatureDanger(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceShellCoreUtilIsM2StorageTemperatureDanger(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceShellCoreUtilGetAvailableSizeM2(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceShellCoreUtilNotifyConnectAccountStatusChanged(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceShellCoreUtilIsInternalCronosUser(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceShellCoreUtilChangePbtcMode(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceShellCoreUtilTelemetryCacheData(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceShellCoreUtilMicMuteKeyPressed(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceShellCoreUtilSwitchMicMute(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceShellCoreUtilNotifyStartEventToUniversalMicMute(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceShellCoreUtilIsLotusMicActivated(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceShellCoreUtilResetAllNoticeScreenSkipFlag(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceShellCoreUtilResetNoticeScreenSkipFlag(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceShellCoreUtilGetNoticeScreenSkipFlagByAppId(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceShellCoreUtilGetPasscodeInputType(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceShellCoreUtilGetPasscodeDisplayInfo(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceShellCoreUtilNotifySystemResumeTelemetryInfo(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceShellCoreUtilUpdateTelemetryToken(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceShellCoreUtilGetVRBaseMatRectangles(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceShellCoreUtilSetVRBaseMatRectangles(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceShellCoreUtilIsLaunchBlockDialog(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceShellCoreUtilGetConsoleToken(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceShellCoreUtilGetDeviceIdByDeviceUniqueId(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceShellCoreUtilGetDeviceUniqueIdByDeviceId(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceShellCoreUtilGetStreamingClientInfo(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceShellCoreUtilRequestCffUpdate(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceShellCoreUtilGetCffConfig(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceShellCoreUtilRemoveCffConfigFile(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceShellCoreUtilDebugGetNumberOfCffItems(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceShellCoreUtilDebugGetCffInfo(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceShellCoreUtilDebugSetCffStatus(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceShellCoreUtilGetPeripheralConnectionSessionId(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceShellCoreUtilGetCdlgEnabledFreezeRendering(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceShellCoreUtilGetNpTitleId(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceShellCoreUtilIsCronosInGameCommerceEnabled(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceShellCoreUtilLemSettingGet(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceShellCoreUtilLemSettingSet(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceShellCoreUtilLemSettingGetList(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceShellCoreUtilLemSettingReset(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceShellCoreUtilIsEChassisVariant(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceSystemStateMgrGetRebootCause(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceCoredumpSequenceHandlerUpdateEventCache(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceCoredumpSequenceHandlerGetEventCache(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceCoredumpSequenceHandlerGetWorkingEventSummary(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceCoredumpSequenceHandlerGetCoredumpStatus(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceCoredumpSequenceHandlerGetCoredumpStatusByAppId(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceCoredumpSequenceHandlerCancelCoredump(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
 }
 
 }

@@ -25,6 +25,17 @@ std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const S
         localDevice->ColorMetadataPass(*pass);
         return DrawVerdict::Drawn;
     }
+    if (const auto copy = Graphics::DecodeDepthCopyPass(queue)) {
+        require(!drawParameters.indirect, "indirect DB depth copies are unsupported");
+        if (DrawPipeline::Active()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, (packet[0] >> 8u) & 0xffu);
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
+        std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        if (device == nullptr) device = std::make_shared<VulkanDevice>();
+        const std::shared_ptr<VulkanDevice> localDevice = device;
+        recordLabelsForPacket(localDevice.get(), submission.queue);
+        localDevice->DepthCopyPass(*copy);
+        return DrawVerdict::Drawn;
+    }
     if (Graphics::DepthResummarizeDrawsNothing(queue)) return DrawVerdict::Nothing;
     rejected = Graphics::DepthMaintenanceRejection(queue);
     if (!rejected.empty()) return DrawVerdict::Rejected;
@@ -47,7 +58,7 @@ std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const S
             const auto primitive = queue.userConfig.find(0x242);
             const std::uint32_t allOnes = drawParameters.indexSize == 2 ? 0xffffu : 0xffffffffu;
             const auto type = primitive == queue.userConfig.end() ? 0u : primitive->second & 0x3fu;
-            const bool strip = type == 3 || type == 5 || type == 6;
+            const bool strip = type == 3 || type == 5 || type == 6 || type == 21;
             const bool list = type == 1 || type == 2 || type == 4;
             const auto restartDevice = device.Load();
             if (!strip && !(list && restartDevice != nullptr && restartDevice->PrimitiveListRestart())) {

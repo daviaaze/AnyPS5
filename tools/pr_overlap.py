@@ -10,6 +10,7 @@ from urllib.parse import quote, urlencode
 
 PARENT = 'if .parent then "\\(.parent.owner.login)/\\(.parent.name)" else .nameWithOwner end'
 EXPORT = re.compile(r"^\+.*\bAPS5_VABI\s+(\w+)\s*\(")
+NID_DISAMBIG = re.compile(r"_nid_disambig[0-9]+$")
 DEPENDS = re.compile(r'Depends on:[ \t]*((?:#\d+\b(?:(?:[ \t]*,[ \t]*(?:and[ \t]+)?|[ \t]+and[ \t]+)#\d+\b)*|none\b)?(?:\r?\n[ \t]*[-*][ \t]*#\d+\b[^\r\n]*)*)')
 PLAIN_DEPENDS = re.compile(r'Depends on[ \t]+(#\d+\b(?:(?:[ \t]*,[ \t]*(?:and[ \t]+)?|[ \t]+and[ \t]+)#\d+\b)*)')
 HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))?", re.M)
@@ -18,7 +19,11 @@ FETCH_REFS = 100
 
 
 def git(*args):
-    return subprocess.run(["git", "-c", "core.quotePath=false", *args], capture_output=True, text=True, encoding="utf-8", errors="replace", check=True).stdout
+    result = subprocess.run(["git", "-c", "core.quotePath=false", *args], capture_output=True)
+    result.stdout = result.stdout.decode("utf-8", errors="replace")
+    result.stderr = result.stderr.decode("utf-8", errors="replace")
+    result.check_returncode()
+    return result.stdout
 
 
 def own(prs, sha):
@@ -36,9 +41,7 @@ def upstream():
 
 def depends_on(body):
     body = re.sub(r"<!--.*?-->", "", body or "", flags=re.S)
-    match = DEPENDS.search(body)
-    if not match or not match.group(1).strip():
-        match = PLAIN_DEPENDS.search(body)
+    match = next((match for match in DEPENDS.finditer(body) if match.group(1).strip()), None) or PLAIN_DEPENDS.search(body)
     return {int(n) for n in re.findall(r"#(\d+)", match.group(1))} if match else set()
 
 
@@ -80,11 +83,12 @@ def fetch(base, prs):
 
 
 def merge(*args):
-    result = subprocess.run(["git", "-c", "core.quotePath=false", "merge-tree", "--write-tree", "--name-only", "--no-messages", *args],
-                            capture_output=True, text=True, encoding="utf-8", errors="replace")
-    lines = result.stdout.splitlines()
-    if result.returncode not in (0, 1) or not lines:
-        raise RuntimeError(f"git merge-tree {' '.join(args)} failed: {result.stderr.strip()}")
+    result = subprocess.run(["git", "-c", "core.quotePath=false", "merge-tree", "--write-tree", "--name-only", "--no-messages", "-z", *args],
+                            capture_output=True)
+    lines = result.stdout.decode("utf-8", errors="replace").rstrip("\0").split("\0")
+    if result.returncode not in (0, 1) or not lines[0]:
+        error = result.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"git merge-tree {' '.join(args)} failed: {error}")
     return lines[0], set(lines[1:]) if result.returncode else set()
 
 
@@ -107,7 +111,8 @@ def exports(diff):
             text += nxt[1:]
         semi, brace = text.find(";"), text.find("{")
         if semi < 0 or 0 <= brace < semi:
-            found.add(m.group(1))
+            name = m.group(1).removesuffix("_nid_postfix")
+            found.add(NID_DISAMBIG.sub("", name))
     return found
 
 
@@ -116,8 +121,8 @@ def scan(pr):
     pr["tree"] = None if conflicted else commit(tree)
     old, new = (git("merge-base", "refs/pr/base", pr["ref"]).strip(), pr["ref"]) if conflicted else ("refs/pr/base", pr["tree"])
     pr["files"], pr["added"] = set(), set()
-    for line in git("diff", "--name-status", "--no-renames", old, new).splitlines():
-        status, path = line.split("\t", 1)
+    changes = git("diff", "--name-status", "--no-renames", "-z", old, new).split("\0")
+    for status, path in zip(changes[::2], changes[1::2]):
         pr["files"].add(path)
         if status == "A":
             pr["added"].add(path)
@@ -236,6 +241,12 @@ def write_reports(out, rows, blob):
         (out / f"{number}.md").write_text(report(found, blob), encoding="utf-8")
 
 
+def describe_failure(error):
+    command = " ".join(str(part) for part in error.cmd)
+    message = (error.stderr or "").strip() or "no error output"
+    return f"pr_overlap: {command} failed with exit code {error.returncode}: {message}"
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="report open pull requests that overlap each other")
     parser.add_argument("--base", default="main")
@@ -248,20 +259,23 @@ if __name__ == "__main__":
         parser.error("pass exactly one of --out or --branch")
     if args.jobs < 1:
         parser.error("--jobs must be at least 1")
-    REPO = args.repo or upstream()
-    prs = open_prs(args.base)
-    fetch(args.base, prs)
-    if args.branch:
-        sha = git("rev-parse", args.branch).strip()
-        prs = own(prs, sha)
-        prs[0] = {"ref": sha, "author": None, "depends": set()}
-    scan_all(prs, args.jobs)
-    rows = {n: {} for n in prs}
-    pairs = [(0, n) for n in prs if n] if args.branch else combinations(prs, 2)
-    for a, b in pairs:
-        if found := overlaps(prs, a, b):
-            rows[a][b] = rows[b][a] = found
-    blob = f'https://github.com/{REPO}/blob/{git("rev-parse", "refs/pr/base").strip()}'
+    try:
+        REPO = args.repo or upstream()
+        prs = open_prs(args.base)
+        fetch(args.base, prs)
+        if args.branch:
+            sha = git("rev-parse", args.branch).strip()
+            prs = own(prs, sha)
+            prs[0] = {"ref": sha, "author": None, "depends": set()}
+        scan_all(prs, args.jobs)
+        rows = {n: {} for n in prs}
+        pairs = [(0, n) for n in prs if n] if args.branch else combinations(prs, 2)
+        for a, b in pairs:
+            if found := overlaps(prs, a, b):
+                rows[a][b] = rows[b][a] = found
+        blob = f'https://github.com/{REPO}/blob/{git("rev-parse", "refs/pr/base").strip()}'
+    except subprocess.CalledProcessError as error:
+        raise SystemExit(describe_failure(error))
     if args.branch:
         print(report(rows[0], blob) or "No overlap with open pull requests.", end="")
         raise SystemExit

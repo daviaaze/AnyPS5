@@ -13,7 +13,6 @@ namespace {
 
 constexpr int POSIX_EINVAL = 22;
 constexpr int POSIX_PROCESS_PRIVATE = 0;
-constexpr int POSIX_PROCESS_SHARED = 1;
 constexpr int GUEST_REALTIME_CLOCK = 0;
 constexpr int POSIX_PRIO_PROTECT = 2;
 constexpr int POSIX_SCHED_RR = 3;
@@ -30,7 +29,7 @@ void _initializeStatic(PthreadMutex* mutex, const char* funcName) {
     PthreadMutex current = slot.load(std::memory_order_acquire);
     if (!_isStaticInitializer(current)) return;
     auto* created = new PthreadMutexPrivate();
-    created->_type = reinterpret_cast<std::uintptr_t>(current) == POSIX_ADAPTIVE_MUTEX_INITIALIZER ? MutexType::Adaptive : MutexType::ErrorCheck;
+    created->SetType(reinterpret_cast<std::uintptr_t>(current) == POSIX_ADAPTIVE_MUTEX_INITIALIZER ? MutexType::Adaptive : MutexType::ErrorCheck);
     if (!slot.compare_exchange_strong(current, created, std::memory_order_acq_rel, std::memory_order_acquire))
         delete created;
 }
@@ -80,6 +79,31 @@ int APS5_VABI pthread_mutex_unlock_nid_postfix(PthreadMutex* mutex) {
     return PosixThread::ToErrno(scePthreadMutexUnlock(mutex));
 }
 
+int APS5_VABI pthread_mutex_reltimedlock_np_nid_postfix(PthreadMutex* mutex, KernelUseconds usec) {
+    _initializeStatic(mutex, __func__);
+    return PosixThread::ToErrno(scePthreadMutexTimedlock(mutex, usec));
+}
+
+int APS5_VABI pthread_mutex_isowned_np_nid_postfix(PthreadMutex* mutex) {
+    return MutexOperations::IsOwned(mutex) ? 1 : 0;
+}
+
+int APS5_VABI pthread_mutex_getspinloops_np_nid_postfix(PthreadMutex* mutex, int* count) {
+    return PosixThread::ToErrno(scePthreadMutexGetspinloops(mutex, count));
+}
+
+int APS5_VABI pthread_mutex_setspinloops_np_nid_postfix(PthreadMutex* mutex, int count) {
+    return PosixThread::ToErrno(scePthreadMutexSetspinloops(mutex, count));
+}
+
+int APS5_VABI pthread_mutex_getyieldloops_np_nid_postfix(PthreadMutex* mutex, int* count) {
+    return PosixThread::ToErrno(scePthreadMutexGetyieldloops(mutex, count));
+}
+
+int APS5_VABI pthread_mutex_setyieldloops_np_nid_postfix(PthreadMutex* mutex, int count) {
+    return PosixThread::ToErrno(scePthreadMutexSetyieldloops(mutex, count));
+}
+
 int APS5_VABI pthread_mutexattr_destroy_nid_postfix(PthreadMutexattr* attr) {
     return PosixThread::ToErrno(scePthreadMutexattrDestroy(attr));
 }
@@ -99,7 +123,7 @@ int APS5_VABI pthread_mutexattr_getpshared_nid_postfix(const PthreadMutexattr* a
 
 int APS5_VABI pthread_mutexattr_setpshared_nid_postfix(PthreadMutexattr* attr, int pshared) {
     if (!attr || !*attr) return POSIX_EINVAL;
-    if (pshared != POSIX_PROCESS_PRIVATE && pshared != POSIX_PROCESS_SHARED) return POSIX_EINVAL;
+    if (pshared != POSIX_PROCESS_PRIVATE) return POSIX_EINVAL;
     (*attr)->pshared = pshared;
     return 0;
 }
@@ -109,6 +133,13 @@ int APS5_VABI pthread_mutexattr_setprotocol_nid_postfix(PthreadMutexattr* attr, 
     if (protocol < 0 || protocol > POSIX_PRIO_PROTECT) return POSIX_EINVAL;
     (*attr)->protocol = protocol;
     (*attr)->ceiling = sched_get_priority_max_nid_postfix(POSIX_SCHED_RR);
+    return 0;
+}
+
+int APS5_VABI pthread_mutexattr_getprotocol_nid_postfix(const PthreadMutexattr* attr, int* protocol) {
+    if (!attr || !*attr) return PosixThread::GUEST_EINVAL;
+    if (!protocol) throw std::runtime_error("pthread_mutexattr_getprotocol: null protocol");
+    *protocol = (*attr)->protocol;
     return 0;
 }
 

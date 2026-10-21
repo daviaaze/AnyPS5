@@ -141,4 +141,45 @@ int APS5_VABI sceContentSearchTerm(void) {
     return 0;
 }
 
+int APS5_VABI sceContentBinderEnd() {
+    return static_cast<int>(0x809D000F);
+}
+int APS5_VABI sceContentBinderGetNumOfDifference() {
+    return static_cast<int>(0x809D000F);
+}
+int APS5_VABI sceContentBinderInitialize() {
+    return static_cast<int>(0x809D000F);
+}
+int APS5_VABI sceContentBinderIsUpdated() {
+    return static_cast<int>(0x809D000F);
+}
+int APS5_VABI sceContentBinderReset() {
+    return static_cast<int>(0x809D000F);
+}
+int APS5_VABI sceContentBinderSearchDifference() {
+    return static_cast<int>(0x809D000F);
+}
+int APS5_VABI sceContentBinderStart() {
+    return static_cast<int>(0x809D000F);
+}
+int APS5_VABI sceContentBinderTerminate() {
+    return static_cast<int>(0x809D000F);
+}
+int APS5_VABI sceContentSearchGetApplicationLastUpdateId() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+int APS5_VABI sceContentSearchGetMyApplicationIndex() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+int APS5_VABI sceContentSearchGetNumOfApplication() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+int APS5_VABI sceContentSearchSearchApplication() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
 }

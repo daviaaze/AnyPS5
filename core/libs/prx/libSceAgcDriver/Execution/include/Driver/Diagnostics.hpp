@@ -3,6 +3,8 @@
 
 #include "prx/libSceAgcDriver/Execution/include/QueueState.hpp"
 #include <cstdint>
+#include <stdexcept>
+#include <string>
 
 namespace AgcDriver::DriverDetail {
 
@@ -13,6 +15,15 @@ std::uint64_t SkippedShader();
 void ResetCommandStorageAcquisitionsForTesting();
 
 std::uint64_t CommandStorageAcquisitionsForTesting();
+class RefusedDraw final : public std::runtime_error {
+public:
+    RefusedDraw(std::uint64_t address, const std::string& what) : std::runtime_error(what), address(address) {}
+    std::uint64_t address;
+};
+
+bool SkipRefusedDraws();
+
+void ReportRefusedDraw(const RefusedDraw& refused);
 
 void require(bool condition, const char* reason);
 

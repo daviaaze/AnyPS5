@@ -167,6 +167,9 @@ Aps5FiberSwitchStack_nid_no_patch:
 Aps5FiberTrampoline_nid_no_patch:
     mov %r12, %rcx
     and $-16, %rsp
+    push $0
+    push $0
+    mov %rsp, %rbp
     sub $32, %rsp
     call Aps5FiberMain_nid_no_patch
     ud2
@@ -236,6 +239,9 @@ asm(".text\n"
     APS5_ASM_FUNCTION("Aps5FiberTrampoline_nid_no_patch") R"(
     mov %r12, %rdi
     and $-16, %rsp
+    push $0
+    push $0
+    mov %rsp, %rbp
     call )" APS5_ASM_SYMBOL("Aps5FiberMain_nid_no_patch") R"(
     ud2
 )" APS5_ASM_FUNCTION_END("Aps5FiberTrampoline_nid_no_patch"));
@@ -559,5 +565,24 @@ int32_t APS5_VABI sceFiberStopContextSizeCheck(void) {
     return g_contextSizeCheck.compare_exchange_strong(expected, false) ? SCE_OK : SCE_FIBER_ERROR_STATE;
 }
 
+int APS5_VABI _sceFiberAttachContextAndRun(FiberObject* fiber, void* addr_context, uint64_t size_context,
+                                          uint64_t arg_on_run, uint64_t* arg_on_return) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
 }
 
+int APS5_VABI _sceFiberAttachContextAndSwitch(FiberObject* fiber, void* addr_context, uint64_t size_context,
+                                              uint64_t arg_on_run, uint64_t* arg_on_run_out) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI _sceFiberInitializeWithInternalOptionImpl(FiberObject* fiber, const char* name, GuestFiberEntry entry,
+                                                        uint64_t arg_on_initialize, void* addr_context,
+                                                        uint64_t size_context, const FiberOptParam* opt_param,
+                                                        uint32_t flags, uint32_t build_version) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+}

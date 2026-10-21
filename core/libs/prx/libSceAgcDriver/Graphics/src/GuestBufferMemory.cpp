@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -33,6 +34,7 @@
 #include <list>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <thread>
 #include <stop_token>
@@ -74,6 +76,7 @@ struct ImageMirror {
     // Identity for the life of this mirror (see ImageMirrorSerial); the top bit keeps mirror serials
     // apart from host import serials.
     std::uint64_t serial = 0;
+    std::atomic<std::uint64_t> watchedSerial{0};
 };
 
 // The address space. An address-based build maps every readable registered range; building that
@@ -160,6 +163,67 @@ struct ImportFailure {
     GuestAllocations::Mapped ranges;
 };
 
+struct ImportRefusal {
+    std::uint64_t base;
+    std::uint64_t bytes;
+    GuestAllocations::Mapped ranges;
+    std::uint64_t liveBytes;
+    std::uint64_t budget;
+};
+
+struct EvictingRefusal {
+    std::uint64_t base;
+    std::uint64_t bytes;
+    GuestAllocations::Mapped ranges;
+    std::uint64_t epoch;
+    std::uint64_t liveBytes;
+    std::uint64_t budget;
+    std::uint64_t room;
+    std::uint64_t window;
+    std::uint64_t floor;
+    std::uint64_t ready;
+    std::uint64_t readyHeld;
+    bool joined;
+};
+
+#ifdef _WIN32
+constexpr std::size_t settleBatchCount = 4;
+constexpr std::uint32_t settleBatchCopies = 256;
+
+struct SettleBatch {
+    VkCommandBuffer commands = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+    std::vector<std::uint64_t> bases;
+    std::vector<VkBuffer> aliases;
+    std::vector<std::shared_ptr<RetiredImport>> retired;
+    bool busy = false;
+};
+
+enum class SettlePhase : std::uint8_t { Wanted, Submitted, Settled };
+
+struct PendingSettle {
+    SettlePhase phase = SettlePhase::Wanted;
+    std::size_t batch = 0;
+    VkDevice device = VK_NULL_HANDLE;
+};
+#endif
+
+struct ImportSettle {
+    VkBuffer settleTarget = VK_NULL_HANDLE;
+    VkDeviceMemory settleMemory = VK_NULL_HANDLE;
+    VkCommandBuffer settleCommands = VK_NULL_HANDLE;
+    VkFence settleFence = VK_NULL_HANDLE;
+    PFN_vkDestroyFence destroyFence = nullptr;
+    PFN_vkDestroyBuffer settleDestroyBuffer = nullptr;
+    PFN_vkFreeMemory settleFreeMemory = nullptr;
+#ifdef _WIN32
+    PFN_vkWaitForFences waitForFences = nullptr;
+    VkBuffer batchTarget = VK_NULL_HANDLE;
+    VkDeviceMemory batchMemory = VK_NULL_HANDLE;
+    std::array<SettleBatch, settleBatchCount> batches{};
+#endif
+};
+
 // Imports persist across draws, keyed by allocation base, and are dropped when their allocation leaves
 // the registered set; a dropped import is destroyed once the recorded work that may read it completed.
 struct HostImports {
@@ -168,13 +232,16 @@ struct HostImports {
     PFN_vkDestroyBuffer destroyBuffer = nullptr;
     PFN_vkFreeMemory freeMemory = nullptr;
     std::map<std::uint64_t, HostImport> imports;
+    std::map<std::uint64_t, HostImport> trimmed;
     std::map<VkDevice, std::vector<std::shared_ptr<RetiredImport>>> parked;
     std::uint64_t liveBytes = 0;
     std::map<std::uint64_t, ImportFailure> failed;
     std::map<std::uint64_t, ImportFailure> failedJoins;
     std::map<std::uint64_t, std::uint64_t> sparseRunEnds;
     std::map<std::uint64_t, std::uint32_t> sparseRunJoins;
-    std::set<std::uint64_t> unaliasedSpans;
+    std::map<std::pair<std::uint64_t, std::uint64_t>, ImportFailure> failedBlocks;
+    std::map<std::pair<std::uint64_t, std::uint64_t>, ImportRefusal> refusals;
+    std::map<std::pair<std::uint64_t, std::uint64_t>, EvictingRefusal> evictingRefusals;
     // Registry generation the imports were last reconciled with.
     std::uint64_t refreshedGeneration = 0;
     // Bumped whenever an import is dropped, so HostImport pointers taken under the lock earlier can be
@@ -184,22 +251,90 @@ struct HostImports {
     bool unwatchImports = false;
     bool unwatchDmaBufImports = false;
     bool watchPrivateImports = false;
-    VkDevice settleDevice = VK_NULL_HANDLE;
-    VkBuffer settleTarget = VK_NULL_HANDLE;
-    VkDeviceMemory settleMemory = VK_NULL_HANDLE;
-    VkCommandBuffer settleCommands = VK_NULL_HANDLE;
-    VkFence settleFence = VK_NULL_HANDLE;
-    PFN_vkDestroyFence destroyFence = nullptr;
-    PFN_vkDestroyBuffer settleDestroyBuffer = nullptr;
-    PFN_vkFreeMemory settleFreeMemory = nullptr;
+    std::map<VkDevice, ImportSettle> settles;
+#ifdef _WIN32
+    std::map<std::uint64_t, PendingSettle> pendingSettles;
+    std::vector<std::uint64_t> settleWanted;
+    std::vector<std::uint64_t> settleReady;
+    std::chrono::steady_clock::time_point settlePolled{};
+    std::uint64_t settlesSubmitted = 0;
+    std::uint64_t settlesWaited = 0;
+    std::uint64_t settlesRewatched = 0;
+    std::uint64_t settlesKeptCompared = 0;
+    std::uint64_t settlesParked = 0;
+    std::uint64_t settleUnmapWaits = 0;
+#endif
     std::uint64_t useCounter = 0;
     std::uint64_t buildFloor = 0;
+    std::array<HostImportRequesterCounts, ImportRequesterCount> counts{};
+    VkPhysicalDevice reportedDevice = VK_NULL_HANDLE;
+    std::chrono::steady_clock::time_point reportedAt{};
+    std::uint64_t reportedBudget = 0;
+    std::uint32_t reportedHeap = 0;
+    std::uint64_t reportedHeapBudget = 0;
+    std::uint64_t reportedHeapUsage = 0;
+    std::uint64_t ceiling = 0;
+    std::uint32_t allocationFailures = 0;
+    bool allocationFailed = false;
+    std::uint8_t reportNoted = 0;
+    std::map<std::uint64_t, std::uint64_t> spaceUses;
 };
 
 HostImports& Imports() {
     static HostImports imports;
     return imports;
 }
+
+#ifdef _WIN32
+void waitSettleBatch(const ImportSettle& settle, VkDevice device, const SettleBatch& batch) {
+    if (batch.busy && settle.waitForFences != nullptr) static_cast<void>(settle.waitForFences(device, 1, &batch.fence, VK_TRUE, 10'000'000'000ull));
+}
+
+bool settleBatchRunning(const ImportSettle& settle, VkDevice device, const SettleBatch& batch) {
+    return batch.busy && settle.waitForFences != nullptr && settle.waitForFences(device, 1, &batch.fence, VK_TRUE, 0) == VK_TIMEOUT;
+}
+
+SettleBatch* forgetSettle(HostImports& state, std::uint64_t base) {
+    const auto found = state.pendingSettles.find(base);
+    if (found == state.pendingSettles.end()) return nullptr;
+    SettleBatch* running = nullptr;
+    if (const auto settle = state.settles.find(found->second.device); found->second.phase == SettlePhase::Submitted && settle != state.settles.end()) {
+        auto& batch = settle->second.batches[found->second.batch];
+        if (settleBatchRunning(settle->second, settle->first, batch)) running = &batch;
+    }
+    state.pendingSettles.erase(found);
+    return running;
+}
+
+void drainSettles(HostImports& state) {
+    for (auto& [device, settle] : state.settles) {
+        for (auto& batch : settle.batches) {
+            waitSettleBatch(settle, device, batch);
+            for (const auto alias : batch.aliases) settle.settleDestroyBuffer(device, alias, nullptr);
+            batch.aliases.clear();
+            batch.retired.clear();
+            batch.bases.clear();
+            batch.busy = false;
+        }
+    }
+    state.pendingSettles.clear();
+    state.settleWanted.clear();
+    state.settleReady.clear();
+}
+
+void releaseSettleBatches(VkDevice device, ImportSettle& settle) {
+    for (auto& batch : settle.batches) {
+        waitSettleBatch(settle, device, batch);
+        for (const auto alias : batch.aliases) settle.settleDestroyBuffer(device, alias, nullptr);
+        if (batch.fence != VK_NULL_HANDLE) settle.destroyFence(device, batch.fence, nullptr);
+        batch = SettleBatch{};
+    }
+    if (settle.batchTarget != VK_NULL_HANDLE) settle.settleDestroyBuffer(device, settle.batchTarget, nullptr);
+    if (settle.batchMemory != VK_NULL_HANDLE) settle.settleFreeMemory(device, settle.batchMemory, nullptr);
+    settle.batchTarget = VK_NULL_HANDLE;
+    settle.batchMemory = VK_NULL_HANDLE;
+}
+#endif
 
 void destroyImport(const Context& context, const HostImport& entry) {
     context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, entry.buffer, nullptr);
@@ -237,13 +372,22 @@ bool runCovers(const GuestAllocations::Lease& lease, std::uint64_t begin, std::u
 bool joinedCovers(const GuestAllocations::Lease& lease, std::uint64_t begin, std::uint64_t end);
 
 void retireImport(VkDevice device, HostImports& state, std::map<std::uint64_t, HostImport>::iterator it, const GuestAllocations::Lease& lease, bool hold = true) {
+#ifdef _WIN32
+    auto* reading = forgetSettle(state, it->first);
+#endif
     // Results shadowed for the import reach its (old) buffer first where the memory is still a
     // readable registered range (the import retires because its registration vanished or changed
     // size); the holder below outlives the batch that copies them.
     RetireShadow(device, it->second, [&lease, joined = it->second.joined](std::uint64_t begin, std::uint64_t end) { return runCovers(lease, begin, end) || (joined && joinedCovers(lease, begin, end)); });
     ++state.epoch;
-    state.liveBytes -= it->second.bytes;
+    state.liveBytes -= it->second.pinnedBytes;
     auto holder = std::make_shared<RetiredImport>(state.device, state.destroyBuffer, state.freeMemory, state.imports.extract(it));
+#ifdef _WIN32
+    if (reading != nullptr) {
+        reading->retired.push_back(holder);
+        ++state.settlesParked;
+    }
+#endif
     auto* recorder = Recorder::Active();
     if (recorder == nullptr) return;
     if (hold) recorder->KeepThroughHold(std::move(holder));
@@ -270,6 +414,28 @@ bool releaseParkedImports(HostImports& state, std::uint64_t begin, std::uint64_t
     return !released.empty();
 }
 
+#ifdef _WIN32
+bool releaseSettleRetired(HostImports& state, std::uint64_t begin, std::uint64_t end) {
+    std::vector<std::shared_ptr<RetiredImport>> released;
+    {
+        std::lock_guard lock(state.mutex);
+        for (auto& [device, settle] : state.settles) {
+            for (auto& batch : settle.batches) {
+                const bool overlaps = std::any_of(batch.retired.begin(), batch.retired.end(), [&](const std::shared_ptr<RetiredImport>& holder) { return holder->node.mapped().base < end && begin < holder->node.mapped().base + holder->node.mapped().bytes; });
+                if (!overlaps) continue;
+                if (settleBatchRunning(settle, device, batch)) {
+                    ++state.settleUnmapWaits;
+                    waitSettleBatch(settle, device, batch);
+                }
+                for (auto& holder : batch.retired) released.push_back(std::move(holder));
+                batch.retired.clear();
+            }
+        }
+    }
+    return !released.empty();
+}
+#endif
+
 #ifndef _WIN32
 struct ImportFamilies {
     std::array<std::uint32_t, 3> indices{};
@@ -292,10 +458,77 @@ void shareDmaBufImport(const Context& context, VkBufferCreateInfo& info, ImportF
 }
 #endif
 
+void releaseTrimmed(HostImports& state, ImportNode node) {
+    state.liveBytes -= node.mapped().pinnedBytes;
+    auto holder = std::make_shared<RetiredImport>(state.device, state.destroyBuffer, state.freeMemory, std::move(node));
+    auto* recorder = Recorder::Active();
+    if (recorder != nullptr) recorder->KeepThroughHold(std::move(holder));
+}
+
+void dropTrimmed(HostImports& state, std::uint64_t begin, std::uint64_t end) {
+    for (auto it = state.trimmed.begin(); it != state.trimmed.end();) {
+        const auto next = std::next(it);
+        if (it->first < end && begin < it->first + it->second.bytes) releaseTrimmed(state, state.trimmed.extract(it));
+        it = next;
+    }
+}
+
+void retireOrTrim(VkDevice device, HostImports& state, std::map<std::uint64_t, HostImport>::iterator it, const GuestAllocations::Lease& lease, std::uint64_t begin, std::uint64_t end) {
+    const auto& entry = it->second;
+    const auto entryEnd = entry.base + entry.bytes;
+    std::uint64_t first = 0;
+    std::uint64_t last = 0;
+    if (begin <= entry.base && end > entry.base && end < entryEnd) {
+        first = end;
+        last = entryEnd;
+    } else if (begin > entry.base && begin < entryEnd && end >= entryEnd) {
+        first = entry.base;
+        last = begin;
+    } else if (begin > entry.base && begin < end && end < entryEnd) {
+        const bool tail = entryEnd - end >= begin - entry.base;
+        first = tail ? end : entry.base;
+        last = tail ? entryEnd : begin;
+    }
+    const bool plain = entry.alias == nullptr && !entry.dmaBuf && entry.chunk == nullptr && !entry.joined && entry.ranges.size() == 1 && entry.backingSerial != 0 && entry.memoryType != std::numeric_limits<std::uint32_t>::max() && entry.base == entry.range->address && entry.bytes == entry.range->bytes;
+#ifdef _WIN32
+    const bool settling = state.pendingSettles.contains(it->first);
+#else
+    const bool settling = false;
+#endif
+    if (first == last || !plain || settling || state.trimmed.contains(first)) {
+        retireImport(device, state, it, lease, false);
+        return;
+    }
+    RetireShadow(device, entry, [&lease](std::uint64_t from, std::uint64_t to) { return runCovers(lease, from, to); });
+    ++state.epoch;
+    auto node = state.imports.extract(it);
+    auto& kept = node.mapped();
+    std::shared_ptr<void> holder(nullptr, [device = state.device, destroy = state.destroyBuffer, buffer = std::exchange(kept.buffer, VK_NULL_HANDLE)](void*) { destroy(device, buffer, nullptr); });
+    kept.range.reset();
+    kept.ranges.clear();
+    kept.base = first;
+    kept.bytes = last - first;
+    kept.address = 0;
+    kept.serial = 0;
+    node.key() = first;
+    state.trimmed.insert(std::move(node));
+    auto* recorder = Recorder::Active();
+    if (recorder != nullptr && !recorder->Idle()) recorder->Keep(std::move(holder));
+}
+
+VkResult createImportBuffer(const Context& context, VkExternalMemoryHandleTypeFlagBits handleType, VkDeviceSize size, VkBuffer* buffer) {
+    const VkExternalMemoryBufferCreateInfo external{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO, nullptr, static_cast<VkExternalMemoryHandleTypeFlags>(handleType)};
+    VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &external};
+    info.size = size;
+    info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    return context.Function<PFN_vkCreateBuffer>("vkCreateBuffer")(context.device, &info, nullptr, buffer);
+}
+
 const char* bindImport(const Context& context, HostImport& entry, VkExternalMemoryHandleTypeFlagBits handleType, const void* import, std::uint32_t importTypes, bool& allocated, VkResult& failure) {
     const auto failed = [&](const char* step, VkResult result) -> const char* {
         if (entry.buffer) context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, entry.buffer, nullptr);
-        if (entry.memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, entry.memory, nullptr);
+        if (allocated && entry.memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, entry.memory, nullptr);
         entry.buffer = VK_NULL_HANDLE;
         entry.memory = VK_NULL_HANDLE;
         failure = result;
@@ -312,7 +545,9 @@ const char* bindImport(const Context& context, HostImport& entry, VkExternalMemo
     ImportFamilies families;
     if (handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) shareDmaBufImport(context, info, families, false);
 #endif
-    if (const auto result = context.Function<PFN_vkCreateBuffer>("vkCreateBuffer")(context.device, &info, nullptr, &entry.buffer); result != VK_SUCCESS) return failed("vkCreateBuffer", result);
+    VkBuffer buffer = VK_NULL_HANDLE;
+    if (const auto result = context.Function<PFN_vkCreateBuffer>("vkCreateBuffer")(context.device, &info, nullptr, &buffer); result != VK_SUCCESS) return failed("vkCreateBuffer", result);
+    entry.buffer = buffer;
     VkMemoryRequirements requirements{};
     context.Function<PFN_vkGetBufferMemoryRequirements>("vkGetBufferMemoryRequirements")(context.device, entry.buffer, &requirements);
     const auto types = requirements.memoryTypeBits & importTypes;
@@ -323,6 +558,7 @@ const char* bindImport(const Context& context, HostImport& entry, VkExternalMemo
     allocation.memoryTypeIndex = static_cast<std::uint32_t>(std::countr_zero(types));
     if (const auto result = context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &entry.memory); result != VK_SUCCESS) return failed("vkAllocateMemory", result);
     allocated = true;
+    entry.memoryType = allocation.memoryTypeIndex;
     if (const auto result = context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, entry.buffer, entry.memory, 0); result != VK_SUCCESS) return failed("vkBindBufferMemory", result);
     const VkBufferDeviceAddressInfo addressInfo{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, nullptr, entry.buffer};
     entry.address = context.Function<PFN_vkGetBufferDeviceAddressKHR>("vkGetBufferDeviceAddressKHR")(context.device, &addressInfo);
@@ -387,6 +623,7 @@ const char* createDmaBufImport(const Context& context, HostImport& entry, int fi
 #ifndef _WIN32
 constexpr std::uint64_t ImportChunkBytes = std::uint64_t{64} << 20u;
 constexpr VkBufferUsageFlags ChunkImportUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+constexpr std::uint64_t SparseBlockBytes = 65536;
 
 struct ImportChunk {
     VkDevice device = VK_NULL_HANDLE;
@@ -559,13 +796,15 @@ VkMemoryRequirements dmaBufBufferRequirements(const Context& context, const Host
 }
 
 bool createSparseDmaBufImport(const Context& context, HostImport& entry, int file, std::uint64_t offset) {
+    const auto lead = offset % SparseBlockBytes;
+    offset -= lead;
     const bool ownQueue = context.sparseQueue != VK_NULL_HANDLE && context.sparseQueueMutex != nullptr;
     if (!context.sparseBinding || entry.bytes <= ImportChunkBytes || (!ownQueue && !GuestMemory::GpuMutex().HeldByThisThread()) || udmabufDevice() < 0) return false;
     struct stat backing {};
     if (fstat(file, &backing) != 0) throwSparseImport(entry, "fstat of the shared backing", VK_ERROR_INVALID_EXTERNAL_HANDLE);
     const auto chunkTypes = dmaBufBufferRequirements(context, entry, 0, ChunkImportUsage, ImportChunkBytes, nullptr).memoryTypeBits;
     VkBuffer buffer = VK_NULL_HANDLE;
-    const auto requirements = dmaBufBufferRequirements(context, entry, VK_BUFFER_CREATE_SPARSE_BINDING_BIT, SparseImportUsage, entry.bytes, &buffer);
+    const auto requirements = dmaBufBufferRequirements(context, entry, VK_BUFFER_CREATE_SPARSE_BINDING_BIT, SparseImportUsage, lead + entry.bytes, &buffer);
     const auto alignment = requirements.alignment;
     const bool chosen = alignment != 0 && offset % alignment == 0 && ImportChunkBytes % alignment == 0 && (chunkTypes & ~requirements.memoryTypeBits) == 0 && (requirements.memoryTypeBits & chunkTypes) != 0 &&
         (offset + requirements.size + ImportChunkBytes - 1) / ImportChunkBytes * ImportChunkBytes <= static_cast<std::uint64_t>(backing.st_size);
@@ -616,9 +855,10 @@ bool createSparseDmaBufImport(const Context& context, HostImport& entry, int fil
     if (address == 0) fail("vkGetBufferDeviceAddressKHR", VK_ERROR_UNKNOWN);
     entry.buffer = buffer;
     entry.memory = VK_NULL_HANDLE;
-    entry.address = address;
+    entry.address = address + lead;
     entry.chunk = std::move(chunks);
     entry.dmaBuf = true;
+    entry.lead = lead;
     return true;
 }
 #endif
@@ -672,57 +912,66 @@ ImportWatchRequest importWatchRequest() {
 }
 #endif
 
+bool importsStale(const Context& context, const HostImports& state);
+
 constexpr std::uint64_t settleFloorBytes = 0x100000;
+#ifdef _WIN32
+constexpr std::uint64_t settleBlockBytes = 0x10000;
+constexpr auto settlePollPeriod = std::chrono::microseconds(100);
+std::atomic<bool> deferredSettles{std::getenv("APS5_NO_DEFERRED_SETTLES") == nullptr};
+#endif
+
+ImportSettle& settleFor(const Context& context, HostImports& state) {
+    auto& settle = state.settles[context.device];
+    settle.destroyFence = context.Function<PFN_vkDestroyFence>("vkDestroyFence");
+    settle.settleDestroyBuffer = context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer");
+    settle.settleFreeMemory = context.Function<PFN_vkFreeMemory>("vkFreeMemory");
+#ifdef _WIN32
+    settle.waitForFences = context.Function<PFN_vkWaitForFences>("vkWaitForFences");
+#endif
+    return settle;
+}
 
 std::atomic<std::uint64_t> settledImports{0};
 
 const char* settleImport(const Context& context, HostImports& state, const HostImport& entry, VkResult& result) {
     std::unique_lock queueLock(*context.settleQueueMutex);
-    if (state.settleDevice != context.device) {
-        state.settleDevice = context.device;
-        state.settleTarget = VK_NULL_HANDLE;
-        state.settleMemory = VK_NULL_HANDLE;
-        state.settleCommands = VK_NULL_HANDLE;
-        state.settleFence = VK_NULL_HANDLE;
-        state.destroyFence = context.Function<PFN_vkDestroyFence>("vkDestroyFence");
-        state.settleDestroyBuffer = context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer");
-        state.settleFreeMemory = context.Function<PFN_vkFreeMemory>("vkFreeMemory");
-    }
-    if (state.settleTarget == VK_NULL_HANDLE) {
+    auto& settle = settleFor(context, state);
+    if (settle.settleTarget == VK_NULL_HANDLE) {
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         info.size = 256;
         info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-        if ((result = context.Function<PFN_vkCreateBuffer>("vkCreateBuffer")(context.device, &info, nullptr, &state.settleTarget)) != VK_SUCCESS) {
-            state.settleTarget = VK_NULL_HANDLE;
+        if ((result = context.Function<PFN_vkCreateBuffer>("vkCreateBuffer")(context.device, &info, nullptr, &settle.settleTarget)) != VK_SUCCESS) {
+            settle.settleTarget = VK_NULL_HANDLE;
             return "vkCreateBuffer (settle)";
         }
         VkMemoryRequirements requirements{};
-        context.Function<PFN_vkGetBufferMemoryRequirements>("vkGetBufferMemoryRequirements")(context.device, state.settleTarget, &requirements);
+        context.Function<PFN_vkGetBufferMemoryRequirements>("vkGetBufferMemoryRequirements")(context.device, settle.settleTarget, &requirements);
         VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         allocation.allocationSize = requirements.size;
         allocation.memoryTypeIndex = static_cast<std::uint32_t>(std::countr_zero(requirements.memoryTypeBits));
-        if ((result = context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &state.settleMemory)) != VK_SUCCESS || (result = context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, state.settleTarget, state.settleMemory, 0)) != VK_SUCCESS) {
-            context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, state.settleTarget, nullptr);
-            if (state.settleMemory != VK_NULL_HANDLE) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, state.settleMemory, nullptr);
-            state.settleTarget = VK_NULL_HANDLE;
-            state.settleMemory = VK_NULL_HANDLE;
+        if ((result = context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &settle.settleMemory)) != VK_SUCCESS || (result = context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, settle.settleTarget, settle.settleMemory, 0)) != VK_SUCCESS) {
+            context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, settle.settleTarget, nullptr);
+            if (settle.settleMemory != VK_NULL_HANDLE) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, settle.settleMemory, nullptr);
+            settle.settleTarget = VK_NULL_HANDLE;
+            settle.settleMemory = VK_NULL_HANDLE;
             return "the settle target";
         }
         VkCommandBufferAllocateInfo allocate{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
         allocate.commandPool = context.settlePool;
         allocate.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
         allocate.commandBufferCount = 1;
-        if ((result = context.Function<PFN_vkAllocateCommandBuffers>("vkAllocateCommandBuffers")(context.device, &allocate, &state.settleCommands)) != VK_SUCCESS) {
-            state.settleCommands = VK_NULL_HANDLE;
+        if ((result = context.Function<PFN_vkAllocateCommandBuffers>("vkAllocateCommandBuffers")(context.device, &allocate, &settle.settleCommands)) != VK_SUCCESS) {
+            settle.settleCommands = VK_NULL_HANDLE;
             return "vkAllocateCommandBuffers (settle)";
         }
         const VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-        if ((result = context.Function<PFN_vkCreateFence>("vkCreateFence")(context.device, &fenceInfo, nullptr, &state.settleFence)) != VK_SUCCESS) {
-            state.settleFence = VK_NULL_HANDLE;
+        if ((result = context.Function<PFN_vkCreateFence>("vkCreateFence")(context.device, &fenceInfo, nullptr, &settle.settleFence)) != VK_SUCCESS) {
+            settle.settleFence = VK_NULL_HANDLE;
             return "vkCreateFence (settle)";
         }
     }
-    if (state.settleCommands == VK_NULL_HANDLE || state.settleFence == VK_NULL_HANDLE) return "the settle commands";
+    if (settle.settleCommands == VK_NULL_HANDLE || settle.settleFence == VK_NULL_HANDLE) return "the settle commands";
     VkBuffer source = entry.buffer;
     VkBuffer alias = VK_NULL_HANDLE;
     const auto run = [&]() -> const char* {
@@ -738,19 +987,22 @@ const char* settleImport(const Context& context, HostImports& state, const HostI
             source = alias;
         }
 #endif
-        if ((result = context.Function<PFN_vkResetFences>("vkResetFences")(context.device, 1, &state.settleFence)) != VK_SUCCESS) return "vkResetFences (settle)";
-        if ((result = context.Function<PFN_vkResetCommandBuffer>("vkResetCommandBuffer")(state.settleCommands, 0)) != VK_SUCCESS) return "vkResetCommandBuffer (settle)";
+        if ((result = context.Function<PFN_vkResetFences>("vkResetFences")(context.device, 1, &settle.settleFence)) != VK_SUCCESS) return "vkResetFences (settle)";
+        if ((result = context.Function<PFN_vkResetCommandBuffer>("vkResetCommandBuffer")(settle.settleCommands, 0)) != VK_SUCCESS) return "vkResetCommandBuffer (settle)";
         VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        if ((result = context.Function<PFN_vkBeginCommandBuffer>("vkBeginCommandBuffer")(state.settleCommands, &begin)) != VK_SUCCESS) return "vkBeginCommandBuffer (settle)";
+        if ((result = context.Function<PFN_vkBeginCommandBuffer>("vkBeginCommandBuffer")(settle.settleCommands, &begin)) != VK_SUCCESS) return "vkBeginCommandBuffer (settle)";
         const VkBufferCopy region{0, 0, 4};
-        context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(state.settleCommands, source, state.settleTarget, 1, &region);
-        if ((result = context.Function<PFN_vkEndCommandBuffer>("vkEndCommandBuffer")(state.settleCommands)) != VK_SUCCESS) return "vkEndCommandBuffer (settle)";
+        context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(settle.settleCommands, source, settle.settleTarget, 1, &region);
+        if ((result = context.Function<PFN_vkEndCommandBuffer>("vkEndCommandBuffer")(settle.settleCommands)) != VK_SUCCESS) return "vkEndCommandBuffer (settle)";
         VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         submit.commandBufferCount = 1;
-        submit.pCommandBuffers = &state.settleCommands;
-        if ((result = context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.settleQueue, 1, &submit, state.settleFence)) != VK_SUCCESS) return "vkQueueSubmit (settle)";
-        if ((result = context.Function<PFN_vkWaitForFences>("vkWaitForFences")(context.device, 1, &state.settleFence, VK_TRUE, 10'000'000'000ull)) != VK_SUCCESS) return "vkWaitForFences (settle)";
+        submit.pCommandBuffers = &settle.settleCommands;
+        if ((result = context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.settleQueue, 1, &submit, settle.settleFence)) != VK_SUCCESS) return "vkQueueSubmit (settle)";
+#ifdef _WIN32
+        ++state.settlesWaited;
+#endif
+        if ((result = context.Function<PFN_vkWaitForFences>("vkWaitForFences")(context.device, 1, &settle.settleFence, VK_TRUE, 10'000'000'000ull)) != VK_SUCCESS) return "vkWaitForFences (settle)";
         return nullptr;
     };
     const char* step = run();
@@ -759,6 +1011,196 @@ const char* settleImport(const Context& context, HostImports& state, const HostI
     if (step == nullptr) settledImports.fetch_add(1, std::memory_order_relaxed);
     return step;
 }
+
+#ifdef _WIN32
+const char* prepareSettleBatch(const Context& context, ImportSettle& settle, SettleBatch& batch, VkResult& result) {
+    if (settle.batchTarget == VK_NULL_HANDLE) {
+        VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        info.size = VkDeviceSize{settleBatchCount} * settleBatchCopies * 4u;
+        info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        if ((result = context.Function<PFN_vkCreateBuffer>("vkCreateBuffer")(context.device, &info, nullptr, &settle.batchTarget)) != VK_SUCCESS) {
+            settle.batchTarget = VK_NULL_HANDLE;
+            return "vkCreateBuffer (settle batch)";
+        }
+        VkMemoryRequirements requirements{};
+        context.Function<PFN_vkGetBufferMemoryRequirements>("vkGetBufferMemoryRequirements")(context.device, settle.batchTarget, &requirements);
+        VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        allocation.allocationSize = requirements.size;
+        allocation.memoryTypeIndex = static_cast<std::uint32_t>(std::countr_zero(requirements.memoryTypeBits));
+        if ((result = context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &settle.batchMemory)) != VK_SUCCESS || (result = context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, settle.batchTarget, settle.batchMemory, 0)) != VK_SUCCESS) {
+            context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, settle.batchTarget, nullptr);
+            if (settle.batchMemory != VK_NULL_HANDLE) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, settle.batchMemory, nullptr);
+            settle.batchTarget = VK_NULL_HANDLE;
+            settle.batchMemory = VK_NULL_HANDLE;
+            return "the settle batch target";
+        }
+    }
+    if (batch.commands == VK_NULL_HANDLE) {
+        VkCommandBufferAllocateInfo allocate{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        allocate.commandPool = context.settlePool;
+        allocate.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        allocate.commandBufferCount = 1;
+        if ((result = context.Function<PFN_vkAllocateCommandBuffers>("vkAllocateCommandBuffers")(context.device, &allocate, &batch.commands)) != VK_SUCCESS) {
+            batch.commands = VK_NULL_HANDLE;
+            return "vkAllocateCommandBuffers (settle batch)";
+        }
+    }
+    if (batch.fence == VK_NULL_HANDLE) {
+        const VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        if ((result = context.Function<PFN_vkCreateFence>("vkCreateFence")(context.device, &fenceInfo, nullptr, &batch.fence)) != VK_SUCCESS) {
+            batch.fence = VK_NULL_HANDLE;
+            return "vkCreateFence (settle batch)";
+        }
+    }
+    return nullptr;
+}
+
+void dropWantedSettles(HostImports& state) {
+    for (const auto base : state.settleWanted) {
+        if (const auto settle = state.pendingSettles.find(base); settle != state.pendingSettles.end() && settle->second.phase == SettlePhase::Wanted) state.pendingSettles.erase(settle);
+    }
+    state.settleWanted.clear();
+}
+
+void submitSettleBatch(const Context& context, HostImports& state) {
+    if (state.settleWanted.empty()) return;
+    auto& deviceSettle = settleFor(context, state);
+    const auto free = std::find_if(deviceSettle.batches.begin(), deviceSettle.batches.end(), [](const SettleBatch& batch) { return !batch.busy; });
+    if (free == deviceSettle.batches.end()) return;
+    const auto index = static_cast<std::size_t>(free - deviceSettle.batches.begin());
+    auto& batch = *free;
+    std::unique_lock queueLock(*context.settleQueueMutex);
+    VkResult result = VK_SUCCESS;
+    const auto destroyBuffer = context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer");
+    const auto fail = [&](const char* step) {
+        for (const auto alias : batch.aliases) destroyBuffer(context.device, alias, nullptr);
+        batch.aliases.clear();
+        for (const auto base : batch.bases) state.pendingSettles.erase(base);
+        batch.bases.clear();
+        dropWantedSettles(state);
+        std::fprintf(stderr, "[gpu] settling host imports under %llu KiB without waiting failed at %s (%d); they stay compared\n", static_cast<unsigned long long>(settleFloorBytes >> 10u), step, static_cast<int>(result));
+    };
+    if (const char* step = prepareSettleBatch(context, deviceSettle, batch, result)) return fail(step);
+    if ((result = context.Function<PFN_vkResetFences>("vkResetFences")(context.device, 1, &batch.fence)) != VK_SUCCESS) return fail("vkResetFences (settle batch)");
+    if ((result = context.Function<PFN_vkResetCommandBuffer>("vkResetCommandBuffer")(batch.commands, 0)) != VK_SUCCESS) return fail("vkResetCommandBuffer (settle batch)");
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if ((result = context.Function<PFN_vkBeginCommandBuffer>("vkBeginCommandBuffer")(batch.commands, &begin)) != VK_SUCCESS) return fail("vkBeginCommandBuffer (settle batch)");
+    const auto copy = context.Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer");
+    const bool otherFamily = context.settleFamily != context.queueFamily;
+    const auto createBuffer = otherFamily ? context.Function<PFN_vkCreateBuffer>("vkCreateBuffer") : nullptr;
+    const auto bindBufferMemory = otherFamily ? context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory") : nullptr;
+    std::size_t consumed = 0;
+    for (; consumed < state.settleWanted.size() && batch.bases.size() < settleBatchCopies; ++consumed) {
+        const auto base = state.settleWanted[consumed];
+        const auto settle = state.pendingSettles.find(base);
+        if (settle == state.pendingSettles.end() || settle->second.phase != SettlePhase::Wanted) continue;
+        const auto import = state.imports.find(base);
+        if (import == state.imports.end() || !import->second.unwatched) {
+            state.pendingSettles.erase(settle);
+            continue;
+        }
+        VkBuffer source = import->second.buffer;
+        if (otherFamily) {
+            VkExternalMemoryBufferCreateInfo external{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+            external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+            VkBufferCreateInfo aliasInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &external};
+            aliasInfo.size = std::min<VkDeviceSize>(import->second.bytes, 65536);
+            aliasInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+            VkBuffer alias = VK_NULL_HANDLE;
+            if (createBuffer(context.device, &aliasInfo, nullptr, &alias) != VK_SUCCESS) {
+                state.pendingSettles.erase(settle);
+                continue;
+            }
+            if (bindBufferMemory(context.device, alias, import->second.memory, 0) != VK_SUCCESS) {
+                destroyBuffer(context.device, alias, nullptr);
+                state.pendingSettles.erase(settle);
+                continue;
+            }
+            batch.aliases.push_back(alias);
+            source = alias;
+        }
+        const VkBufferCopy region{0, (VkDeviceSize{index} * settleBatchCopies + batch.bases.size()) * 4u, 4};
+        copy(batch.commands, source, deviceSettle.batchTarget, 1, &region);
+        settle->second = PendingSettle{SettlePhase::Submitted, index, context.device};
+        batch.bases.push_back(base);
+    }
+    state.settleWanted.erase(state.settleWanted.begin(), state.settleWanted.begin() + static_cast<std::ptrdiff_t>(consumed));
+    if ((result = context.Function<PFN_vkEndCommandBuffer>("vkEndCommandBuffer")(batch.commands)) != VK_SUCCESS) return fail("vkEndCommandBuffer (settle batch)");
+    if (batch.bases.empty()) return;
+    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &batch.commands;
+    if ((result = context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.settleQueue, 1, &submit, batch.fence)) != VK_SUCCESS) return fail("vkQueueSubmit (settle batch)");
+    batch.busy = true;
+    state.settlesSubmitted += batch.bases.size();
+}
+
+void reapSettleBatches(const Context& context, HostImports& state) {
+    const auto found = state.settles.find(context.device);
+    if (found == state.settles.end()) return;
+    auto& deviceSettle = found->second;
+    const auto status = context.Resolved(&DeviceFunctions::getFenceStatus, "vkGetFenceStatus");
+    for (std::size_t index = 0; index < deviceSettle.batches.size(); ++index) {
+        auto& batch = deviceSettle.batches[index];
+        if (!batch.busy) continue;
+        const auto result = status(context.device, batch.fence);
+        if (result == VK_NOT_READY) continue;
+        for (const auto base : batch.bases) {
+            const auto settle = state.pendingSettles.find(base);
+            if (settle == state.pendingSettles.end() || settle->second.phase != SettlePhase::Submitted || settle->second.batch != index || settle->second.device != context.device) continue;
+            if (result != VK_SUCCESS) {
+                state.pendingSettles.erase(settle);
+                continue;
+            }
+            settle->second.phase = SettlePhase::Settled;
+            state.settleReady.push_back(base);
+        }
+        for (const auto alias : batch.aliases) deviceSettle.settleDestroyBuffer(context.device, alias, nullptr);
+        batch.aliases.clear();
+        batch.retired.clear();
+        batch.bases.clear();
+        batch.busy = false;
+    }
+}
+
+void rewatchSettledImports(HostImports& state) {
+    if (state.settleReady.empty()) return;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    for (const auto base : state.settleReady) {
+        const auto settle = state.pendingSettles.find(base);
+        if (settle == state.pendingSettles.end() || settle->second.phase != SettlePhase::Settled) continue;
+        state.pendingSettles.erase(settle);
+        const auto import = state.imports.find(base);
+        if (import == state.imports.end() || !import->second.unwatched) continue;
+        const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> span{{{base, base + import->second.bytes}}};
+        if (StorageTexture::AnyLiveOverlaps(span)) {
+            ++state.settlesKeptCompared;
+            continue;
+        }
+        ranges.push_back(span.front());
+    }
+    state.settleReady.clear();
+    if (ranges.empty()) return;
+    GuestMemory::Rewatch(ranges);
+    for (const auto& [begin, end] : ranges) {
+        const auto import = state.imports.find(begin);
+        if (import == state.imports.end() || !GuestMemory::Watched(begin, static_cast<std::size_t>(end - begin))) continue;
+        import->second.unwatched = false;
+        ++state.settlesRewatched;
+    }
+}
+
+void settleUnwatchedImports(const Context& context, HostImports& state) {
+    if (state.pendingSettles.empty() || importsStale(context, state) || context.settleQueue == VK_NULL_HANDLE || context.settleQueueMutex == nullptr || !GuestMemory::GpuMutex().HeldByThisThread()) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - state.settlePolled < settlePollPeriod) return;
+    state.settlePolled = now;
+    reapSettleBatches(context, state);
+    rewatchSettledImports(state);
+    submitSettleBatch(context, state);
+}
+#endif
 
 void decideImportWatch(const Context& context, HostImports& state) {
     if (state.watchDevice == context.device) return;
@@ -848,30 +1290,77 @@ std::size_t leasedIndexContaining(const GuestAllocations::Lease& lease, std::uin
 
 std::atomic<std::uint64_t> importWindow{0};
 
-ImportRun importRun(const GuestAllocations::Lease& lease, std::uint64_t address) {
+ImportRun leasedRun(const GuestAllocations::Lease& lease, std::size_t first, std::size_t last) {
+    ImportRun run{lease[first]->address, lease[last]->address + lease[last]->bytes - lease[first]->address, {}};
+    run.ranges.assign(lease.begin() + static_cast<std::ptrdiff_t>(first), lease.begin() + static_cast<std::ptrdiff_t>(last) + 1);
+    return run;
+}
+
+template<typename Remembered>
+const Remembered* rememberedRun(const std::map<std::pair<std::uint64_t, std::uint64_t>, Remembered>& runs, const GuestAllocations::Lease& lease, std::size_t first, std::size_t last) {
+    const auto base = lease[first]->address;
+    const auto found = runs.find({base, lease[last]->address + lease[last]->bytes - base});
+    if (found == runs.end() || found->second.ranges.size() != last - first + 1) return nullptr;
+    for (std::size_t index = first; index <= last; ++index) {
+        const auto& remembered = found->second.ranges[index - first];
+        if (remembered.owner_before(lease[index]) || lease[index].owner_before(remembered)) return nullptr;
+    }
+    return &found->second;
+}
+
+bool stillRefused(const HostImports& state, const ImportRefusal* refusal, std::uint64_t budget) {
+    return refusal != nullptr && budget != 0 && budget <= refusal->budget && state.liveBytes >= refusal->liveBytes;
+}
+
+ImportRun importRun(const GuestAllocations::Lease& lease, std::uint64_t address, std::uint64_t largest = std::numeric_limits<std::uint64_t>::max(), std::uint64_t budget = 0) {
     const auto index = leasedIndexContaining(lease, address);
     if (index == lease.size()) return {};
     const auto& containing = *lease[index];
+    const auto& state = Imports();
+    const auto window = importWindow.load(std::memory_order_relaxed);
     std::uint64_t low = 0;
     std::uint64_t high = std::numeric_limits<std::uint64_t>::max();
-    const auto window = importWindow.load(std::memory_order_relaxed);
     if (window != 0) {
         low = address / window * window;
         high = low + window;
-        if (containing.address < low || containing.address + containing.bytes > high) {
-            low = containing.address;
-            high = containing.address + containing.bytes;
-        }
+        if (containing.address < low || containing.address + containing.bytes > high) return leasedRun(lease, index, index);
     }
     auto first = index;
     while (first > 0 && lease[first - 1]->address >= low && continuesRun(*lease[first - 1], *lease[first])) --first;
     auto last = index;
     while (last + 1 < lease.size() && lease[last + 1]->address + lease[last + 1]->bytes <= high && continuesRun(*lease[last], *lease[last + 1])) ++last;
-    if (window != 0 && (lease[first]->address != low || lease[last]->address + lease[last]->bytes != high)) first = last = index;
-    if (first != last && Imports().unaliasedSpans.contains(lease[first]->address)) return {lease[index]->address, lease[index]->bytes, {lease[index]}};
-    ImportRun run{lease[first]->address, lease[last]->address + lease[last]->bytes - lease[first]->address, {}};
-    run.ranges.assign(lease.begin() + static_cast<std::ptrdiff_t>(first), lease.begin() + static_cast<std::ptrdiff_t>(last) + 1);
-    return run;
+    const auto skipped = [&](std::size_t from, std::size_t to) { return rememberedRun(state.failedBlocks, lease, from, to) != nullptr || stillRefused(state, rememberedRun(state.refusals, lease, from, to), budget); };
+    if (window == 0) return first == last || lease[last]->address + lease[last]->bytes - lease[first]->address > largest || skipped(first, last) ? leasedRun(lease, index, index) : leasedRun(lease, first, last);
+    const auto bounding = [&](std::size_t from, std::size_t to, std::uint64_t value, bool start) {
+        const auto found = std::lower_bound(lease.begin() + static_cast<std::ptrdiff_t>(from), lease.begin() + static_cast<std::ptrdiff_t>(to) + 1, value, [start](const auto& range, std::uint64_t wanted) { return (start ? range->address : range->address + range->bytes) < wanted; });
+        const auto position = static_cast<std::size_t>(found - lease.begin());
+        return position <= to && (start ? (*found)->address : (*found)->address + (*found)->bytes) == value ? position : lease.size();
+    };
+    for (auto size = window; size >= containing.bytes; size /= 2) {
+        if (size > largest) continue;
+        const auto blockLow = address / size * size;
+        const auto blockHigh = blockLow + size;
+        if (containing.address < blockLow || containing.address + containing.bytes > blockHigh) break;
+        if (blockLow < lease[first]->address || blockHigh > lease[last]->address + lease[last]->bytes) continue;
+        const auto blockFirst = bounding(first, index, blockLow, true);
+        const auto blockLast = bounding(index, last, blockHigh, false);
+        if (blockFirst == lease.size() || blockLast == lease.size()) continue;
+        if (blockFirst == blockLast) break;
+        if (skipped(blockFirst, blockLast)) continue;
+        return leasedRun(lease, blockFirst, blockLast);
+    }
+    return leasedRun(lease, index, index);
+}
+
+ImportRun exactRun(const GuestAllocations::Lease& lease, std::uint64_t base, std::uint64_t bytes) {
+    const auto first = leasedIndexContaining(lease, base);
+    if (first == lease.size() || lease[first]->address != base) return {};
+    auto last = first;
+    while (lease[last]->address + lease[last]->bytes < base + bytes) {
+        if (last + 1 == lease.size() || !continuesRun(*lease[last], *lease[last + 1])) return {};
+        ++last;
+    }
+    return lease[last]->address + lease[last]->bytes == base + bytes ? leasedRun(lease, first, last) : ImportRun{};
 }
 
 bool runCovers(const GuestAllocations::Lease& lease, std::uint64_t begin, std::uint64_t end) {
@@ -918,6 +1407,9 @@ bool sameRun(const Entry& entry, const ImportRun& run) {
 
 bool wouldRetireImport(const HostImports& state, const ImportRun& run) {
     if (run.ranges.empty()) return false;
+    for (const auto& [base, entry] : state.trimmed) {
+        if (base < run.base + run.bytes && run.base < base + entry.bytes) return true;
+    }
     const auto next = state.imports.lower_bound(run.base);
     if (next != state.imports.end()) {
         if (next->first == run.base && sameRun(next->second, run)) return false;
@@ -928,21 +1420,38 @@ bool wouldRetireImport(const HostImports& state, const ImportRun& run) {
     return previous.base + previous.bytes > run.base;
 }
 
-bool sameRange(const HostImport& entry, const GuestAllocations::Lease& lease) {
+bool sameRange(const ImportFailure& entry, const GuestAllocations::Lease& lease, std::uint64_t budget = 0) {
+    const auto current = entry.ranges.size() == 1 ? leasedRangeOwner(lease, entry.base, entry.base + entry.bytes) : nullptr;
+    if (current != nullptr && entry.bytes < current->bytes) return !entry.ranges.front().owner_before(current) && !current.owner_before(entry.ranges.front());
+    return sameRun(entry, importRun(lease, entry.base, std::numeric_limits<std::uint64_t>::max(), budget));
+}
+
+bool sameRange(const HostImport& entry, const GuestAllocations::Lease& lease, std::uint64_t budget = 0) {
     if (entry.ranges.size() == 1 && !entry.joined && entry.bytes < entry.ranges.front()->bytes) {
         const auto current = leasedRangeOwner(lease, entry.base, entry.base + entry.bytes);
         return current != nullptr && !entry.ranges.front().owner_before(current) && !current.owner_before(entry.ranges.front());
     }
-    return sameRun(entry, entry.joined ? joinedRun(lease, entry.base, entry.base + entry.bytes) : importRun(lease, entry.base));
+    return sameRun(entry, entry.joined ? joinedRun(lease, entry.base, entry.base + entry.bytes) : importRun(lease, entry.base, std::numeric_limits<std::uint64_t>::max(), budget));
+}
+
+std::uint64_t effectiveUse(const HostImports& state, const HostImport& entry) {
+    if (entry.spaceSerial == 0) return entry.lastUse;
+    const auto found = state.spaceUses.find(entry.spaceSerial);
+    return found == state.spaceUses.end() ? entry.lastUse : std::max(entry.lastUse, found->second);
 }
 
 bool pointerHeld(const HostImports& state, const HostImport& entry) {
-    return entry.lastUse >= state.buildFloor;
+    return effectiveUse(state, entry) >= state.buildFloor;
 }
 
+constexpr std::uint64_t ProtectedUses = 256;
+
 bool evictable(const HostImports& state, const HostImport& entry) {
-    constexpr std::uint64_t protectedUses = 256;
-    return !pointerHeld(state, entry) && entry.lastUse + protectedUses < state.useCounter;
+    return !pointerHeld(state, entry) && effectiveUse(state, entry) + ProtectedUses < state.useCounter;
+}
+
+bool evictingRefusalCurrent(const HostImports& state, const EvictingRefusal& refusal, std::uint64_t budget) {
+    return refusal.epoch == state.epoch && refusal.liveBytes == state.liveBytes && budget <= refusal.budget && refusal.window == importWindow.load(std::memory_order_relaxed) && state.useCounter < refusal.ready && (state.buildFloor <= refusal.floor || state.useCounter < refusal.readyHeld);
 }
 
 std::uint64_t retireLeastRecent(const Context& context, HostImports& state, const GuestAllocations::Lease& lease, std::uint64_t wanted) {
@@ -950,10 +1459,10 @@ std::uint64_t retireLeastRecent(const Context& context, HostImports& state, cons
     while (freed < wanted) {
         auto oldest = state.imports.end();
         for (auto it = state.imports.begin(); it != state.imports.end(); ++it) {
-            if (evictable(state, it->second) && (oldest == state.imports.end() || it->second.lastUse < oldest->second.lastUse)) oldest = it;
+            if (evictable(state, it->second) && (oldest == state.imports.end() || effectiveUse(state, it->second) < effectiveUse(state, oldest->second))) oldest = it;
         }
         if (oldest == state.imports.end()) break;
-        freed += oldest->second.bytes;
+        freed += oldest->second.pinnedBytes;
         retireImport(context.device, state, oldest, lease);
     }
     return freed;
@@ -972,24 +1481,73 @@ std::uint64_t physicalMemoryBytes() {
 }
 
 std::atomic<std::uint64_t> budgetOverride{0};
+std::atomic<std::uint64_t> addressCopyLimitOverride{0};
 
-// Pinned imports count against the driver's system memory heap, which imports and type-3 mirrors share; past it
-// ordinary host allocations fail. The budget is APS5_HOST_IMPORT_MIB, else the larger of 6 GiB and half the physical
-// memory, at most the largest host heap less 2 GiB.
-std::uint64_t importBudget(const Context& context) {
+// Pinned imports count against the driver's system memory heap, which imports, type-3 mirrors, buffers and textures
+// placed in host memory share; past it ordinary host allocations fail. The budget is APS5_HOST_IMPORT_MIB, else
+// HostImportBudget.
+std::uint64_t configuredBudget() {
     if (const auto set = budgetOverride.load(std::memory_order_relaxed); set != 0) return set;
     static const std::uint64_t configured = []() -> std::uint64_t {
         const char* value = std::getenv("APS5_HOST_IMPORT_MIB");
         return value != nullptr ? std::strtoull(value, nullptr, 10) << 20u : 0u;
     }();
-    if (configured != 0) return configured;
-    std::uint64_t hostHeap = 0;
-    for (std::uint32_t index = 0; index < context.memory.memoryHeapCount; ++index) {
-        if ((context.memory.memoryHeaps[index].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0) hostHeap = std::max<std::uint64_t>(hostHeap, context.memory.memoryHeaps[index].size);
+    return configured;
+}
+
+std::uint64_t importBudget(const Context& context) {
+    if (const auto configured = configuredBudget(); configured != 0) return configured;
+    return HostImportBudget(context.memory, physicalMemoryBytes());
+}
+
+std::optional<std::uint32_t> hostHeapIndex(const VkPhysicalDeviceMemoryProperties& memory) {
+    std::optional<std::uint32_t> heap;
+    for (std::uint32_t index = 0; index < memory.memoryHeapCount; ++index) {
+        if ((memory.memoryHeaps[index].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0 && (!heap || memory.memoryHeaps[index].size > memory.memoryHeaps[*heap].size)) heap = index;
     }
-    const auto fromMemory = std::max<std::uint64_t>(6144ull << 20u, physicalMemoryBytes() / 2);
-    constexpr std::uint64_t reserve = 2048ull << 20u;
-    return hostHeap > reserve ? std::min(fromMemory, hostHeap - reserve) : fromMemory;
+    return heap;
+}
+
+void noteReportedBudget(HostImports& state, std::uint64_t configured, bool set, std::uint64_t reported) {
+    if (reported >= configured || state.reportedHeapBudget == 0) return;
+    const std::uint8_t stage = !set && state.allocationFailed ? 2 : 1;
+    if (state.reportNoted >= stage) return;
+    state.reportNoted = stage;
+    const char* outcome = set ? "the setting stays, as the report never lowers it" : stage == 2 ? "imports are held to it since an import's vkAllocateMemory failed" : "the default stays until an import's vkAllocateMemory fails";
+    std::fprintf(stderr, "[gpu] host import budget: host heap %u reports a VK_EXT_memory_budget budget of %llu MiB and a usage of %llu MiB with %llu MiB of imports live, which leaves imports %llu MiB of the %llu MiB %s; %s\n", state.reportedHeap, static_cast<unsigned long long>(state.reportedHeapBudget >> 20u), static_cast<unsigned long long>(state.reportedHeapUsage >> 20u), static_cast<unsigned long long>(state.liveBytes >> 20u), static_cast<unsigned long long>(reported >> 20u), static_cast<unsigned long long>(configured >> 20u), set ? "APS5_HOST_IMPORT_MIB sets" : "of the default", outcome);
+}
+
+std::uint64_t effectiveBudget(const Context& context, HostImports& state) {
+    const auto configured = importBudget(context);
+    const bool set = configuredBudget() != 0;
+    auto reported = std::numeric_limits<std::uint64_t>::max();
+    if (context.memoryProperties2 != nullptr && context.physical != VK_NULL_HANDLE) {
+        const auto now = std::chrono::steady_clock::now();
+        if (state.reportedDevice != context.physical || now - state.reportedAt >= std::chrono::seconds(1)) {
+            VkPhysicalDeviceMemoryBudgetPropertiesEXT report{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+            VkPhysicalDeviceMemoryProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &report};
+            context.memoryProperties2(context.physical, &properties);
+            state.reportedBudget = HostImportBudgetFor(context.memory, &report, std::numeric_limits<std::uint64_t>::max(), state.liveBytes);
+            const auto heap = hostHeapIndex(context.memory);
+            state.reportedHeap = heap.value_or(0);
+            state.reportedHeapBudget = heap ? report.heapBudget[*heap] : 0;
+            state.reportedHeapUsage = heap ? report.heapUsage[*heap] : 0;
+            state.reportedDevice = context.physical;
+            state.reportedAt = now;
+        }
+        reported = state.reportedBudget;
+    }
+    noteReportedBudget(state, configured, set, reported);
+    return HostImportBudgetWith(configured, set, reported, state.allocationFailed, state.ceiling);
+}
+
+std::string budgetSource(const Context& context, const HostImports& state, std::uint64_t budget) {
+    const auto configured = importBudget(context);
+    const char* source = state.ceiling != 0 && budget == state.ceiling ? "lowered after vkAllocateMemory failed" : budget < configured ? "the host heap's VK_EXT_memory_budget report" : configuredBudget() != 0 ? "APS5_HOST_IMPORT_MIB" : "the default";
+    if (state.reportedHeapBudget == 0) return source;
+    char text[192];
+    std::snprintf(text, sizeof(text), "%s; host heap %u reports a budget of %llu MiB and a usage of %llu MiB", source, state.reportedHeap, static_cast<unsigned long long>(state.reportedHeapBudget >> 20u), static_cast<unsigned long long>(state.reportedHeapUsage >> 20u));
+    return text;
 }
 
 std::atomic<std::uint64_t> rangeImportWindow{64ull << 20u};
@@ -1027,26 +1585,68 @@ ImportRun windowRun(const HostImports& state, ImportRun run, std::uint64_t begin
 
 const HostImport* peekImport(const HostImports& state, std::uint64_t begin, std::uint64_t end);
 const HostImport* findImport(HostImports& state, std::uint64_t begin, std::uint64_t end);
-bool importsStale(const Context& context, const HostImports& state);
-const HostImport* importRunAt(const Context& context, HostImports& state, ImportRun run, bool joined, std::uint64_t address, const GuestAllocations::Lease& lease, std::uint64_t end, bool evict);
+const HostImport* importRunAt(const Context& context, HostImports& state, ImportRun run, bool joined, std::uint64_t address, const GuestAllocations::Lease& lease, std::uint64_t end, bool evict, ImportRequester requester);
 
 // The bytes retireLeastRecent could free outside [begin, end).
-std::uint64_t evictableBytes(const HostImports& state, std::uint64_t begin, std::uint64_t end) {
+std::uint64_t evictableBytes(const HostImports& state, std::uint64_t begin, std::uint64_t end, std::uint64_t& ready, std::uint64_t& readyHeld) {
     std::uint64_t bytes = 0;
     for (const auto& [base, entry] : state.imports) {
-        if ((entry.base + entry.bytes <= begin || entry.base >= end) && evictable(state, entry)) bytes += entry.bytes;
+        if (entry.base + entry.bytes > begin && entry.base < end) continue;
+        if (evictable(state, entry)) {
+            bytes += entry.pinnedBytes;
+            continue;
+        }
+        auto& horizon = pointerHeld(state, entry) ? readyHeld : ready;
+        horizon = std::min(horizon, effectiveUse(state, entry) + ProtectedUses + 1);
     }
     return bytes;
 }
 
-const HostImport* importAllocation(const Context& context, HostImports& state, std::uint64_t address, const GuestAllocations::Lease& lease, std::uint64_t end = 0, bool evict = true) {
+struct ImportConstruction {
+    ImportConstruction(const Context& context, std::uint64_t base, std::uint64_t bytes)
+        : device(context.device), destroyBuffer(context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")), freeMemory(context.Function<PFN_vkFreeMemory>("vkFreeMemory")), entry{base, bytes, VK_NULL_HANDLE, VK_NULL_HANDLE, 0} {}
+    ImportConstruction(const ImportConstruction&) = delete;
+    ImportConstruction& operator=(const ImportConstruction&) = delete;
+    ~ImportConstruction() {
+        if (!armed) return;
+        if (entry.buffer != VK_NULL_HANDLE) destroyBuffer(device, entry.buffer, nullptr);
+        if (entry.memory != VK_NULL_HANDLE) freeMemory(device, entry.memory, nullptr);
+#ifdef _WIN32
+        GuestArena::GuestArenaUnmapAlias_nid_postfix(entry.alias);
+#endif
+    }
+    VkDevice device;
+    PFN_vkDestroyBuffer destroyBuffer;
+    PFN_vkFreeMemory freeMemory;
+    HostImport entry;
+    bool armed = true;
+};
+
+void ensurePinWaiter();
+
+const HostImport* importAllocation(const Context& context, HostImports& state, std::uint64_t address, const GuestAllocations::Lease& lease, ImportRequester requester, std::uint64_t end = 0, bool evict = true, std::uint64_t largest = std::numeric_limits<std::uint64_t>::max()) {
+    ensurePinWaiter();
+#ifdef _WIN32
+    settleUnwatchedImports(context, state);
+#endif
     const bool fresh = !importsStale(context, state);
     if (fresh && end != 0) {
         if (const auto* current = findImport(state, address, end)) return current;
     } else if (!fresh) {
-        if (const auto* current = findImport(state, address, address + 1); current != nullptr && current->joined && sameRange(*current, lease)) return current;
+        if (const auto* current = peekImport(state, address, address + 1); current != nullptr && current->joined && sameRange(*current, lease)) {
+            current->lastUse = ++state.useCounter;
+            return current;
+        }
     }
-    auto run = importRun(lease, address);
+    const auto budget = evict ? 0 : effectiveBudget(context, state);
+    if (const auto index = leasedIndexContaining(lease, address); budget != 0 && index != lease.size() && stillRefused(state, rememberedRun(state.refusals, lease, index, index), budget) && findImport(state, address, address + 1) == nullptr) {
+        auto& counts = state.counts[static_cast<std::size_t>(requester)];
+        ++counts.refused;
+        counts.refusedBytes += lease[index]->bytes;
+        ++counts.remembered;
+        return nullptr;
+    }
+    auto run = importRun(lease, address, largest, budget);
     // Without an end the caller views the whole run through the import (AcquireRegistered): a window that holds the
     // first byte is shorter than that, so only an import of the whole run is a hit; a window is replaced below.
     if (fresh && end == 0) {
@@ -1054,7 +1654,7 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     }
     if (end != 0) run = windowRun(state, std::move(run), address, end, context.hostImportAlignment);
     if (run.ranges.empty()) return nullptr;
-    return importRunAt(context, state, std::move(run), false, address, lease, end, evict);
+    return importRunAt(context, state, std::move(run), false, address, lease, end, evict, requester);
 }
 
 const HostImport* importJoined(const Context& context, HostImports& state, std::uint64_t begin, std::uint64_t end, const GuestAllocations::Lease& lease) {
@@ -1063,23 +1663,42 @@ const HostImport* importJoined(const Context& context, HostImports& state, std::
     auto run = joinedRun(lease, begin, end);
     if (run.ranges.empty()) return nullptr;
     if (const auto failed = state.failedJoins.find(run.base); failed != state.failedJoins.end() && sameRun(failed->second, run)) return nullptr;
-    return importRunAt(context, state, std::move(run), true, begin, lease, end, true);
+    return importRunAt(context, state, std::move(run), true, begin, lease, end, true, ImportRequester::Join);
 }
 
-const HostImport* importRunAt(const Context& context, HostImports& state, ImportRun run, bool joined, std::uint64_t address, const GuestAllocations::Lease& lease, std::uint64_t end, bool evict) {
+const HostImport* importRunAt(const Context& context, HostImports& state, ImportRun run, bool joined, std::uint64_t address, const GuestAllocations::Lease& lease, std::uint64_t end, bool evict, ImportRequester requester) {
+    auto& counts = state.counts[static_cast<std::size_t>(requester)];
     const auto base = run.base;
     const auto bytes = run.bytes;
     auto& failures = joined ? state.failedJoins : state.failed;
+    const bool stepDown = !joined && run.ranges.size() > 1 && importWindow.load(std::memory_order_relaxed) != 0;
     const auto alignment = context.hostImportAlignment;
     if (joined && (alignment == 0 || base % alignment != 0 || bytes % alignment != 0)) {
         failures.insert_or_assign(base, ImportFailure{base, bytes, GuestAllocations::Mapped(run.ranges.begin(), run.ranges.end())});
         return nullptr;
     }
-    if (const auto found = state.imports.find(base); found != state.imports.end() && sameRun(found->second, run)) return &found->second;
+    if (const auto found = state.imports.find(base); found != state.imports.end() && sameRun(found->second, run)) {
+        found->second.lastUse = ++state.useCounter;
+        return &found->second;
+    }
     if (alignment == 0 || base % alignment != 0 || bytes % alignment != 0) return nullptr;
-    if (const auto failed = failures.find(base); failed != failures.end()) {
+    if (const auto failed = failures.find(base); !stepDown && failed != failures.end()) {
         if (sameRun(failed->second, run)) return nullptr;
         failures.erase(failed);
+    }
+    dropTrimmed(state, base, base + bytes);
+    const auto budget = effectiveBudget(context, state);
+    const auto containing = std::find_if(run.ranges.begin(), run.ranges.end(), [address](const auto& range) { return address >= range->address && address < range->address + range->bytes; });
+    if (const auto remembered = state.evictingRefusals.find({base, bytes}); evict && remembered != state.evictingRefusals.end()) {
+        if (remembered->second.joined == joined && evictingRefusalCurrent(state, remembered->second, budget) && sameRun(remembered->second, run)) {
+            ++counts.refused;
+            counts.refusedBytes += bytes;
+            ++counts.remembered;
+            const auto room = remembered->second.room - std::min(remembered->second.room, remembered->second.budget - budget);
+            if (stepDown && containing != run.ranges.end() && room >= (*containing)->bytes) return importAllocation(context, state, address, lease, requester, end, evict, std::min(bytes / 2, room));
+            return nullptr;
+        }
+        state.evictingRefusals.erase(remembered);
     }
     auto first = state.imports.lower_bound(base);
     if (first != state.imports.begin() && std::prev(first)->second.base + std::prev(first)->second.bytes > base) --first;
@@ -1093,21 +1712,38 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
         return !expandedWindow || Recorder::Active() == nullptr;
     };
     for (auto it = first; it != state.imports.end() && it->first < base + bytes; ++it) {
-        if (held(it->second)) return nullptr;
-        replaced += it->second.bytes;
+        if (held(it->second)) return stepDown ? importAllocation(context, state, address, lease, requester, end, evict, bytes / 2) : nullptr;
+        replaced += it->second.pinnedBytes;
     }
-    const auto budget = importBudget(context);
     const auto live = state.liveBytes - replaced;
-    if (live + bytes > budget && (!evict || live + bytes - evictableBytes(state, base, base + bytes) > budget)) {
+    auto ready = std::numeric_limits<std::uint64_t>::max();
+    auto readyHeld = std::numeric_limits<std::uint64_t>::max();
+    const auto evictable = evict && live + bytes > budget ? evictableBytes(state, base, base + bytes, ready, readyHeld) : 0;
+    if (live + bytes > budget + evictable) {
         // A refused import turns every later use of the range into CPU copies, so say so.
-        static std::uint64_t refused = 0, refusedBytes = 0;
         static auto lastReport = std::chrono::steady_clock::now() - std::chrono::seconds(60);
-        ++refused;
-        refusedBytes += bytes;
+        ++counts.refused;
+        counts.refusedBytes += bytes;
+        const auto remember = [&](std::uint64_t at, std::uint64_t size, GuestAllocations::Mapped ranges) {
+            if (!evict && !joined) state.refusals.insert_or_assign(std::pair{at, size}, ImportRefusal{at, size, std::move(ranges), state.liveBytes, budget});
+        };
+        remember(base, bytes, GuestAllocations::Mapped(run.ranges.begin(), run.ranges.end()));
         if (std::chrono::steady_clock::now() - lastReport > std::chrono::seconds(10)) {
             lastReport = std::chrono::steady_clock::now();
-            std::fprintf(stderr, "[gpu] host import budget: %llu MiB live of %llu MiB (APS5_HOST_IMPORT_MIB); %llu imports (%llu MiB) refused so far, last 0x%llx+0x%llx\n", static_cast<unsigned long long>(state.liveBytes >> 20u), static_cast<unsigned long long>(budget >> 20u), static_cast<unsigned long long>(refused), static_cast<unsigned long long>(refusedBytes >> 20u), static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes));
+            std::uint64_t refused = 0;
+            std::uint64_t refusedBytes = 0;
+            std::uint64_t remembered = 0;
+            for (const auto& requested : state.counts) {
+                refused += requested.refused;
+                refusedBytes += requested.refusedBytes;
+                remembered += requested.remembered;
+            }
+            std::fprintf(stderr, "[gpu] host import budget: %llu MiB live of %llu MiB (%s); %llu imports (%llu MiB) refused so far, %llu of them remembered, last 0x%llx+0x%llx by %s\n", static_cast<unsigned long long>(state.liveBytes >> 20u), static_cast<unsigned long long>(budget >> 20u), budgetSource(context, state, budget).c_str(), static_cast<unsigned long long>(refused), static_cast<unsigned long long>(refusedBytes >> 20u), static_cast<unsigned long long>(remembered), static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), ImportRequesterName(requester));
         }
+        const auto room = budget + evictable > live ? budget + evictable - live : 0;
+        if (evict) state.evictingRefusals.insert_or_assign(std::pair{base, bytes}, EvictingRefusal{base, bytes, GuestAllocations::Mapped(run.ranges.begin(), run.ranges.end()), state.epoch, state.liveBytes, budget, room, importWindow.load(std::memory_order_relaxed), state.buildFloor, ready, readyHeld, joined});
+        if (stepDown && containing != run.ranges.end() && room >= (*containing)->bytes) return importAllocation(context, state, address, lease, requester, end, evict, std::min(bytes / 2, room));
+        if (containing != run.ranges.end() && run.ranges.size() > 1) remember((*containing)->address, (*containing)->bytes, GuestAllocations::Mapped{*containing});
         return nullptr;
     }
     for (auto it = first; it != state.imports.end() && it->first < base + bytes;) {
@@ -1116,20 +1752,33 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
         it = next;
     }
     if (state.liveBytes + bytes > budget) retireLeastRecent(context, state, lease, state.liveBytes + bytes - budget);
-    HostImport entry{base, bytes, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
+    ImportConstruction owner(context, base, bytes);
+    auto& entry = owner.entry;
     entry.range = run.ranges.front();
     entry.ranges = std::move(run.ranges);
+    entry.memoryBase = base;
+    entry.pinnedBytes = bytes;
+    entry.backingSerial = entry.ranges.size() == 1 ? entry.range->backingSerial : 0;
+    const auto failedBlockImport = [&]() -> const HostImport* {
+        ++counts.failed;
+        state.failedBlocks.insert_or_assign(std::pair{base, bytes}, ImportFailure{base, bytes, GuestAllocations::Mapped(entry.ranges.begin(), entry.ranges.end())});
+        return importAllocation(context, state, address, lease, requester, end, evict);
+    };
+    const auto failedImport = [&]() -> const HostImport* {
+        if (stepDown) return failedBlockImport();
+        ++counts.failed;
+        failures.insert_or_assign(base, ImportFailure{base, bytes, GuestAllocations::Mapped(entry.ranges.begin(), entry.ranges.end())});
+        return nullptr;
+    };
 #ifdef _WIN32
     // Drivers pin imported pages, so every page must be committed and accessible.
+    const GuestArena::HostImportAccess importAccess(reinterpret_cast<void*>(base), static_cast<std::size_t>(bytes));
     bool writable = true;
     bool readOnly = true;
     MEMORY_BASIC_INFORMATION refused{};
     for (std::uint64_t cursor = base; cursor < base + bytes;) {
         MEMORY_BASIC_INFORMATION info{};
-        if (VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) == 0 || info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
-            failures.insert_or_assign(base, ImportFailure{base, bytes, GuestAllocations::Mapped(entry.ranges.begin(), entry.ranges.end())});
-            return nullptr;
-        }
+        if (VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) == 0 || info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) return failedImport();
         const auto protection = info.Protect & 0xffu;
         const bool pageWritable = (info.Type == MEM_PRIVATE || info.Type == MEM_IMAGE) && (protection == PAGE_READWRITE || protection == PAGE_EXECUTE_READWRITE || protection == PAGE_WRITECOPY || protection == PAGE_EXECUTE_WRITECOPY);
         const bool pageReadOnly = info.Type != MEM_MAPPED && (protection == PAGE_READONLY || protection == PAGE_EXECUTE_READ);
@@ -1138,10 +1787,7 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
         if (!pageWritable) writable = false;
         cursor = reinterpret_cast<std::uint64_t>(info.BaseAddress) + info.RegionSize;
     }
-    if (!writable && readOnly) {
-        failures.insert_or_assign(base, ImportFailure{base, bytes, GuestAllocations::Mapped(entry.ranges.begin(), entry.ranges.end())});
-        return nullptr;
-    }
+    if (!writable && readOnly) return failedImport();
     if (!writable) {
         if (refused.BaseAddress != nullptr) {
             char text[256];
@@ -1152,20 +1798,12 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
             entry.alias = GuestArena::GuestArenaMapAlias_nid_postfix(static_cast<std::uintptr_t>(base), static_cast<std::size_t>(bytes));
         } catch (const std::runtime_error&) {
             if (entry.ranges.size() == 1) throw;
-            if (joined) {
-                failures.insert_or_assign(base, ImportFailure{base, bytes, GuestAllocations::Mapped(entry.ranges.begin(), entry.ranges.end())});
-                return nullptr;
-            }
-            state.unaliasedSpans.insert(base);
-            return importAllocation(context, state, address, lease, end, evict);
+            return joined ? failedImport() : failedBlockImport();
         }
         if (entry.alias == nullptr) return nullptr;
     }
 #else
-    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(base), static_cast<std::size_t>(bytes), true)) {
-        failures.insert_or_assign(base, ImportFailure{base, bytes, GuestAllocations::Mapped(entry.ranges.begin(), entry.ranges.end())});
-        return nullptr;
-    }
+    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(base), static_cast<std::size_t>(bytes), true)) return failedImport();
 #endif
     decideImportWatch(context, state);
     VkResult result = VK_SUCCESS;
@@ -1212,10 +1850,16 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
     entry.unwatched = step == nullptr && !(entry.dmaBuf ? watchedDmaBuf : watchedHostPointer);
     if (step != nullptr) {
 #ifdef _WIN32
-        GuestArena::GuestArenaUnmapAlias_nid_postfix(entry.alias);
+        GuestArena::GuestArenaUnmapAlias_nid_postfix(std::exchange(entry.alias, nullptr));
 #endif
-        failures.insert_or_assign(base, ImportFailure{base, bytes, GuestAllocations::Mapped(entry.ranges.begin(), entry.ranges.end())});
-        std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx failed at %s (%d); falling back to copies\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), step, static_cast<int>(result));
+        std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx failed at %s (%d); falling back to copies, requested by %s\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), step, static_cast<int>(result), ImportRequesterName(requester));
+        if (std::string_view(step) == "vkAllocateMemory") {
+            state.allocationFailed = true;
+            if (++state.allocationFailures >= 3 || state.liveBytes + bytes + budget / 8 >= budget) {
+                state.ceiling = std::max<std::uint64_t>(state.liveBytes, 1);
+                std::fprintf(stderr, "[gpu] host import budget lowered to the %.1f MiB live after vkAllocateMemory failed %s\n", state.liveBytes / 1048576.0, state.allocationFailures >= 3 ? "3 times in a row" : "within an eighth of the budget");
+            }
+        }
 #ifdef _WIN32
         static const bool trace = std::getenv("APS5_TRACE_HOST_IMPORT") != nullptr;
         for (std::uint64_t cursor = base; trace && cursor < base + bytes;) {
@@ -1238,16 +1882,34 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
             std::fclose(maps);
         }
 #endif
-        return nullptr;
+        return failedImport();
     }
     static std::uint64_t importedBytes = 0;
     importedBytes += bytes;
     static const bool trace = std::getenv("APS5_TRACE_HOST_IMPORT") != nullptr;
     state.liveBytes += bytes;
-    if (trace) std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx ok (%zu live, %.1f MiB live, %.1f MiB ever)%s\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), state.imports.size() + 1, state.liveBytes / 1048576.0, importedBytes / 1048576.0, joined ? ", joined at bind" : "");
+    state.allocationFailures = 0;
+    ++counts.made;
+    counts.madeBytes += bytes;
+    for (auto it = state.refusals.lower_bound({base, 0}); it != state.refusals.end() && it->first.first < base + bytes;) it = it->first.first + it->first.second <= base + bytes ? state.refusals.erase(it) : std::next(it);
+    if (trace) std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx ok (%zu live, %.1f MiB live, %.1f MiB ever)%s by %s\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), state.imports.size() + 1, state.liveBytes / 1048576.0, importedBytes / 1048576.0, joined ? ", joined at bind" : "", ImportRequesterName(requester));
     entry.joined = joined;
     entry.lastUse = ++state.useCounter;
-    return &state.imports.emplace(base, entry).first->second;
+#ifdef _WIN32
+    if (deferredSettles.load(std::memory_order_relaxed) && entry.alias == nullptr && state.watchPrivateImports && writable && base % settleBlockBytes == 0 && bytes % settleBlockBytes == 0) {
+        if (entry.unwatched) {
+            state.pendingSettles.insert_or_assign(base, PendingSettle{});
+            state.settleWanted.push_back(base);
+        } else if (settled && !GuestMemory::Watched(base, static_cast<std::size_t>(bytes))) {
+            entry.unwatched = true;
+            state.pendingSettles.insert_or_assign(base, PendingSettle{SettlePhase::Settled, 0});
+            state.settleReady.push_back(base);
+        }
+    }
+#endif
+    const auto inserted = state.imports.emplace(base, entry);
+    owner.armed = false;
+    return &inserted.first->second;
 }
 
 // The readable registered range containing [begin, end), or null.
@@ -1258,23 +1920,75 @@ const GuestAllocations::Range* containingRange(const GuestAllocations::Lease& le
     return range->readable && begin >= range->address && end <= range->address + range->bytes ? range.get() : nullptr;
 }
 
+bool reattachTrimmed(const Context& context, HostImports& state, HostImport& entry, const GuestAllocations::Lease& lease) {
+    const auto first = entry.base;
+    const auto last = entry.base + entry.bytes;
+    std::shared_ptr<const GuestAllocations::Range> kept;
+    for (auto it = std::lower_bound(lease.begin(), lease.end(), first, [](const auto& range, std::uint64_t value) { return range->address < value; }); it != lease.end() && (*it)->address < last; ++it) {
+        if ((*it)->backingSerial == entry.backingSerial && (*it)->address + (*it)->bytes <= last && (kept == nullptr || (*it)->bytes > kept->bytes)) kept = *it;
+    }
+    if (kept == nullptr) return false;
+    const auto next = state.imports.lower_bound(kept->address);
+    if (next != state.imports.end() && next->first < kept->address + kept->bytes) return false;
+    if (next != state.imports.begin() && std::prev(next)->second.base + std::prev(next)->second.bytes > kept->address) return false;
+    HostImport candidate{kept->address, kept->bytes, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
+    candidate.range = kept;
+    candidate.ranges = {kept};
+    if (!sameRange(candidate, lease)) return false;
+    const auto offset = kept->address - entry.memoryBase;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    if (createImportBuffer(context, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, kept->bytes, &buffer) != VK_SUCCESS) return false;
+    const auto refuse = [&] {
+        context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);
+        return false;
+    };
+    VkMemoryRequirements requirements{};
+    context.Function<PFN_vkGetBufferMemoryRequirements>("vkGetBufferMemoryRequirements")(context.device, buffer, &requirements);
+    if (((requirements.memoryTypeBits >> entry.memoryType) & 1u) == 0 || requirements.alignment == 0 || offset % requirements.alignment != 0 || requirements.size > entry.pinnedBytes - offset) return refuse();
+    if (context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, buffer, entry.memory, offset) != VK_SUCCESS) return refuse();
+    const VkBufferDeviceAddressInfo addressInfo{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, nullptr, buffer};
+    const auto address = context.Function<PFN_vkGetBufferDeviceAddressKHR>("vkGetBufferDeviceAddressKHR")(context.device, &addressInfo);
+    if (address == 0) return refuse();
+    entry.base = kept->address;
+    entry.bytes = kept->bytes;
+    entry.buffer = buffer;
+    entry.address = address;
+    entry.range = kept;
+    entry.ranges = {kept};
+    entry.serial = 0;
+    entry.lastUse = ++state.useCounter;
+    return true;
+}
+
 // Drops imports whose registered range changed or disappeared: their pages may no longer back the
 // guest addresses. Walks the imports only when the registry changed since the last walk.
 void refreshImports(const Context& context, HostImports& state, const GuestAllocations::Lease& lease) {
     if (state.device != context.device) {
-        while (!state.imports.empty()) {
-            auto node = state.imports.extract(state.imports.begin());
-            if (state.device != VK_NULL_HANDLE && state.destroyBuffer != nullptr && state.freeMemory != nullptr) {
-                state.parked[state.device].push_back(std::make_shared<RetiredImport>(state.device, state.destroyBuffer, state.freeMemory, std::move(node)));
-                continue;
-            }
 #ifdef _WIN32
-            GuestArena::GuestArenaUnmapAlias_nid_postfix(node.mapped().alias);
+        drainSettles(state);
 #endif
+        for (auto* held : {&state.imports, &state.trimmed}) {
+            while (!held->empty()) {
+                auto node = held->extract(held->begin());
+                if (state.device != VK_NULL_HANDLE && state.destroyBuffer != nullptr && state.freeMemory != nullptr) {
+                    state.parked[state.device].push_back(std::make_shared<RetiredImport>(state.device, state.destroyBuffer, state.freeMemory, std::move(node)));
+                    continue;
+                }
+#ifdef _WIN32
+                GuestArena::GuestArenaUnmapAlias_nid_postfix(node.mapped().alias);
+#endif
+            }
         }
         state.liveBytes = 0;
         state.failed.clear();
         state.failedJoins.clear();
+        state.failedBlocks.clear();
+        state.refusals.clear();
+        state.evictingRefusals.clear();
+        state.ceiling = 0;
+        state.allocationFailures = 0;
+        state.allocationFailed = false;
+        state.reportNoted = 0;
         state.sparseRunEnds.clear();
         state.sparseRunJoins.clear();
         state.device = context.device;
@@ -1294,8 +2008,19 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
     };
     std::erase_if(state.sparseRunEnds, [&](const auto& entry) { return !starts(entry.first); });
     std::erase_if(state.sparseRunJoins, [&](const auto& entry) { return !starts(entry.first); });
+    while (!state.trimmed.empty()) {
+        auto node = state.trimmed.extract(state.trimmed.begin());
+        if (!reattachTrimmed(context, state, node.mapped(), lease)) {
+            releaseTrimmed(state, std::move(node));
+            continue;
+        }
+        node.key() = node.mapped().base;
+        ++state.epoch;
+        state.imports.insert(std::move(node));
+    }
+    const auto budget = effectiveBudget(context, state);
     for (auto it = state.imports.begin(); it != state.imports.end();) {
-        if (sameRange(it->second, lease)) {
+        if (sameRange(it->second, lease, budget)) {
             if (it->second.unwatched) GuestMemory::Unwatch(it->first, it->second.bytes);
             ++it;
             continue;
@@ -1306,8 +2031,11 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
         retireImport(context.device, state, it, lease);
         it = next;
     }
-    for (auto it = state.failed.begin(); it != state.failed.end();) it = sameRun(it->second, importRun(lease, it->first)) ? std::next(it) : state.failed.erase(it);
+    for (auto it = state.failed.begin(); it != state.failed.end();) it = sameRange(it->second, lease, budget) ? std::next(it) : state.failed.erase(it);
     for (auto it = state.failedJoins.begin(); it != state.failedJoins.end();) it = sameRun(it->second, joinedRun(lease, it->second.base, it->second.base + it->second.bytes)) ? std::next(it) : state.failedJoins.erase(it);
+    for (auto it = state.failedBlocks.begin(); it != state.failedBlocks.end();) it = sameRun(it->second, exactRun(lease, it->first.first, it->first.second)) ? std::next(it) : state.failedBlocks.erase(it);
+    for (auto it = state.refusals.begin(); it != state.refusals.end();) it = stillRefused(state, &it->second, budget) && sameRun(it->second, exactRun(lease, it->first.first, it->first.second)) ? std::next(it) : state.refusals.erase(it);
+    for (auto it = state.evictingRefusals.begin(); it != state.evictingRefusals.end();) it = evictingRefusalCurrent(state, it->second, budget) && sameRun(it->second, exactRun(lease, it->first.first, it->first.second)) ? std::next(it) : state.evictingRefusals.erase(it);
 }
 
 const HostImport* peekImport(const HostImports& state, std::uint64_t begin, std::uint64_t end) {
@@ -1324,9 +2052,9 @@ const HostImport* findImport(HostImports& state, std::uint64_t begin, std::uint6
     return entry;
 }
 
-const HostImport* importAccess(const Context& context, HostImports& state, std::uint64_t begin, std::uint64_t end, const GuestAllocations::Lease& lease) {
+const HostImport* importAccess(const Context& context, HostImports& state, std::uint64_t begin, std::uint64_t end, const GuestAllocations::Lease& lease, ImportRequester requester) {
     if (!runCovers(lease, begin, end)) return findImport(state, begin, end);
-    const auto* entry = importAllocation(context, state, begin, lease, end);
+    const auto* entry = importAllocation(context, state, begin, lease, requester, end);
     return entry != nullptr && findImport(state, begin, end) == entry ? entry : nullptr;
 }
 
@@ -1705,6 +2433,24 @@ void appendChangedBlocks(std::span<ImageMirror* const> mirrors, std::uint64_t ge
     }
 }
 
+void markUnwatched(ImageMirror& mirror) {
+    ++Mirrors().heapUnwatched;
+    std::fill(mirror.generations.begin(), mirror.generations.end(), 0);
+}
+
+void appendHeapRun(std::span<ImageMirror* const> mirrors, std::uint64_t generation, std::vector<RefreshBlock>& blocks) {
+    if (generation != 0) {
+        appendChangedBlocks(mirrors, generation, blocks);
+        return;
+    }
+    for (std::size_t index = 0; index < mirrors.size(); ++index) {
+        auto& mirror = *mirrors[index];
+        const auto own = GuestMemory::CollectWrites(mirror.base, static_cast<std::size_t>(mirror.bytes));
+        if (own == 0) markUnwatched(mirror);
+        appendChangedBlocks(mirrors.subspan(index, 1), own, blocks);
+    }
+}
+
 void refreshHeapMirrors(std::vector<ImageMirror*>& mirrors, std::vector<RefreshBlock>& blocks) {
     std::sort(mirrors.begin(), mirrors.end(), [](const ImageMirror* left, const ImageMirror* right) { return left->base < right->base; });
     for (std::size_t first = 0; first < mirrors.size();) {
@@ -1714,8 +2460,7 @@ void refreshHeapMirrors(std::vector<ImageMirror*>& mirrors, std::vector<RefreshB
         const auto bytes = mirrors[last - 1]->base + mirrors[last - 1]->bytes - begin;
         prepareRange(begin, bytes);
         const auto generation = GuestMemory::CollectWrites(begin, static_cast<std::size_t>(bytes));
-        Require(generation != 0, "a heap mirror's range is no longer write-watched");
-        appendChangedBlocks(std::span<ImageMirror* const>(mirrors).subspan(first, last - first), generation, blocks);
+        appendHeapRun(std::span<ImageMirror* const>(mirrors).subspan(first, last - first), generation, blocks);
         first = last;
     }
 }
@@ -1816,7 +2561,7 @@ bool refreshSparseMirror(ImageMirror& mirror, std::vector<RefreshBlock>& blocks)
     if (!pieces.empty() && pieces.back().second > mirror.base + mirror.bytes) return false;
     syncRange(mirror.base, mirror.bytes);
     const auto generation = collectPieces(pieces);
-    Require(generation != 0, "a sparse heap mirror's range is no longer write-watched");
+    if (generation == 0) markUnwatched(mirror);
     appendSparseBlocks(mirror, std::move(pieces), generation, blocks);
     return true;
 }
@@ -1851,12 +2596,23 @@ std::vector<std::pair<std::size_t, std::uint64_t>> refreshHeapRuns(const GuestBu
         const auto& run = space.heapRuns[index];
         prepareRange(run.begin, run.bytes);
         const auto generation = GuestMemory::CollectWrites(run.begin, static_cast<std::size_t>(run.bytes));
-        Require(generation != 0, "a heap mirror's range is no longer write-watched");
         const auto since = space.verified[index].load(std::memory_order_relaxed);
-        if (since == 0 || !GuestMemory::UnchangedSince(run.begin, static_cast<std::size_t>(run.bytes), since)) appendChangedBlocks(std::span<ImageMirror* const>(space.heapMirrors).subspan(run.first, run.last - run.first), generation, blocks);
+        if (since == 0 || !GuestMemory::UnchangedSince(run.begin, static_cast<std::size_t>(run.bytes), since)) appendHeapRun(std::span<ImageMirror* const>(space.heapMirrors).subspan(run.first, run.last - run.first), generation, blocks);
         checked.emplace_back(index, generation);
     }
     return checked;
+}
+
+bool heapMirrorWatched(ImageMirror& mirror) {
+    const auto serial = GuestMemory::UnwatchSerial();
+    if (mirror.watchedSerial.load(std::memory_order_relaxed) == serial) return true;
+    if (!GuestMemory::Watched(mirror.base, static_cast<std::size_t>(mirror.bytes))) return false;
+    mirror.watchedSerial.store(serial, std::memory_order_relaxed);
+    return true;
+}
+
+bool importsNow(const Context& context, HostImports& state, const GuestAllocations::Lease& lease, std::uint64_t address) {
+    return context.hostImportAlignment != 0 && (importsStale(context, state) || importAllocation(context, state, address, lease, ImportRequester::Build, 0, false) != nullptr);
 }
 
 // The mirror for a leased image range: the existing one, or a new one when none exists or the
@@ -1902,6 +2658,7 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
     mirror->range = range;
     if (heap) {
         std::uint64_t generation = 0;
+        const auto serial = GuestMemory::UnwatchSerial();
         if (sparse) {
             syncRange(mirror->base, mirror->bytes);
             if (GuestMemory::Watched(mirror->base, static_cast<std::size_t>(mirror->bytes))) generation = collectPieces(pieces);
@@ -1912,10 +2669,18 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
         constexpr std::uint64_t block = 65536;
         mirror->generations.assign(static_cast<std::size_t>(((mirror->base + mirror->bytes + block - 1) / block) - mirror->base / block), generation);
         if (generation == 0) {
+            std::shared_ptr<ImageMirror> stale;
             std::lock_guard lock(state.mutex);
             ++state.heapUnwatched;
+            if (const auto found = state.entries.find(range->address); found != state.entries.end() && found->second->heap) {
+                state.heapBytes -= found->second->bytes;
+                stale = std::move(found->second);
+                state.entries.erase(found);
+                ++state.version;
+            }
             return nullptr;
         }
+        mirror->watchedSerial.store(serial, std::memory_order_relaxed);
         if (heapMirrorsBeside(*range) + mirror->bytes > heapMirrorBudget()) {
             sweepMirrors();
             if (const auto held = heapMirrorsBeside(*range); held + mirror->bytes > heapMirrorBudget()) throw std::runtime_error(heapMirrorError(*range, held, "past the budget"));
@@ -2036,6 +2801,11 @@ void reportMirrors() {
         heapBytes = state.heapBytes;
     }
     AgcDriver::ProfilePrint_nid_no_patch("[buffers] image mirrors: %zu ranges (%.1f MiB, %zu writable, %zu heap %.1f MiB), %llu address-based builds served, %llu descriptor sub-ranges bound, %llu sparse heaps bound, %llu rebuilds, %llu refreshes: %llu blocks compared, %llu copied, %llu refresh syncs; heap refills %llu, unwatched heaps %llu, %llu heap mirrors released for imports (%.1f MiB)\n", count, bytes / 1048576.0, writable, heaps, heapBytes / 1048576.0, static_cast<unsigned long long>(state.builds), static_cast<unsigned long long>(state.subranges), static_cast<unsigned long long>(state.sparseBinds), static_cast<unsigned long long>(state.rebuilds), static_cast<unsigned long long>(state.refreshes), static_cast<unsigned long long>(state.blocksCompared), static_cast<unsigned long long>(state.blocksCopied), static_cast<unsigned long long>(state.syncs), static_cast<unsigned long long>(state.heapRefills), static_cast<unsigned long long>(state.heapUnwatched), static_cast<unsigned long long>(state.heapImported), state.heapImportedBytes / 1048576.0);
+#ifdef _WIN32
+    auto& imports = Imports();
+    std::lock_guard importsLock(imports.mutex);
+    if (imports.settlesSubmitted != 0 || imports.settlesWaited != 0 || !imports.settles.empty()) AgcDriver::ProfilePrint_nid_no_patch("[buffers] host imports under %llu KiB: %llu settle reads submitted, %llu back in the write watch, %llu kept compared under a storage image, %llu retired during their read (%llu unmaps waited for it), %zu pending; %llu larger imports settled inside their window\n", static_cast<unsigned long long>(settleFloorBytes >> 10u), static_cast<unsigned long long>(imports.settlesSubmitted), static_cast<unsigned long long>(imports.settlesRewatched), static_cast<unsigned long long>(imports.settlesKeptCompared), static_cast<unsigned long long>(imports.settlesParked), static_cast<unsigned long long>(imports.settleUnmapWaits), imports.settles.size(), static_cast<unsigned long long>(imports.settlesWaited));
+#endif
 }
 
 // Deferred lease release. The lease an address-based build takes (AcquireRegistered) is dropped by its
@@ -2074,6 +2844,7 @@ LeaseState& Leases() {
 struct SnapshotStats {
     std::atomic<std::uint64_t> checked{0};
     std::atomic<std::uint64_t> skipped{0};
+    std::atomic<std::uint64_t> mismatched{0};
 };
 
 SnapshotStats& Snapshots() {
@@ -2081,7 +2852,7 @@ SnapshotStats& Snapshots() {
     return stats;
 }
 
-bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) noexcept {
+bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) {
     const auto start = std::chrono::steady_clock::now();
     bool synced = false;
     bool drained = false;
@@ -2101,19 +2872,85 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) noexcept
         state.stats.contentionMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
         return true;
     }
+    if (Recorder::InCompletion()) throw std::runtime_error("guest allocation mutation cannot wait for an active GPU completion");
     if (GuestMemory::GpuMutex().HeldByThisThread()) {
-        try {
-            auto* recorder = Recorder::Active();
+        auto* recorder = Recorder::Active();
+        if (recorder != nullptr && !recorder->Idle()) {
+            Recorder::CountSync(4);
+            recorder->Sync();
+            synced = true;
+            drained = true;
+        }
+        if (recorder != nullptr) recorder->FlushDeferredReleases();
+        const auto end = static_cast<std::uint64_t>(address) + bytes;
+        auto& imports = Imports();
+        if (releaseParkedImports(imports, address, end)) retiredImport = true;
+        const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+        {
+            std::lock_guard importsLock(imports.mutex);
+            for (auto it = imports.imports.begin(); it != imports.imports.end();) {
+                const auto base = it->first;
+                if (base >= end || address >= base + it->second.bytes) {
+                    ++it;
+                    continue;
+                }
+                const auto next = std::next(it);
+                retireOrTrim(imports.device, imports, it, lease, address, end);
+                it = next;
+                retiredImport = true;
+            }
+        }
+#ifdef _WIN32
+        if (releaseSettleRetired(imports, address, end)) retiredImport = true;
+#endif
+        if (retiredImport && recorder != nullptr && !recorder->Idle()) {
+            Recorder::CountSync(4);
+            recorder->Sync();
+            synced = true;
+            drained = true;
+        }
+        if (retiredImport && recorder != nullptr) recorder->FlushDeferredReleases();
+    } else {
+        std::lock_guard lock(GuestMemory::GpuMutex());
+        auto& state = Leases();
+        auto* recorder = Recorder::Active();
+        const auto target = state.newestLeaseSerial;
+        if (recorder != nullptr && recorder == state.leaseRecorder && target > state.finishedLeaseSerial) {
+            Recorder::CountSync(4);
+            recorder->Submit();
+            recorder->FinishUpTo(target);
+            state.finishedLeaseSerial = target;
+            synced = true;
+        } else if (recorder != nullptr && !recorder->Idle()) {
+            Recorder::CountSync(4);
+            recorder->Sync();
+            synced = true;
+            drained = true;
+        } else {
+            std::this_thread::yield();
+        }
+        if (recorder != nullptr) recorder->FlushDeferredReleases();
+
+        const auto end = static_cast<std::uint64_t>(address) + bytes;
+        auto& imports = Imports();
+        if (releaseParkedImports(imports, address, end)) retiredImport = true;
+        bool overlapsImport = false;
+        {
+            std::lock_guard importsLock(imports.mutex);
+            for (const auto& [base, entry] : imports.imports) {
+                if (base < end && address < base + entry.bytes) {
+                    overlapsImport = true;
+                    break;
+                }
+            }
+        }
+        if (overlapsImport) {
             if (recorder != nullptr && !recorder->Idle()) {
                 Recorder::CountSync(4);
                 recorder->Sync();
                 synced = true;
                 drained = true;
             }
-            if (recorder != nullptr) recorder->FlushDeferredReleases();
-            const auto end = static_cast<std::uint64_t>(address) + bytes;
-            auto& imports = Imports();
-            if (releaseParkedImports(imports, address, end)) retiredImport = true;
             const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
             {
                 std::lock_guard importsLock(imports.mutex);
@@ -2124,7 +2961,7 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) noexcept
                         continue;
                     }
                     const auto next = std::next(it);
-                    retireImport(imports.device, imports, it, lease, false);
+                    retireOrTrim(imports.device, imports, it, lease, address, end);
                     it = next;
                     retiredImport = true;
                 }
@@ -2135,80 +2972,10 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) noexcept
                 synced = true;
                 drained = true;
             }
-            if (retiredImport && recorder != nullptr) recorder->FlushDeferredReleases();
-        } catch (const std::exception& error) {
-            std::fprintf(stderr, "[gpu] lease wait failed: %s\n", error.what());
         }
-    } else {
-        try {
-            std::lock_guard lock(GuestMemory::GpuMutex());
-            auto& state = Leases();
-            auto* recorder = Recorder::Active();
-            const auto target = state.newestLeaseSerial;
-            if (recorder != nullptr && recorder == state.leaseRecorder && target > state.finishedLeaseSerial) {
-                // The open batch may be the target; FinishUpTo waits front to back up to it only.
-                Recorder::CountSync(4);
-                recorder->Submit();
-                recorder->FinishUpTo(target);
-                state.finishedLeaseSerial = target;
-                synced = true;
-            } else if (recorder != nullptr && !recorder->Idle()) {
-                Recorder::CountSync(4);
-                recorder->Sync();
-                synced = true;
-                drained = true;
-            } else {
-                // Nothing recorded holds the lease: the holder is a lease-holding object that has
-                // yet to record (a test's, or a build whose worker gave up the lock); give it time.
-                std::this_thread::yield();
-            }
-            if (recorder != nullptr) recorder->FlushDeferredReleases();
-
-            const auto end = static_cast<std::uint64_t>(address) + bytes;
-            auto& imports = Imports();
-            if (releaseParkedImports(imports, address, end)) retiredImport = true;
-            bool overlapsImport = false;
-            {
-                std::lock_guard importsLock(imports.mutex);
-                for (const auto& [base, entry] : imports.imports) {
-                    if (base < end && address < base + entry.bytes) {
-                        overlapsImport = true;
-                        break;
-                    }
-                }
-            }
-            if (overlapsImport) {
-                if (recorder != nullptr && !recorder->Idle()) {
-                    Recorder::CountSync(4);
-                    recorder->Sync();
-                    synced = true;
-                    drained = true;
-                }
-                const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
-                {
-                    std::lock_guard importsLock(imports.mutex);
-                    for (auto it = imports.imports.begin(); it != imports.imports.end();) {
-                        const auto base = it->first;
-                        if (base >= end || address >= base + it->second.bytes) {
-                            ++it;
-                            continue;
-                        }
-                        const auto next = std::next(it);
-                        retireImport(imports.device, imports, it, lease, false);
-                        it = next;
-                        retiredImport = true;
-                    }
-                }
-                if (retiredImport && recorder != nullptr && !recorder->Idle()) {
-                    Recorder::CountSync(4);
-                    recorder->Sync();
-                    synced = true;
-                    drained = true;
-                }
-            }
-        } catch (const std::exception& error) {
-            std::fprintf(stderr, "[gpu] lease wait failed: %s\n", error.what());
-        }
+#ifdef _WIN32
+        if (releaseSettleRetired(imports, address, end)) retiredImport = true;
+#endif
     }
     auto& state = Leases();
     std::lock_guard lock(state.mutex);
@@ -2263,6 +3030,17 @@ void CountLeaseOutcome(bool synced, std::uint64_t batchSerial) {
     AgcDriver::ProfilePrint_nid_no_patch("[address-sync] leases: %llu released at completion, %llu synced at once; %llu pin-contention waits by guest threads (%llu finished the lease batch, %llu drained the recorder, %llu cache-only drops) %.1f s; BDA table cache %llu hits / %llu misses (%zu tables held); snapshot compares: %llu skipped (live-backed region), %llu made\n", static_cast<unsigned long long>(stats.deferred), static_cast<unsigned long long>(stats.synced), static_cast<unsigned long long>(stats.contentionWaits), static_cast<unsigned long long>(stats.contentionSyncs), static_cast<unsigned long long>(stats.contentionDrains), static_cast<unsigned long long>(stats.cacheDrops), stats.contentionMs / 1000, static_cast<unsigned long long>(table.hits), static_cast<unsigned long long>(table.misses), table.held, static_cast<unsigned long long>(snapshots.skipped.load(std::memory_order_relaxed)), static_cast<unsigned long long>(snapshots.checked.load(std::memory_order_relaxed)));
 }
 
+void FinishLeaseWork() {
+    GuestMemory::AssertGpuLockHeld("FinishLeaseWork");
+    const auto& state = Leases();
+    auto* recorder = Recorder::Active();
+    const auto target = state.newestLeaseSerial;
+    if (recorder == nullptr || recorder != state.leaseRecorder || target <= recorder->CompletedThrough()) return;
+    if (target >= recorder->OpenSerial()) recorder->Submit();
+    Recorder::AnnounceSyncSite(__builtin_return_address(0));
+    recorder->FinishUpTo(target);
+}
+
 LeaseStats LeaseCounters() {
     auto& state = Leases();
     std::lock_guard lock(state.mutex);
@@ -2297,6 +3075,10 @@ MirrorStats MirrorCounters() {
     MirrorStats stats{0, state.heapBytes, state.rebuilds, state.blocksCopied, state.heapRefills, state.sweeps, state.heapChecks, state.sparseBinds};
     for (const auto& [base, mirror] : state.entries) stats.heapMirrors += mirror->heap ? 1 : 0;
     return stats;
+}
+
+std::uint64_t SnapshotMismatches() {
+    return Snapshots().mismatched.load(std::memory_order_relaxed);
 }
 
 std::vector<std::uint64_t> AddressTableKey(std::span<const std::pair<std::uint64_t, std::uint64_t>> writes, std::span<const ShaderRecompiler::BdaAbi::Range> own) {
@@ -2337,15 +3119,19 @@ void ClearHostImports(VkDevice device) {
     auto& state = Imports();
     std::lock_guard lock(state.mutex);
     state.parked.erase(device);
-    if (state.settleDevice == device) {
-        if (state.settleFence != VK_NULL_HANDLE) state.destroyFence(device, state.settleFence, nullptr);
-        if (state.settleTarget != VK_NULL_HANDLE) state.settleDestroyBuffer(device, state.settleTarget, nullptr);
-        if (state.settleMemory != VK_NULL_HANDLE) state.settleFreeMemory(device, state.settleMemory, nullptr);
-        state.settleDevice = VK_NULL_HANDLE;
-        state.settleTarget = VK_NULL_HANDLE;
-        state.settleMemory = VK_NULL_HANDLE;
-        state.settleCommands = VK_NULL_HANDLE;
-        state.settleFence = VK_NULL_HANDLE;
+#ifdef _WIN32
+    if (device == state.device) drainSettles(state);
+#endif
+    if (const auto found = state.settles.find(device); found != state.settles.end()) {
+#ifdef _WIN32
+        releaseSettleBatches(device, found->second);
+        std::erase_if(state.pendingSettles, [device](const auto& settle) { return settle.second.phase == SettlePhase::Submitted && settle.second.device == device; });
+#endif
+        const auto& settle = found->second;
+        if (settle.settleFence != VK_NULL_HANDLE) settle.destroyFence(device, settle.settleFence, nullptr);
+        if (settle.settleTarget != VK_NULL_HANDLE) settle.settleDestroyBuffer(device, settle.settleTarget, nullptr);
+        if (settle.settleMemory != VK_NULL_HANDLE) settle.settleFreeMemory(device, settle.settleMemory, nullptr);
+        state.settles.erase(found);
     }
     if (state.device != device) return;
     for (const auto& [address, entry] : state.imports) {
@@ -2355,10 +3141,19 @@ void ClearHostImports(VkDevice device) {
         GuestArena::GuestArenaUnmapAlias_nid_postfix(entry.alias);
 #endif
     }
+    for (const auto& [address, entry] : state.trimmed) state.freeMemory(state.device, entry.memory, nullptr);
     state.imports.clear();
+    state.trimmed.clear();
     state.liveBytes = 0;
     state.failed.clear();
     state.failedJoins.clear();
+    state.failedBlocks.clear();
+    state.refusals.clear();
+    state.evictingRefusals.clear();
+    state.ceiling = 0;
+    state.allocationFailures = 0;
+    state.allocationFailed = false;
+    state.reportNoted = 0;
     state.device = VK_NULL_HANDLE;
     state.refreshedGeneration = 0;
     ++state.epoch;
@@ -2590,6 +3385,49 @@ void SetHostImportRangeWindow(std::uint64_t bytes) {
 
 void SetHostImportBudget(std::uint64_t bytes) {
     budgetOverride.store(bytes, std::memory_order_relaxed);
+    auto& state = Imports();
+    std::lock_guard lock(state.mutex);
+    state.ceiling = 0;
+    state.allocationFailures = 0;
+    state.allocationFailed = false;
+    state.reportNoted = 0;
+}
+
+std::uint64_t HostImportBudgetFor(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported, std::uint64_t configured, std::uint64_t liveBytes) {
+    const auto heap = hostHeapIndex(memory);
+    if (reported == nullptr || !heap || reported->heapBudget[*heap] == 0) return configured;
+    const auto granted = reported->heapBudget[*heap];
+    const auto others = reported->heapUsage[*heap] - std::min<std::uint64_t>(reported->heapUsage[*heap], liveBytes);
+    const auto held = others + granted / 8u;
+    constexpr std::uint64_t step = 64ull << 20u;
+    return std::min(configured, granted > held ? (granted - held) / step * step : 0u);
+}
+
+std::uint64_t HostImportBudgetWith(std::uint64_t configured, bool set, std::uint64_t reported, bool allocationFailed, std::uint64_t ceiling) {
+    const auto budget = set || !allocationFailed ? configured : std::max<std::uint64_t>(std::min(configured, reported), 1);
+    return ceiling != 0 ? std::min(budget, ceiling) : budget;
+}
+
+void SetAddressCopyLimit(std::uint64_t bytes) {
+    addressCopyLimitOverride.store(bytes, std::memory_order_relaxed);
+}
+
+void SetHostImportDeferredSettles(bool enabled) {
+#ifdef _WIN32
+    deferredSettles.store(enabled, std::memory_order_relaxed);
+#else
+    static_cast<void>(enabled);
+#endif
+}
+
+std::uint64_t HostImportBudget(const VkPhysicalDeviceMemoryProperties& memory, const std::uint64_t physicalBytes) {
+    std::uint64_t hostHeap = 0;
+    for (std::uint32_t index = 0; index < std::min<std::uint32_t>(memory.memoryHeapCount, VK_MAX_MEMORY_HEAPS); ++index) {
+        if ((memory.memoryHeaps[index].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0) hostHeap = std::max<std::uint64_t>(hostHeap, memory.memoryHeaps[index].size);
+    }
+    const auto fromMemory = std::max<std::uint64_t>(6144ull << 20u, physicalBytes / 2);
+    const auto reserve = std::max<std::uint64_t>(2048ull << 20u, hostHeap / 2);
+    return hostHeap > reserve ? std::min(fromMemory, hostHeap - reserve) : fromMemory;
 }
 
 std::uint64_t HostImportLiveBytes() {
@@ -2598,15 +3436,71 @@ std::uint64_t HostImportLiveBytes() {
     return state.liveBytes;
 }
 
+const char* ImportRequesterName(ImportRequester requester) {
+    switch (requester) {
+        case ImportRequester::Map: return "map";
+        case ImportRequester::Build: return "build";
+        case ImportRequester::Access: return "access";
+        case ImportRequester::Join: return "join";
+        case ImportRequester::Segment: return "segment";
+    }
+    return "unknown";
+}
+
+HostImportCounts HostImportCounters() {
+    auto& state = Imports();
+    std::lock_guard lock(state.mutex);
+    return {state.imports.size(), state.liveBytes, state.counts};
+}
+
+std::string FormatHostImportCounts(const HostImportCounts& counts) {
+    HostImportRequesterCounts total;
+    std::string requesters;
+    for (std::size_t index = 0; index < counts.requesters.size(); ++index) {
+        const auto& requested = counts.requesters[index];
+        total.made += requested.made;
+        total.madeBytes += requested.madeBytes;
+        total.refused += requested.refused;
+        total.refusedBytes += requested.refusedBytes;
+        total.failed += requested.failed;
+        total.remembered += requested.remembered;
+        char part[96];
+        std::snprintf(part, sizeof(part), "%s%s %llu/%llu/%llu", index == 0 ? "" : ", ", ImportRequesterName(static_cast<ImportRequester>(index)), static_cast<unsigned long long>(requested.made), static_cast<unsigned long long>(requested.refused), static_cast<unsigned long long>(requested.failed));
+        requesters += part;
+    }
+    char text[256];
+    std::snprintf(text, sizeof(text), "%llu live (%.1f MiB); made %llu (%.1f MiB), refused %llu (%.1f MiB, %llu remembered), failed %llu; by requester (made/refused/failed): ", static_cast<unsigned long long>(counts.live), counts.liveBytes / 1048576.0, static_cast<unsigned long long>(total.made), total.madeBytes / 1048576.0, static_cast<unsigned long long>(total.refused), total.refusedBytes / 1048576.0, static_cast<unsigned long long>(total.remembered), static_cast<unsigned long long>(total.failed));
+    return text + requesters;
+}
+
+void ReportHostImports() {
+    const auto counts = HostImportCounters();
+    if (std::all_of(counts.requesters.begin(), counts.requesters.end(), [](const HostImportRequesterCounts& requested) { return requested.made == 0 && requested.refused == 0 && requested.failed == 0; })) return;
+    std::fprintf(stderr, "[gpu] host imports at shutdown: %s\n", FormatHostImportCounts(counts).c_str());
+}
+
+HostImportSettleCounts HostImportSettles() {
+#ifdef _WIN32
+    auto& state = Imports();
+    std::lock_guard lock(state.mutex);
+    return {state.settlesSubmitted, state.settlesWaited, state.settlesRewatched, state.settlesParked, state.settleUnmapWaits, state.settlesKeptCompared};
+#else
+    return {};
+#endif
+}
+
 std::uint64_t HostImportsSettled() {
     return settledImports.load(std::memory_order_relaxed);
 }
 
-const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes) {
+const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes, ImportRequester requester) {
     if (context.hostImportAlignment == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return nullptr;
     ensurePinWaiter();
     auto& state = Imports();
     std::lock_guard lock(state.mutex);
+#ifdef _WIN32
+    settleUnwatchedImports(context, state);
+#endif
     // A hit is only valid while the registry has not changed since the imports were reconciled.
     if (!importsStale(context, state)) {
         if (const auto* entry = findImport(state, address, address + bytes)) {
@@ -2616,7 +3510,7 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
     }
     const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
     refreshImports(context, state, lease);
-    return importAccess(context, state, address, address + bytes, lease);
+    return importAccess(context, state, address, address + bytes, lease, requester);
 }
 
 const HostImport* ExistingHostImportFor(const Context& context, std::uint64_t address, std::size_t bytes) {
@@ -2647,11 +3541,11 @@ bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& 
         if (range == nullptr || leasedRangeOwner(current, range->address) != range) continue;
         try {
             if (!GuestMemory::GpuMutex().HeldByThisThread()) {
-                const auto run = importRun(current, range->address);
+                const auto run = importRun(current, range->address, std::numeric_limits<std::uint64_t>::max(), effectiveBudget(context, state));
                 const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> span{{{run.base, run.base + run.bytes}}};
                 if (wouldRetireImport(state, run) || StorageTexture::AnyPendingOverlaps(span)) return false;
             }
-            if (importAllocation(context, state, range->address, current, 0, false) == nullptr && GuestAllocations::GuestAllocationsGeneration_nid_postfix() != generation) state.failed.erase(importRun(current, range->address).base);
+            importAllocation(context, state, range->address, current, ImportRequester::Map, 0, false);
         } catch (const std::exception& error) {
             std::fprintf(stderr, "[gpu] import of GPU memory mapped at 0x%llx+0x%zx failed: %s\n", static_cast<unsigned long long>(range->address), range->bytes, error.what());
         }
@@ -2754,16 +3648,33 @@ void GuestBufferMemory::AcquireRegistered() {
         {
             auto& state = Imports();
             std::lock_guard lock(state.mutex);
+            const auto keeps = [&](ImageMirror* mirror) { return heapMirrorWatched(*mirror) || !importsNow(context, state, current->lease, mirror->base); };
             if (current == nullptr) (spaces.droppedByWaiter.exchange(false, std::memory_order_relaxed) ? spaces.rebuiltWaiterDrop : spaces.rebuiltFirst).fetch_add(1, std::memory_order_relaxed);
             else if (current->device != context.device) spaces.rebuiltDevice.fetch_add(1, std::memory_order_relaxed);
             else if (current->generation != generation) spaces.rebuiltGeneration.fetch_add(1, std::memory_order_relaxed);
             else if (current->importsEpoch != state.epoch) spaces.rebuiltEpoch.fetch_add(1, std::memory_order_relaxed);
-            else hit = true;
+            else hit = std::all_of(current->heapMirrors.begin(), current->heapMirrors.end(), keeps) && std::all_of(current->sparseMirrors.begin(), current->sparseMirrors.end(), keeps);
             importFloor = state.useCounter + 1;
             if (hit) {
                 const auto stamp = ++state.useCounter;
-                for (const auto& region : current->base) {
-                    if (region.direct != nullptr) region.direct->lastUse = stamp;
+                static const bool stampOnce = std::getenv("APS5_NO_SPACE_STAMP_ONCE") == nullptr;
+                auto& spaceUse = state.spaceUses[current->serial];
+                if (!stampOnce || spaceUse == 0) {
+                    for (const auto& region : current->base) {
+                        if (region.direct == nullptr) continue;
+                        region.direct->lastUse = stamp;
+                        if (stampOnce) region.direct->spaceSerial = current->serial;
+                    }
+                }
+                spaceUse = stamp;
+                if (state.spaceUses.size() > 64) {
+                    const auto oldest = std::min_element(state.spaceUses.begin(), state.spaceUses.end(), [](const auto& left, const auto& right) { return left.second < right.second; });
+                    for (auto& [base, entry] : state.imports) {
+                        if (entry.spaceSerial != oldest->first) continue;
+                        entry.lastUse = std::max(entry.lastUse, oldest->second);
+                        entry.spaceSerial = 0;
+                    }
+                    state.spaceUses.erase(oldest);
                 }
             }
         }
@@ -2819,15 +3730,25 @@ void GuestBufferMemory::AcquireRegistered() {
         regions.reserve(lease.size());
         std::vector<AddressCopy> copies;
         std::vector<std::uint64_t> imported;
+        const HostImport* covering = nullptr;
+        std::uint64_t coveredBegin = 0;
+        std::uint64_t coveredEnd = 0;
         for (const auto& range : lease) {
             if (!range->readable || !range->gpu) continue;
             validate(range->address, range->bytes);
             Region region{range->address, range->address + range->bytes, range->writable, {}, nullptr};
             const HostImport* entry = nullptr;
-            if (importable) {
+            if (importable && covering != nullptr && range->address >= coveredBegin && range->address + range->bytes <= coveredEnd) {
+                entry = covering;
+            } else if (importable) {
                 auto& state = Imports();
                 std::lock_guard lock(state.mutex);
-                entry = importAllocation(context, state, range->address, lease, 0, false);
+                entry = importAllocation(context, state, range->address, lease, ImportRequester::Build, 0, false);
+                covering = entry;
+                if (entry != nullptr) {
+                    coveredBegin = entry->base;
+                    coveredEnd = entry->base + entry->bytes;
+                }
             }
             lap(timing.importsUs, at);
             if (entry != nullptr) {
@@ -2869,7 +3790,8 @@ void GuestBufferMemory::AcquireRegistered() {
             const char* value = std::getenv("APS5_ADDRESS_COPY_MAX_MIB");
             return (value ? std::strtoull(value, nullptr, 10) : 64ull) << 20u;
         }();
-        if (const auto overflow = AddressCopyOverflow(std::move(copies), copyLimit); !overflow.empty()) {
+        const auto limit = addressCopyLimitOverride.load(std::memory_order_relaxed);
+        if (const auto overflow = AddressCopyOverflow(std::move(copies), limit != 0 ? limit : copyLimit); !overflow.empty()) {
             std::fprintf(stderr, "FATAL: %s\n", overflow.c_str());
             std::fflush(stderr);
             std::abort();
@@ -3208,10 +4130,9 @@ void GuestBufferMemory::AddSnapshot(const GuestMemorySnapshot& snapshot) {
             static const bool fatal = std::getenv("APS5_SNAPSHOT_CHECK_FATAL") != nullptr;
             if (!live || fatal) throw std::runtime_error(text);
             static std::mutex reportMutex;
-            static std::uint64_t mismatches = 0;
             static auto lastReport = std::chrono::steady_clock::now() - std::chrono::seconds(60);
             std::lock_guard lock(reportMutex);
-            ++mismatches;
+            const auto mismatches = Snapshots().mismatched.fetch_add(1, std::memory_order_relaxed) + 1;
             const auto now = std::chrono::steady_clock::now();
             if (now - lastReport >= std::chrono::seconds(10)) {
                 lastReport = now;
@@ -3562,7 +4483,7 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
             // device-local buffer that the CPU fallback replaces (none without a recorder to
             // record the copies: UploadFinish then binds the region in place).
             bool staged = Recorder::Active() != nullptr && stagingEligible(region, addressable);
-            const bool misaligned = !bindableInPlace(region.begin - entry->base, addressable);
+            const bool misaligned = !bindableInPlace(HostImportOffset(*entry, region.begin), addressable);
             if (staged) {
                 const auto allocateStart = std::chrono::steady_clock::now();
                 region.buffer = stagingBuffer(context, static_cast<std::size_t>(region.end - region.begin), gpuCopyUsage(addressable));
@@ -3632,6 +4553,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
     for (const auto& region : regions) CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
     if (space != nullptr) completeSpaceWrites();
     uploaded = true;
+    for (const auto& region : regions) static_cast<void>(FlushDepthPlanes(region.begin, static_cast<std::size_t>(region.end - region.begin)));
     for (const auto& [begin, end] : writes) StorageTexture::FlushPending(begin, static_cast<std::size_t>(end - begin), nullptr, "written buffer range");
     if (context.hostImportAlignment != 0) {
         auto& state = Imports();
@@ -3736,7 +4658,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             if (entry == nullptr) entry = findImport(state, region.begin, region.end);
             const bool sparseRun = region.sparseHeap && region.sparse;
             if (entry == nullptr && !sparseRun) {
-                entry = importAccess(context, state, region.begin, region.end, importRanges());
+                entry = importAccess(context, state, region.begin, region.end, importRanges(), ImportRequester::Build);
             }
             bool runImport = false;
             if (entry == nullptr && sparseRun && !region.backed.empty() && region.backed.front().first == region.begin && !WritesOverlap(region.begin, static_cast<std::size_t>(bytes))) {
@@ -3744,7 +4666,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
                 const auto neededEnd = std::min(region.end, std::max(committedEnd, std::max(region.lastView, region.begin) + 4u));
                 const auto covers = [&](const HostImport* candidate) { return candidate != nullptr && candidate->base <= region.begin && candidate->base + candidate->bytes >= neededEnd; };
                 entry = findImport(state, region.begin, neededEnd);
-                if (entry == nullptr && runCovers(importRanges(), region.begin, neededEnd)) entry = importAllocation(context, state, region.begin, importRanges());
+                if (entry == nullptr && runCovers(importRanges(), region.begin, neededEnd)) entry = importAllocation(context, state, region.begin, importRanges(), ImportRequester::Build);
                 if (!covers(entry)) entry = nullptr;
                 const auto& lease = importRanges();
                 const auto index = leasedIndexContaining(lease, region.begin);
@@ -3766,7 +4688,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             // A staged region (see stagingEligible) is copied out of the import even when aligned;
             // without a recorder to record the copies it binds in place like any other.
             const bool staged = recorder != nullptr && stagingEligible(region, addressable);
-            if (entry != nullptr && !staged && bindableInPlace(region.begin - entry->base, addressable)) {
+            if (entry != nullptr && !staged && bindableInPlace(HostImportOffset(*entry, region.begin), addressable)) {
                 region.direct = entry;
                 region.runCut = runImport;
                 region.snapshot.clear();
@@ -3782,7 +4704,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
                 copyOnGpu = true;
                 region.deviceLocal = staged;
                 region.copySource = entry->buffer;
-                region.copySourceBase = entry->base;
+                region.copySourceBase = entry->base - entry->lead;
             }
         }
         if (region.direct != nullptr) {
@@ -3944,15 +4866,19 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         recorder->FlushKeyStoresOverlapping(region->begin, static_cast<std::size_t>(region->end - region->begin));
         recorder->FlushStoresOverlapping(region->begin, static_cast<std::size_t>(region->end - region->begin));
     }
-    const auto commands = recorder->Commands();
+    VkAccessFlags covered = 0;
+    const auto commands = recorder->Commands(&covered);
     const auto timing = recorder->BeginGpuTiming(StagingCopyInKey);
     if (Recorder::BarrierValidate()) {
         std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
         for (const auto* region : copies) reads.emplace_back(region->begin, region->end);
         recorder->NoteAccess(Recorder::CommandClass::StagingIn, Recorder::Access{reads, {}, {}, VK_PIPELINE_STAGE_TRANSFER_BIT});
     }
-    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-    Recorder::CountBarriers(Recorder::CommandClass::StagingIn);
+    constexpr BarrierMask leading{VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
+    if (!Recorder::ElideCovered(Recorder::CommandClass::StagingIn, leading, covered)) {
+        RecordMemoryBarrier(context, commands, leading.srcStage, leading.dstStage, leading.srcAccess, leading.dstAccess);
+        Recorder::CountBarriers(Recorder::CommandClass::StagingIn);
+    }
     bool stagedAny = false;
     std::uint64_t copiedBytes = 0;
     for (auto* region : copies) {
@@ -3983,7 +4909,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
             std::memcpy(inputSnapshot->Bytes().data(), reinterpret_cast<const void*>(address), static_cast<std::size_t>(bytes));
             copySource = inputSnapshot->Handle();
             copyOffset = 0;
-            recorder->Keep(inputSnapshot);
+            recorder->Keep(inputSnapshot, inputSnapshot->Bytes().size());
             CaptureTrace::Log("copy-input-snapshot batch=%llu address=%llx bytes=%llu", batch, static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes));
         }
         if (capture && bytes == 32) {
@@ -4063,11 +4989,15 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
             const auto to = std::min(end, region.end);
             if (from >= to) continue;
             if (!recording) {
-                commands = recorder.Commands();
+                VkAccessFlags covered = 0;
+                commands = recorder.Commands(&covered);
                 timing = recorder.BeginGpuTiming(StagingCopyBackKey);
                 // The shader's stores into the buffer (whichever stage made them) precede the copy.
-                RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-                Recorder::CountBarriers(Recorder::CommandClass::StagingOut);
+                constexpr BarrierMask leading{VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
+                if (!Recorder::ElideCovered(Recorder::CommandClass::StagingOut, leading, covered)) {
+                    RecordMemoryBarrier(context, commands, leading.srcStage, leading.dstStage, leading.srcAccess, leading.dstAccess);
+                    Recorder::CountBarriers(Recorder::CommandClass::StagingOut);
+                }
                 recording = true;
             }
             // Exactly the sub-range the shader may write, in place in the import: what the shader
@@ -4110,7 +5040,7 @@ VkDescriptorBufferInfo GuestBufferMemory::Descriptor(std::uint64_t address, std:
         return std::string(text);
     };
     if (!(address >= region.begin && address + bytes <= region.end && (region.buffer != nullptr || region.direct != nullptr || region.mirror != nullptr))) Require(false, describe("exceeds"));
-    const auto base = region.direct != nullptr ? region.direct->base : region.mirror != nullptr ? region.mirror->base : region.begin;
+    const auto base = region.direct != nullptr ? region.direct->base - region.direct->lead : region.mirror != nullptr ? region.mirror->base : region.begin;
     const auto offset = address - base;
     Require(context.limits.minStorageBufferOffsetAlignment != 0, "no storage buffer offset alignment");
     Require(base % 4 == 0, "a guest buffer view in a GPU owner that does not start at a DWORD boundary is not implemented");
@@ -4544,9 +5474,9 @@ std::uint64_t GuestBufferMemory::inPlaceEnd(const Region& region) {
     return region.direct != nullptr && region.runCut ? std::min(region.end, region.direct->base + region.direct->bytes) : region.end;
 }
 
-std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::InPlaceReads() const {
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> result;
-    if (!uploaded || committed) return result;
+void GuestBufferMemory::InPlaceReads(std::vector<std::pair<std::uint64_t, std::uint64_t>>& result) const {
+    result.clear();
+    if (!uploaded || committed) return;
     if (space != nullptr) {
         for (const auto& region : space->base) {
             if (region.direct != nullptr) result.emplace_back(region.begin, region.end);
@@ -4555,6 +5485,11 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::InPlaceR
     for (const auto& region : regions) {
         if (region.direct != nullptr) result.emplace_back(region.begin, inPlaceEnd(region));
     }
+}
+
+std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::InPlaceReads() const {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> result;
+    InPlaceReads(result);
     return result;
 }
 
@@ -4567,9 +5502,9 @@ std::optional<GuestBufferMemory::SplitReads> GuestBufferMemory::SplitInPlaceRead
     return split;
 }
 
-std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::DeviceReads() const {
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> result;
-    if (!uploaded || committed) return result;
+void GuestBufferMemory::DeviceReads(std::vector<std::pair<std::uint64_t, std::uint64_t>>& result) const {
+    result.clear();
+    if (!uploaded || committed) return;
     if (space != nullptr) {
         for (const auto& region : space->base) {
             if (region.direct != nullptr || region.mirror != nullptr) result.emplace_back(region.begin, region.end);
@@ -4578,6 +5513,11 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::DeviceRe
     for (const auto& region : regions) {
         if (region.direct != nullptr || region.mirror != nullptr) result.emplace_back(region.begin, region.end);
     }
+}
+
+std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::DeviceReads() const {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> result;
+    DeviceReads(result);
     return result;
 }
 

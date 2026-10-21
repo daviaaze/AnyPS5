@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WriteWatchCoverage.hpp"
 #include "ThreadOwned.hpp"
@@ -34,9 +35,11 @@
 #include <cstdint>
 #include <fcntl.h>
 #include <fstream>
+#include <link.h>
 #include <pthread.h>
 #include <sstream>
 #include <sys/ioctl.h>
+#include <sys/uio.h>
 #include <unistd.h>
 #include "prx/libc/include/specifics/linux/HostMapping.hpp"
 #endif
@@ -351,8 +354,6 @@ namespace {
 // remembered, one byte of access flags per 4 KiB page (the table is committed lazily, so only the
 // pages ever verified cost memory). libc reports every range whose mapping or protection changed
 // (registry mutations and guest heap decommits) through the invalidator, which forgets those pages.
-// Only committed pages are cached; reserved pages are queried each time, so a commit made outside the
-// registry (the guest heap grows that way) is seen at once.
 // A second table covers the main guest image (the PE at 0x7ff6b...): its protections change only
 // through registry mutations (mprotect replaces the registered range and invalidates through the same
 // callback), and address-based builds verify every image section on each build, so without the table
@@ -360,6 +361,7 @@ namespace {
 constexpr std::size_t PageBytes = 4096;
 constexpr std::uint8_t PageReadable = 1;
 constexpr std::uint8_t PageWritable = 2;
+constexpr std::uint8_t PageInaccessible = 4;
 
 struct PageSpan {
     std::uintptr_t base = 0;
@@ -418,6 +420,7 @@ struct PageSpan {
 
 struct PageStates {
     std::once_flag once;
+    std::atomic<bool> ready{false};
     PageSpan arena;
     PageSpan image;
 
@@ -434,14 +437,26 @@ struct PageStates {
         image.forget(address, bytes);
     }
 
-    void record(std::uintptr_t base, std::uintptr_t regionEnd, bool readable, bool writable, std::uint64_t generation) {
+    std::atomic<std::uint64_t> accessSerial{0};
+
+    void record(std::uintptr_t base, std::uintptr_t regionEnd, bool readable, bool writable, std::uint64_t generation, std::uint64_t access) {
         for (PageSpan* span : {&arena, &image}) {
-            if (!readable || span->size == 0 || regionEnd <= span->base || base >= span->base + span->size) continue;
-            const std::uint8_t value = PageReadable | (writable ? PageWritable : 0u);
+            if (span->size == 0 || regionEnd <= span->base || base >= span->base + span->size) continue;
+            const std::uint8_t value = readable ? static_cast<std::uint8_t>(PageReadable | (writable ? PageWritable : 0u)) : PageInaccessible;
             const auto first = std::max(base, span->base);
             const auto last = std::min(regionEnd, span->base + span->size);
             for (auto at = first; at < last; at += PageBytes) span->store(at, value);
-            if (GuestAllocations::GuestAllocationsGeneration_nid_postfix() != generation) span->forget(first, static_cast<std::size_t>(last - first));
+            if (GuestAllocations::GuestAllocationsGeneration_nid_postfix() != generation || accessSerial.load(std::memory_order_acquire) != access) span->forget(first, static_cast<std::size_t>(last - first));
+        }
+    }
+
+    void forgetInaccessible(std::uintptr_t address, std::size_t bytes) {
+        for (PageSpan* span : {&arena, &image}) {
+            if (span->size == 0 || bytes == 0 || address >= span->base + span->size || address + bytes <= span->base) continue;
+            const auto last = std::min(address + bytes, span->base + span->size);
+            for (auto at = std::max(address, span->base) & ~static_cast<std::uintptr_t>(PageBytes - 1); at < last; at += PageBytes) {
+                if (span->load(at) == PageInaccessible) span->store(at, 0);
+            }
         }
     }
 };
@@ -475,7 +490,33 @@ void ForgetPages(std::uintptr_t address, std::size_t bytes) {
     forgetSerial.fetch_add(1, std::memory_order_release);
 }
 
+void ForgetInaccessiblePages(std::uintptr_t address, std::size_t bytes) {
+    Pages().accessSerial.fetch_add(1, std::memory_order_acq_rel);
+    Pages().forgetInaccessible(address, bytes);
+}
+
+#ifdef __linux__
+int mainImageExtent(dl_phdr_info* info, std::size_t, void* data) {
+    constexpr auto mask = static_cast<std::uintptr_t>(PageBytes - 1);
+    auto& span = *static_cast<PageSpan*>(data);
+    std::uintptr_t first = std::numeric_limits<std::uintptr_t>::max();
+    std::uintptr_t last = 0;
+    for (int index = 0; index < info->dlpi_phnum; ++index) {
+        const auto& header = info->dlpi_phdr[index];
+        if (header.p_type != PT_LOAD || header.p_memsz == 0) continue;
+        first = std::min(first, static_cast<std::uintptr_t>(info->dlpi_addr + header.p_vaddr) & ~mask);
+        last = std::max(last, static_cast<std::uintptr_t>(info->dlpi_addr + header.p_vaddr + header.p_memsz + mask) & ~mask);
+    }
+    if (first < last) {
+        span.base = first;
+        span.size = static_cast<std::size_t>(last - first);
+    }
+    return 1;
+}
+#endif
+
 void PageStates::initialize() {
+    if (ready.load(std::memory_order_acquire)) return;
     std::call_once(once, [&] {
         GuestArena::GuestArenaRange_nid_postfix(&arena.base, &arena.size);
         const bool arenaCached = arena.allocate();
@@ -496,9 +537,19 @@ void PageStates::initialize() {
             image.size = cursor - start;
             imageCached = image.allocate();
         }
+#elif defined(__linux__)
+        static const bool noImageCache = std::getenv("APS5_NO_IMAGE_PAGE_CACHE") != nullptr;
+        if (!noImageCache) {
+            dl_iterate_phdr(mainImageExtent, &image);
+            imageCached = image.allocate();
+        }
 #endif
-        if (arenaCached || imageCached) GuestAllocations::GuestAllocationsSetInvalidator_nid_postfix(&ForgetPages);
+        if (arenaCached || imageCached) {
+            GuestAllocations::GuestAllocationsSetInvalidator_nid_postfix(&ForgetPages);
+            GuestArena::GuestArenaSetAccessObserver_nid_postfix(&ForgetInaccessiblePages);
+        }
     });
+    ready.store(true, std::memory_order_release);
 }
 
 struct PageRun {
@@ -520,9 +571,9 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
     while (cursor < end) {
         if (const auto* span = pages.spanOf(cursor)) {
             const auto value = span->load(cursor);
-            if ((value & 3u) != 0) {
+            if (value != 0) {
                 const auto next = span->runEnd(cursor, value, end);
-                if (!emit(PageRun{cursor, next, true, (value & PageWritable) != 0})) return true;
+                if (!emit(PageRun{cursor, next, (value & PageReadable) != 0, (value & PageWritable) != 0})) return true;
                 cursor = next;
                 continue;
             }
@@ -535,6 +586,7 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
         // before it invalidates, so a generation change across the query and the store below means
         // the stored pages may describe the old state and are forgotten again.
         const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+        const auto access = pages.accessSerial.load(std::memory_order_acquire);
         if (cursor > userAddressLimit()) {
             static_cast<void>(emit(PageRun{cursor, end, false, false}));
             return true;
@@ -558,15 +610,16 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
         const bool committed = memory.State == MEM_COMMIT && (memory.Protect & (PAGE_GUARD | PAGE_NOACCESS)) == 0;
         const bool readable = committed && readableProtection(protection);
         const bool writable = readable && writableProtection(protection);
-        pages.record(base, regionEnd, readable, writable, generation);
+        if ((memory.Protect & PAGE_GUARD) == 0) pages.record(base, regionEnd, readable, writable, generation, access);
         const auto next = std::min(end, regionEnd);
         if (!emit(PageRun{cursor, next, readable, writable})) return true;
         cursor = next;
 #else
         const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+        const auto access = pages.accessSerial.load(std::memory_order_acquire);
         const auto recordRun = [&](std::uintptr_t next, bool readable, bool writable) {
             constexpr auto mask = static_cast<std::uintptr_t>(PageBytes - 1);
-            pages.record(cursor & ~mask, (next + mask) & ~mask, readable, writable, generation);
+            pages.record(cursor & ~mask, (next + mask) & ~mask, readable, writable, generation, access);
         };
         if (const int fd = HostMapping::QueryFd(); fd >= 0) {
             procmap_query query{};
@@ -577,6 +630,7 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
                 if (query.vma_end <= cursor || query.vma_start >= query.vma_end) return false;
                 if (query.vma_start > cursor) {
                     const auto gapEnd = std::min<std::uintptr_t>(end, query.vma_start);
+                    recordRun(gapEnd, false, false);
                     if (!emit(PageRun{cursor, gapEnd, false, false})) return true;
                     cursor = gapEnd;
                     continue;
@@ -609,6 +663,7 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
             if (last <= cursor) continue;
             if (first > cursor) {
                 const auto gapEnd = std::min(end, first);
+                recordRun(gapEnd, false, false);
                 if (!emit(PageRun{cursor, gapEnd, false, false})) return true;
                 cursor = gapEnd;
                 found = true;
@@ -657,16 +712,39 @@ bool onOwnLiveStack(std::uintptr_t address, std::size_t bytes) {
         }
     };
     thread_local const Bounds bounds;
-    const volatile unsigned char marker = 0;
-    const auto frame = reinterpret_cast<std::uintptr_t>(&marker);
+    const auto frame = reinterpret_cast<std::uintptr_t>(__builtin_frame_address(0));
     return bounds.high != 0 && frame >= bounds.low && frame < bounds.high && address >= frame && address < bounds.high && bytes <= bounds.high - address;
 }
+
+#ifdef __linux__
+bool pageStateRecorded(std::uintptr_t address, std::size_t bytes) {
+    auto& pages = Pages();
+    pages.initialize();
+    for (auto at = address & ~static_cast<std::uintptr_t>(PageBytes - 1); at < address + bytes; at += PageBytes) {
+        if (const auto* span = pages.spanOf(at); span != nullptr && span->load(at) != 0) return true;
+    }
+    return false;
+}
+
+bool readableWithoutQuery(std::uintptr_t address, std::size_t bytes) {
+    constexpr std::size_t limit = 4096;
+    if (bytes > limit || HostMapping::QueryFd() >= 0 || pageStateRecorded(address, bytes)) return false;
+    thread_local std::array<std::byte, limit> scratch;
+    iovec local{scratch.data(), bytes};
+    iovec remote{reinterpret_cast<void*>(address), bytes};
+    static const pid_t self = getpid();
+    return ::process_vm_readv(self, &local, 1, &remote, 1, 0) == static_cast<ssize_t>(bytes);
+}
+#endif
 
 // Checks that [address, address + bytes) is mapped with read (and, if asked, write) access. Returns
 // an empty string when it is, otherwise why it is not.
 std::string verify(std::uintptr_t address, std::size_t bytes, bool writable) {
     const TimedAccess timed(CounterVerify, bytes);
     if (onOwnLiveStack(address, bytes)) return {};
+#ifdef __linux__
+    if (!writable && readableWithoutQuery(address, bytes)) return {};
+#endif
     std::string reason;
     const bool queried = describePages(address, bytes, [&](const PageRun& run) {
         if (!run.readable) {
@@ -758,25 +836,23 @@ struct WriteTracker {
     std::mutex mutex;
     bool initialized = false;
     bool watched = false;
-#ifdef _WIN32
-    std::uintptr_t base = 0;
-    std::size_t size = 0;
-    // Generation of the last collected write per 64 KiB block of the arena.
-    std::vector<std::uint32_t> blocks;
-    // The same, stamped by collects only (dirty pages = CPU stores), never by MarkWritten: the
-    // late label rule asks whether the CPU touched a label's block, and the driver's own GPU label
-    // records in the same block (the title's per-job slots are 0x20 apart) must not count.
-    std::vector<std::uint32_t> cpuBlocks;
-    WriteWatchCoverage coverage;
-    std::vector<std::uint32_t> hintBlocks;
-#else
+    static constexpr std::size_t CoarseBlocks = 64;
     static constexpr std::size_t LeafBlocks = std::size_t{1} << 16;
-    static constexpr std::size_t LeafCount = std::size_t{1} << 15;
     struct Leaf {
         std::array<std::uint32_t, LeafBlocks> blocks{};
         std::array<std::uint32_t, LeafBlocks> cpuBlocks{};
+        std::array<std::uint32_t, LeafBlocks / CoarseBlocks> coarseBlocks{};
+#ifdef _WIN32
+        std::array<std::uint32_t, LeafBlocks> hintBlocks{};
+#endif
     };
     std::vector<std::unique_ptr<Leaf>> leaves;
+#ifdef _WIN32
+    std::uintptr_t base = 0;
+    std::size_t size = 0;
+    WriteWatchCoverage coverage;
+#else
+    static constexpr std::size_t LeafCount = std::size_t{1} << 15;
 #endif
     // Atomic only so a per-thread memo hit can read it without the mutex (every mutation and every
     // stamp still happen under it): a hit must return the current value, including MarkWritten
@@ -808,10 +884,8 @@ struct WriteTracker {
         GuestArena::GuestArenaRange_nid_postfix(&base, &size);
         watched = size != 0 && GuestArena::GuestArenaWriteWatched_nid_postfix();
         if (!watched) return;
-        blocks.assign(size / WriteBlockBytes + 1, 0);
-        cpuBlocks.assign(size / WriteBlockBytes + 1, 0);
+        leaves.resize((size / WriteBlockBytes + LeafBlocks) / LeafBlocks);
         coverage.Initialize(base, size);
-        hintBlocks.assign(size / WriteBlockBytes + 1, 0);
         pages.resize(1u << 16);
         GuestArena::GuestArenaSetPrivateMappingObserver_nid_postfix(&watchPrivateMapping);
 #else
@@ -851,24 +925,24 @@ struct WriteTracker {
         if (first >= stop) return;
         bool started = false;
         for (auto block = blockOf(first); block <= blockOf(stop - 1); ++block) {
-            if (!coverage.Covers(blockBegin(block), 1)) continue;
+            if (!coverage.Covers(blockBegin(block), static_cast<std::size_t>(std::min<std::uint64_t>(WriteBlockBytes, base + size - blockBegin(block))))) continue;
             if (!started) ++generation;
             started = true;
-            hintBlocks[block] = generation;
+            stampHint(block);
         }
     }
 
     bool hinted(std::uint64_t first, std::uint64_t stop) const {
         if (first >= stop || first < base || stop > base + size) return false;
         for (auto block = blockOf(first); block <= blockOf(stop - 1); ++block) {
-            if (hintBlocks[block] == 0 || coverage.Covers(blockBegin(block), 1)) return false;
+            if (hintOf(block) == 0 || coverage.Covers(blockBegin(block), static_cast<std::size_t>(std::min<std::uint64_t>(WriteBlockBytes, base + size - blockBegin(block))))) return false;
         }
         return !GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first));
     }
 
     std::uint32_t newestHint(std::uint64_t first, std::uint64_t stop) const {
         std::uint32_t newest = 0;
-        for (auto block = blockOf(first); block <= blockOf(stop - 1); ++block) newest = std::max(newest, hintBlocks[block]);
+        for (auto block = blockOf(first); block <= blockOf(stop - 1); ++block) newest = std::max(newest, hintOf(block));
         return newest;
     }
 #endif
@@ -904,17 +978,52 @@ struct WriteTracker {
         std::array<std::uint32_t, WritePagesPerBlock> pages{};
     };
     std::unordered_map<std::uint64_t, CpuPages> cpuPages;
+    std::unordered_map<std::uint64_t, CpuPages> walkPages;
 
     void noteCpuStore(std::uint64_t begin, std::uint64_t end, std::uint32_t stampGeneration) {
+        notePages(cpuPages, begin, end, stampGeneration);
+    }
+
+    void noteWalkStore(std::uint64_t begin, std::uint64_t end, std::uint32_t stampGeneration) {
+        notePages(walkPages, begin, end, stampGeneration);
+    }
+
+    void notePages(std::unordered_map<std::uint64_t, CpuPages>& pages, std::uint64_t begin, std::uint64_t end, std::uint32_t stampGeneration) {
         for (auto block = blockOf(begin); block <= blockOf(end - 1); ++block) {
             const auto blockStart = blockBegin(block);
             const auto from = std::max(begin, blockStart) - blockStart;
             const auto to = std::min<std::uint64_t>(end, blockStart + WriteBlockBytes) - blockStart;
-            auto& entry = cpuPages[block];
+            auto& entry = pages[block];
             for (auto page = from / WritePageBytes; page <= (to - 1) / WritePageBytes; ++page) {
                 auto& stamp = entry.pages[page];
                 stamp = std::max(stamp, stampGeneration);
             }
+        }
+    }
+
+    bool blockPartWatched(std::uint64_t first, std::uint64_t stop) const {
+#ifdef _WIN32
+        return covers(first, 1) || covers(stop - 1, 1);
+#else
+        return GuestWriteWatch::GuestWriteWatchOverlaps_nid_postfix(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first));
+#endif
+    }
+
+    void stampWatchedPart(std::uint64_t address, std::uint64_t end, std::uint32_t stampGeneration) {
+#ifdef _WIN32
+        address = std::max<std::uint64_t>(address, base);
+        end = std::min<std::uint64_t>(end, base + size);
+        if (address >= end) return;
+#else
+        end = std::min<std::uint64_t>(end, LeafCount * LeafBlocks * WriteBlockBytes);
+        if (address >= end || !GuestWriteWatch::GuestWriteWatchOverlaps_nid_postfix(static_cast<std::uintptr_t>(address), static_cast<std::size_t>(end - address))) return;
+#endif
+        for (auto block = blockOf(address); block <= blockOf(end - 1); ++block) {
+            const auto first = std::max(address, blockBegin(block));
+            const auto stop = std::min<std::uint64_t>(end, blockBegin(block) + WriteBlockBytes);
+            if (!blockPartWatched(first, stop)) continue;
+            stamp(block, stampGeneration, StampKind::Driver);
+            noteDriverStore(block, address, end, stampGeneration);
         }
     }
 
@@ -934,13 +1043,26 @@ struct WriteTracker {
         slot = {stampGeneration, from, to};
     }
 
-    std::uint32_t stampOf(std::uint64_t block) const {
+    Leaf& leafFor(std::uint64_t block) {
+        auto& leaf = leaves[block / LeafBlocks];
+        if (leaf == nullptr) leaf = std::make_unique<Leaf>();
+        return *leaf;
+    }
+
 #ifdef _WIN32
-        return blocks[block];
-#else
+    void stampHint(std::uint64_t block) {
+        leafFor(block).hintBlocks[block % LeafBlocks] = generation;
+    }
+
+    std::uint32_t hintOf(std::uint64_t block) const {
+        const auto& leaf = leaves[block / LeafBlocks];
+        return leaf != nullptr ? leaf->hintBlocks[block % LeafBlocks] : 0;
+    }
+#endif
+
+    std::uint32_t stampOf(std::uint64_t block) const {
         const auto& leaf = leaves[block / LeafBlocks];
         return leaf != nullptr ? leaf->blocks[block % LeafBlocks] : 0;
-#endif
     }
 
     static constexpr std::size_t UnstampedSlots = 1u << 16;
@@ -977,46 +1099,80 @@ struct WriteTracker {
         return newest;
     }
 
+    std::uint32_t coarseStampOf(std::uint64_t block) const {
+        const auto& leaf = leaves[block / LeafBlocks];
+        return leaf != nullptr ? leaf->coarseBlocks[(block % LeafBlocks) / CoarseBlocks] : 0;
+    }
+
     bool unchanged(std::uint64_t first, std::uint64_t last, std::uint64_t since) const {
         if (first == last) return stampOf(first) <= since;
         const auto newer = [since](std::uint32_t stamp) { return stamp > since; };
-#ifdef _WIN32
-        return std::none_of(blocks.begin() + first, blocks.begin() + last + 1, newer);
-#else
         while (first <= last) {
-            const auto index = first / LeafBlocks;
-            const auto end = std::min<std::uint64_t>(last + 1, (index + 1) * LeafBlocks);
-            if (const auto& leaf = leaves[index]; leaf != nullptr) {
+            const auto& leaf = leaves[first / LeafBlocks];
+            if (leaf == nullptr) {
+                first = (first / LeafBlocks + 1) * LeafBlocks;
+                continue;
+            }
+            const auto end = std::min<std::uint64_t>(last + 1, (first / CoarseBlocks + 1) * CoarseBlocks);
+            if (end - first < CoarseBlocks || coarseStampOf(first) > since) {
                 const auto begin = leaf->blocks.begin() + first % LeafBlocks;
                 if (std::any_of(begin, begin + (end - first), newer)) return false;
             }
             first = end;
         }
         return true;
-#endif
     }
 
     std::uint32_t cpuStampOf(std::uint64_t block) const {
-#ifdef _WIN32
-        return cpuBlocks[block];
-#else
         const auto& leaf = leaves[block / LeafBlocks];
         return leaf != nullptr ? leaf->cpuBlocks[block % LeafBlocks] : 0;
-#endif
+    }
+
+    bool storedOver(std::uint64_t address, std::uint64_t end, std::uint64_t generation, bool walked) const {
+        for (auto block = blockOf(address); block <= blockOf(end - 1); ++block) {
+            if (stampOf(block) <= generation) continue;
+            const auto begin = blockBegin(block);
+            const auto from = std::max(address, begin) - begin;
+            const auto to = std::min<std::uint64_t>(end, begin + WriteBlockBytes) - begin;
+            const auto newerPage = [&](const std::unordered_map<std::uint64_t, CpuPages>& pages, std::uint64_t first, std::uint64_t stop) {
+                const auto found = pages.find(block);
+                if (found == pages.end()) return false;
+                for (auto page = first / WritePageBytes; page <= (stop - 1) / WritePageBytes; ++page) {
+                    if (found->second.pages[page] > generation) return true;
+                }
+                return false;
+            };
+            if (cpuPages.find(block) == cpuPages.end() && cpuStampOf(block) > generation) return true;
+            if (newerPage(cpuPages, from, to)) return true;
+            if (walked && newerPage(walkPages, from, to)) return true;
+            const auto found = driverPieces.find(block);
+            if (found == driverPieces.end()) {
+                if (!walked && newerPage(walkPages, 0, WriteBlockBytes)) return true;
+                continue;
+            }
+            const auto& entry = found->second;
+            if (entry.whole > generation || entry.dropped > generation) return true;
+            for (const auto& piece : entry.pieces) {
+                if (piece.generation > generation && piece.begin < to && from < piece.end) return true;
+            }
+        }
+        return false;
+    }
+
+    bool rangeUnchanged(std::uint64_t address, std::size_t bytes, std::uint64_t since) const {
+        return unchanged(blockOf(address), blockOf(address + bytes - 1), since) || !storedOver(address, address + bytes, since, true);
     }
 
     void stamp(std::uint64_t block, std::uint32_t stampGeneration, StampKind kind) {
         const bool cpu = kind == StampKind::Cpu || kind == StampKind::ImportWindow;
         const bool stored = kind != StampKind::ImportWindow;
-#ifdef _WIN32
-        if (stored) blocks[block] = stampGeneration;
-        if (cpu) cpuBlocks[block] = stampGeneration;
-#else
-        auto& leaf = leaves[block / LeafBlocks];
-        if (leaf == nullptr) leaf = std::make_unique<Leaf>();
-        if (stored) leaf->blocks[block % LeafBlocks] = stampGeneration;
-        if (cpu) leaf->cpuBlocks[block % LeafBlocks] = stampGeneration;
-#endif
+        auto& leaf = leafFor(block);
+        if (stored) {
+            leaf.blocks[block % LeafBlocks] = stampGeneration;
+            auto& coarse = leaf.coarseBlocks[(block % LeafBlocks) / CoarseBlocks];
+            coarse = std::max(coarse, stampGeneration);
+        }
+        if (cpu) leaf.cpuBlocks[block % LeafBlocks] = stampGeneration;
     }
 };
 
@@ -1048,7 +1204,8 @@ void watchPrivateMapping(std::uintptr_t address, std::size_t bytes, std::uint64_
     ++tracker.generation;
     tracker.noteCpuStore(address, address + bytes, tracker.generation);
     for (auto block = tracker.blockOf(address); block <= tracker.blockOf(address + bytes - 1); ++block) {
-        tracker.driverPieces.erase(block);
+        if (const auto& leaf = tracker.leaves[block / WriteTracker::LeafBlocks]; leaf != nullptr) leaf->hintBlocks[block % WriteTracker::LeafBlocks] = 0;
+        if (const auto found = tracker.driverPieces.find(block); found != tracker.driverPieces.end()) found->second.dropped = std::max<std::uint32_t>(found->second.dropped, tracker.generation);
         tracker.stamp(block, tracker.generation, StampKind::Cpu);
     }
     unwatchSerial.fetch_add(1, std::memory_order_release);
@@ -1062,6 +1219,7 @@ void watchPrivateMapping(std::uintptr_t address, std::size_t bytes, std::uint64_
 // presenter, game threads inside the flush hook), as nothing orders the CPU's writes for it.
 std::atomic<std::uint64_t> nextCollectEpoch{1};
 thread_local std::uint64_t threadCollectEpoch = 0;
+std::atomic<std::uint64_t> lastBumpedEpoch{0};
 
 std::uint64_t currentCollectEpoch() {
     if (threadCollectEpoch != 0) return threadCollectEpoch;
@@ -1123,6 +1281,7 @@ void stampWrittenRun(void* context, std::uintptr_t begin, std::uintptr_t end) {
     ++runs.stamped;
     const auto generation = tracker.generation.load(std::memory_order_relaxed);
     if (kind != StampKind::Driver) tracker.noteCpuStore(begin, end, generation);
+    else tracker.noteWalkStore(begin, end, generation);
     if (runs.window != nullptr) {
         for (auto page = begin; page < end; page += WritePageBytes) tracker.stamp(tracker.blockOf(page), generation, runs.window->Holds(page) ? StampKind::ImportWindow : kind);
     } else {
@@ -1134,9 +1293,14 @@ void stampWrittenRun(void* context, std::uintptr_t begin, std::uintptr_t end) {
 }
 
 #ifdef _WIN32
+std::atomic<FreshCollectHook> freshCollectHook{nullptr};
+
 bool collectWindowsWrites(StampRuns& runs, std::uint64_t first, std::uint64_t stop, bool armedOnly) {
     auto& tracker = runs.tracker;
     const bool fresh = runs.kind == StampKind::Fresh;
+    if (fresh) {
+        if (const auto hook = freshCollectHook.load(std::memory_order_acquire)) return hook(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first), &stampWrittenRun, &runs);
+    }
     const auto collect = fresh ? &GuestArena::GuestArenaCollectFreshWrites_nid_postfix : armedOnly ? &GuestArena::GuestArenaCollectArmedWrites_nid_postfix : &GuestArena::GuestArenaCollectWrites_nid_postfix;
     static const bool singlePass = std::getenv("APS5_NO_SINGLE_PASS_COLLECT") == nullptr;
     const auto walk = [&](bool clear) {
@@ -1256,6 +1420,8 @@ std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes) {
 
 void BumpCollectEpoch() {
     threadCollectEpoch = nextCollectEpoch.fetch_add(1, std::memory_order_relaxed) + 1;
+    auto last = lastBumpedEpoch.load(std::memory_order_relaxed);
+    while (last < threadCollectEpoch && !lastBumpedEpoch.compare_exchange_weak(last, threadCollectEpoch, std::memory_order_release, std::memory_order_relaxed)) {}
     collectEpochBumps.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -1265,6 +1431,11 @@ std::uint64_t ThreadCollectEpoch() {
 
 std::uint64_t UnwatchSerial() {
     return unwatchSerial.load(std::memory_order_acquire);
+}
+
+void AdoptLatestCollectEpoch() {
+    const auto latest = lastBumpedEpoch.load(std::memory_order_acquire);
+    if (latest > threadCollectEpoch) threadCollectEpoch = latest;
 }
 
 std::uint64_t CollectEpochBumps() {
@@ -1313,6 +1484,12 @@ void SetUnwatchHook(void (*hook)(std::uint64_t, std::size_t)) {
     unwatchHook.store(hook, std::memory_order_release);
 }
 
+#ifdef _WIN32
+void SetFreshCollectHook(FreshCollectHook hook) {
+    freshCollectHook.store(hook, std::memory_order_release);
+}
+#endif
+
 void Unwatch(std::uint64_t address, std::size_t bytes) {
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return;
     beforeUnwatch(address, bytes);
@@ -1320,6 +1497,31 @@ void Unwatch(std::uint64_t address, std::size_t bytes) {
     const auto lock = lockTracker(tracker);
     tracker.initialize();
     unwatchLocked(tracker, address, bytes);
+}
+
+void Rewatch(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
+#ifdef _WIN32
+    auto& tracker = Tracker();
+    const auto lock = lockTracker(tracker);
+    tracker.initialize();
+    if (!tracker.watched) return;
+    bool restored = false;
+    for (const auto& [begin, end] : ranges) {
+        if (end <= begin || begin < tracker.base || end - tracker.base > tracker.size || (begin - tracker.base) % WriteBlockBytes != 0 || (end - tracker.base) % WriteBlockBytes != 0) continue;
+        const auto bytes = static_cast<std::size_t>(end - begin);
+        if (tracker.coverage.Covers(begin, bytes) || !walkWrites(tracker, begin, end, StampKind::Cpu) || !tracker.coverage.Restore(begin, bytes)) continue;
+        ++tracker.generation;
+        tracker.noteCpuStore(begin, end, tracker.generation);
+        for (auto block = tracker.blockOf(begin); block <= tracker.blockOf(end - 1); ++block) {
+            tracker.driverPieces.erase(block);
+            tracker.stamp(block, tracker.generation, StampKind::Cpu);
+        }
+        restored = true;
+    }
+    if (restored) unwatchSerial.fetch_add(1, std::memory_order_release);
+#else
+    static_cast<void>(ranges);
+#endif
 }
 
 bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function<bool()>& import, bool staysWatched) {
@@ -1340,39 +1542,55 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
     const auto first = address & ~(page - 1);
     const auto stop = (address + bytes + page - 1) & ~(page - 1);
     const bool covered = tracker.covers(first, static_cast<std::size_t>(stop - first));
-    std::vector<std::byte> saved;
-    std::vector<std::uint32_t> slots;
-    if (covered && staysWatched) {
-        const auto length = static_cast<std::size_t>(stop - first);
-        CheckRange(reinterpret_cast<const void*>(first), length, 1, false);
-        const auto* source = reinterpret_cast<const std::byte*>(first);
-        slots.resize(length / page);
-        std::size_t kept = 0;
-        for (std::size_t index = 0; index < slots.size(); ++index) {
-            const bool zero = std::memcmp(source + index * page, ZeroPage.data(), page) == 0;
-            slots[index] = zero ? WindowCopy::Zero : static_cast<std::uint32_t>(kept++);
-        }
-        saved.reserve(kept * page);
-        for (std::size_t index = 0; index < slots.size(); ++index) {
-            if (slots[index] != WindowCopy::Zero) saved.insert(saved.end(), source + index * page, source + (index + 1) * page);
-        }
-    }
-    const bool before = covered && walkWrites(tracker, first, stop, StampKind::Cpu, true);
-    bool imported = false;
-    {
+    const auto runImport = [&] {
 #ifdef __APPLE__
         const GuestArena::HostWrite open(reinterpret_cast<void*>(first), static_cast<std::size_t>(stop - first));
 #endif
-        imported = import();
-    }
-    if (!imported) return false;
+        return import();
+    };
     if (!staysWatched) {
+        const bool before = covered && walkWrites(tracker, first, stop, StampKind::Cpu, true);
+        if (!runImport()) return false;
         if (!before || !walkWrites(tracker, first, stop, StampKind::ImportWindow, true)) unwatchLocked(tracker, first, static_cast<std::size_t>(stop - first));
         unwatchLocked(tracker, address, bytes);
         return true;
     }
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> spans;
+    if (covered) spans.emplace_back(first, stop);
+    else {
+        for (auto begin = first; begin < stop;) {
+            const auto end = std::min<std::uint64_t>((begin / WriteBlockBytes + 1) * WriteBlockBytes, stop);
+            if (tracker.covers(begin, static_cast<std::size_t>(end - begin))) {
+                if (!spans.empty() && spans.back().second == begin) spans.back().second = end;
+                else spans.emplace_back(begin, end);
+            }
+            begin = end;
+        }
+    }
+    std::vector<std::uint32_t> slots(static_cast<std::size_t>((stop - first) / page), WindowCopy::Zero);
+    std::size_t kept = 0;
+    for (const auto& [begin, end] : spans) {
+        CheckRange(reinterpret_cast<const void*>(begin), static_cast<std::size_t>(end - begin), 1, false);
+        for (auto cursor = begin; cursor < end; cursor += page) {
+            if (std::memcmp(reinterpret_cast<const void*>(cursor), ZeroPage.data(), page) != 0) slots[static_cast<std::size_t>((cursor - first) / page)] = static_cast<std::uint32_t>(kept++);
+        }
+    }
+    std::vector<std::byte> saved;
+    saved.reserve(kept * page);
+    const auto* source = reinterpret_cast<const std::byte*>(first);
+    for (std::size_t index = 0; index < slots.size(); ++index) {
+        if (slots[index] != WindowCopy::Zero) saved.insert(saved.end(), source + index * page, source + (index + 1) * page);
+    }
+    std::erase_if(spans, [&](const auto& span) { return !walkWrites(tracker, span.first, span.second, StampKind::Cpu, true); });
+    if (!runImport()) return false;
     const WindowCopy window{first, saved, slots};
-    if (!before || !walkWrites(tracker, first, stop, StampKind::Cpu, true, &window)) unwatchLocked(tracker, first, static_cast<std::size_t>(stop - first));
+    auto unwatchedFrom = first;
+    for (const auto& [begin, end] : spans) {
+        if (!walkWrites(tracker, begin, end, StampKind::Cpu, true, &window)) continue;
+        if (unwatchedFrom < begin) unwatchLocked(tracker, unwatchedFrom, static_cast<std::size_t>(begin - unwatchedFrom));
+        unwatchedFrom = end;
+    }
+    if (unwatchedFrom < stop) unwatchLocked(tracker, unwatchedFrom, static_cast<std::size_t>(stop - unwatchedFrom));
     return true;
 }
 
@@ -1397,9 +1615,7 @@ bool UnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t gene
     const auto lock = lockTracker(tracker);
     tracker.initialize();
     if (!tracker.watched || generation == 0 || bytes == 0 || !tracker.covers(address, bytes)) return false;
-    const auto first = tracker.blockOf(address);
-    const auto last = tracker.blockOf(address + bytes - 1);
-    return tracker.unchanged(first, last, generation);
+    return tracker.rangeUnchanged(address, bytes, generation);
 }
 
 bool UnchangedSinceAll(std::span<const UnchangedQuery> queries) {
@@ -1409,9 +1625,7 @@ bool UnchangedSinceAll(std::span<const UnchangedQuery> queries) {
     if (!tracker.watched) return false;
     for (const auto& [address, bytes, generation] : queries) {
         if (generation == 0 || bytes == 0 || !tracker.covers(address, bytes)) return false;
-        const auto first = tracker.blockOf(address);
-        const auto last = tracker.blockOf(address + bytes - 1);
-        if (!tracker.unchanged(first, last, generation)) return false;
+        if (!tracker.rangeUnchanged(address, bytes, generation)) return false;
     }
     return true;
 }
@@ -1447,6 +1661,7 @@ std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::func
         ++tracker.generation;
         if (!tracker.watched || !tracker.covers(stored.first, static_cast<std::size_t>(stored.second - stored.first))) {
             tracker.noteUnstampedStore(stored.first, stored.second);
+            if (tracker.watched) tracker.stampWatchedPart(stored.first, stored.second, tracker.generation);
             return 0;
         }
         for (auto block = tracker.blockOf(stored.first); block <= tracker.blockOf(stored.second - 1); ++block) {
@@ -1486,12 +1701,13 @@ std::uint64_t StoreOwnBytes(std::uint64_t address, std::span<const std::byte> so
 
 std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes) {
     auto& tracker = Tracker();
-    const auto lock = lockTracker(tracker);
+    auto lock = lockTracker(tracker);
     tracker.initialize();
     if (bytes == 0) return 0;
     ++tracker.generation;
     if (!tracker.watched || !tracker.covers(address, bytes)) {
         tracker.noteUnstampedStore(address, address + bytes);
+        if (tracker.watched) tracker.stampWatchedPart(address, address + bytes, tracker.generation);
         return 0;
     }
     {
@@ -1504,6 +1720,9 @@ std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes) {
         const bool complete = GuestWriteWatch::GuestWriteWatchCollectFresh_nid_postfix(static_cast<std::uintptr_t>(blockFirst), static_cast<std::size_t>(blockStop - blockFirst), &stampWrittenRun, &runs);
 #endif
         if (!complete) {
+            lock.unlock();
+            beforeUnwatch(blockFirst, static_cast<std::size_t>(blockStop - blockFirst));
+            lock.lock();
             unwatchLocked(tracker, blockFirst, static_cast<std::size_t>(blockStop - blockFirst));
             tracker.noteUnstampedStore(address, address + bytes);
             return 0;
@@ -1527,33 +1746,7 @@ bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generati
 #ifdef _WIN32
     if (GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(address, bytes)) return true;
 #endif
-    const auto end = address + bytes;
-    const auto first = tracker.blockOf(address);
-    const auto last = tracker.blockOf(end - 1);
-    for (auto block = first; block <= last; ++block) {
-        if (tracker.stampOf(block) <= generation) continue;
-        if (const auto found = tracker.cpuPages.find(block); found != tracker.cpuPages.end()) {
-            const auto begin = tracker.blockBegin(block);
-            const auto from = std::max(address, begin) - begin;
-            const auto to = std::min<std::uint64_t>(end, begin + WriteBlockBytes) - begin;
-            for (auto page = from / WritePageBytes; page <= (to - 1) / WritePageBytes; ++page) {
-                if (found->second.pages[page] > generation) return true;
-            }
-        } else if (tracker.cpuStampOf(block) > generation) {
-            return true;
-        }
-        const auto found = tracker.driverPieces.find(block);
-        if (found == tracker.driverPieces.end()) return true;
-        const auto& entry = found->second;
-        if (entry.whole > generation || entry.dropped > generation) return true;
-        const auto begin = tracker.blockBegin(block);
-        const auto from = std::max(address, begin) - begin;
-        const auto to = std::min<std::uint64_t>(end, begin + WriteBlockBytes) - begin;
-        for (const auto& piece : entry.pieces) {
-            if (piece.generation > generation && piece.begin < to && from < piece.end) return true;
-        }
-    }
-    return false;
+    return tracker.storedOver(address, address + bytes, generation, false);
 }
 
 bool StoredAllSince_nid_no_patch(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
@@ -1611,7 +1804,7 @@ bool walkHints(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop) {
         if (!GuestArena::GuestArenaCollectWrites_nid_postfix(static_cast<std::uintptr_t>(cursor), static_cast<std::size_t>(stop - cursor), tracker.pages.data(), &count, true)) return false;
         if (count != 0 && !marked) ++tracker.generation;
         marked = marked || count != 0;
-        for (std::size_t i = 0; i < count; ++i) tracker.hintBlocks[tracker.blockOf(reinterpret_cast<std::uintptr_t>(tracker.pages[i]))] = tracker.generation;
+        for (std::size_t i = 0; i < count; ++i) tracker.stampHint(tracker.blockOf(reinterpret_cast<std::uintptr_t>(tracker.pages[i])));
         if (count < tracker.pages.size()) break;
         cursor = reinterpret_cast<std::uintptr_t>(tracker.pages[count - 1]) + WritePageBytes;
     }
@@ -1931,12 +2124,12 @@ void GpuMutexType::lock() {
     if (!GpuLockProfiled()) {
         auto* trace = PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr;
         if (trace == nullptr) {
-            mutex.lock();
+            LockSpinning(mutex, HandoffSpinWindow());
         } else {
             const auto site = static_cast<std::size_t>(std::exchange(LockStats().nextSite, GpuLockSite::Other));
             if (!mutex.try_lock()) {
                 const auto start = std::chrono::steady_clock::now();
-                mutex.lock();
+                LockSpinning(mutex, HandoffSpinWindow());
                 trace->Add("GpuMutex.wait", GpuLockSiteNames[site], start, std::chrono::steady_clock::now());
             }
         }
@@ -1954,7 +2147,7 @@ void GpuMutexType::lock() {
         HolderMatrixValues before{};
         if (holders) Holders().Snapshot(before);
         const auto start = std::chrono::steady_clock::now();
-        mutex.lock();
+        LockSpinning(mutex, HandoffSpinWindow());
         acquired();
         const auto now = std::chrono::steady_clock::now();
         if (auto* trace = PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr) trace->Add("GpuMutex.wait", GpuLockSiteNames[site], start, now);
@@ -2070,16 +2263,26 @@ unsigned long long CodeOffset(const void* address) {
 
 namespace {
 std::atomic<void (*)(std::uint64_t, std::size_t)> flushHook{nullptr};
+std::atomic<void (*)(std::uint64_t, std::size_t)> readGuard{nullptr};
+
+void PrepareHostRead(std::uintptr_t address, std::size_t bytes) {
+    if (const auto guard = readGuard.load(std::memory_order_acquire)) guard(address, bytes);
+    FlushGpuWrites(address, bytes);
+}
 }
 
 void SetFlushHook(void (*hook)(std::uint64_t, std::size_t)) {
     flushHook.store(hook, std::memory_order_release);
+    GuestArena::GuestArenaSetHostReadHook_nid_no_patch(&PrepareHostRead);
 }
-
-std::atomic<void (*)(std::uint64_t, std::size_t)> readGuard{nullptr};
 
 void SetReadGuard(void (*guard)(std::uint64_t address, std::size_t bytes)) {
     readGuard.store(guard, std::memory_order_release);
+    GuestArena::GuestArenaSetHostReadHook_nid_no_patch(&PrepareHostRead);
+}
+
+void GuardRead(std::uint64_t address, std::size_t bytes) {
+    if (const auto guard = readGuard.load(std::memory_order_acquire)) guard(address, bytes);
 }
 
 void FlushGpuWrites(std::uint64_t address, std::size_t bytes) {
@@ -2088,7 +2291,7 @@ void FlushGpuWrites(std::uint64_t address, std::size_t bytes) {
 
 void Read(std::uint64_t address, std::span<std::byte> destination, std::size_t alignment) {
     if (destination.empty()) return;
-    if (const auto guard = readGuard.load(std::memory_order_acquire)) guard(address, destination.size());
+    GuardRead(address, destination.size());
     FlushGpuWrites(address, destination.size());
     const TimedAccess timed(CounterRead, destination.size());
     CountReadCaller(__builtin_return_address(0));
@@ -2100,8 +2303,25 @@ void Read(std::uint64_t address, std::span<std::byte> destination, std::size_t a
         if (trace) std::fprintf(stderr, "[unreadable]   read from +0x%llx\n", ModuleOffset(__builtin_return_address(0)));
         throw;
     }
-    std::memcpy(destination.data(), source, destination.size());
+    CopyGuestBytes(destination.data(), source, destination.size());
 }
+
+#ifdef ANYPS5_ENABLE_ASAN
+[[gnu::no_sanitize("address")]] void CopyGuestBytes(void* destination, const void* source, std::size_t bytes) {
+    auto* to = static_cast<unsigned char*>(destination);
+    const auto* from = static_cast<const unsigned char*>(source);
+    std::size_t index = 0;
+    for (; index + sizeof(std::uint64_t) <= bytes; index += sizeof(std::uint64_t)) {
+        const std::uint64_t word = *reinterpret_cast<const volatile std::uint64_t*>(from + index);
+        std::memcpy(to + index, &word, sizeof(word));
+    }
+    for (; index < bytes; ++index) to[index] = static_cast<const volatile unsigned char*>(from)[index];
+}
+#else
+void CopyGuestBytes(void* destination, const void* source, std::size_t bytes) {
+    std::memcpy(destination, source, bytes);
+}
+#endif
 
 namespace {
 
@@ -2118,7 +2338,7 @@ void copyCommitted(std::uint64_t address, std::span<std::byte> destination) {
 
 void ReadCommitted(std::uint64_t address, std::span<std::byte> destination) {
     if (destination.empty()) return;
-    if (const auto guard = readGuard.load(std::memory_order_acquire)) guard(address, destination.size());
+    GuardRead(address, destination.size());
     FlushGpuWrites(address, destination.size());
     const TimedAccess timed(CounterRead, destination.size());
     CountReadCaller(__builtin_return_address(0));
@@ -2127,7 +2347,7 @@ void ReadCommitted(std::uint64_t address, std::span<std::byte> destination) {
 
 void ReadCommittedUnsynced(std::uint64_t address, std::span<std::byte> destination) {
     if (destination.empty()) return;
-    if (const auto guard = readGuard.load(std::memory_order_acquire)) guard(address, destination.size());
+    GuardRead(address, destination.size());
     const TimedAccess timed(CounterRead, destination.size());
     CountReadCaller(__builtin_return_address(0));
     copyCommitted(address, destination);

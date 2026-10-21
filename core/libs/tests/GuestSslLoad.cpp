@@ -29,11 +29,17 @@ void* APS5_VABI sceSslGetIssuerName(int, void*);
 int APS5_VABI sceSslGetNameEntryCount(int, void*);
 int APS5_VABI sceSslGetNameEntryInfo(int, void*, int, char*, std::size_t, char*, std::size_t, std::size_t*);
 int APS5_VABI sceSslFreeSslCertName(int, void*);
+int APS5_VABI sceSslClose(int);
+int APS5_VABI sceSslGetNotBefore(int, void*, SceSsl::RtcTick*);
+int APS5_VABI sceSslGetNotAfter(int, void*, SceSsl::RtcTick*);
+int APS5_VABI sceSslGetFingerprint(int, void*, int, unsigned char*);
+int APS5_VABI sceSslGetPem(int, void*, char*, std::size_t*);
 }
 
 namespace {
 
 constexpr int NotFound = static_cast<int>(0x8095F004);
+constexpr int InvalidId = static_cast<int>(0x8095F006);
 
 void Check(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
@@ -115,8 +121,8 @@ void ConnectionLifetime() {
     Check(sceSslSetVerifyCallback(retained, nullptr, nullptr) == 0, "credential unload invalidated the connection");
     Check(sceSslFreeCaCerts(id, &bytes) == 0 && Stats(id).currentInuseSize == 0, "CA snapshot leaked with a retained connection");
     Check(sceSslTerm_nid_postfix(id) == 0, "context termination failed with a retained connection");
-    Throws([&] { sceSslSetVerifyCallback(retained, nullptr, nullptr); });
-    Check(sceSslDeleteConnection(retained) == 0, "terminated context's connection cannot be released");
+    Check(sceSslSetVerifyCallback(retained, nullptr, nullptr) == InvalidId, "terminated context's connection did not report an invalid id");
+    Check(sceSslDeleteConnection(retained) == InvalidId, "terminated context's connection was still deletable");
     Check(sceSslGetCaCerts(other, &empty) == NotFound, "unrelated context was invalidated");
     Check(sceSslTerm_nid_postfix(other) == 0, "unrelated context termination failed");
 }
@@ -183,7 +189,7 @@ void CertificateReaders() {
     unsigned char serialData[8]{};
     std::size_t serialLen = sizeof(serialData);
     Check(sceSslGetSerialNumber(id, cert, serialData, &serialLen) == 0, "get serial failed");
-    Check(serialLen == 3, "serial length mismatch");
+    Check(serialLen == sizeof(serialData) && serialData[3] == 0, "a large enough serial buffer changed the caller's length");
     Check(serialData[0] == 0x00 && serialData[1] == 0x80 && serialData[2] == 0xa1, "serial bytes mismatch");
     Check(sceSslGetSerialNumber(id, cert, serialData, nullptr) == static_cast<int>(0x8095177a), "null serial length accepted");
     Throws([&] { sceSslGetSerialNumber(id, nullptr, serialData, &serialLen); });
@@ -212,11 +218,11 @@ void CertificateReaders() {
     char val[64]{};
     std::size_t vlen = 0;
     Check(sceSslGetNameEntryInfo(id, subject, 0, oid, sizeof(oid), val, sizeof(val), &vlen) == 0, "entry 0 info failed");
-    Check(std::strcmp(oid, "C") == 0 && std::strcmp(val, "GB") == 0 && vlen == 2, "entry 0 mismatch");
+    Check(std::strcmp(oid, "countryName") == 0 && std::strcmp(val, "GB") == 0 && vlen == 2, "entry 0 mismatch");
     Check(sceSslGetNameEntryInfo(id, subject, 1, oid, sizeof(oid), val, sizeof(val), &vlen) == 0, "entry 1 info failed");
-    Check(std::strcmp(oid, "O") == 0 && std::strcmp(val, "AnyPS5 Tests") == 0 && vlen == 12, "entry 1 mismatch");
+    Check(std::strcmp(oid, "organizationName") == 0 && std::strcmp(val, "AnyPS5 Tests") == 0 && vlen == 12, "entry 1 mismatch");
     Check(sceSslGetNameEntryInfo(id, subject, 2, oid, sizeof(oid), val, sizeof(val), &vlen) == 0, "entry 2 info failed");
-    Check(std::strcmp(oid, "CN") == 0 && std::strcmp(val, "AnyPS5 fixture root") == 0 && vlen == 19, "entry 2 mismatch");
+    Check(std::strcmp(oid, "commonName") == 0 && std::strcmp(val, "AnyPS5 fixture root") == 0 && vlen == 19, "entry 2 mismatch");
 
     char smallVal[4]{};
     std::size_t fullLen = 0;
@@ -236,11 +242,72 @@ void CertificateReaders() {
     Throws([&] { sceSslFreeSslCertName(id, fake); });
     Throws([&] { sceSslFreeSslCertName(9999, subject); });
 
+    SceSsl::RtcTick begin{};
+    Check(sceSslGetNotBefore(id, cert, &begin) == 0, "get not before failed");
+    Check(begin.tick == 63927094442000000ULL, "not before tick mismatch");
+    Check(sceSslGetNotBefore(id, cert, nullptr) == static_cast<int>(0x8095177a), "null begin accepted");
+    Throws([&] { sceSslGetNotBefore(id, nullptr, &begin); });
+    Throws([&] { sceSslGetNotBefore(id, fake, &begin); });
+    Throws([&] { sceSslGetNotBefore(9999, cert, &begin); });
+
+    SceSsl::RtcTick limit{};
+    Check(sceSslGetNotAfter(id, cert, &limit) == 0, "get not after failed");
+    Check(limit.tick == 64242454442000000ULL, "not after tick mismatch");
+    Check(sceSslGetNotAfter(id, cert, nullptr) == static_cast<int>(0x8095177a), "null limit accepted");
+    Throws([&] { sceSslGetNotAfter(id, nullptr, &limit); });
+    Throws([&] { sceSslGetNotAfter(id, fake, &limit); });
+    Throws([&] { sceSslGetNotAfter(9999, cert, &limit); });
+
+    unsigned char md5[16]{};
+    Check(sceSslGetFingerprint(id, cert, 0, md5) == 0, "get md5 fingerprint failed");
+    constexpr unsigned char expectedMd5[16] = {0x71, 0x3c, 0xe5, 0x20, 0x88, 0x2b, 0x6b, 0xd0, 0x17, 0x85, 0x07, 0xde, 0xbd, 0xdc, 0xa9, 0x4f};
+    Check(std::memcmp(md5, expectedMd5, sizeof(md5)) == 0, "md5 digest mismatch");
+
+    unsigned char sha1[20]{};
+    Check(sceSslGetFingerprint(id, cert, 1, sha1) == 0, "get sha1 fingerprint failed");
+    constexpr unsigned char expectedSha1[20] = {0x47, 0xe0, 0x89, 0xab, 0xb7, 0x02, 0xee, 0xb6, 0x2f, 0x8b, 0x5b, 0x7a, 0x13, 0xfe, 0x82, 0x6d, 0x2b, 0xe8, 0xee, 0xa7};
+    Check(std::memcmp(sha1, expectedSha1, sizeof(sha1)) == 0, "sha1 digest mismatch");
+
+    unsigned char sha256[32]{};
+    Check(sceSslGetFingerprint(id, cert, 3, sha256) == 0, "get sha256 fingerprint failed");
+    constexpr unsigned char expectedSha256[32] = {0x3d, 0x7d, 0xac, 0xd3, 0x04, 0x90, 0x42, 0xe1, 0x57, 0x19, 0x87, 0x27, 0x54, 0x45, 0xae, 0xed, 0xc4, 0xea, 0xd6, 0xd4, 0x20, 0xa0, 0x7f, 0xc4, 0xf5, 0x26, 0xc1, 0xa0, 0x85, 0x87, 0x5a, 0x4c};
+    Check(std::memcmp(sha256, expectedSha256, sizeof(sha256)) == 0, "sha256 digest mismatch");
+
+    Check(sceSslGetFingerprint(id, cert, 3, nullptr) == static_cast<int>(0x8095177a), "null fingerprint buffer accepted");
+    Check(sceSslGetFingerprint(id, cert, -1, sha256) == static_cast<int>(0x8095177a), "negative hash type accepted");
+    Check(sceSslGetFingerprint(id, cert, 99, sha256) == static_cast<int>(0x8095177a), "invalid hash type accepted");
+    Throws([&] { sceSslGetFingerprint(id, nullptr, 3, sha256); });
+    Throws([&] { sceSslGetFingerprint(id, fake, 3, sha256); });
+    Throws([&] { sceSslGetFingerprint(9999, cert, 3, sha256); });
+
+    std::size_t pemLen = 0;
+    Check(sceSslGetPem(id, cert, nullptr, &pemLen) == 0, "query pem size failed");
+    Check(pemLen > 0, "pem length is 0");
+    std::vector<char> pemBuf(pemLen);
+    std::size_t writtenLen = pemBuf.size();
+    Check(sceSslGetPem(id, cert, pemBuf.data(), &writtenLen) == 0, "write pem failed");
+    Check(writtenLen == pemLen, "written pem length mismatch");
+    Check(std::strstr(pemBuf.data(), "-----BEGIN CERTIFICATE-----\n") != nullptr, "pem header missing");
+    Check(std::strstr(pemBuf.data(), "-----END CERTIFICATE-----\n") != nullptr, "pem footer missing");
+
+    char smallPem[8]{};
+    std::size_t smallPemLen = sizeof(smallPem);
+    Throws([&] { sceSslGetPem(id, cert, smallPem, &smallPemLen); });
+    Check(sceSslGetPem(id, cert, pemBuf.data(), nullptr) == static_cast<int>(0x8095177a), "null pem len accepted");
+    Throws([&] { sceSslGetPem(id, nullptr, pemBuf.data(), &writtenLen); });
+    Throws([&] { sceSslGetPem(id, fake, pemBuf.data(), &writtenLen); });
+
+    Check(sceSslClose(1) == InvalidId, "closing an unknown connection did not report an invalid id");
+
     Check(sceSslFreeCaList(id, &handles) == 0, "free ca list failed");
     Check(sceSslTerm_nid_postfix(id) == 0, "term failed");
     Throws([&] { sceSslGetSerialNumber(id, cert, serialData, &serialLen); });
     Throws([&] { sceSslGetSubjectName(id, cert); });
     Throws([&] { sceSslGetIssuerName(id, cert); });
+    Throws([&] { sceSslGetNotBefore(id, cert, &begin); });
+    Throws([&] { sceSslGetNotAfter(id, cert, &limit); });
+    Throws([&] { sceSslGetFingerprint(id, cert, 3, sha256); });
+    Throws([&] { sceSslGetPem(id, cert, pemBuf.data(), &writtenLen); });
 
     const int id2 = sceSslInit_nid_postfix(1024 * 1024);
     Check(sceSslLoadCert(id2, 1, &pointer, nullptr, nullptr) == 0, "CA load failed");
@@ -254,6 +321,10 @@ void CertificateReaders() {
     Throws([&] { sceSslGetSerialNumber(id2, cert2, serialData, &serialLen); });
     Throws([&] { sceSslGetSubjectName(id2, cert2); });
     Throws([&] { sceSslGetIssuerName(id2, cert2); });
+    Throws([&] { sceSslGetNotBefore(id2, cert2, &begin); });
+    Throws([&] { sceSslGetNotAfter(id2, cert2, &limit); });
+    Throws([&] { sceSslGetFingerprint(id2, cert2, 3, sha256); });
+    Throws([&] { sceSslGetPem(id2, cert2, pemBuf.data(), &writtenLen); });
     Check(sceSslTerm_nid_postfix(id2) == 0, "term failed");
     Throws([&] { sceSslGetNameEntryCount(id2, subject2); });
     Throws([&] { sceSslFreeSslCertName(id2, subject2); });

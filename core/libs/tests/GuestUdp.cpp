@@ -110,12 +110,6 @@ static void CheckDontWait() {
     char buffer[16]{};
     Iovec vector{buffer, sizeof(buffer)};
     Msghdr message{nullptr, 0, &vector, 1, nullptr, 0, 0};
-#ifdef _WIN32
-    Require(recv_nid_postfix(receiver, buffer, sizeof(buffer), 0x80) == -1 && *__error_nid_postfix() == 45);
-    Require(recvfrom_nid_postfix(receiver, buffer, sizeof(buffer), 0x80, nullptr, nullptr) == -1 && *__error_nid_postfix() == 45);
-    Require(recvmsg_nid_postfix(receiver, &message, 0x80) == -1 && *__error_nid_postfix() == 45);
-    Require(sendto_nid_postfix(sender, "x", 1, 0x80, address.data(), address.size()) == -1 && *__error_nid_postfix() == 45);
-#else
     const auto start = std::chrono::steady_clock::now();
     Require(recv_nid_postfix(receiver, buffer, sizeof(buffer), 0x80) == -1 && *__error_nid_postfix() == 35);
     Require(recvfrom_nid_postfix(receiver, buffer, sizeof(buffer), 0x80, nullptr, nullptr) == -1 && *__error_nid_postfix() == 35);
@@ -134,7 +128,6 @@ static void CheckDontWait() {
     std::memset(buffer, 0, sizeof(buffer));
     Require(recvmsg_nid_postfix(receiver, &message, 0) == sizeof(datagram) && std::strcmp(buffer, datagram) == 0);
     Require(recv_nid_postfix(receiver, buffer, sizeof(buffer), 0x80) == -1 && *__error_nid_postfix() == 35);
-#endif
     Require(recv_nid_postfix(receiver, buffer, sizeof(buffer), 0x1) == -1 && *__error_nid_postfix() == 45);
     Require(close_nid_postfix(receiver) == 0 && close_nid_postfix(sender) == 0);
 }
@@ -199,7 +192,7 @@ int main() {
     Require(recvfrom_nid_postfix(receiver, buffer, sizeof(buffer), 0, nullptr, nullptr) == -1);
     Require(*__error_nid_postfix() == 35);
     const char message[] = "guest UDP loopback";
-    Require(sendto_nid_postfix(sender, message, sizeof(message), 0x20000, destination.data(), destination.size()) == sizeof(message));
+    Require(send_nid_postfix(sender, message, sizeof(message), 0x20000) == sizeof(message));
     int queued = 0;
     for (int i = 0; i < 100 && queued == 0; ++i) {
         Require(ioctl_nid_postfix(receiver, 0x4004667f, &queued) == 0);
@@ -219,7 +212,7 @@ int main() {
     char head[] = "scatter ";
     char tail[] = "gather";
     Iovec parts[2]{{head, 8}, {tail, 6}};
-    Msghdr outgoing{destination.data(), static_cast<std::uint32_t>(destination.size()), parts, 2, nullptr, 0, 0};
+    Msghdr outgoing{nullptr, 0, parts, 2, nullptr, 0, 0};
     Require(sendmsg_nid_postfix(sender, &outgoing, 0) == 14);
     const auto wait = [&] {
         queued = 0;

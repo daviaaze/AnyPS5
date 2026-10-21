@@ -35,6 +35,7 @@ add_library(libSceAgc SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/Misc/src/RegisterDefaults.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Misc/src/Semaphore.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Misc/src/ShaderFusion.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Misc/src/StaticBuffer.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Misc/src/Suspend.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Patch/src/CondExec.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Patch/src/Dma.cpp
@@ -81,7 +82,33 @@ if(BUILD_TESTING)
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()
+
+add_test_executable(agc_atomic_gds_size_tests EXCLUDE_FROM_ALL tests/AtomicGdsSize.cpp)
+target_include_directories(agc_atomic_gds_size_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(agc_atomic_gds_size_tests PRIVATE libSceAgc libc)
+configure_windows_unwind(agc_atomic_gds_size_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_atomic_gds_size_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_atomic_gds_size COMMAND agc_atomic_gds_size_tests)
+    if(WIN32)
+        set_tests_properties(agc_atomic_gds_size PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
 configure_windows_unwind(libSceAgc)
+
+add_test_executable(agc_static_buffer_tests EXCLUDE_FROM_ALL tests/StaticBuffer.cpp)
+target_include_directories(agc_static_buffer_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(agc_static_buffer_tests PRIVATE libSceAgc libSceAgcDriver libc)
+configure_windows_unwind(agc_static_buffer_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_static_buffer_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_static_buffer COMMAND agc_static_buffer_tests)
+    if(WIN32)
+        set_tests_properties(agc_static_buffer PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
 
 add_test_executable(agc_platform_tests EXCLUDE_FROM_ALL tests/Platform.cpp)
 target_include_directories(agc_platform_tests PRIVATE ${LIBS_INCLUDE_DIR})
@@ -415,6 +442,7 @@ configure_windows_unwind(agc_shader_helpers_tests)
 if(BUILD_TESTING)
     set_target_properties(agc_shader_helpers_tests PROPERTIES EXCLUDE_FROM_ALL FALSE)
     add_test(NAME agc_shader_helpers COMMAND agc_shader_helpers_tests)
+    set_tests_properties(agc_shader_helpers PROPERTIES TIMEOUT 30)
     if(WIN32)
         set_tests_properties(agc_shader_helpers PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
