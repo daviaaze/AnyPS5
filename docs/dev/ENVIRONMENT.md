@@ -494,6 +494,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | Name | Kind | Source | Default | Description |
 |------|------|--------|---------|-------------|
 | `APS5_PAD_INPUT_FILE` | string | `core/libs/prx/libScePad/src/PadState.cpp` |  | path of the file polled for injected pad button and stick commands |
+| `APS5_PAD_INPUT_ACK_FILE` | string | `core/libs/prx/libScePad/src/PadState.cpp` | unset | writes `<sequence> accepted` when a sequenced command is consumed and `<sequence> released` after its full timeline/hold interval; prevents automation from replacing an unread command |
 
 ### libScePlayGo
 
