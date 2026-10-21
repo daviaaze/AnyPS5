@@ -5434,23 +5434,37 @@ bool storageHoleCopyBarrierTests(const Device& device, Recorder& previous) {
     const auto geometry = DescribeSurface(resource);
     const auto surfaceBytes = static_cast<std::size_t>(geometry.guestBytes);
     const auto bytes = (surfaceBytes + 65535) / 65536 * 65536 + 65536;
-    void* block = AllocateWatched(bytes, 65536);
-    if (block == nullptr) return false;
-    auto* memory = static_cast<std::uint8_t*>(block);
-    for (std::size_t i = 0; i < bytes; ++i) memory[i] = static_cast<std::uint8_t>(i * 131u + 7u);
-    const auto address = reinterpret_cast<std::uint64_t>(block);
-    GuestAllocations::Mutation().Add(block, bytes, true, true, true);
     struct Release {
         const Context& context;
-        void* block;
-        std::uint64_t address;
+        void* block = nullptr;
+        std::uint64_t address = 0;
         std::size_t bytes;
+        std::int64_t physical = -1;
         ~Release() {
+#ifdef __linux__
+            if (block != nullptr) sceKernelMunmap(block, bytes);
+            if (physical >= 0) sceKernelReleaseDirectMemory(physical, bytes);
+#else
+            if (block == nullptr) return;
             GuestAllocations::Mutation().Remove(block);
             HostImportFor(context, address, bytes);
             ReleaseWatched(block, bytes);
+#endif
         }
-    } release{base, block, address, bytes};
+    } release{base, nullptr, 0, bytes};
+#ifdef __linux__
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, bytes, 65536, 0, &release.physical) == 0, "cannot allocate hole-copy direct memory");
+    Require(sceKernelMapDirectMemory(&release.block, bytes, 0x33, 0, release.physical, 65536) == 0, "cannot map hole-copy direct memory for the GPU");
+#else
+    release.block = AllocateWatched(bytes, 65536);
+    if (release.block == nullptr) return false;
+    GuestAllocations::Mutation().Add(release.block, bytes, true, true, true);
+#endif
+    void* block = release.block;
+    auto* memory = static_cast<std::uint8_t*>(block);
+    for (std::size_t i = 0; i < bytes; ++i) memory[i] = static_cast<std::uint8_t>(i * 131u + 7u);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    release.address = address;
     const auto* import = HostImportFor(base, address, bytes);
     if (import == nullptr || !AgcDriver::GuestMemory::Watched(address, bytes)) return false;
     auto destination = ShadowDestinationFor(base, *import, address, address + surfaceBytes);
