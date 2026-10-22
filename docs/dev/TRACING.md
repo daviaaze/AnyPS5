@@ -72,6 +72,8 @@ See [Build](BUILD.md#performance-trace) for the trace format, summary fields and
 
 A window of N complete frame intervals emits N+1 `present` boundary witnesses with consecutive IDs and timestamps spanning both ends of the capture. The final witness records the closing boundary; it is not an additional completed frame. The summary's `presents` count remains N.
 
+The digest uses the actual timestamp of the closing witness whose ID equals `window.first_present + presents`, rather than the rounded summary duration. Rounding that duration upward must not create a tiny extra frame interval. Historical captures without that witness retain the summary endpoint for digest reporting; strict presentation-window checks still require recorded endpoint coverage.
+
 ## Shader registers
 
 `APS5_TRACE_SHADER_REGS=all` prints register snapshots for every shader. Set it to a shader code address in hexadecimal to print one shader's registers.
