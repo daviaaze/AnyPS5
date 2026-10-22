@@ -10563,10 +10563,10 @@ index 000000000..8125314db
 +if __name__=='__main__': raise SystemExit(main())
 diff --git a/causal-analyze-fixture.py b/causal-analyze-fixture.py
 new file mode 100755
-index 000000000..9c050c697
+index 000000000..064133f7e
 --- /dev/null
 +++ b/causal-analyze-fixture.py
-@@ -0,0 +1,95 @@
+@@ -0,0 +1,114 @@
 +#!/usr/bin/env python3
 +"""Focused pure-data semantic regressions for causal-analyze.py."""
 +import importlib.util
@@ -10585,7 +10585,7 @@ index 000000000..9c050c697
 +      'namespace_ids':{'availability':'available','ids':{'NSpid':[tid],'NStgid':[tid]}},
 +      'wchan':{'availability':'available','raw':wchan}}]}}
 +
-+def event(name,ts,args,dur=0): return {'cat':'causal','name':name,'ph':'X','ts':ts,'dur':dur,'args':args}
++def event(name,ts,args,dur=0,pid=77,tid=1): return {'cat':'causal','name':name,'ph':'X','ts':ts,'dur':dur,'pid':pid,'tid':tid,'args':args}
 +
 +def check(ok,msg):
 +    if not ok: raise RuntimeError(msg)
@@ -10598,10 +10598,11 @@ index 000000000..9c050c697
 +               snap(base+155,base+165,9,90,5,4),snap(base+90,base+95,10,100,1,0),
 +               snap(base+205,base+210,10,100,8,0)]
 +    trace={'clock':{'origin_ns':1_000_000_000},'trace_dropped':False,'traceEvents':[
-+      {'name':'thread_name','ph':'M','args':{'native_tid':7,'native_starttime_ticks':70}},
++      {'name':'thread_name','ph':'M','pid':77,'tid':1,'args':{'native_tid':7,'native_starttime_ticks':70}},
++      {'name':'thread_name','ph':'M','pid':77,'tid':2,'args':{'native_tid':8,'native_starttime_ticks':80}},
 +      event('phase.outer',.12,{'thread_cpu_ns':30},.06),
 +      event('phase.inner',.13,{'thread_cpu_ns':10},.02),
-+      event('gpu_mutex.released',.151,{'object':1,'generation':9,'operation':0},.002),
++      event('gpu_mutex.released',.151,{'object':1,'generation':9,'operation':0},.002,tid=2),
 +      event('gpu_mutex.wait',.15,{'object':1,'generation':0,'related':9,'operation':3},.01),
 +      event('gpu_mutex.acquired',.16,{'object':1,'generation':10,'related':9,'operation':3}),
 +      event('vulkan.queue_submit',.158,{'object':12,'generation':4,'batch':4,'operation':8,'outcome':0,'thread_cpu_ns':22},.001),
@@ -10613,6 +10614,11 @@ index 000000000..9c050c697
 +    ]}
 +    r=A.analyze_trace(trace,resources,1_000_000_100,1_000_000_200)
 +    check(r['os_lane_joins'][0]['join']=='verified','matching TID birth did not join')
++    wait_thread=r['mutex_edges'][0]['wait_thread']
++    release_thread=r['mutex_edges'][0]['release_thread']
++    check((wait_thread['trace_pid'],wait_thread['trace_tid'],wait_thread['native_tid'],wait_thread['native_starttime_ticks'])==(77,1,7,70)
++          and (release_thread['trace_pid'],release_thread['trace_tid'],release_thread['native_tid'],release_thread['native_starttime_ticks'])==(77,2,8,80),
++          'edge participant identities were not mapped to their own native lanes')
 +    check(len(r['resource_cpu_deltas'])==2,'TID reuse or counters failed to form exactly valid brackets')
 +    check(r['resource_cpu_deltas'][0]['thread_cpu_ns']==70_000_000,'CPU ticks conversion/reset guard failed')
 +    check(all(base+100 <= x['snapshot_brackets_ns'][0][0] <= x['snapshot_brackets_ns'][0][1] <= base+200
@@ -10634,20 +10640,33 @@ index 000000000..9c050c697
 +      event('vulkan.fence_wait',.1,{'object':1,'generation':2,'related':4,'batch':2})]}
 +    dropped=A.analyze_trace(lost,[],0,1000)
 +    check(not dropped['causal_coverage_complete'] and not dropped['fence_edges'][0]['confirmed'],'dropped coverage did not invalidate edge')
-+    reused=A.analyze_trace({'clock':{'origin_ns':0},'traceEvents':[{'name':'thread_name','ph':'M','args':{'native_tid':7}}]},resources,0,200)
++    reused=A.analyze_trace({'clock':{'origin_ns':0},'traceEvents':[{'name':'thread_name','ph':'M','pid':77,'tid':1,'args':{'native_tid':7}}]},resources,0,200)
 +    check(reused['os_lane_joins'][0]['join']=='unproven','missing native birth accepted on reused TID')
++    missing_pid=A.analyze_trace({'clock':{'origin_ns':base},'traceEvents':[
++      {'name':'thread_name','ph':'M','tid':1,'args':{'native_tid':7,'native_starttime_ticks':70}},
++      event('phase',.12,{},.01)]},[resources[0]],base,base+1000)
++    check(missing_pid['trace_events'][0]['native_tid'] is None
++          and missing_pid['trace_events'][0]['os_lane_join']=='unproven',
++          'thread metadata without trace PID was joined to an event')
++    conflicting_pid=A.analyze_trace({'clock':{'origin_ns':base},'traceEvents':[
++      {'name':'thread_name','ph':'M','pid':77,'tid':1,'args':{'native_tid':7,'native_starttime_ticks':70}},
++      event('phase',.12,{},.01,pid=78)]},[resources[0]],base,base+1000)
++    check(conflicting_pid['os_lane_joins'][0]['join']=='verified'
++          and conflicting_pid['trace_events'][0]['os_lane_join']=='unproven'
++          and conflicting_pid['trace_events'][0]['native_tid'] is None,
++          'event with conflicting trace PID borrowed a verified lane identity')
 +    nested=snap(base+120,base+125,100,500,1,0)
 +    nested['threads']['items'][0]['namespace_ids']['ids']['NSpid']=[100,5]
 +    nested_join=A.analyze_trace({'clock':{'origin_ns':base},'traceEvents':[
-+      {'name':'thread_name','ph':'M','args':{'native_tid':5,'native_starttime_ticks':500}}]},[nested],base,base+1000)
++      {'name':'thread_name','ph':'M','pid':90,'tid':1,'args':{'native_tid':5,'native_starttime_ticks':500}}]},[nested],base,base+1000)
 +    check(nested_join['os_lane_joins'][0]['join']=='verified','namespace PID mapping with matching birth failed')
 +    nested['time_namespace_offsets']['raw']='monotonic 1 0\nboottime 1 0\n'
 +    offset_join=A.analyze_trace({'clock':{'origin_ns':base},'traceEvents':[
-+      {'name':'thread_name','ph':'M','args':{'native_tid':5,'native_starttime_ticks':500}}]},[nested],base,base+1000)
++      {'name':'thread_name','ph':'M','pid':90,'tid':1,'args':{'native_tid':5,'native_starttime_ticks':500}}]},[nested],base,base+1000)
 +    check(offset_join['os_lane_joins'][0]['join']=='unproven','nonzero time namespace offset accepted without mapping')
 +    zero_birth=snap(base+120,base+125,101,0,1,0)
 +    zero_join=A.analyze_trace({'clock':{'origin_ns':base},'trace_dropped':False,'traceEvents':[
-+      {'name':'thread_name','ph':'M','args':{'native_tid':101,'native_starttime_ticks':0}}]},
++      {'name':'thread_name','ph':'M','pid':1010,'tid':1,'args':{'native_tid':101,'native_starttime_ticks':0}}]},
 +      [zero_birth],base,base+1000)
 +    check(zero_join['os_lane_joins'][0]['join']=='verified','zero birth tick conflated with unavailable')
 +    bounded=A.analyze_trace({'clock':{'origin_ns':0},'trace_dropped':False,
@@ -10657,7 +10676,7 @@ index 000000000..9c050c697
 +          and crossing['wall_ns']==100 and crossing['thread_cpu_ns']==17
 +          and crossing['thread_cpu_scope']=='full_span_not_attributed_to_interval',
 +          'overlapping phase wall/CPU was clipped or prorated')
-+    return {'status':'passed','checks':['birth_identity','zero_birth_tick','tid_reuse','namespace_pid_mapping','time_namespace_offset','counter_reset','wholly_interior_brackets','nested_wall_cpu_independence','full_span_cpu_boundary','causal_spans_in_phase_metrics','zero_duration_boundary_excluded','fence_generation','missing_release','dropped_coverage','snapshot_bounds','missing_birth']}
++    return {'status':'passed','checks':['birth_identity','edge_lane_identity','missing_trace_pid','conflicting_trace_pid','zero_birth_tick','tid_reuse','namespace_pid_mapping','time_namespace_offset','counter_reset','wholly_interior_brackets','nested_wall_cpu_independence','full_span_cpu_boundary','causal_spans_in_phase_metrics','zero_duration_boundary_excluded','fence_generation','missing_release','dropped_coverage','snapshot_bounds','missing_birth']}
 +
 +if __name__=='__main__':
 +    import json
