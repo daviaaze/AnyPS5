@@ -841,10 +841,15 @@ bool createSparseDmaBufImport(const Context& context, HostImport& entry, int fil
     if (const auto result = context.Function<PFN_vkCreateFence>("vkCreateFence")(context.device, &fenceInfo, nullptr, &fence); result != VK_SUCCESS) fail("vkCreateFence", result);
     VkResult bound = VK_SUCCESS;
     VkResult waited = VK_SUCCESS;
-    {
-        std::unique_lock<std::mutex> queueLock;
-        if (ownQueue) queueLock = std::unique_lock(*context.sparseQueueMutex);
-        bound = context.Function<PFN_vkQueueBindSparse>("vkQueueBindSparse")(ownQueue ? context.sparseQueue : context.queue, 1, &bind, fence);
+    const auto bindSparse = context.Function<PFN_vkQueueBindSparse>("vkQueueBindSparse");
+    if (ownQueue) {
+        std::unique_lock queueLock(*context.sparseQueueMutex);
+        bound = bindSparse(context.sparseQueue, 1, &bind, fence);
+        if (bound == VK_SUCCESS) waited = context.Function<PFN_vkWaitForFences>("vkWaitForFences")(context.device, 1, &fence, VK_TRUE, UINT64_MAX);
+    } else {
+        bound = OnQueue(context.queueLane, [] { return GuestMemory::GpuMutex().DepthOnThisThread(); },
+            [] { GuestMemory::GpuMutex().unlock(); }, [] { GuestMemory::GpuMutex().lock(); },
+            [&] { return bindSparse(context.queue, 1, &bind, fence); });
         if (bound == VK_SUCCESS) waited = context.Function<PFN_vkWaitForFences>("vkWaitForFences")(context.device, 1, &fence, VK_TRUE, UINT64_MAX);
     }
     context.Function<PFN_vkDestroyFence>("vkDestroyFence")(context.device, fence, nullptr);
@@ -3214,7 +3219,10 @@ void runImportProbe(const Context& context, std::uint64_t base, std::uint64_t by
             VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
             submit.commandBufferCount = 1;
             submit.pCommandBuffers = &buffer;
-            if ((probe.result = context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.queue, 1, &submit, fence)) != VK_SUCCESS) return "vkQueueSubmit";
+            probe.result = OnQueue(context.queueLane, [] { return GuestMemory::GpuMutex().DepthOnThisThread(); },
+                [] { GuestMemory::GpuMutex().unlock(); }, [] { GuestMemory::GpuMutex().lock(); },
+                [&] { return context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.queue, 1, &submit, fence); });
+            if (probe.result != VK_SUCCESS) return "vkQueueSubmit";
             submitted = true;
             if ((probe.result = context.Function<PFN_vkWaitForFences>("vkWaitForFences")(context.device, 1, &fence, VK_TRUE, 10'000'000'000ull)) != VK_SUCCESS) return "vkWaitForFences";
             submitted = false;
@@ -3231,7 +3239,9 @@ void runImportProbe(const Context& context, std::uint64_t base, std::uint64_t by
         return nullptr;
     };
     probe.failure = run();
-    if (submitted) context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue);
+    if (submitted) static_cast<void>(OnQueue(context.queueLane, [] { return GuestMemory::GpuMutex().DepthOnThisThread(); },
+        [] { GuestMemory::GpuMutex().unlock(); }, [] { GuestMemory::GpuMutex().lock(); },
+        [&] { return context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue); }));
     if (fence != VK_NULL_HANDLE) context.Function<PFN_vkDestroyFence>("vkDestroyFence")(context.device, fence, nullptr);
     if (commands[0] != VK_NULL_HANDLE) context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 2, commands);
     if (destination != VK_NULL_HANDLE) context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, destination, nullptr);

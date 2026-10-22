@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <array>
 #include <deque>
+#include <condition_variable>
 #include <mutex>
 #include <functional>
 #include <list>
@@ -85,9 +86,9 @@ public:
     void FlushKeyStores();
     void FlushKeyStoresOverlapping(std::uint64_t address, std::size_t bytes) { if (HasQueuedKeyStores() && QueuedKeyStoreOverlaps(address, bytes)) FlushKeyStores(); }
     bool Recording() const { return open != nullptr; }
-    bool Idle() const { return open == nullptr && inFlight.empty(); }
-    std::uint64_t OpenSerial() const { return submissions + 1; }
-    std::uint64_t CompletedThrough() const { return inFlight.empty() ? submissions : inFlight.front()->serial - 1; }
+    bool Idle() const { return open == nullptr && submitting.empty() && inFlight.empty(); }
+    std::uint64_t OpenSerial() const { return (reservedSubmissions > submissions ? reservedSubmissions : submissions) + 1; }
+    std::uint64_t CompletedThrough() const { return !inFlight.empty() ? inFlight.front()->serial - 1 : !submitting.empty() ? submitting.front()->serial - 1 : submissions; }
     // Whether recorded work still has completion actions (write-backs the CPU must see) to run.
     bool HasCompletions() const;
     void Keep(std::shared_ptr<void> object, std::size_t bytes = 0);
@@ -571,6 +572,10 @@ private:
         std::uint64_t serial = 0;
         std::uint64_t traceId = 0;
         bool submitted = false;
+        std::atomic<bool> submitting{false};
+        std::atomic<bool> submitComplete{false};
+        VkResult submitResult = VK_NOT_READY;
+        std::chrono::steady_clock::time_point submitCompletedAt{};
         // The GpuMutex queue tag of the thread that opened the batch, and when it was submitted
         // (the [syncwait] line reports what a wait's target and the batches ahead of it were).
         std::uint32_t queue = 0xffffffffu;
@@ -763,6 +768,10 @@ private:
     // Per-batch runs: records the queued stores with their barriers (`atSubmit`: the batch-end
     // form, toward the host only); returns whether the batch's host-read barrier was included.
     bool closeStoreRun(bool atSubmit = false);
+    void publishSubmissions();
+    void waitForSubmissions();
+    void waitForSubmittingOverlap(std::uint64_t address, std::uint64_t end);
+    void checkSubmissionFailure(std::uint64_t serial) const;
     // Ends the render pass a draw left open (vkCmdEndRenderPass, the pass's trailing barrier).
     void endOpenRenderPass(bool barrier = true);
     // Records the queued key stores as one run (`forWriter`: before a command writing, reading or
@@ -830,6 +839,16 @@ private:
     // table is empty (most of the time between label groups).
     std::atomic<std::size_t> recordedLabels{0};
     std::unique_ptr<Batch> open;
+    std::deque<std::unique_ptr<Batch>> submitting;
+    std::size_t submittingKeptBytes = 0;
+    std::uint64_t reservedSubmissions = 0;
+    std::mutex submissionWaitMutex;
+    std::condition_variable submissionWait;
+    std::uint64_t submissionGeneration = 0;
+    std::atomic<std::uint64_t> publishedSubmissions{0};
+    mutable std::mutex submissionFailureMutex;
+    std::uint64_t submissionFailureSerial = 0;
+    VkResult submissionFailureResult = VK_SUCCESS;
     std::vector<std::shared_ptr<void>> holdKept;
     std::uint64_t holdKeptSerial = 0;
     std::deque<std::unique_ptr<Batch>> inFlight;

@@ -94,6 +94,13 @@ void check(VkResult result, const char* operation) {
 void require(bool condition, const char* reason) {
     if (!condition) throw std::runtime_error(std::string("Vulkan presentation: ") + reason);
 }
+bool SubmitOutsideGpuMutexEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_SUBMIT_OUTSIDE_GPU_MUTEX");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
 
 bool CoreVulkanCapability(std::uint32_t capability) {
     switch (capability) {
@@ -280,6 +287,7 @@ struct VulkanDevice::State {
     VkDevice device = VK_NULL_HANDLE;
     VkPhysicalDevice physical = VK_NULL_HANDLE;
     VkQueue queue = VK_NULL_HANDLE;
+    Graphics::QueueLane queueLane;
     VkCommandPool pool = VK_NULL_HANDLE;
     void* window = nullptr;
     VkSurfaceKHR surface = VK_NULL_HANDLE;
@@ -3355,6 +3363,7 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
     // presentation's own submission, which reads the image in queue order. No reap first: queue 0
     // reaps at its next packet, so the presenter's hold carries no completions.
     SubmitRecorded(false);
+    if (state->recorder && state->context.queueLane != nullptr) state->recorder->SubmitAndEpoch();
     std::chrono::steady_clock::time_point lastSubmittedAt{};
     const std::uint64_t batchesAtBlit = state->recorder ? state->recorder->NewestSubmitted(&lastSubmittedAt) : 0;
     CaptureTrace::Log("blit dump=%d batch=%llu slot=%zu image=%u direct=%d", dumpFrame ? state->nextDumpIndex : -1, static_cast<unsigned long long>(batchesAtBlit), state->presentCursor, index, direct);
@@ -3498,7 +3507,10 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
     timing.Mark("command_record_scale");
     // The slot's fence signaled (retired above) or was never used: the reset cannot block.
     check(state->DeviceFunction<PFN_vkResetFences>("vkResetFences")(state->device, 1, &slot.fence), "vkResetFences present");
-    check(state->DeviceFunction<PFN_vkQueueSubmit>("vkQueueSubmit")(state->queue, 1, &submit, slot.fence), "vkQueueSubmit clear");
+    const auto submitResult = Graphics::OnQueue(state->context.queueLane, [] { return GuestMemory::GpuMutex().DepthOnThisThread(); },
+        [] { GuestMemory::GpuMutex().unlock(); }, [] { GuestMemory::GpuMutex().lock(); },
+        [&] { return state->DeviceFunction<PFN_vkQueueSubmit>("vkQueueSubmit")(state->queue, 1, &submit, slot.fence); });
+    check(submitResult, "vkQueueSubmit clear");
     const auto submittedAt = std::chrono::steady_clock::now();
     timing.Mark("queue_submit");
     APS5_LOG_CHARS_OUT_DEBUG("Presentation vkQueueSubmit OK");
@@ -3622,16 +3634,21 @@ void VulkanDevice::QueuePresent() {
     present.pSwapchains = &state->swapchain;
     present.pImageIndices = &index;
     const auto presentFunction = state->DeviceFunction<PFN_vkQueuePresentKHR>("vkQueuePresentKHR");
+    const auto submitPresent = [&] {
+        return Graphics::OnQueue(state->context.queueLane, [] { return GuestMemory::GpuMutex().DepthOnThisThread(); },
+            [] { GuestMemory::GpuMutex().unlock(); }, [] { GuestMemory::GpuMutex().lock(); },
+            [&] { return presentFunction(state->queue, &present); });
+    };
     VkResult presented;
     if (SlowVulkanCallTiming::Enabled()) {
         const auto presentSerial = state->lastPresentSerial;
         const auto inFlight = static_cast<std::uint64_t>(state->queuedPresentInFlight);
         const auto presentBegin = SlowVulkanCallTiming::Begin();
-        presented = presentFunction(state->queue, &present);
+        presented = submitPresent();
         const auto presentEnd = SlowVulkanCallTiming::End();
         SlowVulkanCallTiming::EmitIfSlow("vkQueuePresentKHR", presentBegin, presentEnd, reinterpret_cast<std::uintptr_t>(state->device), reinterpret_cast<std::uintptr_t>(state->queue), "image_index", index, "blit_batch_serial", presentSerial, static_cast<std::int32_t>(presented), inFlight, "present_slots_at_blit_submit");
     } else {
-        presented = presentFunction(state->queue, &present);
+        presented = submitPresent();
     }
     if (presented == VK_ERROR_OUT_OF_DATE_KHR || presented == VK_SUBOPTIMAL_KHR) state->extent = {0, 0};
     else check(presented, "vkQueuePresentKHR");
@@ -3803,6 +3820,7 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.sparseFamily = state->sparseFamily;
     context.sparseQueue = state->sparseQueue;
     context.sparseQueueMutex = &state->sparseQueueMutex;
+    context.queueLane = SubmitOutsideGpuMutexEnabled() ? &state->queueLane : nullptr;
     context.settleQueue = state->settlePool != VK_NULL_HANDLE ? state->settleQueue : VK_NULL_HANDLE;
     context.settlePool = state->settlePool;
     context.settleFamily = state->settleFamily;

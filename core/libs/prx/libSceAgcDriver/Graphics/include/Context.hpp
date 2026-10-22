@@ -8,15 +8,16 @@
 #include <vulkan/vulkan.h>
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <functional>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace AgcDriver::Graphics {
@@ -48,6 +49,114 @@ public:
 private:
     mutable std::shared_mutex mutex;
 };
+
+class QueueLane {
+public:
+    class Turn {
+    public:
+        explicit Turn(QueueLane& owner) : lane(owner), ticket(owner.reserve()) {}
+        Turn(const Turn&) = delete;
+        Turn& operator=(const Turn&) = delete;
+        ~Turn() { Finish(); }
+        std::uint64_t Ticket() const { return ticket; }
+        bool TryEnter() {
+            if (entered) return true;
+            entered = lane.tryEnter(ticket);
+            return entered;
+        }
+        void Enter() {
+            if (entered) return;
+            lane.enter(ticket);
+            entered = true;
+        }
+        void Finish() {
+            if (left) return;
+            if (!entered) Enter();
+            left = true;
+            lane.leave(ticket);
+        }
+
+    private:
+        QueueLane& lane;
+        std::uint64_t ticket;
+        bool entered = false;
+        bool left = false;
+    };
+
+    template<typename TCall>
+    decltype(auto) Run(TCall&& call) {
+        Turn turn(*this);
+        turn.Enter();
+        return std::forward<TCall>(call)();
+    }
+    bool Done(std::uint64_t ticket) const {
+        std::lock_guard lock(mutex);
+        return serving > ticket;
+    }
+    void WaitDone(std::uint64_t ticket) const {
+        std::unique_lock lock(mutex);
+        served.wait(lock, [&] { return serving > ticket; });
+    }
+    std::uint64_t Reserved() const {
+        std::lock_guard lock(mutex);
+        return next;
+    }
+
+private:
+    std::uint64_t reserve() {
+        std::lock_guard lock(mutex);
+        return next++;
+    }
+    bool tryEnter(std::uint64_t ticket) {
+        std::lock_guard lock(mutex);
+        return serving == ticket;
+    }
+    void enter(std::uint64_t ticket) {
+        std::unique_lock lock(mutex);
+        served.wait(lock, [&] { return serving == ticket; });
+    }
+    void leave(std::uint64_t ticket) {
+        std::lock_guard lock(mutex);
+        serving = ticket + 1;
+        served.notify_all();
+    }
+
+    mutable std::mutex mutex;
+    mutable std::condition_variable served;
+    std::uint64_t next = 0;
+    std::uint64_t serving = 0;
+};
+
+template<typename TDepth, typename TUnlock, typename TLock>
+void EnterQueueTurn(QueueLane::Turn& turn, TDepth&& depth, TUnlock&& unlock, TLock&& lock) {
+    const auto held = depth();
+    if (held != 0 && !turn.TryEnter()) {
+        for (auto count = held; count != 0; --count) unlock();
+        try {
+            turn.Enter();
+        } catch (...) {
+            for (auto count = held; count != 0; --count) lock();
+            throw;
+        }
+        for (auto count = held; count != 0; --count) lock();
+        return;
+    }
+    if (!turn.TryEnter()) turn.Enter();
+}
+
+template<typename TCall>
+decltype(auto) OnQueue(QueueLane* lane, TCall&& call) {
+    if (lane == nullptr) return std::forward<TCall>(call)();
+    return lane->Run(std::forward<TCall>(call));
+}
+
+template<typename TDepth, typename TUnlock, typename TLock, typename TCall>
+decltype(auto) OnQueue(QueueLane* lane, TDepth&& depth, TUnlock&& unlock, TLock&& lock, TCall&& call) {
+    if (lane == nullptr) return std::forward<TCall>(call)();
+    QueueLane::Turn turn(*lane);
+    EnterQueueTurn(turn, std::forward<TDepth>(depth), std::forward<TUnlock>(unlock), std::forward<TLock>(lock));
+    return std::forward<TCall>(call)();
+}
 
 inline void Require(bool condition, const std::string& reason) {
     if (!condition) throw std::runtime_error("AGC graphics: " + reason);
@@ -190,6 +299,7 @@ struct Context {
     VkCommandPool settlePool = VK_NULL_HANDLE;
     std::uint32_t settleFamily = 0;
     std::mutex* settleQueueMutex = nullptr;
+    QueueLane* queueLane = nullptr;
     PFN_vkGetPhysicalDeviceMemoryProperties2 memoryProperties2 = nullptr;
     VkDeviceSize (*cacheReclaim)(VkDeviceSize bytes) = nullptr;
     RenderCache* renderCache = nullptr;
