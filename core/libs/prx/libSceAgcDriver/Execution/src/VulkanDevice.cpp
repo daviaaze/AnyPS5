@@ -5194,7 +5194,7 @@ VkPipeline VulkanDevice::splitComputePipeline(const Graphics::Context& context, 
 std::shared_ptr<ComputePipelineObjects> VulkanDevice::computePipeline(const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, VkDescriptorSetLayout setLayout, std::span<const std::uint32_t> layoutKey, VkShaderStageFlags pushStages, std::uint64_t programAddress) {
     const auto pipelineKey = ComputePipelineKey::Of(shader, pushStages != 0);
     static const bool profilePrefetch = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    if (profilePrefetch) {
+    if (ParallelComputeCompile() && profilePrefetch) {
         auto& counters = ComputePrefetchStats();
         const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
         auto last = counters.lastReport.load(std::memory_order_relaxed);
@@ -5208,7 +5208,7 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::computePipeline(const Grap
         {
             std::lock_guard pipelines(state->computePipelinesMutex);
             if (const auto found = state->computePipelines.find(pipelineKey); found != state->computePipelines.end()) {
-                if (state->computePipelinesPrefetched.erase(pipelineKey) != 0) ComputePrefetchStats().hits.fetch_add(1, std::memory_order_relaxed);
+                if (ParallelComputeCompile() && state->computePipelinesPrefetched.erase(pipelineKey) != 0) ComputePrefetchStats().hits.fetch_add(1, std::memory_order_relaxed);
                 return found->second;
             }
             if (const auto pending = state->computePipelinesBuilding.find(pipelineKey); pending != state->computePipelinesBuilding.end()) other = pending->second;
