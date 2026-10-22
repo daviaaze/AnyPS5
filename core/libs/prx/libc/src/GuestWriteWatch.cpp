@@ -81,6 +81,7 @@ public:
         std::unique_lock lock(_lock);
         const bool watched = remove(_ranges, begin, end);
         remove(_fresh, begin, end);
+        if (watched) releaseUnwatched(begin, end);
         return watched;
     }
 
@@ -237,6 +238,79 @@ private:
         protection.range.len = end - begin;
         protection.mode = UFFDIO_WRITEPROTECT_MODE_WP;
         return ioctl(_uffd, UFFDIO_WRITEPROTECT, &protection) == 0;
+    }
+
+    void releaseUnwatched(std::uintptr_t begin, std::uintptr_t end) const {
+        auto cursor = begin & ~(PageBytes - 1);
+        end = (end + PageBytes - 1) & ~(PageBytes - 1);
+        auto it = _ranges.upper_bound(cursor);
+        if (it != _ranges.begin()) --it;
+        for (; it != _ranges.end() && it->first < end; ++it) {
+            const auto kept = it->first & ~(PageBytes - 1);
+            if (kept > cursor) releaseRegistered(cursor, kept);
+            cursor = std::max(cursor, (it->second + PageBytes - 1) & ~(PageBytes - 1));
+        }
+        if (cursor < end) releaseRegistered(cursor, end);
+    }
+
+    void releaseRegistered(std::uintptr_t begin, std::uintptr_t end) const {
+        std::array<page_region, 16> regions;
+        auto cursor = begin;
+        while (cursor < end) {
+            pm_scan_arg scan{};
+            scan.size = sizeof(scan);
+            scan.start = cursor;
+            scan.end = end;
+            scan.vec = reinterpret_cast<std::uintptr_t>(regions.data());
+            scan.vec_len = regions.size();
+            scan.category_mask = PAGE_IS_WPALLOWED;
+            scan.return_mask = PAGE_IS_WPALLOWED;
+            const auto count = ioctl(_pagemap, PAGEMAP_SCAN, &scan);
+            if (count < 0) {
+                static bool reported = false;
+                if (!reported) {
+                    reported = true;
+                    const int error = errno;
+                    std::fprintf(stderr, "[memory] write watch: cannot inspect UFFD-WP ranges in 0x%llx+0x%llx (%s); UFFD-WP release is incomplete\n", static_cast<unsigned long long>(cursor), static_cast<unsigned long long>(end - cursor), std::strerror(error));
+                }
+                return;
+            }
+            for (long i = 0; i < count; ++i) releaseRange(regions[i].start, regions[i].end);
+            if (scan.walk_end <= cursor) {
+                if (cursor < end) {
+                    static bool reported = false;
+                    if (!reported) {
+                        reported = true;
+                        std::fprintf(stderr, "[memory] write watch: PAGEMAP_SCAN did not advance in 0x%llx+0x%llx; UFFD-WP release may be incomplete\n", static_cast<unsigned long long>(cursor), static_cast<unsigned long long>(end - cursor));
+                    }
+                }
+                return;
+            }
+            if (scan.walk_end >= end) return;
+            cursor = scan.walk_end;
+        }
+    }
+
+    void releaseRange(std::uintptr_t begin, std::uintptr_t end) const {
+        if (end <= begin) return;
+        uffdio_range range{};
+        range.start = begin;
+        range.len = end - begin;
+        uffdio_writeprotect protection{};
+        protection.range = range;
+        int protectionError = 0;
+        bool unprotected = ioctl(_uffd, UFFDIO_WRITEPROTECT, &protection) == 0;
+        if (!unprotected) protectionError = errno;
+        if (ioctl(_uffd, UFFDIO_UNREGISTER, &range) == 0) return;
+        const int unregisterError = errno;
+        if (!unprotected) {
+            unprotected = ioctl(_uffd, UFFDIO_WRITEPROTECT, &protection) == 0;
+            if (!unprotected) protectionError = errno;
+        }
+        static bool reported = false;
+        if (reported) return;
+        reported = true;
+        std::fprintf(stderr, "[memory] write watch: cannot unregister 0x%llx+0x%llx (%s); UFFD-WP is %s%s\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), std::strerror(unregisterError), unprotected ? "cleared" : "not confirmed cleared", protectionError == 0 ? "" : " after a write-protection ioctl error");
     }
 
     bool probe(int pagemap) {
