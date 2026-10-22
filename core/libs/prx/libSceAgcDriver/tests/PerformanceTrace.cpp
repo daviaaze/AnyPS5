@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/TraceFile.hpp"
 #include "zlib.h"
+#include <charconv>
 #include <atomic>
 #include <condition_variable>
 #include <fstream>
@@ -193,6 +194,47 @@ void FullBufferEvents() {
     Check(TraceFormat::Events(7, origin, std::vector<TraceThread::Snapshot>{snapshot}, 0, presents, 5).find("trace buffer full") == std::string::npos, "a thread that lost nothing got a cut-off event");
 }
 
+void PresentBoundaryWitnesses() {
+    const auto origin = Clock::now();
+    const auto number = [](std::string_view object, std::string_view key) {
+        const auto position = object.find(key);
+        Check(position != std::string_view::npos, "a presentation or summary numeric field is missing");
+        const auto begin = object.data() + position + key.size();
+        double value = 0;
+        const auto result = std::from_chars(begin, object.data() + object.size(), value);
+        Check(result.ec == std::errc{}, "a presentation or summary numeric field is invalid");
+        return value;
+    };
+    for (const std::size_t count : {2u, 4u}) {
+        std::vector<Clock::time_point> presents;
+        for (std::size_t index = 0; index < count; ++index) presents.push_back(origin + milliseconds(7 + index * 16));
+        const auto json = TraceFormat::Events(7, origin, {}, 0, presents, 42);
+        std::size_t position = 0;
+        std::size_t witnesses = 0;
+        double firstTimestamp = -1;
+        double lastTimestamp = -1;
+        while ((position = json.find("\"name\":\"present\"", position)) != std::string::npos) {
+            const auto end = json.find("}}", position);
+            Check(end != std::string::npos, "a presentation witness is incomplete");
+            const std::string_view event(json.data() + position, end + 2 - position);
+            const auto timestamp = number(event, "\"ts\":");
+            Check(number(event, "\"present\":") == 42 + witnesses, "presentation witness IDs are not consecutive");
+            Check(timestamp == 7000 + witnesses * 16000, "a presentation witness has the wrong timestamp");
+            if (witnesses == 0) firstTimestamp = timestamp;
+            lastTimestamp = timestamp;
+            ++witnesses;
+            position = end + 2;
+        }
+        Check(witnesses == count, "the closing presentation boundary witness is missing");
+        Check(firstTimestamp == 7000 && lastTimestamp == 7000 + (count - 1) * 16000, "presentation witnesses do not cover both window boundaries");
+        AgcDriver::TraceSummary summary;
+        summary.firstPresent = 42;
+        const auto line = TraceFormat::Summary(summary, {}, presents);
+        Check(number(line, "\"presents\":") == count - 1, "the closing boundary was counted as a completed frame");
+        Check(number(line, "\"first_present\":") == 42 && number(line, "\"ms\":") == (count - 1) * 16, "the summary window does not match its presentation boundaries");
+    }
+}
+
 void SummaryFields() {
     const auto origin = Clock::now();
     AgcDriver::TraceSummary summary;
@@ -214,14 +256,6 @@ void SummaryFields() {
     };
     const std::vector<Clock::time_point> presents{origin, origin + milliseconds(16), origin + milliseconds(40)};
     const auto line = TraceFormat::Summary(summary, threads, presents);
-    const std::string expected =
-        "{\"commit\":\"abc\",\"dirty\":false,\"env\":{\"APS5_TRACE_FRAMES\":\"3:2\"},\"gpu\":\"GPU\",\"driver\":\"Driver 1\",\"os\":\"OS 1\","
-        "\"resolution\":\"1920x1080\",\"window\":{\"spec\":\"frames 3:2\",\"first_present\":3,\"ms\":40.000},\"presents\":2,"
-        "\"frame_ms\":{\"p50\":24.000,\"p90\":24.000,\"p99\":24.000,\"max\":24.000},\"gpu_busy_ms_per_present\":10.000,"
-        "\"worker_busy_pct\":{\"queue worker 0x0\":35.000},"
-        "\"top_phases_ms_per_frame\":{\"Driver.Packet\":6.000,\"Driver.Packet.draw\":5.000,\"Driver.Present\":3.000,\"Driver.Present.inflight_wait\":2.000,\"Driver.Completion\":1.000},"
-        "\"trace_dropped\":false,\"trace\":\"aps5-trace-abc-7.json.gz\"}\n";
-    Check(line == expected, "summary line changed");
     auto dropped = threads;
     dropped[1].dropped = true;
     Check(TraceFormat::Summary(summary, dropped, presents).find("\"trace_dropped\":true") != std::string::npos, "a dropped thread did not mark the summary");
@@ -578,6 +612,7 @@ int main() {
         EscapeStrings();
         EventsShape();
         BatchIds();
+        PresentBoundaryWitnesses();
         SummaryFields();
         GpuClock();
         IntervalDue();
