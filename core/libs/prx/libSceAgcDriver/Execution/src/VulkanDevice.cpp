@@ -734,11 +734,12 @@ struct VulkanDevice::State {
     void WaitPresentFence(VkFence fence, std::uint64_t generation, std::uint64_t batch) {
         static const bool poll = std::getenv("APS5_PRESENT_POLL_FENCE") != nullptr;
         if (!poll) {
+            const auto waitForFences = DeviceFunction<PFN_vkWaitForFences>("vkWaitForFences");
             const bool causal = PerformanceTrace::CausalThread() != nullptr;
             const auto operation = causal ? PerformanceTrace::NextCausalOperation() : 0;
             if (causal) PerformanceTrace::RecordCausal("vulkan.fence_wait", reinterpret_cast<std::uintptr_t>(fence), generation, reinterpret_cast<std::uintptr_t>(queue), batch, "vkWaitForFences present", operation);
             const auto begin = causal ? SlowVulkanCallTiming::Begin() : SlowVulkanCallTiming::Sample{};
-            const auto outcome = DeviceFunction<PFN_vkWaitForFences>("vkWaitForFences")(device, 1, &fence, VK_TRUE, std::numeric_limits<std::uint64_t>::max());
+            const auto outcome = waitForFences(device, 1, &fence, VK_TRUE, std::numeric_limits<std::uint64_t>::max());
             if (causal) {
                 const auto end = SlowVulkanCallTiming::End();
                 RecordCausalVulkanSpan("vulkan.fence_wait", begin, end, reinterpret_cast<std::uintptr_t>(fence), generation, reinterpret_cast<std::uintptr_t>(queue), batch, "vkWaitForFences present", operation, static_cast<int>(outcome));
@@ -3324,10 +3325,11 @@ bool VulkanDevice::AcquireImage() {
     std::uint32_t index = 0;
     timing.Mark("fence_reset");
     // An out-of-date swapchain (the window changed) drops this frame; the next Resize recreates it.
+    const auto acquireNextImage = state->DeviceFunction<PFN_vkAcquireNextImageKHR>("vkAcquireNextImageKHR");
     const auto acquireOperation = causal ? PerformanceTrace::NextCausalOperation() : 0;
     if (causal) PerformanceTrace::RecordCausal("vulkan.acquire_image", reinterpret_cast<std::uintptr_t>(state->swapchain), acquisitionGeneration, reinterpret_cast<std::uintptr_t>(state->acquireFence), 0, "vkAcquireNextImageKHR", acquireOperation);
     const auto acquireBegin = causal ? SlowVulkanCallTiming::Begin() : SlowVulkanCallTiming::Sample{};
-    const auto acquired = state->DeviceFunction<PFN_vkAcquireNextImageKHR>("vkAcquireNextImageKHR")(state->device, state->swapchain, 0, VK_NULL_HANDLE, state->acquireFence, &index);
+    const auto acquired = acquireNextImage(state->device, state->swapchain, 0, VK_NULL_HANDLE, state->acquireFence, &index);
     if (causal) {
         const auto acquireEnd = SlowVulkanCallTiming::End();
         RecordCausalVulkanSpan("vulkan.acquire_image", acquireBegin, acquireEnd, reinterpret_cast<std::uintptr_t>(state->swapchain), acquisitionGeneration, reinterpret_cast<std::uintptr_t>(state->acquireFence), 0, "vkAcquireNextImageKHR", acquireOperation, static_cast<int>(acquired));
@@ -3557,10 +3559,11 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
     // The slot's fence signaled (retired above) or was never used: the reset cannot block.
     const auto fenceGeneration = ++slot.fenceGeneration;
     const bool causalSubmit = PerformanceTrace::CausalThread() != nullptr;
+    const auto resetPresentFence = state->DeviceFunction<PFN_vkResetFences>("vkResetFences");
     const auto resetOperation = causalSubmit ? PerformanceTrace::NextCausalOperation() : 0;
     if (causalSubmit) PerformanceTrace::RecordCausal("vulkan.fence_reset", reinterpret_cast<std::uintptr_t>(slot.fence), fenceGeneration, reinterpret_cast<std::uintptr_t>(state->queue), batchesAtBlit, "vkResetFences present", resetOperation);
     const auto resetBegin = causalSubmit ? SlowVulkanCallTiming::Begin() : SlowVulkanCallTiming::Sample{};
-    const auto resetResult = state->DeviceFunction<PFN_vkResetFences>("vkResetFences")(state->device, 1, &slot.fence);
+    const auto resetResult = resetPresentFence(state->device, 1, &slot.fence);
     if (causalSubmit) {
         const auto resetEnd = SlowVulkanCallTiming::End();
         RecordCausalVulkanSpan("vulkan.fence_reset", resetBegin, resetEnd, reinterpret_cast<std::uintptr_t>(slot.fence), fenceGeneration, reinterpret_cast<std::uintptr_t>(state->queue), batchesAtBlit, "vkResetFences present", resetOperation, static_cast<int>(resetResult));
@@ -3569,11 +3572,12 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
     const auto submitResult = Graphics::OnQueue(state->context.queueLane, [] { return GuestMemory::GpuMutex().DepthOnThisThread(); },
         [] { GuestMemory::GpuMutex().unlock(); }, [] { GuestMemory::GpuMutex().lock(); },
         [&] {
+            const auto submitBlit = state->DeviceFunction<PFN_vkQueueSubmit>("vkQueueSubmit");
             const bool causal = PerformanceTrace::CausalThread() != nullptr;
             const auto operation = causal ? PerformanceTrace::NextCausalOperation() : 0;
             if (causal) PerformanceTrace::RecordCausal("vulkan.queue_submit", reinterpret_cast<std::uintptr_t>(state->queue), fenceGeneration, 0, batchesAtBlit, "vkQueueSubmit present blit", operation);
             const auto begin = causal ? SlowVulkanCallTiming::Begin() : SlowVulkanCallTiming::Sample{};
-            const auto result = state->DeviceFunction<PFN_vkQueueSubmit>("vkQueueSubmit")(state->queue, 1, &submit, slot.fence);
+            const auto result = submitBlit(state->queue, 1, &submit, slot.fence);
             if (causal) {
                 const auto end = SlowVulkanCallTiming::End();
                 RecordCausalVulkanSpan("vulkan.queue_submit", begin, end, reinterpret_cast<std::uintptr_t>(state->queue), fenceGeneration, 0, batchesAtBlit, "vkQueueSubmit present blit", operation, static_cast<int>(result));
