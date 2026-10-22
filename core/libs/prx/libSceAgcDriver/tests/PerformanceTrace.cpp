@@ -223,6 +223,7 @@ void PresentBoundaryWitnesses() {
         exactOrigin + std::chrono::nanoseconds(33'654'000),
     };
     const std::vector<TraceThread::Snapshot> threads{{"queue worker", {}, {}, false, 0, {}, false, nativeTid}};
+#if defined(__linux__) && (defined(__GLIBCXX__) || defined(_LIBCPP_VERSION))
     timespec before{};
     timespec after{};
     Check(::clock_gettime(CLOCK_MONOTONIC, &before) == 0, "failed to sample CLOCK_MONOTONIC before export");
@@ -249,13 +250,6 @@ void PresentBoundaryWitnesses() {
     Check(originNs >= monotonicNs(before) - marginNs && originNs <= monotonicNs(after) + marginNs, "exported origin is not in the sampled CLOCK_MONOTONIC interval");
     Check(uncertaintyNs >= 0 && uncertaintyNs <= marginNs, "cross-clock calibration uncertainty is invalid");
 #else
-    const auto exactOrigin = Clock::now();
-    const std::vector<Clock::time_point> exactPresents{
-        exactOrigin + std::chrono::nanoseconds(123'000),
-        exactOrigin + std::chrono::nanoseconds(16'789'000),
-        exactOrigin + std::chrono::nanoseconds(33'654'000),
-    };
-    const std::vector<TraceThread::Snapshot> threads{{"queue worker", {}, {}, false, 0, {}, false, nativeTid}};
     const auto exactJson = TraceFormat::Events(7, exactOrigin, threads, 0, exactPresents, 42);
     Check(exactJson.find("\"domain\":\"steady_clock\"") != std::string::npos, "steady-clock domain was not identified");
 #endif
