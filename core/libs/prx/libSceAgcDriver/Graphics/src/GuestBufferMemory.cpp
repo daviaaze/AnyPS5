@@ -1791,8 +1791,31 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
 #ifdef _WIN32
         GuestArena::GuestArenaUnmapAlias_nid_postfix(std::exchange(entry.alias, nullptr));
 #endif
-        std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx failed at %s (%d); falling back to copies, requested by %s\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), step, static_cast<int>(result), ImportRequesterName(requester));
-        if (std::string_view(step) == "vkAllocateMemory") {
+        const bool allocation = std::string_view(step) == "vkAllocateMemory";
+        const bool pressure = allocation && (result == VK_ERROR_OUT_OF_HOST_MEMORY || result == VK_ERROR_OUT_OF_DEVICE_MEMORY);
+        if (allocation && !pressure) {
+            static std::mutex loggedMutex;
+            static std::set<int> logged;
+            bool first = false;
+            {
+                std::lock_guard lock(loggedMutex);
+                first = logged.insert(static_cast<int>(result)).second;
+            }
+            if (first) {
+#ifdef _WIN32
+                const char* dmaBuf = "unavailable";
+#else
+                BackingFile backing;
+                const char* dmaBuf = sharedBacking(context, entry, backing) ? "failed" : "unavailable";
+#endif
+                std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx failed at %s (%d), not memory pressure; dma-buf fallback %s; the range falls back to copies and the import budget is kept, requested by %s (logged once per error)\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), step, static_cast<int>(result), dmaBuf, ImportRequesterName(requester));
+            }
+            state.allocationFailures = 0;
+        } else {
+            if (!pressure) state.allocationFailures = 0;
+            std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx failed at %s (%d); falling back to copies, requested by %s\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), step, static_cast<int>(result), ImportRequesterName(requester));
+        }
+        if (pressure) {
             state.allocationFailed = true;
             if (++state.allocationFailures >= 3 || state.liveBytes + bytes + budget / 8 >= budget) {
                 state.ceiling = std::max<std::uint64_t>(state.liveBytes, 1);
