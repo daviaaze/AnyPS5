@@ -75,7 +75,12 @@ struct SurfaceGeometry {
 };
 SurfaceGeometry DescribeSurface(const GuestTextureResource& descriptor);
 bool LevelsFitAllocation(const GuestTextureResource& surface, std::uint32_t levels);
-GuestTextureResource ViewedArrayWindow(const GuestTextureResource& viewed);
+// The viewed slices of a layered view as a surface of their own, from the last slice at or before the
+// base whose slice-swizzle bits are zero (the view unchanged when that is slice 0 or they cannot be
+// cut out). DCC keys cover the whole surface, so a view with metadata keeps its descriptor unless
+// `keysReadAsStored` says its keys resolve to Uncompressed (texels read as stored, e.g. unreadable
+// or mixed keys): its window then carries no metadata and samples the same stored texels.
+GuestTextureResource ViewedArrayWindow(const GuestTextureResource& viewed, bool keysReadAsStored);
 GuestTextureResource ArrayLayerWindow(const GuestTextureResource& viewed, std::uint32_t maxArrayLayers);
 
 }
