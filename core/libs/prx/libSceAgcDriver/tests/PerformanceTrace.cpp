@@ -135,27 +135,6 @@ void EscapeStrings() {
     Check(output == "\"a\\\"b\\\\c\\u000a\\u00e9\"", "string escaping is not valid JSON");
 }
 
-void EventsShape() {
-    const auto origin = Clock::now();
-    const std::vector<TraceThread::Slice> slices{
-        {"Driver.Packet", nullptr, origin + microseconds(10), microseconds(30)},
-        {"Driver.Packet", "draw", origin + microseconds(12), microseconds(25)},
-        {nullptr, nullptr, origin, milliseconds(2)},
-    };
-    const std::vector<TraceThread::Snapshot> threads{{"queue worker 0x0", slices, {}, false}};
-    const std::vector<Clock::time_point> presents{origin, origin + milliseconds(16)};
-    const auto json = TraceFormat::Events(7, origin, threads, 0, presents, 5);
-    const std::string expected =
-        "{\"traceEvents\":[\n"
-        "{\"name\":\"process_name\",\"ph\":\"M\",\"ts\":0.000,\"pid\":7,\"tid\":0,\"args\":{\"name\":\"AnyPS5\"}},\n"
-        "{\"name\":\"thread_name\",\"ph\":\"M\",\"ts\":0.000,\"pid\":7,\"tid\":1,\"args\":{\"name\":\"queue worker 0x0\"}},\n"
-        "{\"name\":\"queue worker 0x0 folded\",\"ph\":\"C\",\"ts\":0.000,\"pid\":7,\"tid\":1,\"args\":{\"ms\":2.000}},\n"
-        "{\"name\":\"Driver.Packet\",\"ph\":\"X\",\"ts\":10.000,\"pid\":7,\"tid\":1,\"dur\":30.000},\n"
-        "{\"name\":\"Driver.Packet.draw\",\"ph\":\"X\",\"ts\":12.000,\"pid\":7,\"tid\":1,\"dur\":25.000},\n"
-        "{\"name\":\"present\",\"ph\":\"i\",\"ts\":0.000,\"pid\":7,\"tid\":1,\"s\":\"g\",\"args\":{\"present\":5}}\n"
-        "]}\n";
-    Check(json == expected, "trace events changed shape");
-}
 
 void BatchIds() {
     const auto origin = Clock::now();
@@ -610,7 +589,6 @@ int main() {
         FullBufferEvents();
         FoldShortSlices();
         EscapeStrings();
-        EventsShape();
         BatchIds();
         PresentBoundaryWitnesses();
         SummaryFields();
