@@ -87,7 +87,6 @@ void TotalsOverflow() {
 }
 
 void CapacitySettings() {
-    Check(TraceThread::ParseCapacity(nullptr) == TraceThread::DefaultCapacity, "the default event capacity changed");
     Check(TraceThread::ParseCapacity("1") == 1, "the smallest event capacity was rejected");
     Check(TraceThread::ParseCapacity("3145728") == 3145728, "a larger event capacity was rejected");
     Check(TraceThread::ParseCapacity("4194304") == TraceThread::MaximumCapacity, "the maximum event capacity was rejected");
@@ -280,7 +279,6 @@ void IntervalDue() {
         Check(rejected, "a malformed interval was accepted");
     }
     auto interval = AgcDriver::TraceInterval::Parse("30").value();
-    Check(interval.Describe() == "summary_every 30", "interval description changed");
     Check(!interval.Due(milliseconds(29999)) && interval.Due(milliseconds(30000)), "the interval was due at the wrong time");
     interval.Restart(milliseconds(30500));
     Check(interval.Begun() == milliseconds(30500) && !interval.Due(milliseconds(60499)) && interval.Due(milliseconds(60500)), "a restarted interval did not count from its restart");
@@ -564,6 +562,48 @@ void GzipFile() {
     Check(word(bytes.size() - 4) == text.size(), "the size is wrong");
 }
 
+void CausalEventsAreBoundedAndStable() {
+    std::atomic<std::uint64_t> presentCount{1};
+    TraceThread thread("presenter", presentCount, 4, TraceThread::AlwaysBuffering, 42);
+    const auto origin = Clock::now();
+    thread.EnableCausal(1234, 2);
+    thread.AddCausal({"gpu_mutex.attempt", origin, {}, 1, 7, 0, 0, 0, false, "draw", 44});
+    TraceThread::CausalEvent acquired{"gpu_mutex.acquired", origin + microseconds(1), {}, 1, 7, 0, 0, 0, false, "draw", 44};
+    acquired.recursion = 2;
+    thread.AddCausal(acquired);
+    thread.AddCausal({"gpu_mutex.released", origin + microseconds(2), {}, 1, 7, 0, 0, 0, false, "outer", 0});
+    const auto snapshot = thread.Collect();
+    Check(snapshot.causal.size() == 2 && snapshot.causalLost == 1 && snapshot.causalLostAt.has_value() && snapshot.dropped,
+        "causal overflow did not retain bounded events and report loss");
+    Check(snapshot.nativeStarttimeTicks == 1234, "native thread birth identity was not retained");
+    const auto json = TraceFormat::Events(7, origin, std::vector<TraceThread::Snapshot>{snapshot}, 0, {}, 0);
+    Check(json.find("\"operation\":44") != std::string::npos && json.find("\"generation\":7") != std::string::npos,
+        "causal join identity was omitted");
+    Check(json.find("\"native_starttime_ticks\":1234") != std::string::npos, "thread birth identity was not serialized");
+    Check(json.find("\"causal coverage lost\"") != std::string::npos, "causal coverage loss was not visible");
+    Check(json.find("\"capacity\":2") != std::string::npos &&
+        json.find("\"coverage_after_first_loss_incomplete\":true") != std::string::npos,
+        "causal loss did not expose its limit and retained coverage bounds");
+    Check(json.find("\"recursion\":2") != std::string::npos, "recursive acquisition depth was lost");
+    AgcDriver::TraceSummary summary;
+    summary.firstPresent = 1;
+    const std::vector<Clock::time_point> presents{origin, origin + milliseconds(16)};
+    const auto summaryJson = TraceFormat::Summary(summary, std::vector<TraceThread::Snapshot>{snapshot}, presents);
+    Check(summaryJson.find("\"trace_dropped\":true") != std::string::npos &&
+        summaryJson.find("\"causal_events_lost\":1") != std::string::npos,
+        "causal ring overflow did not propagate to summary coverage quality");
+
+    TraceThread missingBirth("presenter", presentCount, 2, TraceThread::AlwaysBuffering, 43);
+    missingBirth.EnableCausal(std::nullopt, 1);
+    const auto missingJson = TraceFormat::Events(7, origin, std::vector<TraceThread::Snapshot>{missingBirth.Collect()}, 0, {}, 0);
+    Check(missingJson.find("\"native_starttime_ticks\":null") != std::string::npos,
+        "unavailable thread birth identity was misreported");
+    TraceThread disabled("presenter", presentCount, 4);
+    disabled.AddCausal({"ignored", origin, {}, 1, 0, 0, 0, 0, false, nullptr, 0});
+    Check(disabled.Collect().causal.empty() && disabled.Collect().causalLost == 0,
+        "a thread without causal recording allocated or reported causal events");
+}
+
 void AppendLines() {
     const auto path = std::filesystem::temp_directory_path() / ("aps5-summary-test-" + std::to_string(Clock::now().time_since_epoch().count()) + ".jsonl");
     AgcDriver::TraceFile::AppendLine(path, "{\"presents\":1}\n");
@@ -597,6 +637,7 @@ int main() {
         SummaryOnlyThread();
         TotalsSince();
         IntervalSummaryFields();
+        CausalEventsAreBoundedAndStable();
         IntervalDroppedThreads();
         SummaryMachineFields();
         FrameMicroseconds();

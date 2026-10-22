@@ -1,5 +1,6 @@
 #define SDL_MAIN_HANDLED
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include <SDL.h>
 #include <SDL_vulkan.h>
 #include <array>
@@ -31,6 +32,10 @@ ShaderRecompiler::RecompileResult LoadShader(const std::filesystem::path& path) 
 }
 
 void Run(SDL_Window* window, const std::filesystem::path& directory, bool verifyOnly) {
+    // This standalone fixture has no driver frame loop. Bound its opt-in causal
+    // capture explicitly; these witnesses are fixture timing, never game FPS.
+    const bool causalCapture = AgcDriver::PerformanceTrace::CausalEnabled();
+    if (causalCapture) AgcDriver::PerformanceTrace::Present(Width, Height, nullptr);
     unsigned count = 0;
     Require(SDL_Vulkan_GetInstanceExtensions(window, &count, nullptr) == SDL_TRUE, SDL_GetError());
     std::vector<const char*> extensions(count);
@@ -90,6 +95,10 @@ void Run(SDL_Window* window, const std::filesystem::path& directory, bool verify
     Require(std::to_integer<unsigned>(Pixels[center]) > 30 && std::to_integer<unsigned>(Pixels[center + 1]) > 30 && std::to_integer<unsigned>(Pixels[center + 2]) > 30, "GPU readback: triangle center was not rendered");
     Require(Pixels[0] == std::byte{16} && Pixels[1] == std::byte{24} && Pixels[2] == std::byte{40}, "GPU readback: background changed");
     device.PresentPixels(Width, Height, Pixels);
+    if (causalCapture) {
+        AgcDriver::PerformanceTrace::Present(Width, Height, &device);
+        AgcDriver::PerformanceTrace::StopOutput();
+    }
     std::cout << "SPIR-V triangle rendered, GPU readback verified, frame queued for presentation. Close the window or press Escape.\n" << std::flush;
     if (!verifyOnly) {
         bool running = true;

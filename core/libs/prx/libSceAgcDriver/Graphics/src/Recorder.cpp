@@ -1092,8 +1092,8 @@ struct Recorder::ProgressWatcher {
     bool stop = false;
     std::thread thread;
 
-    ProgressWatcher(VkDevice device, VkSemaphore timeline, PFN_vkWaitSemaphoresKHR waitSemaphores, PFN_vkGetSemaphoreCounterValueKHR counterValue) {
-        thread = std::thread([this, device, timeline, waitSemaphores, counterValue] {
+    ProgressWatcher(VkDevice device, VkQueue queue, VkSemaphore timeline, PFN_vkWaitSemaphoresKHR waitSemaphores, PFN_vkGetSemaphoreCounterValueKHR counterValue) {
+        thread = std::thread([this, device, queue, timeline, waitSemaphores, counterValue] {
             CpuTopology::PinHelperThread("GPU progress watcher");
             std::uint64_t seen = 0;
             for (;;) {
@@ -1107,7 +1107,16 @@ struct Recorder::ProgressWatcher {
                 info.semaphoreCount = 1;
                 info.pSemaphores = &timeline;
                 info.pValues = &target;
+                const bool causal = AgcDriver::PerformanceTrace::CausalThread() != nullptr;
+                const auto operation = causal ? AgcDriver::PerformanceTrace::NextCausalOperation() : 0;
+                if (causal) AgcDriver::PerformanceTrace::RecordCausal("vulkan.timeline_wait", reinterpret_cast<std::uintptr_t>(timeline), target, reinterpret_cast<std::uintptr_t>(queue), target, "vkWaitSemaphoresKHR progress watcher", operation);
+                const auto begin = causal ? AgcDriver::SlowVulkanCallTiming::Begin() : AgcDriver::SlowVulkanCallTiming::Sample{};
                 const auto result = waitSemaphores(device, &info, 50'000'000ull);
+                if (causal) {
+                    const auto end = AgcDriver::SlowVulkanCallTiming::End();
+                    AgcDriver::RecordCausalVulkanSpan("vulkan.timeline_wait", begin, end, reinterpret_cast<std::uintptr_t>(timeline), target, reinterpret_cast<std::uintptr_t>(queue), target, "vkWaitSemaphoresKHR progress watcher", operation, static_cast<int>(result));
+                    if (result == VK_SUCCESS) AgcDriver::PerformanceTrace::RecordCausal("gpu.timeline_observed_complete", reinterpret_cast<std::uintptr_t>(timeline), target, reinterpret_cast<std::uintptr_t>(queue), target, "vkWaitSemaphoresKHR progress watcher", operation);
+                }
                 if (result == VK_TIMEOUT) continue;
                 if (result != VK_SUCCESS) {
                     std::fprintf(stderr, "[gpu] progress watcher: vkWaitSemaphoresKHR failed (%d), watcher stops\n", static_cast<int>(result));
@@ -3617,21 +3626,34 @@ void Recorder::Submit() {
     std::chrono::steady_clock::time_point submitStart{};
     std::chrono::steady_clock::time_point submittedAt{};
     const auto submitBatch = [&](Batch* target) {
+        const bool causal = AgcDriver::PerformanceTrace::CausalThread() != nullptr;
+        const auto operation = causal ? AgcDriver::PerformanceTrace::NextCausalOperation() : 0;
         submitStart = std::chrono::steady_clock::now();
         VkResult result;
+        AgcDriver::SlowVulkanCallTiming::Sample begin{}, end{};
         if (AgcDriver::SlowVulkanCallTiming::Enabled()) {
+            if (causal) AgcDriver::PerformanceTrace::RecordCausal("vulkan.queue_submit", reinterpret_cast<std::uintptr_t>(context.queue), serial, 0, serial, "vkQueueSubmit", operation);
             const auto submitBegin = AgcDriver::SlowVulkanCallTiming::Begin();
+            if (causal) begin = submitBegin;
             result = submitFunction(context.queue, 1, &submission, target->fence);
             const auto submitEnd = AgcDriver::SlowVulkanCallTiming::End();
+            if (causal) end = submitEnd;
             AgcDriver::SlowVulkanCallTiming::EmitIfSlow("vkQueueSubmit", submitBegin, submitEnd, reinterpret_cast<std::uintptr_t>(context.device), reinterpret_cast<std::uintptr_t>(context.queue), "submit_serial", serial, "command_buffer", reinterpret_cast<std::uintptr_t>(target->commands), static_cast<std::int32_t>(result), inFlightBefore, "recorder_batches_before_submit");
         } else {
+            if (causal) AgcDriver::PerformanceTrace::RecordCausal("vulkan.queue_submit", reinterpret_cast<std::uintptr_t>(context.queue), serial, 0, serial, "vkQueueSubmit", operation);
+            if (causal) begin = AgcDriver::SlowVulkanCallTiming::Begin();
             result = submitFunction(context.queue, 1, &submission, target->fence);
+            if (causal) end = AgcDriver::SlowVulkanCallTiming::End();
+        }
+        submittedAt = std::chrono::steady_clock::now();
+        if (causal) AgcDriver::RecordCausalVulkanSpan("vulkan.queue_submit", begin, end, reinterpret_cast<std::uintptr_t>(context.queue), serial, 0, serial, "vkQueueSubmit", operation, static_cast<int>(result));
+        if (causal && result == VK_SUCCESS) {
+            AgcDriver::PerformanceTrace::RecordCausal("gpu.fence_submitted", reinterpret_cast<std::uintptr_t>(target->fence), serial, reinterpret_cast<std::uintptr_t>(context.queue), serial, "vkQueueSubmit", operation);
         }
         if (result == VK_ERROR_DEVICE_LOST) {
             const auto idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
             if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST) std::terminate();
         }
-        submittedAt = std::chrono::steady_clock::now();
         return result;
     };
     VkResult result;
@@ -3697,7 +3719,7 @@ void Recorder::Submit() {
     }
     if (timeline != VK_NULL_HANDLE) {
         if (!progressWatcher) {
-            progressWatcher = std::make_unique<ProgressWatcher>(context.device, timeline, context.Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR"),
+            progressWatcher = std::make_unique<ProgressWatcher>(context.device, context.queue, timeline, context.Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR"),
                                                                 context.Function<PFN_vkGetSemaphoreCounterValueKHR>("vkGetSemaphoreCounterValueKHR"));
         }
         progressWatcher->Submitted(batch->serial);
@@ -3744,7 +3766,7 @@ void Recorder::publishSubmissions() {
         batch.submitting.store(false, std::memory_order_release);
         if (timeline != VK_NULL_HANDLE) {
             if (!progressWatcher) {
-                progressWatcher = std::make_unique<ProgressWatcher>(context.device, timeline, context.Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR"),
+                progressWatcher = std::make_unique<ProgressWatcher>(context.device, context.queue, timeline, context.Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR"),
                                                                     context.Function<PFN_vkGetSemaphoreCounterValueKHR>("vkGetSemaphoreCounterValueKHR"));
             }
             progressWatcher->Submitted(batch.serial);
@@ -3830,16 +3852,29 @@ struct RestoreSyncSite {
 // The timeline wait itself, on handles copied out of the recorder: the caller holds no mutex, and
 // the recorder may be torn down meanwhile (its destructor waits for the registered waiters to
 // leave after completing every batch, so the handles stay valid until this returns).
-VkResult WaitTimeline(VkDevice device, VkSemaphore timeline, PFN_vkWaitSemaphoresKHR waitSemaphores, std::uint64_t serial) {
+VkResult WaitTimeline(VkDevice device, VkQueue queue, VkSemaphore timeline, PFN_vkWaitSemaphoresKHR waitSemaphores, std::uint64_t serial) {
     VkSemaphoreWaitInfoKHR wait{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO_KHR};
     wait.semaphoreCount = 1;
     wait.pSemaphores = &timeline;
     wait.pValues = &serial;
-    auto result = waitSemaphores(device, &wait, 5'000'000'000ull);
+    const auto observedWait = [&] {
+        const bool causal = AgcDriver::PerformanceTrace::CausalThread() != nullptr;
+        const auto operation = causal ? AgcDriver::PerformanceTrace::NextCausalOperation() : 0;
+        if (causal) AgcDriver::PerformanceTrace::RecordCausal("vulkan.timeline_wait", reinterpret_cast<std::uintptr_t>(timeline), serial, reinterpret_cast<std::uintptr_t>(queue), serial, "vkWaitSemaphoresKHR", operation);
+        const auto begin = causal ? AgcDriver::SlowVulkanCallTiming::Begin() : AgcDriver::SlowVulkanCallTiming::Sample{};
+        const auto outcome = waitSemaphores(device, &wait, 5'000'000'000ull);
+        if (causal) {
+            const auto end = AgcDriver::SlowVulkanCallTiming::End();
+            AgcDriver::RecordCausalVulkanSpan("vulkan.timeline_wait", begin, end, reinterpret_cast<std::uintptr_t>(timeline), serial, reinterpret_cast<std::uintptr_t>(queue), serial, "vkWaitSemaphoresKHR", operation, static_cast<int>(outcome));
+            if (outcome == VK_SUCCESS) AgcDriver::PerformanceTrace::RecordCausal("gpu.timeline_observed_complete", reinterpret_cast<std::uintptr_t>(timeline), serial, reinterpret_cast<std::uintptr_t>(queue), serial, "vkWaitSemaphoresKHR", operation);
+        }
+        return outcome;
+    };
+    auto result = observedWait();
     for (int waited = 5; result == VK_TIMEOUT; waited += 5) {
         // As for the fence wait in finish(): a hung batch is reported every 5 s.
         std::fprintf(stderr, "[gpu] recorded batch %llu still running on the GPU after %d s (timeline wait)\n", static_cast<unsigned long long>(serial), waited);
-        result = waitSemaphores(device, &wait, 5'000'000'000ull);
+        result = observedWait();
     }
     return result;
 }
@@ -3861,7 +3896,7 @@ void Recorder::WaitSerial(std::uint64_t serial) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const UnlockedWaiter waiter{id};
-    const auto result = WaitTimeline(context.device, timeline, context.Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR"), serial);
+    const auto result = WaitTimeline(context.device, context.queue, timeline, context.Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR"), serial);
     if (profile) {
         unlockedWaits.fetch_add(1, std::memory_order_relaxed);
         unlockedWaitedUs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
@@ -4067,6 +4102,7 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
     const auto device = context.device;
     const auto semaphore = timeline;
     const auto waitSemaphores = context.Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR");
+    const auto queue = context.queue;
     // The site entry is taken under the mutex (the table is only touched under it; entries are
     // appended, never removed, so the index stays valid across the release).
     const RestoreSyncSite restoreSite{BeginSyncSite(source, site)};
@@ -4104,7 +4140,7 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
         // Registered before the release: a teardown can only start once the mutex is free.
         const UnlockedWaiter waiter{myId};
         mutex.unlock();
-        result = WaitTimeline(device, semaphore, waitSemaphores, targetSerial);
+        result = WaitTimeline(device, queue, semaphore, waitSemaphores, targetSerial);
         // Read before the relock: the GPU wait, not the wait for the mutex behind it.
         if (profile || trace) waited = std::chrono::steady_clock::now();
     }
@@ -4247,11 +4283,24 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             }
         } report{profile, source, waitStart, *this, signaledAtStart};
         const auto waitFences = function(waitForFences, "vkWaitForFences");
-        auto result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
+        const auto observedWait = [&] {
+            const bool causal = AgcDriver::PerformanceTrace::CausalThread() != nullptr;
+            const auto operation = causal ? AgcDriver::PerformanceTrace::NextCausalOperation() : 0;
+            if (causal) AgcDriver::PerformanceTrace::RecordCausal("vulkan.fence_wait", reinterpret_cast<std::uintptr_t>(batch->fence), batch->serial, reinterpret_cast<std::uintptr_t>(context.queue), batch->serial, "vkWaitForFences", operation);
+            const auto begin = causal ? AgcDriver::SlowVulkanCallTiming::Begin() : AgcDriver::SlowVulkanCallTiming::Sample{};
+            const auto outcome = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
+            if (causal) {
+                const auto end = AgcDriver::SlowVulkanCallTiming::End();
+                AgcDriver::RecordCausalVulkanSpan("vulkan.fence_wait", begin, end, reinterpret_cast<std::uintptr_t>(batch->fence), batch->serial, reinterpret_cast<std::uintptr_t>(context.queue), batch->serial, "vkWaitForFences", operation, static_cast<int>(outcome));
+                if (outcome == VK_SUCCESS) AgcDriver::PerformanceTrace::RecordCausal("gpu.fence_observed_complete", reinterpret_cast<std::uintptr_t>(batch->fence), batch->serial, reinterpret_cast<std::uintptr_t>(context.queue), batch->serial, "vkWaitForFences", operation);
+            }
+            return outcome;
+        };
+        auto result = observedWait();
         for (int waited = 5; result == VK_TIMEOUT; waited += 5) {
             // A batch still running after 5 s is reported (every 5 s) so a GPU-side hang is visible.
             std::fprintf(stderr, "[gpu] recorded batch still running on the GPU after %d s\n", waited);
-            result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
+            result = observedWait();
         }
         if (result != VK_SUCCESS && result != VK_ERROR_DEVICE_LOST) {
             const auto idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
@@ -4384,11 +4433,22 @@ void Recorder::release(Batch& batch) noexcept {
     batch.segmentPool.reset();
     // A completed (or never submitted) batch's objects are kept for reuse: the fence is signaled or
     // untouched, so resetting it cannot block, and the command buffer is no longer pending.
-    if (batch.commands != VK_NULL_HANDLE && batch.fence != VK_NULL_HANDLE && spare.size() < 64 && function(resetFences, "vkResetFences")(context.device, 1, &batch.fence) == VK_SUCCESS) {
-        spare.emplace_back(batch.commands, batch.fence);
-        batch.commands = VK_NULL_HANDLE;
-        batch.fence = VK_NULL_HANDLE;
-        return;
+    if (batch.commands != VK_NULL_HANDLE && batch.fence != VK_NULL_HANDLE && spare.size() < 64) {
+        const bool causal = AgcDriver::PerformanceTrace::CausalThread() != nullptr;
+        const auto operation = causal ? AgcDriver::PerformanceTrace::NextCausalOperation() : 0;
+        if (causal) AgcDriver::PerformanceTrace::RecordCausal("vulkan.fence_reset", reinterpret_cast<std::uintptr_t>(batch.fence), batch.serial, reinterpret_cast<std::uintptr_t>(context.queue), batch.serial, "vkResetFences", operation);
+        const auto begin = causal ? AgcDriver::SlowVulkanCallTiming::Begin() : AgcDriver::SlowVulkanCallTiming::Sample{};
+        const auto outcome = function(resetFences, "vkResetFences")(context.device, 1, &batch.fence);
+        if (causal) {
+            const auto end = AgcDriver::SlowVulkanCallTiming::End();
+            AgcDriver::RecordCausalVulkanSpan("vulkan.fence_reset", begin, end, reinterpret_cast<std::uintptr_t>(batch.fence), batch.serial, reinterpret_cast<std::uintptr_t>(context.queue), batch.serial, "vkResetFences", operation, static_cast<int>(outcome));
+        }
+        if (outcome == VK_SUCCESS) {
+            spare.emplace_back(batch.commands, batch.fence);
+            batch.commands = VK_NULL_HANDLE;
+            batch.fence = VK_NULL_HANDLE;
+            return;
+        }
     }
     if (batch.commands != VK_NULL_HANDLE) context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 1, &batch.commands);
     if (batch.fence != VK_NULL_HANDLE) context.Function<PFN_vkDestroyFence>("vkDestroyFence")(context.device, batch.fence, nullptr);

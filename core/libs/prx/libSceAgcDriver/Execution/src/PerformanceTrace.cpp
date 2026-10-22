@@ -6,12 +6,11 @@
 #include "prx/libkernel/AppMetadata/include/AppMetadata.hpp"
 #include <array>
 #include <cstdlib>
-#include <cstring>
+#include <fstream>
 #include <filesystem>
 #include <limits>
 #include <mutex>
-#include <system_error>
-#include <thread>
+#include <sstream>
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -21,6 +20,7 @@
 #endif
 #if defined(__linux__)
 #include <sys/syscall.h>
+#include <time.h>
 #endif
 #if defined(_MSC_VER) && !defined(__clang__)
 #include <intrin.h>
@@ -93,6 +93,29 @@ std::uint64_t processId() {
 #else
     return static_cast<std::uint64_t>(::getpid());
 #endif
+}
+std::uint64_t nativeThreadId();
+std::optional<std::uint64_t> nativeStarttimeTicks() {
+#if defined(__linux__)
+    const auto path = std::string("/proc/self/task/") + std::to_string(nativeThreadId()) + "/stat";
+    std::ifstream input(path);
+    std::string line;
+    if (!std::getline(input, line)) return std::nullopt;
+    const auto end = line.rfind(')');
+    if (end == std::string::npos || end + 2 >= line.size()) return std::nullopt;
+    std::istringstream fields(line.substr(end + 2));
+    std::string value;
+    for (int field = 3; field <= 22; ++field) {
+        if (!(fields >> value)) return std::nullopt;
+        if (field == 22) {
+            std::uint64_t result = 0;
+            const auto parsed = std::from_chars(value.data(), value.data() + value.size(), result);
+            if (parsed.ec == std::errc{}) return result;
+            return std::nullopt;
+        }
+    }
+#endif
+    return std::nullopt;
 }
 std::uint64_t nativeThreadId() {
 #if defined(_WIN32)
@@ -230,6 +253,7 @@ void PerformanceTrace::BindThread(const char* name, std::size_t capacity) {
     const bool windowed = std::getenv("APS5_TRACE_FRAMES") != nullptr || std::getenv("APS5_TRACE_SECONDS") != nullptr;
     if (windowed && capacity == TraceThread::DefaultCapacity) capacity = TraceThread::ParseCapacity(std::getenv("APS5_TRACE_EVENTS"));
     auto bound = std::make_unique<TraceThread>(name, presentCount, windowed ? capacity : 0, buffering, nativeThreadId());
+    if (CausalEnabled() && windowed) bound->EnableCausal(nativeStarttimeTicks(), capacity);
     auto& state = session();
     std::lock_guard lock(state.mutex);
     local = bound.get();

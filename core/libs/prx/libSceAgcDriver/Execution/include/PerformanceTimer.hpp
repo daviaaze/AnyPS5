@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_PERFORMANCETIMER_HPP
 
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/SlowVulkanCallTiming.hpp"
 #include "prx/libSceAgcDriver/Execution/include/TracyZone.hpp"
 #include <algorithm>
 #include <chrono>
@@ -18,6 +19,27 @@
 #include <utility>
 
 namespace AgcDriver {
+inline void RecordCausalVulkanSpan(const char* name, const SlowVulkanCallTiming::Sample& begin, const SlowVulkanCallTiming::Sample& end,
+                                   std::uint64_t object, std::uint64_t generation, std::uint64_t related, std::uint64_t batch, const char* site,
+                                   std::uint64_t operation, int outcome) {
+    auto* trace = PerformanceTrace::CausalThread();
+    if (trace == nullptr || !begin.wallAvailable || !end.wallAvailable || end.wallNs < begin.wallNs) return;
+    const bool cpuValid = begin.threadCpuAvailable && end.threadCpuAvailable && end.threadCpuNs >= begin.threadCpuNs;
+    TraceThread::CausalEvent event{};
+    event.name = name;
+    event.begin = TraceThread::Clock::time_point(std::chrono::nanoseconds(begin.wallNs));
+    event.length = std::chrono::nanoseconds(end.wallNs - begin.wallNs);
+    event.object = object;
+    event.generation = generation;
+    event.related = related;
+    event.batch = batch;
+    event.cpuNs = cpuValid ? end.threadCpuNs - begin.threadCpuNs : 0;
+    event.cpuValid = cpuValid;
+    event.site = site;
+    event.operation = operation;
+    event.outcome = outcome;
+    trace->AddCausal(event);
+}
 
 class FrameTiming {
 public:
@@ -260,12 +282,13 @@ private:
 
 class PerformanceTimer {
 public:
-    explicit PerformanceTimer(const char* scope) : frame(PerformanceContext::Current()), trace(PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr), scope(scope) {
+    explicit PerformanceTimer(const char* scope) : frame(PerformanceContext::Current()), trace(PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr), scope(scope), causalTrace(PerformanceTrace::CausalThread()) {
         if (frame != nullptr) {
             total = frame->Get(scope, "total");
         }
         if (frame != nullptr || trace != nullptr) start = Clock::now();
         previous = start;
+        if (causalTrace != nullptr && IsResourceScope()) causalStart = SlowVulkanCallTiming::Begin();
     }
 
     PerformanceTimer(const PerformanceTimer&) = delete;
@@ -277,6 +300,7 @@ public:
 
     void Finish() {
         zone.End();
+        if (causalTrace != nullptr && PerformanceTrace::Recording() && IsResourceScope() && causalStart.wallAvailable) RecordResourcePhase("finish");
         if (frame == nullptr && trace == nullptr) return;
         const auto end = Clock::now();
         if (trace != nullptr) trace->Add(scope, nullptr, start, end);
@@ -293,6 +317,7 @@ public:
     }
 
     void Mark(const char* stage, std::uint64_t bytes = 0) {
+        if (causalTrace != nullptr && PerformanceTrace::Recording() && IsResourceScope() && causalStart.wallAvailable) RecordResourcePhase(stage);
         if (frame == nullptr && trace == nullptr) return;
         const auto now = Clock::now();
         if (trace != nullptr) trace->Add(scope, stage, previous, now);
@@ -314,6 +339,32 @@ private:
     FrameTiming::Metric* tail = nullptr;
     Clock::time_point start{};
     Clock::time_point previous{};
+    bool IsResourceScope() const {
+        return scope == std::string_view("Vulkan.Present") || scope == std::string_view("Vulkan.ComputePipeline") ||
+               scope == std::string_view("Vulkan.GraphicsPipelinePrebuild") || scope == std::string_view("Vulkan.Dispatch") ||
+               scope == std::string_view("Vulkan.DrawFromRecipe");
+    }
+
+    void RecordResourcePhase(const char* stage) {
+        const auto end = SlowVulkanCallTiming::End();
+        if (end.wallAvailable && end.wallNs >= causalStart.wallNs) {
+            const bool cpuValid = causalStart.threadCpuAvailable && end.threadCpuAvailable && end.threadCpuNs >= causalStart.threadCpuNs;
+            TraceThread::CausalEvent event{};
+            event.name = "graphics.resources";
+            event.begin = TraceThread::Clock::time_point(std::chrono::nanoseconds(causalStart.wallNs));
+            event.length = std::chrono::nanoseconds(end.wallNs - causalStart.wallNs);
+            event.batch = TraceBatchTag;
+            event.cpuNs = cpuValid ? end.threadCpuNs - causalStart.threadCpuNs : 0;
+            event.cpuValid = cpuValid;
+            event.site = stage;
+            event.operation = PerformanceTrace::NextCausalOperation();
+            causalTrace->AddCausal(event);
+        }
+        causalStart = end;
+    }
+
+    TraceThread* causalTrace;
+    SlowVulkanCallTiming::Sample causalStart{};
 };
 
 }

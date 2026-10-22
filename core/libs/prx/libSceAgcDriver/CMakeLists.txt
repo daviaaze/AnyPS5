@@ -1378,6 +1378,30 @@ add_custom_command(
         VERBATIM
 )
 
+add_test_executable(agc_gpu_mutex_causality_tests EXCLUDE_FROM_ALL
+        tests/GpuMutexCausality.cpp
+)
+target_include_directories(agc_gpu_mutex_causality_tests PRIVATE
+        ${LIBS_INCLUDE_DIR}
+        ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR}
+)
+target_link_libraries(agc_gpu_mutex_causality_tests PRIVATE
+        libkernel libSceAgcDriver SDL2-static libc
+)
+set_target_properties(agc_gpu_mutex_causality_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_gpu_mutex_causality_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_gpu_mutex_causality_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_gpu_mutex_causality COMMAND agc_gpu_mutex_causality_tests)
+    set_tests_properties(agc_gpu_mutex_causality PROPERTIES
+            TIMEOUT 20
+            ENVIRONMENT "APS5_TRACE_CAUSAL=1;APS5_TRACE_SECONDS=0:1;APS5_TRACE_EVENTS=4096")
+    if(WIN32)
+        set_tests_properties(agc_gpu_mutex_causality PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
 add_test_executable(agc_driver_recorder_tests EXCLUDE_FROM_ALL
         tests/Recorder.cpp
         tests/HostImportLifetime.cpp
@@ -1410,10 +1434,12 @@ if(BUILD_TESTING)
     add_test(NAME agc_recorder_device_selection COMMAND agc_driver_recorder_tests --device-selection-only)
     add_test(NAME agc_gpu_timing_complete COMMAND agc_driver_recorder_tests --gpu-timing-complete-only)
     add_test(NAME agc_gpu_timing_incomplete COMMAND agc_driver_recorder_tests --gpu-timing-incomplete-only)
+    add_test(NAME agc_causal_vulkan_lifecycle COMMAND agc_driver_recorder_tests --causal-vulkan-lifecycle-only)
+    set_tests_properties(agc_causal_vulkan_lifecycle PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
     set_tests_properties(agc_gpu_timing_complete agc_gpu_timing_incomplete PROPERTIES
         ENVIRONMENT "APS5_PROFILE_GPU=1" TIMEOUT 15 SKIP_RETURN_CODE 77)
     if(WIN32)
-        set_tests_properties(agc_recorder_device_selection agc_gpu_timing_complete agc_gpu_timing_incomplete PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_recorder_device_selection agc_gpu_timing_complete agc_gpu_timing_incomplete agc_causal_vulkan_lifecycle PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test(NAME agc_pipeline_cache COMMAND agc_driver_recorder_tests --pipeline-cache-only)

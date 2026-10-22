@@ -141,6 +141,7 @@ public:
     using Clock = std::chrono::steady_clock;
     static constexpr std::size_t DefaultCapacity = 262144;
     static constexpr std::size_t MaximumCapacity = 4194304;
+    static constexpr std::size_t MaximumCausalCapacity = DefaultCapacity;
     static constexpr Clock::duration MinimumSlice = std::chrono::microseconds(20);
 
     static std::size_t ParseCapacity(const char* events) {
@@ -162,6 +163,20 @@ public:
         std::uint64_t batch = 0;
     };
 
+    // Separate storage: causal boundaries are never folded and ordinary slices stay compact.
+    struct CausalEvent {
+        const char* name;
+        Clock::time_point begin;
+        Clock::duration length{};
+        std::uint64_t object = 0, generation = 0, related = 0, batch = 0;
+        std::uint64_t cpuNs = 0;
+        bool cpuValid = false;
+        const char* site = nullptr;
+        std::uint64_t operation = 0;
+        std::uint32_t recursion = 0;
+        std::int32_t outcome = std::numeric_limits<std::int32_t>::min();
+    };
+
     struct Total {
         const char* scope;
         const char* stage;
@@ -178,6 +193,12 @@ public:
         std::optional<Clock::time_point> eventsFullAt;
         bool totalsFull = false;
         std::uint64_t nativeTid = 0;
+        std::span<const CausalEvent> causal;
+        std::size_t causalCapacity = 0;
+        std::optional<Clock::time_point> causalRetainedThrough;
+        std::uint64_t causalLost = 0;
+        std::optional<Clock::time_point> causalLostAt;
+        std::optional<std::uint64_t> nativeStarttimeTicks;
     };
 
     inline static const std::atomic<bool> AlwaysBuffering{true};
@@ -204,9 +225,36 @@ public:
         else append({scope, stage, begin, length, TraceBatchTag});
     }
 
+    void EnableCausal(std::optional<std::uint64_t> birth, std::size_t limit = DefaultCapacity) {
+        nativeStarttimeTicks = birth;
+        causalCapacity = std::min(limit, MaximumCausalCapacity);
+        causal = std::make_unique<CausalEvent[]>(causalCapacity);
+    }
+
+    void AddCausal(CausalEvent value) {
+        if (!causal || !buffering.load(std::memory_order_relaxed)) return;
+        const auto index = causalUsed.load(std::memory_order_relaxed);
+        if (index == causalCapacity) {
+            const auto count = causalLost.fetch_add(1, std::memory_order_relaxed);
+            if (count == 0) causalFirstLost.store(Clock::now().time_since_epoch().count(), std::memory_order_relaxed);
+            return;
+        }
+        causal[index] = value;
+        causalUsed.store(index + 1, std::memory_order_release);
+        const auto retainedThrough = (value.begin + value.length).time_since_epoch().count();
+        auto previous = causalRetainedThrough.load(std::memory_order_relaxed);
+        while (previous < retainedThrough && !causalRetainedThrough.compare_exchange_weak(previous, retainedThrough, std::memory_order_relaxed)) {}
+    }
+
     Snapshot Collect() const {
         Snapshot snapshot{name, {slices.get(), used.load(std::memory_order_acquire)}, {}, false};
         snapshot.nativeTid = nativeTid;
+        snapshot.causal = {causal.get(), causalUsed.load(std::memory_order_acquire)};
+        snapshot.causalCapacity = causalCapacity;
+        if (!snapshot.causal.empty()) snapshot.causalRetainedThrough = Clock::time_point(Clock::duration(causalRetainedThrough.load(std::memory_order_relaxed)));
+        snapshot.causalLost = causalLost.load(std::memory_order_relaxed);
+        if (snapshot.causalLost != 0) snapshot.causalLostAt = Clock::time_point(Clock::duration(causalFirstLost.load(std::memory_order_relaxed)));
+        snapshot.nativeStarttimeTicks = nativeStarttimeTicks;
         for (const auto& entry : entries) {
             const auto* scope = entry.scope.load(std::memory_order_acquire);
             if (scope == nullptr) continue;
@@ -215,7 +263,7 @@ public:
         snapshot.eventsLost = lost.load(std::memory_order_acquire);
         if (snapshot.eventsLost != 0) snapshot.eventsFullAt = Clock::time_point(Clock::duration(firstLost.load(std::memory_order_relaxed)));
         snapshot.totalsFull = totalsFull.load(std::memory_order_relaxed);
-        snapshot.dropped = snapshot.eventsLost != 0 || snapshot.totalsFull;
+        snapshot.dropped = snapshot.eventsLost != 0 || snapshot.totalsFull || snapshot.causalLost != 0;
         return snapshot;
     }
 
@@ -275,6 +323,13 @@ private:
     std::uint64_t sampledPresent = 0;
     Clock::time_point sampleBegin{};
     Clock::duration folded{};
+    std::unique_ptr<CausalEvent[]> causal;
+    std::size_t causalCapacity = 0;
+    std::atomic<std::size_t> causalUsed{0};
+    std::atomic<std::uint64_t> causalLost{0};
+    std::atomic<Clock::rep> causalFirstLost{0};
+    std::atomic<Clock::rep> causalRetainedThrough{0};
+    std::optional<std::uint64_t> nativeStarttimeTicks;
 };
 
 struct TraceHost {
@@ -506,6 +561,10 @@ public:
             output += ",\"args\":{\"name\":";
             AppendString(output, thread.name);
             if (thread.nativeTid != 0) output += ",\"native_tid\":" + std::to_string(thread.nativeTid);
+            if (thread.nativeTid != 0) {
+                output += ",\"native_starttime_ticks\":";
+                output += thread.nativeStarttimeTicks ? std::to_string(*thread.nativeStarttimeTicks) : "null";
+            }
             output += "}}";
             std::vector<TraceThread::Slice> slices(thread.slices.begin(), thread.slices.end());
             std::stable_sort(slices.begin(), slices.end(), [](const auto& a, const auto& b) { return a.begin != b.begin ? a.begin < b.begin : a.length > b.length; });
@@ -521,6 +580,29 @@ public:
                     else std::snprintf(text, sizeof text, ",\"dur\":%.3f}", microseconds(slice.length));
                 }
                 output += text;
+            }
+            for (const auto& causal : thread.causal) {
+                event(causal.name, "X", causal.begin, tid);
+                output += ",\"cat\":\"causal\",\"dur\":" + number(microseconds(causal.length));
+                output += ",\"args\":{\"object\":" + std::to_string(causal.object);
+                output += ",\"generation\":" + std::to_string(causal.generation);
+                output += ",\"related\":" + std::to_string(causal.related);
+                output += ",\"operation\":" + std::to_string(causal.operation);
+                output += ",\"recursion\":" + std::to_string(causal.recursion);
+                output += ",\"batch\":" + std::to_string(causal.batch);
+                output += ",\"thread_cpu_ns\":";
+                output += causal.cpuValid ? std::to_string(causal.cpuNs) : "null";
+                if (causal.site) { output += ",\"site\":"; AppendString(output, causal.site); }
+                output += ",\"outcome\":" + std::to_string(causal.outcome);
+                output += "}}";
+            }
+            if (thread.causalLost) {
+                event("causal coverage lost", "i", thread.causalLostAt.value_or(origin), tid);
+                output += ",\"s\":\"t\",\"args\":{\"events_lost\":" + std::to_string(thread.causalLost);
+                output += ",\"capacity\":" + std::to_string(thread.causalCapacity);
+                output += ",\"retained_through_ts_us\":";
+                output += thread.causalRetainedThrough ? number(microseconds(*thread.causalRetainedThrough - origin)) : "null";
+                output += ",\"coverage_after_first_loss_incomplete\":true}}";
             }
             if (thread.eventsFullAt) {
                 event("trace buffer full", "i", *thread.eventsFullAt, tid);
@@ -609,16 +691,18 @@ public:
         struct DroppedThread {
             std::string name;
             std::uint64_t eventsLost = 0;
+            std::uint64_t causalEventsLost = 0;
             std::optional<Clock::time_point> eventsFullAt;
             bool totalsFull = false;
         };
         std::vector<DroppedThread> droppedList;
         for (const auto& thread : threads) {
             dropped = dropped || thread.dropped;
-            if (thread.eventsLost != 0 || thread.totalsFull) {
+            if (thread.eventsLost != 0 || thread.totalsFull || thread.causalLost != 0) {
                 auto entry = std::find_if(droppedList.begin(), droppedList.end(), [&](const DroppedThread& candidate) { return candidate.name == thread.name; });
                 if (entry == droppedList.end()) entry = droppedList.insert(droppedList.end(), DroppedThread{thread.name});
                 entry->eventsLost += thread.eventsLost;
+                entry->causalEventsLost += thread.causalLost;
                 if (thread.eventsLost != 0 && thread.eventsFullAt && (!entry->eventsFullAt || *thread.eventsFullAt < *entry->eventsFullAt)) entry->eventsFullAt = thread.eventsFullAt;
                 entry->totalsFull = entry->totalsFull || thread.totalsFull;
             }
@@ -654,6 +738,7 @@ public:
                     if (entry.eventsFullAt && !presents.empty() && *entry.eventsFullAt >= presents.front() && *entry.eventsFullAt <= presents.back()) droppedThreads += "\"events_full_after_s\":" + number(std::chrono::duration<double>(*entry.eventsFullAt - presents.front()).count()) + ",";
                     droppedThreads += "\"events_lost\":" + std::to_string(entry.eventsLost) + ",";
                 }
+                if (entry.causalEventsLost != 0) droppedThreads += "\"causal_events_lost\":" + std::to_string(entry.causalEventsLost) + ",";
                 droppedThreads += std::string("\"totals_full\":") + (entry.totalsFull ? "true" : "false") + "}";
             }
             output += ",\"trace_dropped_threads\":{" + droppedThreads + "}";
@@ -752,7 +837,27 @@ public:
     }
 
     static void BindThread(const char* name, std::size_t capacity = TraceThread::DefaultCapacity);
+    static bool CausalEnabled() {
+        static const bool enabled = [] {
+            const auto* value = std::getenv("APS5_TRACE_CAUSAL");
+            return value && std::string_view(value) == "1" && Configured();
+        }();
+        return enabled;
+    }
+    static TraceThread* CausalThread() {
+        return CausalEnabled() && Recording() ? Thread() : nullptr;
+    }
     static void Present(std::uint32_t width, std::uint32_t height, const VulkanDevice* device);
+    static std::uint64_t NextCausalOperation() {
+        if (!CausalEnabled() || !Recording()) return 0;
+        return causalOperations.fetch_add(1, std::memory_order_relaxed) + 1;
+    }
+    static void RecordCausal(const char* name, std::uint64_t object, std::uint64_t generation, std::uint64_t related, std::uint64_t batch, const char* site = nullptr, std::uint64_t operation = 0) {
+        if (!CausalEnabled() || !Recording()) return;
+        auto* trace = Thread();
+        if (!trace) return;
+        trace->AddCausal({name, std::chrono::steady_clock::now(), {}, object, generation, related, batch, 0, false, site, operation});
+    }
 
     static void GpuRange(const char* name, double beginNs, double endNs, std::uint64_t batch = 0) {
         if (!buffering.load(std::memory_order_relaxed)) return;
@@ -783,6 +888,7 @@ private:
 
     static std::atomic<bool> recording;
     inline static std::atomic<bool> buffering{false};
+    inline static std::atomic<std::uint64_t> causalOperations{0};
     inline static std::atomic<std::uint64_t> presentCount{0};
     static thread_local TraceThread* local;
     inline static std::mutex gpuMutex;

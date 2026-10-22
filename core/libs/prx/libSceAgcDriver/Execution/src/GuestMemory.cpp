@@ -17,6 +17,9 @@
 #include <functional>
 #include <cstdio>
 #include <cstdlib>
+#if defined(__linux__)
+#include <time.h>
+#endif
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -2050,30 +2053,61 @@ const void* ThreadToken() {
 }
 
 std::atomic<std::uint64_t> gpuHoldSerial{0};
+
+thread_local std::uint64_t causalGpuGeneration = 0;
+std::atomic<std::uint64_t> lastReleasedGeneration{0};
+void causalLockEvent(const char* name, const char* site, std::uint64_t generation, std::uint64_t related, std::uint32_t recursion, std::uint64_t operation = 0) {
+    auto* trace = AgcDriver::PerformanceTrace::CausalThread();
+    if (!trace) return;
+    trace->AddCausal({name, std::chrono::steady_clock::now(), {}, 1, generation, related, 0, 0, false, site, operation, recursion});
+}
+bool causalThreadCpuNs(std::uint64_t& result) {
+#if defined(__linux__)
+    timespec value{};
+    if (::clock_gettime(CLOCK_THREAD_CPUTIME_ID, &value) == 0) {
+        result = static_cast<std::uint64_t>(value.tv_sec) * 1000000000ull + static_cast<std::uint64_t>(value.tv_nsec);
+        return true;
+    }
+#endif
+    result = 0;
+    return false;
+}
+void causalLockWait(std::chrono::steady_clock::time_point begin, std::chrono::steady_clock::time_point end, std::uint64_t released, std::uint64_t operation, const char* site, std::uint32_t recursion, std::uint64_t cpuBegin, std::uint64_t cpuEnd, bool cpuBeginValid, bool cpuEndValid) {
+    auto* trace = AgcDriver::PerformanceTrace::CausalThread();
+    if (!trace) return;
+    const bool cpuValid = cpuBeginValid && cpuEndValid && cpuEnd >= cpuBegin;
+    trace->AddCausal({"gpu_mutex.wait", begin, end - begin, 1, 0, released, 0,
+        cpuValid ? cpuEnd - cpuBegin : 0, cpuValid, site, operation, recursion});
+}
+void causalLockRelease(TraceThread* trace, std::chrono::steady_clock::time_point begin, std::chrono::steady_clock::time_point end, std::uint64_t generation, std::uint64_t cpuBegin, std::uint64_t cpuEnd, bool cpuBeginValid, bool cpuEndValid) {
+    if (!trace) return;
+    const bool cpuValid = cpuBeginValid && cpuEndValid && cpuEnd >= cpuBegin;
+    TraceThread::CausalEvent event{"gpu_mutex.released", begin, end - begin, 1, generation, 0, 0,
+        cpuValid ? cpuEnd - cpuBegin : 0, cpuValid, "outer", 0};
+    trace->AddCausal(event);
+}
 }
 
 void GpuMutexType::acquired() {
     owner.store(ThreadToken(), std::memory_order_relaxed);
-    if (++depth == 1) gpuHoldSerial.fetch_add(1, std::memory_order_relaxed);
+    if (++depth == 1) causalGpuGeneration = gpuHoldSerial.fetch_add(1, std::memory_order_relaxed) + 1;
 }
 
 bool GpuMutexType::try_lock() {
-    if (!GpuLockProfiled()) {
-        if (!mutex.try_lock()) return false;
-        acquired();
-        return true;
-    }
-    // The tag is consumed whether or not the try succeeds (a failed try must not name the next
-    // acquisition); an untagged try's hold is charged to 'try' (a boundary reap, an idle worker).
-    auto& stats = LockStats();
-    const auto tagged = std::exchange(stats.nextSite, GpuLockSite::Other);
-    ++stats.tries;
+    const bool causal = AgcDriver::PerformanceTrace::CausalEnabled();
+    const auto attempt = AgcDriver::PerformanceTrace::NextCausalOperation();
+    const auto tagged = (GpuLockProfiled() || GpuHoldProfiled() || attempt != 0) ? std::exchange(LockStats().nextSite, GpuLockSite::Other) : GpuLockSite::Other;
+    const char* site = GpuLockSiteNames[static_cast<std::size_t>(tagged)];
+    if (causal) causalLockEvent("gpu_mutex.attempt", site, causalGpuGeneration, 0, DepthOnThisThread(), attempt);
+    if (GpuLockProfiled()) ++LockStats().tries;
     if (!mutex.try_lock()) {
-        ++stats.triesFailed;
+        if (GpuLockProfiled()) ++LockStats().triesFailed;
+        if (causal) causalLockEvent("gpu_mutex.try_failed", site, causalGpuGeneration, 0, DepthOnThisThread(), attempt);
         return false;
     }
     acquired();
     if (depth == 1 && GpuHoldProfiled()) BeginHold(static_cast<std::size_t>(tagged == GpuLockSite::Other ? GpuLockSite::Try : tagged));
+    if (causal) causalLockEvent("gpu_mutex.acquired", site, causalGpuGeneration, 0, depth, attempt);
     return true;
 }
 
@@ -2096,10 +2130,22 @@ void GpuMutexType::unlock() {
         // Still the holder here: the hold ends when the mutex is given up, not before.
         if (GpuHoldProfiled()) EndHold();
     }
+    auto* causalTrace = outermost ? AgcDriver::PerformanceTrace::CausalThread() : nullptr;
+    const auto releaseBegin = causalTrace ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    std::uint64_t cpuBegin = 0;
+    const bool cpuBeginValid = causalTrace && causalThreadCpuNs(cpuBegin);
+    if (causalTrace) lastReleasedGeneration.store(causalGpuGeneration, std::memory_order_relaxed);
     mutex.unlock();
     // After the release, so what the hook does (destroying a batch's kept objects) is neither part
     // of the hold nor waited for by the next holder.
     if (outermost) {
+        if (causalTrace) {
+            const auto releaseEnd = std::chrono::steady_clock::now();
+            std::uint64_t cpuEnd = 0;
+            const bool cpuEndValid = causalThreadCpuNs(cpuEnd);
+            causalLockRelease(causalTrace, releaseBegin, releaseEnd, causalGpuGeneration, cpuBegin, cpuEnd, cpuBeginValid, cpuEndValid);
+        }
+        causalGpuGeneration = 0;
         if (auto* hook = gpuUnlockHook.load(std::memory_order_acquire); hook != nullptr) hook();
     }
 }
@@ -2122,23 +2168,43 @@ void AssertGpuLockHeld(const char* where) {
 
 void GpuMutexType::lock() {
     if (!GpuLockProfiled()) {
+        const auto attempt = AgcDriver::PerformanceTrace::NextCausalOperation();
         auto* trace = PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr;
-        if (trace == nullptr) {
+        const auto site = (attempt || trace) ? static_cast<std::size_t>(std::exchange(LockStats().nextSite, GpuLockSite::Other)) : static_cast<std::size_t>(GpuLockSite::Other);
+        const auto releasedBefore = attempt ? lastReleasedGeneration.load(std::memory_order_relaxed) : 0;
+        if (attempt) causalLockEvent("gpu_mutex.attempt", GpuLockSiteNames[site], 0, 0, DepthOnThisThread(), attempt);
+        const bool contended = !mutex.try_lock();
+        if (contended) {
+            const auto start = (trace || attempt) ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            if (attempt) causalLockEvent("gpu_mutex.wait_begin", GpuLockSiteNames[site], 0, 0, DepthOnThisThread(), attempt);
+            std::uint64_t cpuBegin = 0;
+            const bool cpuBeginValid = attempt && causalThreadCpuNs(cpuBegin);
             LockSpinning(mutex, HandoffSpinWindow());
-        } else {
-            const auto site = static_cast<std::size_t>(std::exchange(LockStats().nextSite, GpuLockSite::Other));
-            if (!mutex.try_lock()) {
-                const auto start = std::chrono::steady_clock::now();
-                LockSpinning(mutex, HandoffSpinWindow());
-                trace->Add("GpuMutex.wait", GpuLockSiteNames[site], start, std::chrono::steady_clock::now());
+            const auto end = (trace || attempt) ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            if (trace != nullptr) trace->Add("GpuMutex.wait", GpuLockSiteNames[site], start, end);
+            if (attempt) {
+                std::uint64_t cpuEnd = 0;
+                const bool cpuEndValid = causalThreadCpuNs(cpuEnd);
+                const auto releasedAfter = lastReleasedGeneration.load(std::memory_order_relaxed);
+                const auto releaseEdge = releasedAfter != releasedBefore ? releasedAfter : 0;
+                causalLockWait(start, end, releaseEdge, attempt, GpuLockSiteNames[site], depth, cpuBegin, cpuEnd, cpuBeginValid, cpuEndValid);
+                acquired();
+                causalLockEvent("gpu_mutex.acquired", GpuLockSiteNames[site], causalGpuGeneration, releaseEdge, depth, attempt);
+            } else {
+                acquired();
             }
+        } else {
+            acquired();
+            if (attempt) causalLockEvent("gpu_mutex.acquired", GpuLockSiteNames[site], causalGpuGeneration, 0, depth, attempt);
         }
-        acquired();
         return;
     }
     auto& stats = LockStats();
     ++stats.acquisitions;
     const auto site = static_cast<std::size_t>(std::exchange(stats.nextSite, GpuLockSite::Other));
+    const auto attempt = AgcDriver::PerformanceTrace::NextCausalOperation();
+    const auto releasedBefore = attempt ? lastReleasedGeneration.load(std::memory_order_relaxed) : 0;
+    if (attempt) causalLockEvent("gpu_mutex.attempt", GpuLockSiteNames[site], 0, 0, DepthOnThisThread(), attempt);
     ++stats.siteAcquisitions[site];
     // An uncontended (or recursive) acquisition costs no clock reads for the wait; only a wait is
     // timed. The hold timer (outermost acquisitions only) starts once the mutex is held.
@@ -2147,10 +2213,21 @@ void GpuMutexType::lock() {
         HolderMatrixValues before{};
         if (holders) Holders().Snapshot(before);
         const auto start = std::chrono::steady_clock::now();
+        if (attempt) causalLockEvent("gpu_mutex.wait_begin", GpuLockSiteNames[site], 0, 0, DepthOnThisThread(), attempt);
+        std::uint64_t cpuBegin = 0;
+        const bool cpuBeginValid = attempt && causalThreadCpuNs(cpuBegin);
         LockSpinning(mutex, HandoffSpinWindow());
         acquired();
         const auto now = std::chrono::steady_clock::now();
         if (auto* trace = PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr) trace->Add("GpuMutex.wait", GpuLockSiteNames[site], start, now);
+        const auto releasedAfter = lastReleasedGeneration.load(std::memory_order_relaxed);
+        const auto releaseEdge = releasedAfter != releasedBefore ? releasedAfter : 0;
+        if (attempt) {
+            std::uint64_t cpuEnd = 0;
+            const bool cpuEndValid = causalThreadCpuNs(cpuEnd);
+            causalLockWait(start, now, releaseEdge, attempt, GpuLockSiteNames[site], depth, cpuBegin, cpuEnd, cpuBeginValid, cpuEndValid);
+            causalLockEvent("gpu_mutex.acquired", GpuLockSiteNames[site], causalGpuGeneration, releaseEdge, depth, attempt);
+        }
         if (holders) {
             HolderMatrixValues after{};
             Holders().Snapshot(after);
@@ -2219,6 +2296,7 @@ void GpuMutexType::lock() {
         return;
     }
     acquired();
+    if (attempt) causalLockEvent("gpu_mutex.acquired", GpuLockSiteNames[site], causalGpuGeneration, 0, depth, attempt);
     if (depth == 1 && GpuHoldProfiled()) BeginHold(site);
 }
 

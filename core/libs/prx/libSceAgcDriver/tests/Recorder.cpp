@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/tools/ComputePipelineFixture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PipelineLinkOptimization.hpp"
@@ -75,6 +76,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <limits>
 #include <vector>
 
 namespace {
@@ -10124,8 +10126,72 @@ void Run(Context context) {
 }
 #endif
 
+void causalFenceLifecycleTests(const Device& device) {
+    AgcDriver::PerformanceTrace::Present(1, 1, nullptr);
+    auto* trace = AgcDriver::PerformanceTrace::CausalThread();
+    Require(trace != nullptr, "causal Vulkan capture did not start");
+    Recorder recorder(device.GetContext());
+    recorder.Activate();
+    for (std::uint64_t serial = 1; serial <= 2; ++serial) {
+        recorder.NotePendingRead(0x10000 + serial * 0x1000, 16, Kind::DispatchElement);
+        recorder.Submit();
+        recorder.Sync();
+        Require(recorder.Submissions() == serial, "causal lifecycle submission serial did not advance");
+    }
+
+    const auto events = trace->Collect().causal;
+    std::vector<const AgcDriver::TraceThread::CausalEvent*> submissions;
+    for (const auto& event : events) {
+        if (std::string_view(event.name) == "gpu.fence_submitted") submissions.push_back(&event);
+    }
+    Require(submissions.size() == 2, "two actual submissions did not produce two fence generations");
+    Require(submissions[0]->object == submissions[1]->object && submissions[0]->generation != submissions[1]->generation,
+            "reused fence handle did not receive distinct submission generations");
+    for (const auto* fence : submissions) {
+        const auto producer = std::find_if(events.begin(), events.end(), [&](const auto& event) {
+            return std::string_view(event.name) == "vulkan.queue_submit" && event.operation == fence->operation &&
+                   event.object == fence->related && event.generation == fence->generation && event.batch == fence->batch && event.outcome == VK_SUCCESS &&
+                   (event.length != std::chrono::steady_clock::duration::zero() || event.cpuValid);
+        });
+        Require(producer != events.end(), "fence submission has no successful matching pure queue-submit event");
+        const auto reset = std::find_if(events.begin(), events.end(), [&](const auto& event) {
+            return std::string_view(event.name) == "vulkan.fence_reset" && event.object == fence->object &&
+                   event.generation == fence->generation && event.outcome == VK_SUCCESS &&
+                   (event.length != std::chrono::steady_clock::duration::zero() || event.cpuValid);
+        });
+        Require(reset != events.end(), "submitted fence generation has no successful reset/reuse record");
+        const auto observedFence = std::find_if(events.begin(), events.end(), [&](const auto& event) {
+            return std::string_view(event.name) == "gpu.fence_observed_complete" && event.object == fence->object &&
+                   event.generation == fence->generation && event.related == fence->related && event.batch == fence->batch;
+        });
+        const auto observedTimeline = std::find_if(events.begin(), events.end(), [&](const auto& event) {
+            return std::string_view(event.name) == "gpu.timeline_observed_complete" && event.related == fence->related &&
+                   event.batch == fence->batch && event.generation == fence->generation;
+        });
+        Require(observedFence != events.end() || observedTimeline != events.end(),
+                "submitted fence generation has no successful host-observed fence/timeline completion");
+    }
+    for (const auto& wait : events) {
+        if ((std::string_view(wait.name) != "vulkan.fence_wait" && std::string_view(wait.name) != "vulkan.timeline_wait") ||
+            wait.outcome == std::numeric_limits<std::int32_t>::min() || wait.outcome == VK_SUCCESS) continue;
+        const auto completionName = std::string_view(wait.name) == "vulkan.fence_wait" ? "gpu.fence_observed_complete" : "gpu.timeline_observed_complete";
+        Require(std::none_of(events.begin(), events.end(), [&](const auto& event) {
+            return std::string_view(event.name) == completionName && event.operation == wait.operation;
+        }), "failed/timed-out wait produced a completion observation");
+    }
+    std::cout << "Causal fence generation and completion linkage passed\n";
+}
+
 int main(int argc, char** argv) {
     try {
+        const bool causalLifecycle = argc == 2 && std::string_view(argv[1]) == "--causal-vulkan-lifecycle-only";
+        if (causalLifecycle) {
+#ifdef _WIN32
+            Require(_putenv_s("APS5_TRACE_FRAMES", "0:100") == 0 && _putenv_s("APS5_TRACE_CAUSAL", "1") == 0 && _putenv_s("APS5_TRACE_EVENTS", "4096") == 0, "cannot configure causal trace test");
+#else
+            Require(setenv("APS5_TRACE_FRAMES", "0:100", 1) == 0 && setenv("APS5_TRACE_CAUSAL", "1", 1) == 0 && setenv("APS5_TRACE_EVENTS", "4096", 1) == 0, "cannot configure causal trace test");
+#endif
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--compute-pipeline-teardown-only") {
             auto fixture = AgcDriver::ComputePipelineFixture();
             ShaderRecompiler::RecompileResult shader;
@@ -10178,6 +10244,11 @@ int main(int argc, char** argv) {
             return 77;
         }
         Device& device = *created;
+        if (causalLifecycle) {
+            std::unique_lock gpu(GpuMutex());
+            causalFenceLifecycleTests(device);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--host-import-lifetime-only") return RunHostImportLifetimeTests(device.GetContext());
         if (argc == 2 && std::string_view(argv[1]) == "--host-import-mutation-race-only") return RunHostImportMutationRaceTests(device.GetContext());
         if (argc == 2 && (std::string_view(argv[1]) == "--gpu-timing-complete-only" || std::string_view(argv[1]) == "--gpu-timing-incomplete-only")) {

@@ -295,6 +295,7 @@ struct VulkanDevice::State {
     VkExtent2D extent{};
     std::vector<VkImage> images;
     VkFence acquireFence = VK_NULL_HANDLE;
+    std::uint64_t acquireGeneration = 0;
     VkPresentModeKHR presentMode = VK_PRESENT_MODE_FIFO_KHR;
     struct RetiredSwapchain {
         VkSwapchainKHR swapchain = VK_NULL_HANDLE;
@@ -469,6 +470,7 @@ struct VulkanDevice::State {
     // from a queue worker; it is never taken before GuestMemory::GpuMutex on a thread.
     struct PresentSlot {
         VkFence fence = VK_NULL_HANDLE;
+        std::uint64_t fenceGeneration = 0;
         VkCommandBuffer commands = VK_NULL_HANDLE;
         std::shared_ptr<void> kept;
         std::unique_ptr<Graphics::Buffer> dumpBuffer;
@@ -729,16 +731,32 @@ struct VulkanDevice::State {
 
     // Blocks on the fence, or polls it every 50 us with APS5_PRESENT_POLL_FENCE=1 (the difference
     // in the wait is the presenter's wake-up latency).
-    void WaitPresentFence(VkFence fence) {
+    void WaitPresentFence(VkFence fence, std::uint64_t generation, std::uint64_t batch) {
         static const bool poll = std::getenv("APS5_PRESENT_POLL_FENCE") != nullptr;
         if (!poll) {
-            check(DeviceFunction<PFN_vkWaitForFences>("vkWaitForFences")(device, 1, &fence, VK_TRUE, std::numeric_limits<std::uint64_t>::max()), "vkWaitForFences present");
+            const bool causal = PerformanceTrace::CausalThread() != nullptr;
+            const auto operation = causal ? PerformanceTrace::NextCausalOperation() : 0;
+            if (causal) PerformanceTrace::RecordCausal("vulkan.fence_wait", reinterpret_cast<std::uintptr_t>(fence), generation, reinterpret_cast<std::uintptr_t>(queue), batch, "vkWaitForFences present", operation);
+            const auto begin = causal ? SlowVulkanCallTiming::Begin() : SlowVulkanCallTiming::Sample{};
+            const auto outcome = DeviceFunction<PFN_vkWaitForFences>("vkWaitForFences")(device, 1, &fence, VK_TRUE, std::numeric_limits<std::uint64_t>::max());
+            if (causal) {
+                const auto end = SlowVulkanCallTiming::End();
+                RecordCausalVulkanSpan("vulkan.fence_wait", begin, end, reinterpret_cast<std::uintptr_t>(fence), generation, reinterpret_cast<std::uintptr_t>(queue), batch, "vkWaitForFences present", operation, static_cast<int>(outcome));
+                if (outcome == VK_SUCCESS) PerformanceTrace::RecordCausal("gpu.fence_observed_complete", reinterpret_cast<std::uintptr_t>(fence), generation, reinterpret_cast<std::uintptr_t>(queue), batch, "vkWaitForFences present", operation);
+            }
+            check(outcome, "vkWaitForFences present");
             return;
         }
         const auto status = DeviceFunction<PFN_vkGetFenceStatus>("vkGetFenceStatus");
         for (;;) {
             const auto result = status(device, fence);
-            if (result == VK_SUCCESS) return;
+            if (result == VK_SUCCESS) {
+                if (PerformanceTrace::CausalThread() != nullptr) {
+                    const auto operation = PerformanceTrace::NextCausalOperation();
+                    PerformanceTrace::RecordCausal("gpu.fence_observed_complete", reinterpret_cast<std::uintptr_t>(fence), generation, reinterpret_cast<std::uintptr_t>(queue), batch, "vkGetFenceStatus present", operation);
+                }
+                return;
+            }
             if (result != VK_NOT_READY) check(result, "vkGetFenceStatus present");
             const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(50);
             while (std::chrono::steady_clock::now() < until) std::this_thread::yield();
@@ -3291,12 +3309,29 @@ bool VulkanDevice::AcquireImage() {
     require(!state->imageAcquired, "the previously acquired image was not presented");
     auto wait = state->DeviceFunction<PFN_vkWaitForFences>("vkWaitForFences");
     auto reset = state->DeviceFunction<PFN_vkResetFences>("vkResetFences");
-    check(reset(state->device, 1, &state->acquireFence), "vkResetFences");
+    const auto acquisitionGeneration = ++state->acquireGeneration;
+    const bool causal = PerformanceTrace::CausalThread() != nullptr;
+    const auto resetOperation = causal ? PerformanceTrace::NextCausalOperation() : 0;
+    if (causal) PerformanceTrace::RecordCausal("vulkan.fence_reset", reinterpret_cast<std::uintptr_t>(state->acquireFence), acquisitionGeneration, 0, 0, "vkResetFences acquire", resetOperation);
+    const auto resetBegin = causal ? SlowVulkanCallTiming::Begin() : SlowVulkanCallTiming::Sample{};
+    const auto resetResult = reset(state->device, 1, &state->acquireFence);
+    if (causal) {
+        const auto resetEnd = SlowVulkanCallTiming::End();
+        RecordCausalVulkanSpan("vulkan.fence_reset", resetBegin, resetEnd, reinterpret_cast<std::uintptr_t>(state->acquireFence), acquisitionGeneration, 0, 0, "vkResetFences acquire", resetOperation, static_cast<int>(resetResult));
+    }
+    check(resetResult, "vkResetFences");
     APS5_LOG_CHARS_OUT_DEBUG("acquire fence reset");
     std::uint32_t index = 0;
     timing.Mark("fence_reset");
     // An out-of-date swapchain (the window changed) drops this frame; the next Resize recreates it.
+    const auto acquireOperation = causal ? PerformanceTrace::NextCausalOperation() : 0;
+    if (causal) PerformanceTrace::RecordCausal("vulkan.acquire_image", reinterpret_cast<std::uintptr_t>(state->swapchain), acquisitionGeneration, reinterpret_cast<std::uintptr_t>(state->acquireFence), 0, "vkAcquireNextImageKHR", acquireOperation);
+    const auto acquireBegin = causal ? SlowVulkanCallTiming::Begin() : SlowVulkanCallTiming::Sample{};
     const auto acquired = state->DeviceFunction<PFN_vkAcquireNextImageKHR>("vkAcquireNextImageKHR")(state->device, state->swapchain, 0, VK_NULL_HANDLE, state->acquireFence, &index);
+    if (causal) {
+        const auto acquireEnd = SlowVulkanCallTiming::End();
+        RecordCausalVulkanSpan("vulkan.acquire_image", acquireBegin, acquireEnd, reinterpret_cast<std::uintptr_t>(state->swapchain), acquisitionGeneration, reinterpret_cast<std::uintptr_t>(state->acquireFence), 0, "vkAcquireNextImageKHR", acquireOperation, static_cast<int>(acquired));
+    }
     if (acquired == VK_ERROR_OUT_OF_DATE_KHR) {
         state->extent = {0, 0};
         return false;
@@ -3308,7 +3343,16 @@ bool VulkanDevice::AcquireImage() {
     if (acquired != VK_SUBOPTIMAL_KHR) check(acquired, "vkAcquireNextImageKHR");
     timing.Mark("acquire_image");
     APS5_LOG_OUT_DEBUG("vkAcquireNextImageKHR index=%u imageCount=%zu", index, state->images.size());
-    check(wait(state->device, 1, &state->acquireFence, VK_TRUE, std::numeric_limits<std::uint64_t>::max()), "vkWaitForFences acquire");
+    const auto acquireWaitOperation = causal ? PerformanceTrace::NextCausalOperation() : 0;
+    if (causal) PerformanceTrace::RecordCausal("vulkan.fence_wait", reinterpret_cast<std::uintptr_t>(state->acquireFence), acquisitionGeneration, 0, 0, "vkWaitForFences acquire", acquireWaitOperation);
+    const auto acquireWaitBegin = causal ? SlowVulkanCallTiming::Begin() : SlowVulkanCallTiming::Sample{};
+    const auto acquireWaitResult = wait(state->device, 1, &state->acquireFence, VK_TRUE, std::numeric_limits<std::uint64_t>::max());
+    if (causal) {
+        const auto acquireWaitEnd = SlowVulkanCallTiming::End();
+        RecordCausalVulkanSpan("vulkan.fence_wait", acquireWaitBegin, acquireWaitEnd, reinterpret_cast<std::uintptr_t>(state->acquireFence), acquisitionGeneration, 0, 0, "vkWaitForFences acquire", acquireWaitOperation, static_cast<int>(acquireWaitResult));
+        if (acquireWaitResult == VK_SUCCESS) PerformanceTrace::RecordCausal("gpu.fence_observed_complete", reinterpret_cast<std::uintptr_t>(state->acquireFence), acquisitionGeneration, 0, 0, "vkWaitForFences acquire", acquireWaitOperation);
+    }
+    check(acquireWaitResult, "vkWaitForFences acquire");
     timing.Mark("acquire_fence_wait");
     APS5_LOG_OUT_DEBUG("Acquire fence complete index=%u", index);
     require(index < state->images.size() && index < state->rendered.size(), "acquired image index is out of range");
@@ -3511,10 +3555,32 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
     submit.pSignalSemaphores = &rendered;
     timing.Mark("command_record_scale");
     // The slot's fence signaled (retired above) or was never used: the reset cannot block.
-    check(state->DeviceFunction<PFN_vkResetFences>("vkResetFences")(state->device, 1, &slot.fence), "vkResetFences present");
+    const auto fenceGeneration = ++slot.fenceGeneration;
+    const bool causalSubmit = PerformanceTrace::CausalThread() != nullptr;
+    const auto resetOperation = causalSubmit ? PerformanceTrace::NextCausalOperation() : 0;
+    if (causalSubmit) PerformanceTrace::RecordCausal("vulkan.fence_reset", reinterpret_cast<std::uintptr_t>(slot.fence), fenceGeneration, reinterpret_cast<std::uintptr_t>(state->queue), batchesAtBlit, "vkResetFences present", resetOperation);
+    const auto resetBegin = causalSubmit ? SlowVulkanCallTiming::Begin() : SlowVulkanCallTiming::Sample{};
+    const auto resetResult = state->DeviceFunction<PFN_vkResetFences>("vkResetFences")(state->device, 1, &slot.fence);
+    if (causalSubmit) {
+        const auto resetEnd = SlowVulkanCallTiming::End();
+        RecordCausalVulkanSpan("vulkan.fence_reset", resetBegin, resetEnd, reinterpret_cast<std::uintptr_t>(slot.fence), fenceGeneration, reinterpret_cast<std::uintptr_t>(state->queue), batchesAtBlit, "vkResetFences present", resetOperation, static_cast<int>(resetResult));
+    }
+    check(resetResult, "vkResetFences present");
     const auto submitResult = Graphics::OnQueue(state->context.queueLane, [] { return GuestMemory::GpuMutex().DepthOnThisThread(); },
         [] { GuestMemory::GpuMutex().unlock(); }, [] { GuestMemory::GpuMutex().lock(); },
-        [&] { return state->DeviceFunction<PFN_vkQueueSubmit>("vkQueueSubmit")(state->queue, 1, &submit, slot.fence); });
+        [&] {
+            const bool causal = PerformanceTrace::CausalThread() != nullptr;
+            const auto operation = causal ? PerformanceTrace::NextCausalOperation() : 0;
+            if (causal) PerformanceTrace::RecordCausal("vulkan.queue_submit", reinterpret_cast<std::uintptr_t>(state->queue), fenceGeneration, 0, batchesAtBlit, "vkQueueSubmit present blit", operation);
+            const auto begin = causal ? SlowVulkanCallTiming::Begin() : SlowVulkanCallTiming::Sample{};
+            const auto result = state->DeviceFunction<PFN_vkQueueSubmit>("vkQueueSubmit")(state->queue, 1, &submit, slot.fence);
+            if (causal) {
+                const auto end = SlowVulkanCallTiming::End();
+                RecordCausalVulkanSpan("vulkan.queue_submit", begin, end, reinterpret_cast<std::uintptr_t>(state->queue), fenceGeneration, 0, batchesAtBlit, "vkQueueSubmit present blit", operation, static_cast<int>(result));
+                if (result == VK_SUCCESS) PerformanceTrace::RecordCausal("gpu.fence_submitted", reinterpret_cast<std::uintptr_t>(slot.fence), fenceGeneration, reinterpret_cast<std::uintptr_t>(state->queue), batchesAtBlit, "vkQueueSubmit present blit", operation);
+            }
+            return result;
+        });
     check(submitResult, "vkQueueSubmit clear");
     const auto submittedAt = std::chrono::steady_clock::now();
     timing.Mark("queue_submit");
@@ -3607,10 +3673,14 @@ double VulkanDevice::RetirePresents(std::size_t keepInFlight) {
             const auto result = status(state->device, slot.fence);
             if (result == VK_NOT_READY) break;
             check(result, "vkGetFenceStatus present");
+            if (PerformanceTrace::CausalThread() != nullptr) {
+                const auto operation = PerformanceTrace::NextCausalOperation();
+                PerformanceTrace::RecordCausal("gpu.fence_observed_complete", reinterpret_cast<std::uintptr_t>(slot.fence), slot.fenceGeneration, reinterpret_cast<std::uintptr_t>(state->queue), slot.recorderSerial, "vkGetFenceStatus present", operation);
+            }
             timing.Mark("poll");
         } else {
             const auto start = std::chrono::steady_clock::now();
-            state->WaitPresentFence(slot.fence);
+            state->WaitPresentFence(slot.fence, slot.fenceGeneration, slot.recorderSerial);
             waitedMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
             timing.Mark("wait");
         }
@@ -3642,7 +3712,19 @@ void VulkanDevice::QueuePresent() {
     const auto submitPresent = [&] {
         return Graphics::OnQueue(state->context.queueLane, [] { return GuestMemory::GpuMutex().DepthOnThisThread(); },
             [] { GuestMemory::GpuMutex().unlock(); }, [] { GuestMemory::GpuMutex().lock(); },
-            [&] { return presentFunction(state->queue, &present); });
+            [&] {
+                const bool causal = PerformanceTrace::CausalThread() != nullptr;
+                const auto operation = causal ? PerformanceTrace::NextCausalOperation() : 0;
+                const auto serial = state->lastPresentSerial;
+                if (causal) PerformanceTrace::RecordCausal("vulkan.queue_present", reinterpret_cast<std::uintptr_t>(state->queue), 0, state->acquireGeneration, serial, "vkQueuePresentKHR", operation);
+                const auto begin = causal ? SlowVulkanCallTiming::Begin() : SlowVulkanCallTiming::Sample{};
+                const auto result = presentFunction(state->queue, &present);
+                if (causal) {
+                    const auto end = SlowVulkanCallTiming::End();
+                    RecordCausalVulkanSpan("vulkan.queue_present", begin, end, reinterpret_cast<std::uintptr_t>(state->queue), 0, state->acquireGeneration, serial, "vkQueuePresentKHR", operation, static_cast<int>(result));
+                }
+                return result;
+            });
     };
     VkResult presented;
     if (SlowVulkanCallTiming::Enabled()) {

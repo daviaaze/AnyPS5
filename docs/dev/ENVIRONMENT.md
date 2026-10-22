@@ -395,6 +395,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | `APS5_TRACE_BENCH` | string | `core/libs/prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp` |  | `1` with `APS5_TRACE_SUMMARY_EVERY` also rewrites `aps5-bench-<commit>-<pid>.json.gz` with every interval's frame times; any other value fails the first present |
 | `APS5_TRACE_BIGBUF` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/GuestBufferMemory.cpp` |  | lists every copied guest region of at least 1 MiB |
 | `APS5_TRACE_CAPSYNC` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Memory/WriteEvidence.cpp` |  | prints every unlocked hook wait |
+| `APS5_TRACE_CAUSAL` | string | `core/libs/prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp` |  | `1` records bounded GPU-mutex, resource and Vulkan API causal events during a frame or seconds capture |
 | `APS5_TRACE_CONTEXT_STATE` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Pm4.cpp` |  | logs context-state operations and the context registers written |
 | `APS5_TRACE_COPY_HLE` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Memory/BufferCopy.cpp` |  | traces the CPU copy HLE's refusals |
 | `APS5_TRACE_DCC_KEYS` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/DisplayBuffer.cpp` |  | traces stores of uncompressed DCC keys |
