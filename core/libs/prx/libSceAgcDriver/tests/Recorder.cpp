@@ -1,3 +1,5 @@
+#include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/tools/ComputePipelineFixture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PipelineLinkOptimization.hpp"
 #include "Triangle_frag_spv.h"
 #include "Triangle_vert_spv.h"
@@ -10124,6 +10126,34 @@ void Run(Context context) {
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--compute-pipeline-teardown-only") {
+            auto fixture = AgcDriver::ComputePipelineFixture();
+            ShaderRecompiler::RecompileResult shader;
+            shader.spirv = std::move(fixture.spirv);
+            shader.specialization.reserve(fixture.specialization.size());
+            for (const auto& constant : fixture.specialization) shader.specialization.push_back({constant.id, constant.value});
+            if (shader.Identity().Empty()) throw std::runtime_error("compute pipeline fixture has no stable pipeline identity");
+            std::optional<AgcDriver::VulkanDevice> compileOnly;
+            try {
+                compileOnly.emplace(AgcDriver::VulkanDevice::CompileOnly{});
+            } catch (const std::exception& error) {
+                const std::string_view message(error.what());
+                const bool absent = (message.starts_with("Vulkan loader: ") && message != "Vulkan loader: vkGetInstanceProcAddr missing") || message == "Vulkan: no Vulkan 1.1 graphics and compute queue" || message == "vkCreateInstance: Vulkan result -9";
+                if (std::getenv("ANYPS5_REQUIRE_VULKAN") != nullptr || !absent) throw;
+                std::cout << "skipped, no usable Vulkan device: " << error.what() << '\n';
+                return 77;
+            }
+            const std::span<const AgcDriver::Graphics::GuestMemorySnapshot> snapshots;
+            auto warm = compileOnly->PrepareDispatch(shader, snapshots);
+            Require(warm != nullptr && compileOnly->ComputePipelinesCreated() == 1, "compute pipeline teardown fixture did not create exactly one pipeline");
+            auto cached = compileOnly->PrepareDispatch(shader, snapshots);
+            Require(cached != nullptr && compileOnly->ComputePipelinesCreated() == 1, "cached compute pipeline was not reused");
+            cached.reset();
+            warm.reset();
+            compileOnly.reset();
+            std::cout << "compile-only compute pipeline teardown passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--partial-watch-restoration-only") {
             if (!partialWatchRestorationTests()) return 77;
             std::cout << "partial private write-watch restoration tests passed\n";
