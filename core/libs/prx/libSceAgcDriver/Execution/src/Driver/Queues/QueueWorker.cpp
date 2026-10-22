@@ -272,6 +272,7 @@ void Driver::run(std::uint32_t id) noexcept {
                 if (!std::exchange(completionDeferred(), false)) {
                     markCompleted(submission.serial);
                     forgetUnfinishedWrites(workers.at(id), submission);
+                    recycleCommandStorageLocked(workers.at(id), submission.commands);
                 }
                 if (id == 0) queue0Executing = 0;
 

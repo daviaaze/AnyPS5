@@ -107,6 +107,43 @@ static void CheckInputCommands() {
     Pad::InputCommandFile disabled(std::filesystem::path{});
     Require(disabled.Buttons(0) == 0);
 }
+static void CheckInputCommandAcknowledgement() {
+    const auto path = std::filesystem::temp_directory_path()
+        / ("anyps5-pad-ack-" + std::to_string(
+            std::chrono::steady_clock::now().time_since_epoch().count()));
+    auto ackPath = path;
+    ackPath += ".ack";
+    struct Cleanup {
+        std::filesystem::path input;
+        std::filesystem::path ack;
+        ~Cleanup() {
+            std::error_code error;
+            std::filesystem::remove(input, error);
+            std::filesystem::remove(ack, error);
+        }
+    } cleanup{path, ackPath};
+    const auto readAck = [&]() {
+        std::ifstream file(ackPath);
+        std::string line;
+        std::getline(file, line);
+        return line;
+    };
+    std::ofstream(path) << "0 0 1\n";
+    Pad::InputCommandFile commands(path, ackPath);
+    std::ofstream(path) << "1 16384 100\n";
+    Require(commands.Poll(1000).buttons == 0x4000);
+    Require(readAck() == "1 accepted");
+    std::ofstream(path) << "2 8192 100\n";
+    Require(commands.Poll(100999).buttons == 0x4000);
+    const Pad::InputCommandFile::Input none;
+    Require(commands.Poll(101000) == none);
+    Require(readAck() == "1 released");
+    Require(commands.Poll(201000).buttons == 0x2000);
+    Require(readAck() == "2 accepted");
+    Require(commands.Poll(300999).buttons == 0x2000);
+    Require(commands.Poll(301000) == none);
+    Require(readAck() == "2 released");
+}
 
 static float SettleOrientationW() {
     float w = 1.0f;
@@ -325,7 +362,14 @@ static void CheckAccessibilityControllerState(int handle) {
     Require(state == 0);
 }
 
-static void CheckInjectedState(const std::filesystem::path& path) {
+static void CheckInjectedState(const std::filesystem::path& path,
+                               const std::filesystem::path& ackPath) {
+    const auto readAck = [&]() {
+        std::ifstream file(ackPath);
+        std::string line;
+        std::getline(file, line);
+        return line;
+    };
     PadInputState physical;
     physical.buttons = 0x2000;
     physical.analogButtonsR2 = 73;
@@ -343,10 +387,12 @@ static void CheckInjectedState(const std::filesystem::path& path) {
     Require(pressed.buttons == (0x2000 | 0x4000 | 0x100));
     Require(pressed.analog_buttons_l2 == 255 && pressed.analog_buttons_r2 == 73);
     Require(pressed.left_stick_x == 42 && pressed.timestamp > before.timestamp);
+    Require(readAck() == "1 accepted");
     std::this_thread::sleep_for(std::chrono::milliseconds(310));
     const auto released = Pad::ReadState();
     Require(released.buttons == 0x2000 && released.analog_buttons_l2 == 0);
     Require(released.timestamp > pressed.timestamp);
+    Require(readAck() == "1 released");
     physical.sticks[3] = 17;
     PadPublishInput_nid_postfix(physical);
     const auto still = Pad::ReadState();
@@ -361,10 +407,12 @@ static void CheckInjectedState(const std::filesystem::path& path) {
     Require(moved.left_stick_x == 200 && moved.left_stick_y == 0);
     Require(moved.right_stick_x == 128 && moved.right_stick_y == 128);
     Require(moved.buttons == 0x2000 && moved.timestamp > still.timestamp);
+    Require(readAck() == "2 accepted");
     std::this_thread::sleep_for(std::chrono::milliseconds(310));
     const auto centred = Pad::ReadState();
     Require(centred.left_stick_x == 42 && centred.right_stick_y == 17);
     Require(centred.timestamp > moved.timestamp);
+    Require(readAck() == "2 released");
     for (const auto& [command, x] : {std::pair{"3 2097152 300\n", kTouchPadWidth / 4}, std::pair{"4 4194304 300\n", kTouchPadWidth * 3 / 4}}) {
         std::ofstream(path) << command;
         PadData touched{};
@@ -385,23 +433,32 @@ static void CheckInjectedState(const std::filesystem::path& path) {
 
 int main() {
     CheckInputCommands();
+    CheckInputCommandAcknowledgement();
     std::uint32_t accessibilityState = 7;
     Require(scePadGetAccessibilityControllerState(PAD_HANDLE, nullptr) == PAD_ERROR_NOT_INITIALIZED);
     Require(scePadGetAccessibilityControllerState(PAD_HANDLE, &accessibilityState) == PAD_ERROR_NOT_INITIALIZED);
     Require(accessibilityState == 7);
     Require(scePadUnknown_n3kSX62fgNo() == static_cast<int>(0x80920005));
     const auto path = std::filesystem::temp_directory_path() / ("anyps5-pad-state-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
-    struct Cleanup {
-        std::filesystem::path path;
-        ~Cleanup() { std::error_code error; std::filesystem::remove(path, error); }
-    };
     auto commandPath = path;
     commandPath += std::filesystem::path(u8"-žluťoučký-漢字");
-    Cleanup cleanup{commandPath};
+    auto ackPath = path;
+    ackPath += ".ack";
+    struct Cleanup {
+        std::filesystem::path input;
+        std::filesystem::path ack;
+        ~Cleanup() {
+            std::error_code error;
+            std::filesystem::remove(input, error);
+            std::filesystem::remove(ack, error);
+        }
+    } cleanup{commandPath, ackPath};
 #ifdef _WIN32
     Require(_wputenv_s(L"APS5_PAD_INPUT_FILE", commandPath.c_str()) == 0);
+    Require(_wputenv_s(L"APS5_PAD_INPUT_ACK_FILE", ackPath.c_str()) == 0);
 #else
     Require(setenv("APS5_PAD_INPUT_FILE", commandPath.string().c_str(), 1) == 0);
+    Require(setenv("APS5_PAD_INPUT_ACK_FILE", ackPath.string().c_str(), 1) == 0);
 #endif
     {
         std::uint32_t sequence = 0;
@@ -461,7 +518,7 @@ int main() {
     CheckReadStateHandle(handle);
     CheckRemoteController(handle);
     CheckAccessibilityControllerState(handle);
-    CheckInjectedState(commandPath);
+    CheckInjectedState(commandPath, ackPath);
     PadLightBarParam lightBar{255, 128, 64};
     Require(scePadSetLightBar(handle, &lightBar) == PAD_OK);
     Require(scePadSetLightBar(handle, nullptr) == PAD_ERROR_INVALID_ARG);

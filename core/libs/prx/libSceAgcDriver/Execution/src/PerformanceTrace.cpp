@@ -19,6 +19,9 @@
 #include <sys/utsname.h>
 #include <unistd.h>
 #endif
+#if defined(__linux__)
+#include <sys/syscall.h>
+#endif
 #if defined(_MSC_VER) && !defined(__clang__)
 #include <intrin.h>
 #elif defined(__x86_64__) || defined(__i386__)
@@ -34,7 +37,6 @@ namespace AgcDriver {
 namespace {
 
 using Clock = std::chrono::steady_clock;
-constexpr std::size_t GpuRangeCapacity = TraceThread::DefaultCapacity;
 
 struct Session {
     std::mutex mutex;
@@ -90,6 +92,17 @@ std::uint64_t processId() {
     return GetCurrentProcessId();
 #else
     return static_cast<std::uint64_t>(::getpid());
+#endif
+}
+
+std::uint64_t nativeThreadId() {
+#if defined(_WIN32)
+    return static_cast<std::uint64_t>(GetCurrentThreadId());
+#elif defined(__linux__) && defined(SYS_gettid)
+    const auto tid = ::syscall(SYS_gettid);
+    return tid > 0 ? static_cast<std::uint64_t>(tid) : 0;
+#else
+    return 0;
 #endif
 }
 
@@ -217,7 +230,7 @@ void PerformanceTrace::BindThread(const char* name, std::size_t capacity) {
     if (!Configured() || local != nullptr) return;
     const bool windowed = std::getenv("APS5_TRACE_FRAMES") != nullptr || std::getenv("APS5_TRACE_SECONDS") != nullptr;
     if (windowed && capacity == TraceThread::DefaultCapacity) capacity = TraceThread::ParseCapacity(std::getenv("APS5_TRACE_EVENTS"));
-    auto bound = std::make_unique<TraceThread>(name, presentCount, windowed ? capacity : 0, buffering);
+    auto bound = std::make_unique<TraceThread>(name, presentCount, windowed ? capacity : 0, buffering, nativeThreadId());
     auto& state = session();
     std::lock_guard lock(state.mutex);
     local = bound.get();
@@ -318,7 +331,7 @@ void PerformanceTrace::Present(std::uint32_t width, std::uint32_t height, const 
             std::lock_guard gpu(gpuMutex);
             gpuRanges.clear();
             gpuLost = 0;
-            gpuRanges.reserve(GpuRangeCapacity);
+            gpuRanges.reserve(TraceThread::ParseCapacity(std::getenv("APS5_TRACE_EVENTS")));
         }
         state.presents.push_back(now);
         presentCount.fetch_add(1, std::memory_order_relaxed);

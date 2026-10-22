@@ -2579,7 +2579,8 @@ void Recorder::readSamples(Batch& batch) {
 
 void Recorder::readGpuTiming(Batch& batch) {
     if (batch.queries == VK_NULL_HANDLE || batch.timedKeys.empty()) return;
-    std::vector<std::uint64_t> stamps(batch.timedKeys.size() * 2);
+    auto& stamps = gpuTimingStamps;
+    stamps.resize(batch.timedKeys.size() * 2);
     const auto result = context.Function<PFN_vkGetQueryPoolResults>("vkGetQueryPoolResults")(context.device, batch.queries, 0, static_cast<std::uint32_t>(stamps.size()), stamps.size() * sizeof(std::uint64_t), stamps.data(), sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT);
     if (result != VK_SUCCESS) return;
     const auto period = context.limits.timestampPeriod;
@@ -2594,7 +2595,8 @@ void Recorder::readGpuTiming(Batch& batch) {
     static auto lastReport = std::chrono::steady_clock::now();
     // The union of the timed ranges (class ranges nest program ranges: a copy's transfer inside
     // its class range) against the batch span gives what no range covers.
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> intervals;
+    auto& intervals = gpuTimingIntervals;
+    intervals.clear();
     intervals.reserve(batch.timedKeys.size());
     std::unique_lock lock(timingMutex);
     for (std::size_t i = 0; i < batch.timedKeys.size(); ++i) {

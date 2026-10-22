@@ -11,6 +11,9 @@
 #else
 #include <sys/mman.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <fcntl.h>
+#endif
 #endif
 #ifdef __GLIBC__
 #include <malloc.h>
@@ -40,6 +43,20 @@ constexpr wchar_t ResidentRemapMode[] = L"--resident-direct-remap";
 void Require(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
 }
+
+#if defined(__linux__)
+bool UffdWriteProtected(std::uintptr_t address) {
+    constexpr auto UffdWpBit = std::uint64_t{1} << 57;
+    const int pagemap = open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
+    Require(pagemap >= 0, "cannot open process pagemap");
+    std::uint64_t entry = 0;
+    const auto offset = static_cast<off_t>((address / 4096) * sizeof(entry));
+    const auto bytesRead = pread(pagemap, &entry, sizeof(entry), offset);
+    const auto closeResult = close(pagemap);
+    Require(bytesRead == static_cast<ssize_t>(sizeof(entry)) && closeResult == 0, "cannot read process pagemap entry");
+    return (entry & UffdWpBit) != 0;
+}
+#endif
 
 #ifdef _WIN32
 bool CheckMetadataCommit() {
@@ -1352,6 +1369,44 @@ void CheckUnwatchedImport() {
 #endif
 }
 
+#if defined(__linux__)
+void CheckHostImportUffdUnwatch() {
+    constexpr std::size_t PageBytes = 4096;
+    void* memory = AllocateWatched(3 * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    auto* bytes = static_cast<volatile std::uint8_t*>(memory);
+    std::memset(memory, 0x11, 3 * Block);
+    const auto synced = CollectWritesUncached(base, 3 * Block);
+    Require(synced != 0, "the host-import UFFD range was not initially collected");
+
+    const auto imported = base + Block / 2 + 17;
+    constexpr std::size_t importBytes = 3 * PageBytes - 34;
+    const auto firstPage = imported & ~(std::uint64_t{PageBytes} - 1);
+    const auto end = (imported + importBytes + PageBytes - 1) & ~(std::uint64_t{PageBytes} - 1);
+    const auto released = firstPage + PageBytes;
+    const auto writeAddress = released + 17;
+    Require(UffdWriteProtected(released), "the host-import page was not UFFD-WP armed");
+    bytes[writeAddress - base] = 0x22;
+    const auto collected = CollectWritesUncached(writeAddress, 1);
+    Require(collected > synced && !UnchangedSince(writeAddress, 1, synced), "a write before host import was not collected");
+    Require(UffdWriteProtected(released), "collecting the pre-import write did not re-arm its page");
+
+    Require(ImportWatched(imported, importBytes, [] { return true; }, false), "the host import failed");
+    Require(!Watched(released, PageBytes), "the host-import page remained watched");
+    Require(!UffdWriteProtected(released), "the host-import page remained UFFD-WP protected");
+    Require(UffdWriteProtected(firstPage) && UffdWriteProtected(end - PageBytes), "partial-page overlap lost its neighboring UFFD-WP protection");
+    Require(UffdWriteProtected(base + 3 * Block - PageBytes), "unrelated UFFD-WP protection was removed");
+
+    GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(reinterpret_cast<void*>(released), PageBytes);
+    Require(Watched(released, PageBytes), "the host-import page could not be watched again");
+    Require(CollectWritesUncached(released, PageBytes) != 0 && UffdWriteProtected(released), "the re-registered host-import page was not armed");
+    Require(ImportWatched(released, PageBytes, [] { return true; }), "the stays-watched import failed");
+    Require(Watched(released, PageBytes) && UffdWriteProtected(released), "a stays-watched import released UFFD-WP");
+    Unwatch(base, 3 * Block);
+    Require(munmap(memory, 3 * Block) == 0, "cannot unmap the host-import UFFD range");
+}
+#endif
+
 class PartlyCommitted {
 public:
     static constexpr std::size_t Bytes = 4 * Block;
@@ -1565,6 +1620,9 @@ int main() {
         CheckStoreAcrossImports();
         CheckImportWindowFootprint();
         CheckUnwatchedImport();
+#if defined(__linux__)
+        CheckHostImportUffdUnwatch();
+#endif
         CheckCommittedRanges();
         CheckAdoptLatestEpoch();
     } catch (const std::exception& error) {
