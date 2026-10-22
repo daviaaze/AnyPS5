@@ -74,6 +74,8 @@ A window of N complete frame intervals emits N+1 `present` boundary witnesses wi
 
 The digest uses the actual timestamp of the closing witness whose ID equals `window.first_present + presents`, rather than the rounded summary duration. Rounding that duration upward must not create a tiny extra frame interval. Historical captures without that witness retain the summary endpoint for digest reporting; strict presentation-window checks still require recorded endpoint coverage.
 
+The event JSON has a top-level `clock` object. On Linux using libstdc++ or libc++, `origin_ns` is the integer nanosecond estimate of the exact `steady_clock` origin in `CLOCK_MONOTONIC`: export brackets a steady-clock sample around `clock_gettime`, maps the origin through that pair, and records the half-bracket width as `uncertainty_ns`. Other platforms export the steady-clock epoch and label it `steady_clock`. Chrome `ts` remains microseconds with three decimal places, so joins are precise only at that exported event-timestamp resolution plus the stated clock calibration uncertainty. Each `thread_name` event includes `args.native_tid` when exposed by the platform (Linux TID or Windows thread ID); synthetic Chrome trace `tid` values remain unchanged.
+
 ## Shader registers
 
 `APS5_TRACE_SHADER_REGS=all` prints register snapshots for every shader. Set it to a shader code address in hexadecimal to print one shader's registers.

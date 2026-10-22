@@ -25,6 +25,9 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#if defined(__linux__)
+#include <time.h>
+#endif
 
 namespace AgcDriver {
 class TraceThread;
@@ -177,12 +180,13 @@ public:
         std::uint64_t eventsLost = 0;
         std::optional<Clock::time_point> eventsFullAt;
         bool totalsFull = false;
+        std::uint64_t nativeTid = 0;
     };
 
     inline static const std::atomic<bool> AlwaysBuffering{true};
 
-    TraceThread(std::string name, const std::atomic<std::uint64_t>& presents, std::size_t capacity = DefaultCapacity, const std::atomic<bool>& buffering = AlwaysBuffering)
-        : name(std::move(name)), presents(presents), buffering(buffering), slices(std::make_unique<Slice[]>(capacity)), capacity(capacity) {}
+    TraceThread(std::string name, const std::atomic<std::uint64_t>& presents, std::size_t capacity = DefaultCapacity, const std::atomic<bool>& buffering = AlwaysBuffering, std::uint64_t nativeTid = 0)
+        : name(std::move(name)), nativeTid(nativeTid), presents(presents), buffering(buffering), slices(std::make_unique<Slice[]>(capacity)), capacity(capacity) {}
 
     TraceThread(const TraceThread&) = delete;
     TraceThread& operator=(const TraceThread&) = delete;
@@ -205,6 +209,7 @@ public:
 
     Snapshot Collect() const {
         Snapshot snapshot{name, {slices.get(), used.load(std::memory_order_acquire)}, {}, false};
+        snapshot.nativeTid = nativeTid;
         for (const auto& entry : entries) {
             const auto* scope = entry.scope.load(std::memory_order_acquire);
             if (scope == nullptr) continue;
@@ -257,6 +262,7 @@ private:
     }
 
     const std::string name;
+    const std::uint64_t nativeTid;
     const std::atomic<std::uint64_t>& presents;
     const std::atomic<bool>& buffering;
     const std::unique_ptr<Slice[]> slices;
@@ -472,7 +478,22 @@ public:
     }
 
     static std::string Events(std::uint64_t process, Clock::time_point origin, std::span<const TraceThread::Snapshot> threads, std::size_t presenter, std::span<const Clock::time_point> presents, std::uint64_t firstPresent) {
-        std::string output = "{\"traceEvents\":[\n";
+#if defined(__linux__) && (defined(__GLIBCXX__) || defined(_LIBCPP_VERSION))
+        // Calibrate steady_clock against CLOCK_MONOTONIC at export time; the
+        // bracket bounds the cross-clock sampling uncertainty.
+        const auto steadyBefore = Clock::now();
+        timespec monotonic{};
+        if (::clock_gettime(CLOCK_MONOTONIC, &monotonic) != 0) throw std::runtime_error("clock_gettime(CLOCK_MONOTONIC) failed");
+        const auto steadyAfter = Clock::now();
+        const auto steadyMidpoint = steadyBefore + (steadyAfter - steadyBefore) / 2;
+        const auto originNs = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::nanoseconds(monotonic.tv_sec * 1'000'000'000LL + monotonic.tv_nsec) - (steadyMidpoint - origin)).count();
+        const auto uncertaintyNs = std::chrono::duration_cast<std::chrono::nanoseconds>(steadyAfter - steadyBefore).count() / 2;
+        std::string output = "{\"clock\":{\"name\":\"steady_clock\",\"domain\":\"CLOCK_MONOTONIC\",\"origin_ns\":" + std::to_string(originNs) + ",\"uncertainty_ns\":" + std::to_string(uncertaintyNs);
+#else
+        const auto originNs = std::chrono::duration_cast<std::chrono::nanoseconds>(origin.time_since_epoch()).count();
+        std::string output = "{\"clock\":{\"name\":\"steady_clock\",\"domain\":\"steady_clock\",\"origin_ns\":" + std::to_string(originNs);
+#endif
+        output += "},\"traceEvents\":[\n";
         bool first = true;
         const auto event = [&](std::string_view name, const char* phase, Clock::time_point at, std::size_t tid) {
             if (!first) output += ",\n";
@@ -491,6 +512,7 @@ public:
             event("thread_name", "M", origin, tid);
             output += ",\"args\":{\"name\":";
             AppendString(output, thread.name);
+            if (thread.nativeTid != 0) output += ",\"native_tid\":" + std::to_string(thread.nativeTid);
             output += "}}";
             std::vector<TraceThread::Slice> slices(thread.slices.begin(), thread.slices.end());
             std::stable_sort(slices.begin(), slices.end(), [](const auto& a, const auto& b) { return a.begin != b.begin ? a.begin < b.begin : a.length > b.length; });
