@@ -119,7 +119,14 @@ def load_stacks(path):
 
 def digest(trace, summary=None, stacks=None, worst=5, top=10):
     window_ms = summary["window"]["ms"] if summary else None
-    frames = trace.frames(window_ms * 1000.0 if window_ms is not None else None)
+    end = window_ms * 1000.0 if window_ms is not None else None
+    if summary:
+        closing_id = summary.get("window", {}).get("first_present")
+        closing_count = summary.get("presents")
+        if closing_id is not None and closing_count is not None:
+            closing_present = closing_id + closing_count
+            end = next((ts for ts, present in trace.presents if present == closing_present), end)
+    frames = trace.frames(end)
     span_us = frames[-1][2] - frames[0][1] if frames else 0.0
     count = max(len(frames), 1)
     result = {"summary": summary, "frames": len(frames), "window_ms": span_us / 1000.0}
