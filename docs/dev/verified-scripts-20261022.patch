@@ -4911,10 +4911,10 @@ index 000000000..c28dc9018
 +    sys.exit(main())
 diff --git a/headless-input-step.py b/headless-input-step.py
 new file mode 100755
-index 000000000..8f9cd0960
+index 000000000..dbee3a9e0
 --- /dev/null
 +++ b/headless-input-step.py
-@@ -0,0 +1,207 @@
+@@ -0,0 +1,234 @@
 +#!/usr/bin/env python3
 +"""Send one explicitly visually confirmed headless button; ACKs never prove scene state."""
 +import argparse
@@ -4925,6 +4925,7 @@ index 000000000..8f9cd0960
 +import os
 +from pathlib import Path
 +import stat
++import signal
 +import subprocess
 +import sys
 +import time
@@ -4956,6 +4957,20 @@ index 000000000..8f9cd0960
 +    if fields[0] in ('Z', 'X'):
 +        raise RuntimeError('Compositor is no longer running')
 +    return {'pid': pid, 'exe': os.readlink(root / 'exe'), 'starttime_ticks': int(fields[19])}
++
++
++def request_screenshot(identity):
++    """Request only; the capture helper's copied log receipt proves an image exists."""
++    fd = os.pidfd_open(identity['pid'])
++    try:
++        if compositor_identity(identity['pid']) != identity:
++            raise RuntimeError('Compositor identity changed before screenshot request')
++        requested = time.monotonic_ns()
++        signal.pidfd_send_signal(fd, signal.SIGUSR2)
++        return {'status': 'signal_returned', 'requested_monotonic_ns': requested,
++                'returned_monotonic_ns': time.monotonic_ns(), 'identity': identity}
++    finally:
++        os.close(fd)
 +
 +
 +def validate_headless(args, previous_release):
@@ -5093,6 +5108,15 @@ index 000000000..8f9cd0960
 +                             'observed_monotonic_ns': time.monotonic_ns()}
 +        save()
 +        raise
++    if args.capture_after_release:
++        try:
++            result['screenshot_request'] = request_screenshot(frame['compositor_identity'])
++        except (OSError, RuntimeError) as error:
++            # Screenshot failure must not turn a proven released input into an unknown outcome.
++            result['screenshot_request'] = {
++                'status': 'failed', 'error': type(error).__name__, 'reason': str(error),
++                'observed_monotonic_ns': time.monotonic_ns()}
++        save()
 +    return result
 +
 +
@@ -5105,6 +5129,9 @@ index 000000000..8f9cd0960
 +    parser.add_argument('--frame', required=True)
 +    parser.add_argument('--button', choices=BUTTONS, required=True)
 +    parser.add_argument('--hold-ms', type=int, default=100)
++    parser.add_argument('--capture-after-release', action='store_true',
++                        help='Request an owned-compositor screenshot after ACK release; '
++                             'inspect a fresh copied receipt separately')
 +    parser.add_argument('--confirm-visual', action='store_true', required=True,
 +                        help='Confirm the exact fresh frame was visually inspected externally')
 +    args = parser.parse_args()
@@ -5117,7 +5144,7 @@ index 000000000..8f9cd0960
 +                          'reason': str(error), 'observed_monotonic_ns': time.monotonic_ns()}), file=sys.stderr)
 +        return 1
 +    print(json.dumps(result, sort_keys=True))
-+    return 0
++    return 1 if result.get('screenshot_request', {}).get('status') == 'failed' else 0
 +
 +
 +if __name__ == '__main__':
