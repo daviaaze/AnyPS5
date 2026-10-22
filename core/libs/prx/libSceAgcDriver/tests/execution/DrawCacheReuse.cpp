@@ -120,6 +120,55 @@ AgcDriver::DriverDetail::DrawEntryCounters SubmitConstantDraws(std::size_t draws
     return Submit(Draws(32.0f, TriangleVertexCode.data(), 0, ConstantPixelCode.data(), 2, words));
 }
 
+std::vector<std::uint32_t> DrawCycle(std::size_t distinct) {
+    auto commands = Draws(32.0f, VertexCode.data(), 1, PixelCode.data(), 1, {});
+    for (std::size_t i = 0; i < distinct; ++i) {
+        const auto scale = std::bit_cast<std::uint32_t>(2.0f + static_cast<float>(i) / 1024.0f);
+        Append(commands, 0x69, {0x10f, scale});
+        Append(commands, 0x69, {0x110, scale});
+        Append(commands, 0x2d, {3, 2});
+    }
+    return commands;
+}
+
+void CyclicWorkingSet(bool libraries) {
+    constexpr std::size_t BelowCapacity = 2048;
+    constexpr std::size_t TargetWorkingSet = 6000;
+    const auto run = [&](std::size_t distinct, const char* name) {
+        const auto commands = DrawCycle(distinct);
+        Submit(commands);
+        Submit(commands);
+        auto previous = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+        constexpr std::size_t MeasuredFrames = 8;
+        auto hits = std::uint64_t{};
+        auto lookups = std::uint64_t{};
+        double spent = 0.0;
+        for (std::size_t frame = 0; frame < MeasuredFrames; ++frame) {
+            auto packetCommands = commands;
+            const auto started = std::chrono::steady_clock::now();
+            const auto after = Submit(std::move(packetCommands));
+            spent += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - started).count();
+            lookups += after.lookups >= previous.lookups ? after.lookups - previous.lookups : after.lookups;
+            hits += after.hits >= previous.hits ? after.hits - previous.hits : after.hits;
+            previous = after;
+        }
+        const auto draws = distinct * MeasuredFrames;
+        std::cout << "Cyclic draw cache " << name << ": " << distinct << " keys, " << hits << " hits / " << lookups
+                  << " lookups, " << (draws != 0 ? spent / static_cast<double>(draws) : 0.0) << " us per draw over "
+                  << MeasuredFrames << " frames\n";
+        if (std::getenv("APS5_PROFILE_DRAW") == nullptr) {
+            Require(hits > distinct * 9 / 10, "cyclic draw working set did not hit after warmup");
+        }
+    };
+    if (std::getenv("APS5_PROFILE_DRAW") == nullptr) {
+        Require(std::getenv("APS5_DRAW_CACHE_ENTRIES") == nullptr, "cyclic working-set test requires the default draw-cache capacity");
+    }
+    Registered(VertexHeader, VertexCode.data(), sizeof(VertexCode), 2);
+    Registered(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
+    run(BelowCapacity, "2048-key cycle");
+    run(TargetWorkingSet, "6000-key cycle");
+}
+
 unsigned BrightestColorByte() {
     AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(ColorMemory.data()), ColorMemory.size());
     unsigned brightest = 0;
@@ -260,6 +309,7 @@ int main() {
             UserDataDrawsReuseTheirShape(libraries);
             StageDataHitsRefreshTheirWords(libraries);
             RetainedPixelCacheTransitions();
+            CyclicWorkingSet(libraries);
         }
         AgcDriverShutdown_nid_postfix();
         Require(AgcDriver::Graphics::PipelineLibraryWorkers() == 0, "the driver's shutdown left the pipeline library worker running");
