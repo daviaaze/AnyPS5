@@ -5224,7 +5224,7 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::computePipeline(const Grap
         {
             std::lock_guard pipelines(state->computePipelinesMutex);
             if (built != nullptr) built = state->computePipelines.try_emplace(pipelineKey, built).first->second;
-            if (error == nullptr) state->computePipelinesBuilding.erase(pipelineKey);
+            state->computePipelinesBuilding.erase(pipelineKey);
         }
         if (error != nullptr) building->set_exception(error);
         else building->set_value(built);
