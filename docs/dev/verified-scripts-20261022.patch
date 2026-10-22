@@ -4521,10 +4521,10 @@ index 000000000..772ab05d9
 +    raise SystemExit(main())
 diff --git a/headless-capture.py b/headless-capture.py
 new file mode 100755
-index 000000000..c28dc9018
+index 000000000..406d48e35
 --- /dev/null
 +++ b/headless-capture.py
-@@ -0,0 +1,384 @@
+@@ -0,0 +1,385 @@
 +#!/usr/bin/env python3
 +"""Own one headless gamescope inside a required per-unit PrivateTmp namespace.
 +
@@ -4780,7 +4780,8 @@ index 000000000..c28dc9018
 +                info = source.lstat()
 +                if not source.is_file() or source.is_symlink():
 +                    raise OSError('receipt path is not a regular non-symlink file')
-+                destination = evidence / 'screenshots' / source.name
++                # Gamescope filenames have only second precision; archive each log receipt separately.
++                destination = evidence / 'screenshots' / f'{log_number:06d}-{source.name}'
 +                destination.parent.mkdir(mode=0o700, exist_ok=True)
 +                shutil.copyfile(source, destination)
 +                if destination.stat().st_size != info.st_size:
