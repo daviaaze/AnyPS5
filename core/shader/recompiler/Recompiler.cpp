@@ -951,6 +951,80 @@ std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& 
     return plan;
 }
 
+std::string specializationRole(std::uint32_t id) {
+    namespace S = PipelineSpecialization;
+    const auto at = [](const char* name, std::uint32_t index, const char* part) { return std::string(name) + "[" + std::to_string(index) + "]" + part; };
+    if (id < S::ImageBase) {
+        static constexpr const char* parts[] = {".stride", ".format", ".presence", ".misalignment"};
+        return at("buffer", id / S::BufferWords, parts[id % S::BufferWords]);
+    }
+    if (id < S::VertexBase) {
+        static constexpr const char* parts[] = {".mode", ".dst_sel_x", ".dst_sel_y", ".dst_sel_z", ".dst_sel_w"};
+        const auto local = id - S::ImageBase;
+        return at("image", local / S::ImageWords, parts[local % S::ImageWords]);
+    }
+    if (id < S::PushDataOffset) return at("vertex", (id - S::VertexBase) / S::VertexWords, "");
+    if (id == S::PushDataOffset) return "push_data_offset";
+    if (id >= S::ExportBase && id < S::ExportPackingBase) return at("export", (id - S::ExportBase) / 4u, ".swizzle");
+    if (id >= S::ExportPackingBase && id < S::DualSourceBlend) return "export_packing";
+    if (S::IsWorkgroupOffset(id)) return "workgroup_offset";
+    if (id >= S::HeapCountBase && id < S::MipCountBase) return at("heap", id - S::HeapCountBase, ".active_count");
+    if (id >= S::MipCountBase && id < S::StoreQuantizeBase) return at("storage_image", id - S::MipCountBase, ".mip_count");
+    if (id >= S::StoreQuantizeBase && id < S::DescriptorIndexBase) {
+        static constexpr const char* parts[] = {".quantize", ".scale", ".reciprocal", ".snorm"};
+        const auto local = id - S::StoreQuantizeBase;
+        return at("store", local / S::StoreQuantizeWords, parts[local % S::StoreQuantizeWords]);
+    }
+    if (id >= S::DescriptorIndexBase && id < S::CompareBase) {
+        const auto local = id - S::DescriptorIndexBase;
+        return at("heap", local / S::DescriptorIndexStride, (".active_index[" + std::to_string(local % S::DescriptorIndexStride) + "]").c_str());
+    }
+    if (id >= S::CompareBase && id < S::FoldOffsetBase) return at("compare", (id - S::CompareBase) / S::CompareWords, "");
+    if (id >= S::FoldOffsetBase && id < S::UnnormalizedBaseLevelBase) return at("sampler", id - S::FoldOffsetBase, ".fold_offset");
+    if (id >= S::UnnormalizedBaseLevelBase) return at("sampler", id - S::UnnormalizedBaseLevelBase, ".unnormalized_base_level");
+    return "other";
+}
+
+void reportSpecializationChurn(std::uint64_t variantId, std::span<const PipelineSpecializationConstant> constants) {
+    struct Seen {
+        std::vector<PipelineSpecializationConstant> last;
+        std::uint64_t keys = 0;
+        std::uint64_t suppressed = 0;
+    };
+    static constexpr std::uint64_t LoggedMisses = 64;
+    static std::mutex mutex;
+    static std::unordered_map<std::uint64_t, Seen> variants;
+    std::string changes;
+    std::uint64_t keys = 0, suppressed = 0;
+    {
+        std::lock_guard lock(mutex);
+        auto& seen = variants[variantId];
+        keys = seen.keys++;
+        if (keys != 0) {
+            if (keys <= LoggedMisses) {
+                std::map<std::uint32_t, std::pair<std::optional<std::uint32_t>, std::optional<std::uint32_t>>> diff;
+                for (const auto& constant : seen.last) diff[constant.id].first = constant.value;
+                for (const auto& constant : constants) diff[constant.id].second = constant.value;
+                char text[64];
+                for (const auto& [id, values] : diff) {
+                    if (values.first == values.second) continue;
+                    const auto show = [](const std::optional<std::uint32_t>& value) { return value ? std::to_string(*value) + "(0x" + [&] { char hex[16]; std::snprintf(hex, sizeof(hex), "%x", *value); return std::string(hex); }() + ")" : std::string("absent"); };
+                    changes += specializationRole(id) + "=" + show(values.first) + "->" + show(values.second) + " ";
+                }
+            } else {
+                suppressed = ++seen.suppressed;
+            }
+        }
+        seen.last.assign(constants.begin(), constants.end());
+    }
+    if (keys == 0) return;
+    if (keys <= LoggedMisses) {
+        std::fprintf(stderr, "[specchurn] variant 0x%llx miss with %llu prior keys, changed:%s\n", static_cast<unsigned long long>(variantId), static_cast<unsigned long long>(keys), changes.empty() ? " none (non-constant key part)" : changes.c_str());
+    } else if ((suppressed & (suppressed - 1u)) == 0u) {
+        std::fprintf(stderr, "[specchurn] variant 0x%llx %llu prior keys, %llu further misses not itemized\n", static_cast<unsigned long long>(variantId), static_cast<unsigned long long>(keys), static_cast<unsigned long long>(suppressed));
+    }
+}
+
 std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
     struct ModuleKeyStorage {};
     auto& key = HostThreadLocal<std::vector<std::uint64_t>, ModuleKeyStorage>();
@@ -965,9 +1039,15 @@ std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderAr
         if (const auto found = modules.find(key); found != modules.end()) entry = found->second;
     }
     if (entry == nullptr) {
-        std::unique_lock lock(mutex);
-        const auto found = modules.find(key);
-        entry = found != modules.end() ? found->second : modules.emplace(key, std::make_shared<SpecializedModuleEntry>()).first->second;
+        bool inserted = false;
+        {
+            std::unique_lock lock(mutex);
+            const auto found = modules.find(key);
+            inserted = found == modules.end();
+            entry = !inserted ? found->second : modules.emplace(key, std::make_shared<SpecializedModuleEntry>()).first->second;
+        }
+        static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+        if (profile && inserted) reportSpecializationChurn(artifact.variantId, constants);
     }
     std::call_once(entry->ready, [&] {
         try {
