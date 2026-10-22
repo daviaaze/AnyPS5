@@ -102,9 +102,10 @@ static void AccumulatePort(const AudioOut2Port& port, const void* data, float* o
     }
 }
 
-AudioOut2Grain AudioOut2CaptureGrain(const AudioOut2Context& context, bool snapshot) {
+AudioOut2Grain AudioOut2CaptureGrain(AudioOut2Context& context, bool snapshot) {
     std::lock_guard lock(g_portsLock);
-    AudioOut2Grain grain;
+    auto grain = std::move(context.reusableGrain);
+    std::size_t capturedCount = 0;
     for (std::size_t index = 0; index < g_ports.size(); index++) {
         auto& port = g_ports[index];
         if (!port.used || port.context != &context || port.channels == 0) continue;
@@ -114,15 +115,19 @@ AudioOut2Grain AudioOut2CaptureGrain(const AudioOut2Context& context, bool snaps
             port.queuedData.pop_front();
         }
         if (data != nullptr) {
-            AudioOut2CapturedPort captured{index, port.generation, data};
+            if (capturedCount == grain.size()) grain.emplace_back();
+            auto& captured = grain[capturedCount++];
+            captured.index = index;
+            captured.generation = port.generation;
+            captured.data = data;
             if (snapshot) {
                 captured.pcm.resize(static_cast<std::size_t>(context.grain) * port.channels * (port.int16 ? sizeof(std::int16_t) : sizeof(float)));
                 std::memcpy(captured.pcm.data(), data, captured.pcm.size());
                 std::copy_n(port.volume, port.channels, captured.volume.begin());
-            }
-            grain.push_back(std::move(captured));
+            } else captured.pcm.clear();
         }
     }
+    grain.resize(capturedCount);
     return grain;
 }
 

@@ -267,6 +267,7 @@ int APS5_VABI sceAudioOut2ContextAdvance(AudioOut2ContextHandle ctx) try {
             while (!context->pendingGrains.empty()) {
                 Render(*context, context->pendingGrains.front());
                 context->output.insert(context->output.end(), context->mix.begin(), context->mix.end());
+                context->reusableGrain = std::move(context->pendingGrains.front());
                 context->pendingGrains.pop_front();
                 context->pendingSince.pop_front();
             }
@@ -363,10 +364,12 @@ int APS5_VABI sceAudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t block
     const auto mixed = static_cast<std::uint32_t>(grain.size());
     if (context->device == 0) {
         Render(*context, grain);
+        context->reusableGrain = std::move(grain);
     } else if (context->advancedMode) {
         Render(*context, grain);
         if (PendingMs(*context) > MAX_QUEUED_MS) context->dropped++;
         else context->output.insert(context->output.end(), context->mix.begin(), context->mix.end());
+        context->reusableGrain = std::move(grain);
     } else {
         context->pendingGrains.push_back(std::move(grain));
         context->pendingSince.push_back(Clock::now());
@@ -379,6 +382,7 @@ int APS5_VABI sceAudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t block
                 continue;
             }
             Render(*context, context->pendingGrains.front());
+            context->reusableGrain = std::move(context->pendingGrains.front());
             context->pendingGrains.pop_front();
             context->pendingSince.pop_front();
             if (PendingMs(*context) > MAX_QUEUED_MS) {
