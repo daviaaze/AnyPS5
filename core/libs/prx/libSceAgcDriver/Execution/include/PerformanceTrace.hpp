@@ -512,7 +512,7 @@ public:
                 output += ",\"s\":\"t\",\"args\":{\"events_lost\":" + std::to_string(thread.eventsLost) + "}}";
             }
         }
-        for (std::size_t index = 0; index + 1 < presents.size(); ++index) {
+        for (std::size_t index = 0; index < presents.size(); ++index) {
             event("present", "i", presents[index], presenter + 1);
             output += ",\"s\":\"g\",\"args\":{\"present\":" + std::to_string(firstPresent + index) + "}}";
         }

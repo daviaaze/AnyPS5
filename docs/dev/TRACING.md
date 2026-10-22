@@ -70,6 +70,8 @@ See [Build](BUILD.md#performance-trace) for the trace format, summary fields and
 | `APS5_TRACE_DIR=<path>` | Writes performance capture and summary files to this directory instead of the working directory. |
 | `APS5_VIDEOOUT_TELEMETRY_DIR=<path>` | Writes the presents and the pad changes of a run to `<path>/videoout.jsonl`; see [Usage](../user/USAGE.md#video-out-and-pad-telemetry). |
 
+A window of N complete frame intervals emits N+1 `present` boundary witnesses with consecutive IDs and timestamps spanning both ends of the capture. The final witness records the closing boundary; it is not an additional completed frame. The summary's `presents` count remains N.
+
 ## Shader registers
 
 `APS5_TRACE_SHADER_REGS=all` prints register snapshots for every shader. Set it to a shader code address in hexadecimal to print one shader's registers.
