@@ -752,6 +752,11 @@ struct VulkanDevice::State {
             Graphics::DeviceLostOwner() = nullptr;
         }
         if (compileOnly && device != VK_NULL_HANDLE) {
+            {
+                std::lock_guard pipelines(computePipelinesMutex);
+                computePipelines.clear();
+                computePipelinesBuilding.clear();
+            }
             reinterpret_cast<PFN_vkDestroyDevice>(deviceProc(device, "vkDestroyDevice"))(device, nullptr);
             device = VK_NULL_HANDLE;
         }
@@ -5057,26 +5062,29 @@ VkPipeline VulkanDevice::splitComputePipeline(const Graphics::Context& context, 
 
 std::shared_ptr<ComputePipelineObjects> VulkanDevice::computePipeline(const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, VkDescriptorSetLayout setLayout, std::span<const std::uint32_t> layoutKey, VkShaderStageFlags pushStages, std::uint64_t programAddress) {
     const auto pipelineKey = ComputePipelineKey::Of(shader, pushStages != 0);
-    std::promise<std::shared_ptr<ComputePipelineObjects>> building;
+    std::optional<std::promise<std::shared_ptr<ComputePipelineObjects>>> building;
     if (!pipelineKey.identity.Empty()) {
         std::shared_future<std::shared_ptr<ComputePipelineObjects>> other;
         {
             std::lock_guard pipelines(state->computePipelinesMutex);
             if (const auto found = state->computePipelines.find(pipelineKey); found != state->computePipelines.end()) return found->second;
             if (const auto pending = state->computePipelinesBuilding.find(pipelineKey); pending != state->computePipelinesBuilding.end()) other = pending->second;
-            else state->computePipelinesBuilding.emplace(pipelineKey, building.get_future().share());
+            else {
+                building.emplace();
+                state->computePipelinesBuilding.emplace(pipelineKey, building->get_future().share());
+            }
         }
         if (other.valid()) return other.get();
     }
     const auto finish = [&](std::shared_ptr<ComputePipelineObjects> built, std::exception_ptr error) {
-        if (pipelineKey.identity.Empty()) return built;
+        if (!building.has_value()) return built;
         {
             std::lock_guard pipelines(state->computePipelinesMutex);
             if (built != nullptr) built = state->computePipelines.try_emplace(pipelineKey, built).first->second;
             state->computePipelinesBuilding.erase(pipelineKey);
         }
-        if (error != nullptr) building.set_exception(error);
-        else building.set_value(built);
+        if (error != nullptr) building->set_exception(error);
+        else building->set_value(built);
         return built;
     };
     std::shared_ptr<ComputePipelineObjects> objects;
