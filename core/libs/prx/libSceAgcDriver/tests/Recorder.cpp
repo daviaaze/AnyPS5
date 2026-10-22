@@ -5464,6 +5464,173 @@ void staleGenerationTests(const Device& device, Recorder& recorder) {
 #endif
 }
 
+class StorageReadyProbe {
+public:
+    explicit StorageReadyProbe(Context& context) : context(context), resolver(context.deviceProc) {
+        Require(active == nullptr && context.functions == nullptr, "storage ready probe requires uncached device functions");
+        active = this;
+        context.deviceProc = resolve;
+    }
+    ~StorageReadyProbe() {
+        context.deviceProc = resolver;
+        active = nullptr;
+    }
+    void Begin(VkBuffer source, VkBuffer destination) {
+        this->source = source;
+        this->destination = destination;
+        recording = true;
+    }
+    void End() { recording = false; }
+    std::uint32_t Copies() const { return copies; }
+    std::uint32_t Dispatches() const { return dispatches; }
+    std::uint32_t ReadyBarriers() const { return readyBarriers; }
+    std::uint32_t UnorderedDispatches() const { return unorderedDispatches; }
+
+private:
+    template<typename TFunction>
+    TFunction function(const char* name) const { return reinterpret_cast<TFunction>(resolver(context.device, name)); }
+    static VKAPI_ATTR void VKAPI_CALL copyBuffer(VkCommandBuffer commands, VkBuffer source, VkBuffer destination, std::uint32_t count, const VkBufferCopy* regions) {
+        if (active->recording && source == active->source && destination == active->destination) {
+            for (std::uint32_t i = 0; i < count; ++i) {
+                if (regions[i].size != 0) {
+                    ++active->copies;
+                    active->pending = true;
+                }
+            }
+        }
+        active->function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, source, destination, count, regions);
+    }
+    static VKAPI_ATTR void VKAPI_CALL barrier(VkCommandBuffer commands, VkPipelineStageFlags sourceStage, VkPipelineStageFlags destinationStage, VkDependencyFlags flags, std::uint32_t memoryCount, const VkMemoryBarrier* memory, std::uint32_t bufferCount, const VkBufferMemoryBarrier* buffers, std::uint32_t imageCount, const VkImageMemoryBarrier* images) {
+        const bool fromTransfer = (sourceStage & (VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT)) != 0;
+        const bool toCompute = (destinationStage & (VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT)) != 0;
+        if (active->recording && active->pending && fromTransfer && toCompute) {
+            for (std::uint32_t i = 0; i < memoryCount; ++i) {
+                if ((memory[i].srcAccessMask & VK_ACCESS_TRANSFER_WRITE_BIT) != 0 && (memory[i].dstAccessMask & VK_ACCESS_SHADER_READ_BIT) != 0) {
+                    active->pending = false;
+                    ++active->readyBarriers;
+                    break;
+                }
+            }
+        }
+        active->function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, sourceStage, destinationStage, flags, memoryCount, memory, bufferCount, buffers, imageCount, images);
+    }
+    static VKAPI_ATTR void VKAPI_CALL dispatch(VkCommandBuffer commands, std::uint32_t x, std::uint32_t y, std::uint32_t z) {
+        if (active->recording && active->copies != 0) {
+            ++active->dispatches;
+            if (active->pending) ++active->unorderedDispatches;
+        }
+        active->function<PFN_vkCmdDispatch>("vkCmdDispatch")(commands, x, y, z);
+    }
+    static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL resolve(VkDevice device, const char* name) {
+        if (std::strcmp(name, "vkCmdCopyBuffer") == 0) return reinterpret_cast<PFN_vkVoidFunction>(copyBuffer);
+        if (std::strcmp(name, "vkCmdPipelineBarrier") == 0) return reinterpret_cast<PFN_vkVoidFunction>(barrier);
+        if (std::strcmp(name, "vkCmdDispatch") == 0) return reinterpret_cast<PFN_vkVoidFunction>(dispatch);
+        return active->resolver(device, name);
+    }
+    Context& context;
+    PFN_vkGetDeviceProcAddr resolver;
+    VkBuffer source = VK_NULL_HANDLE;
+    VkBuffer destination = VK_NULL_HANDLE;
+    bool recording = false;
+    bool pending = false;
+    std::uint32_t copies = 0;
+    std::uint32_t dispatches = 0;
+    std::uint32_t readyBarriers = 0;
+    std::uint32_t unorderedDispatches = 0;
+    static inline StorageReadyProbe* active = nullptr;
+};
+
+bool storageHoleCopyBarrierTests(const Device& device, Recorder& previous) {
+    const auto& base = device.GetContext();
+    Require(Recorder::BarrierBatch() && Recorder::MergeBarriers(), "storage hole-copy barrier test requires default barrier batching");
+    GuestTextureResource resource{};
+    resource.width = 1000;
+    resource.height = 700;
+    resource.mipCount = 1;
+    resource.tileMode = TextureTileMode::kR64KBX;
+    resource.dimension = TextureDimension::k2D;
+    resource.format = 56;
+    resource.dstSelX = 4;
+    resource.dstSelY = 5;
+    resource.dstSelZ = 6;
+    resource.dstSelW = 7;
+    const auto geometry = DescribeSurface(resource);
+    const auto surfaceBytes = static_cast<std::size_t>(geometry.guestBytes);
+    const auto bytes = (surfaceBytes + 65535) / 65536 * 65536 + 65536;
+    struct Release {
+        const Context& context;
+        void* block = nullptr;
+        std::uint64_t address = 0;
+        std::size_t bytes;
+        std::int64_t physical = -1;
+        ~Release() {
+#ifdef __linux__
+            if (block != nullptr) sceKernelMunmap(block, bytes);
+            if (physical >= 0) sceKernelReleaseDirectMemory(physical, bytes);
+#else
+            if (block == nullptr) return;
+            GuestAllocations::Mutation().Remove(block);
+            HostImportFor(context, address, bytes);
+            ReleaseWatched(block, bytes);
+#endif
+        }
+    } release{base, nullptr, 0, bytes};
+#ifdef __linux__
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, bytes, 65536, 0, &release.physical) == 0, "cannot allocate hole-copy direct memory");
+    Require(sceKernelMapDirectMemory(&release.block, bytes, 0x33, 0, release.physical, 65536) == 0, "cannot map hole-copy direct memory for the GPU");
+#else
+    release.block = AllocateWatched(bytes, 65536);
+    if (release.block == nullptr) return false;
+    GuestAllocations::Mutation().Add(release.block, bytes, true, true, true);
+#endif
+    void* block = release.block;
+    auto* memory = static_cast<std::uint8_t*>(block);
+    for (std::size_t i = 0; i < bytes; ++i) memory[i] = static_cast<std::uint8_t>(i * 131u + 7u);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    release.address = address;
+    const auto* import = HostImportFor(base, address, bytes);
+    if (import == nullptr || !AgcDriver::GuestMemory::Watched(address, bytes)) return false;
+    auto destination = ShadowDestinationFor(base, *import, address, address + surfaceBytes);
+    Require(destination.has_value() && destination->seedUnits.empty() && SlabBoundary(*import, address) >= address + surfaceBytes, "storage hole-copy test did not allocate an unseeded slab");
+    auto context = base;
+    StorageReadyProbe probe(context);
+    TextureDetiler detiler(context);
+    context.detiler = &detiler;
+    resource.baseAddress = address;
+    bool retiled = false;
+    std::weak_ptr<StorageTexture> lifetime;
+    {
+        Recorder recorder(context);
+        recorder.Activate();
+        auto image = StorageTexture::Create(context, detiler, resource, 0);
+        lifetime = image;
+        const auto commands = recorder.Commands();
+        recorder.Keep(image);
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, resource.mipCount, 0, 1};
+        const VkClearColorValue value{{1.0f, 0.0f, 0.0f, 1.0f}};
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image->Image(), VK_IMAGE_LAYOUT_GENERAL, &value, 1, &range);
+        image->MarkDirty();
+        constexpr VkAccessFlags covered = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, covered | VK_ACCESS_HOST_WRITE_BIT, covered);
+        recorder.MarkCovered(covered);
+        const auto before = StorageTexture::SlabRetiles();
+        probe.Begin(import->buffer, destination->buffer);
+        image->WriteBack();
+        probe.End();
+        recorder.Sync();
+        retiled = StorageTexture::SlabRetiles() > before;
+    }
+    previous.Activate();
+    Require(lifetime.expired(), "storage hole-copy test image outlived its recorder");
+    Require(retiled, "storage hole-copy test did not retile into a slab");
+    Require(probe.Copies() != 0 && probe.Dispatches() != 0, "storage hole-copy test did not record import-to-slab hole copies followed by a retile dispatch");
+    std::cout << "storage hole-copy barrier: " << probe.Copies() << " hole copies, " << probe.Dispatches() << " retile dispatches, " << probe.ReadyBarriers() << " ready barriers, " << probe.UnorderedDispatches() << " unordered dispatches" << std::endl;
+    Require(probe.ReadyBarriers() != 0 && probe.UnorderedDispatches() == 0, "storage retile reads slab hole copies without a following ready barrier");
+    return true;
+}
+
+
 // A write-back stores the texels of an image and leaves every other byte of the surface's memory
 // as it was: the padding of the tile blocks the surface covers only partly (its last block column
 // and row), the tail block of a mip chain, the bytes between the mips and the pitch padding of a
@@ -10344,6 +10511,13 @@ int main(int argc, char** argv) {
                 return 77;
             }
             splitWriteBackTests(device, recorder);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--storage-hole-copy-barrier-only") {
+            if (!UnitShadowEnabled() || device.GetContext().hostImportAlignment == 0 || !storageHoleCopyBarrierTests(device, recorder)) {
+                std::cout << "skipped, the device imports no watched host memory for storage hole copies\n";
+                return 77;
+            }
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--storage-write-back-only") {
