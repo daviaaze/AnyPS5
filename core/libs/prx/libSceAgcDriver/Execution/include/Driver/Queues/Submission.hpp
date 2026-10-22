@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -48,6 +49,7 @@ struct Submission {
 
 struct QueueWorker {
     std::deque<Submission> pending;
+    std::array<std::vector<std::uint32_t>, 2> reusableCommands;
 
     std::atomic<std::uint64_t> queued{0};
     std::unordered_map<std::uint64_t, std::uint32_t> unfinishedWrites;
