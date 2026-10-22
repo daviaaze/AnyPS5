@@ -10542,6 +10542,152 @@ void ResourceContentKeyTests(bool benchmark) {
 // into a second device) rebuilds the recorded graphics pipeline so the same configuration hits the
 // store, hands the compute result to its hook, recovers a tail torn inside a record's padding and
 // stops when cancelled.
+struct PipelineFlightFixture {
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool release = false;
+    bool fail = false;
+    std::size_t sameCreates = 0;
+    std::size_t otherCreates = 0;
+    std::atomic<std::uintptr_t> next{1000000};
+
+    template<typename THandle>
+    THandle Handle() {
+        const auto value = next.fetch_add(1);
+        if constexpr (std::is_pointer_v<THandle>) return reinterpret_cast<THandle>(value);
+        else return static_cast<THandle>(value);
+    }
+};
+
+PipelineFlightFixture* pipelineFlightFixture = nullptr;
+
+VKAPI_ATTR VkResult VKAPI_CALL pipelineFlightCreate(VkDevice, VkPipelineCache, std::uint32_t count, const VkGraphicsPipelineCreateInfo* infos, const VkAllocationCallbacks*, VkPipeline* pipeline) {
+    auto& fixture = *pipelineFlightFixture;
+    std::unique_lock lock(fixture.mutex);
+    Require(count == 1 && infos->pInputAssemblyState != nullptr, "single-flight fixture requires one complete graphics pipeline");
+    if (infos->pInputAssemblyState->topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST) {
+        ++fixture.sameCreates;
+        fixture.condition.notify_all();
+        fixture.condition.wait(lock, [&] { return fixture.release; });
+        if (fixture.fail) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    } else {
+        ++fixture.otherCreates;
+        fixture.condition.notify_all();
+    }
+    *pipeline = fixture.Handle<VkPipeline>();
+    return VK_SUCCESS;
+}
+
+PFN_vkVoidFunction VKAPI_CALL pipelineFlightProc(VkDevice, const char* name) {
+    const std::string_view function(name);
+    if (function == "vkCreateGraphicsPipelines") return reinterpret_cast<PFN_vkVoidFunction>(pipelineFlightCreate);
+    if (function == "vkCreateShaderModule") return reinterpret_cast<PFN_vkVoidFunction>(+[](VkDevice, const VkShaderModuleCreateInfo*, const VkAllocationCallbacks*, VkShaderModule* handle) -> VkResult {
+        *handle = pipelineFlightFixture->Handle<VkShaderModule>();
+        return VK_SUCCESS;
+    });
+    if (function == "vkCreatePipelineLayout") return reinterpret_cast<PFN_vkVoidFunction>(+[](VkDevice, const VkPipelineLayoutCreateInfo*, const VkAllocationCallbacks*, VkPipelineLayout* handle) -> VkResult {
+        *handle = pipelineFlightFixture->Handle<VkPipelineLayout>();
+        return VK_SUCCESS;
+    });
+    if (function == "vkCreateRenderPass") return reinterpret_cast<PFN_vkVoidFunction>(+[](VkDevice, const VkRenderPassCreateInfo*, const VkAllocationCallbacks*, VkRenderPass* handle) -> VkResult {
+        *handle = pipelineFlightFixture->Handle<VkRenderPass>();
+        return VK_SUCCESS;
+    });
+    if (function == "vkDestroyRenderPass") return reinterpret_cast<PFN_vkVoidFunction>(+[](VkDevice, VkRenderPass, const VkAllocationCallbacks*) {});
+    if (function == "vkDestroyShaderModule") return reinterpret_cast<PFN_vkVoidFunction>(+[](VkDevice, VkShaderModule, const VkAllocationCallbacks*) {});
+    if (function == "vkDestroyPipelineLayout") return reinterpret_cast<PFN_vkVoidFunction>(+[](VkDevice, VkPipelineLayout, const VkAllocationCallbacks*) {});
+    if (function == "vkDestroyPipeline") return reinterpret_cast<PFN_vkVoidFunction>(+[](VkDevice, VkPipeline, const VkAllocationCallbacks*) {});
+    return nullptr;
+}
+
+void pipelineStoreConcurrentSameKeyTests() {
+    using namespace AgcDriver::Graphics;
+    for (const bool fail : {false, true}) {
+        PipelineFlightFixture fixture;
+        fixture.fail = fail;
+        pipelineFlightFixture = &fixture;
+        auto context = mockContext();
+        context.device = fixture.Handle<VkDevice>();
+        context.deviceProc = pipelineFlightProc;
+        context.graphicsPipelineLibrary = false;
+        context.pipelineLinkTimeOptimization = false;
+        context.limits.framebufferNoAttachmentsSampleCounts = VK_SAMPLE_COUNT_1_BIT;
+        ShaderRecompiler::RecompileResult vertex, fragment;
+        vertex.spirv = makeModule({});
+        fragment.spirv = makeModule({.fragment = true});
+        vertex.variantId = 301;
+        fragment.variantId = 302;
+        Require(!vertex.Identity().Empty() && !fragment.Identity().Empty(), "single-flight fixture shaders lack cache identities");
+        const std::array<CompiledShader, 2> shaders{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, PipelinePushSlotBytes}}};
+        const std::array<std::uint32_t, 1> mainKey{41}, fragmentKey{42};
+        const PipelineSetLayouts resources{fixture.Handle<VkDescriptorSetLayout>(), fixture.Handle<VkDescriptorSetLayout>(), true, mainKey, fragmentKey};
+        State state{};
+        state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        auto other = state;
+        other.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+        std::array<std::shared_ptr<Pipeline>, 3> results;
+        std::array<std::exception_ptr, 3> errors;
+        std::array<std::thread, 3> workers;
+        std::array<std::atomic<bool>, 3> done{};
+        const auto start = [&](std::size_t index, const State& configuration) {
+            workers[index] = std::thread([&, index, configuration] {
+                try {
+                    results[index] = CachedPipeline(context, configuration, VertexInputLayout{}, resources, shaders);
+                } catch (...) {
+                    errors[index] = std::current_exception();
+                }
+                done[index].store(true, std::memory_order_release);
+                fixture.condition.notify_all();
+            });
+        };
+        const auto finish = [&] {
+            {
+                std::lock_guard lock(fixture.mutex);
+                fixture.release = true;
+            }
+            fixture.condition.notify_all();
+            for (auto& worker : workers) if (worker.joinable()) worker.join();
+        };
+        try {
+            const auto misses = PipelineStoreTotals().misses;
+            start(0, state);
+            {
+                std::unique_lock lock(fixture.mutex);
+                Require(fixture.condition.wait_for(lock, std::chrono::seconds(3), [&] { return fixture.sameCreates != 0 || done[0].load(std::memory_order_acquire); }), "single-flight owner did not reach Vulkan");
+                Require(fixture.sameCreates == 1, "single-flight owner failed before Vulkan");
+            }
+            start(1, state);
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+            while (PipelineStoreTotals().misses < misses + 2 && !done[1].load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+            Require(PipelineStoreTotals().misses >= misses + 2, "identical-key contender did not enter the pipeline store");
+            start(2, other);
+            {
+                std::unique_lock lock(fixture.mutex);
+                Require(fixture.condition.wait_for(lock, std::chrono::seconds(3), [&] { return done[2].load(std::memory_order_acquire); }), "a distinct pipeline key was serialized behind the blocked owner");
+                Require(fixture.otherCreates == 1 && !errors[2], "distinct-key creation did not progress independently");
+                Require(fixture.sameCreates == 1, "identical-key contenders created duplicate Vulkan pipelines");
+            }
+            finish();
+            if (fail) {
+                Require(errors[0] && errors[1] && !results[0] && !results[1], "owner failure did not reach every same-key waiter");
+                fixture.fail = false;
+                const auto retry = CachedPipeline(context, state, VertexInputLayout{}, resources, shaders);
+                const auto hit = CachedPipeline(context, state, VertexInputLayout{}, resources, shaders);
+                Require(retry && retry == hit && fixture.sameCreates == 2, "failed single-flight poisoned retry or its cached result");
+            } else {
+                Require(!errors[0] && !errors[1] && results[0] && results[0] == results[1], "same-key contenders did not receive one shared pipeline");
+                Require(CachedPipeline(context, state, VertexInputLayout{}, resources, shaders) == results[0] && fixture.sameCreates == 1, "single-flight result was not retained in the pipeline store");
+            }
+        } catch (...) {
+            finish();
+            ClearCachedPipelines(context.device);
+            throw;
+        }
+        ClearCachedPipelines(context.device);
+    }
+    pipelineFlightFixture = nullptr;
+}
+
 void pipelineStoreLazyBufferPoolTests() {
     using namespace AgcDriver::Graphics;
     mock = MockVulkan{};
@@ -10942,6 +11088,11 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--pipeline-library-clear-waits-for-build") {
             pipelineLibraryClearWaitsForBuildTests();
             std::cout << "pipeline library clear waits for active part builds\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--pipeline-store-concurrent-same-key") {
+            pipelineStoreConcurrentSameKeyTests();
+            std::cout << "pipeline store shares concurrent keys, preserves distinct-key progress and retries failures\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--pipeline-store-lazy-buffer-pool") {
