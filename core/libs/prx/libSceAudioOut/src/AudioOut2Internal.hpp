@@ -95,6 +95,7 @@ struct AudioOut2Context {
     std::condition_variable_any grainReady;
     std::deque<AudioOut2Grain> advancedGrains;
     std::deque<AudioOut2Grain> pendingGrains;
+    AudioOut2Grain reusableGrain;
     std::deque<std::chrono::steady_clock::time_point> pendingSince;
     SDL_AudioDeviceID padDevice = 0;
     std::chrono::steady_clock::time_point nextPadProbe;
@@ -120,7 +121,7 @@ struct AudioOut2Context {
 // Mixes every port of the context that carries PCM data into out (stereo float, frames frames), summing
 // onto the zeroed buffer. Returns the number of ports mixed.
 std::uint32_t AudioOut2MixPorts(const AudioOut2Context& context, const AudioOut2Grain& grain, float* out, float* padOut, std::uint32_t frames);
-AudioOut2Grain AudioOut2CaptureGrain(const AudioOut2Context& context, bool snapshot = false);
+AudioOut2Grain AudioOut2CaptureGrain(AudioOut2Context& context, bool snapshot = false);
 bool AudioOut2HasPadPorts(const AudioOut2Context& context);
 // Forgets the ports of a context being destroyed.
 void AudioOut2ReleasePorts(const AudioOut2Context& context);
