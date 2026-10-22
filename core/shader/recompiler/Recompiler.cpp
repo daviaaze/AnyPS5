@@ -857,11 +857,12 @@ std::vector<std::uint32_t> specializeWords(const CompiledShaderArtifact& artifac
         }
         cursor += count;
     }
-    materialized = std::move(compact);
 #if ANYPS5_ENABLE_SPIRV_TOOLS
-    materialized = ValidateAndOptimizeSpirv(materialized, target.vulkanVersion, target.spirvVersion, target.nonConstantImageOffsets, false);
+    if (compact != materialized) {
+        compact = ValidateAndOptimizeSpirv(compact, target.vulkanVersion, target.spirvVersion, target.nonConstantImageOffsets, false);
+    }
 #endif
-    return materialized;
+    return compact;
 }
 
 SpecializedSpirv buildSpecializedModule(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
