@@ -2265,26 +2265,42 @@ void VulkanDevice::PrefetchComputePipeline(std::shared_ptr<const ShaderRecompile
     const auto key = ComputePipelineKey::Of(*shader, pushStages != 0);
     if (key.identity.Empty()) return;
     auto& counters = ComputePrefetchStats();
-    {
-        std::lock_guard pipelines(state->computePipelinesMutex);
-        if (state->computePipelines.contains(key) || state->computePipelinesBuilding.contains(key)) return;
-    }
-    const bool queued = state->computePrefetch.Enqueue([this, shader = std::move(shader), pushStages, key, &counters] {
-        try {
-            const auto context = graphicsContext();
-            if (context.descriptorCache == nullptr) return;
-            const std::array<Graphics::CompiledShader, 1> compute{{{ShaderRecompiler::ShaderStage::Compute, shader.get(), 0}}};
-            const auto described = Graphics::DescribeSetLayouts(context, compute);
-            const auto result = computePipeline(context, *shader, described.layouts.main, described.mainKey, pushStages, 0);
-            if (result != nullptr) {
-                std::lock_guard pipelines(state->computePipelinesMutex);
-                state->computePipelinesPrefetched.insert(key);
-                counters.prefetched.fetch_add(1, std::memory_order_relaxed);
+    std::lock_guard pipelines(state->computePipelinesMutex);
+    if (state->computePipelines.contains(key) || state->computePipelinesBuilding.contains(key)) return;
+    auto completion = std::make_shared<std::promise<std::shared_ptr<ComputePipelineObjects>>>();
+    state->computePipelinesBuilding.emplace(key, completion->get_future().share());
+    bool queued = false;
+    try {
+        queued = state->computePrefetch.Enqueue([this, shader = std::move(shader), pushStages, key, completion, &counters] {
+            std::shared_ptr<ComputePipelineObjects> objects;
+            try {
+                const auto context = graphicsContext();
+                if (context.descriptorCache != nullptr) {
+                    const std::array<Graphics::CompiledShader, 1> compute{{{ShaderRecompiler::ShaderStage::Compute, shader.get(), 0}}};
+                    const auto described = Graphics::DescribeSetLayouts(context, compute);
+                    objects = createComputePipeline(context, *shader, described.layouts.main, described.mainKey, pushStages, 0);
+                    if (Graphics::PipelineJournalEnabled() && !state->probingFloatControls) Graphics::RecordComputePipeline(*shader, pushStages != 0);
+                }
+                std::lock_guard lock(state->computePipelinesMutex);
+                if (objects != nullptr) {
+                    objects = state->computePipelines.try_emplace(key, objects).first->second;
+                    state->computePipelinesPrefetched.insert(key);
+                    counters.prefetched.fetch_add(1, std::memory_order_relaxed);
+                }
+                completion->set_value(objects);
+                state->computePipelinesBuilding.erase(key);
+            } catch (...) {
+                completion->set_exception(std::current_exception());
             }
-        } catch (...) {
-        }
-    });
-    if (!queued) counters.dropped.fetch_add(1, std::memory_order_relaxed);
+        });
+    } catch (...) {
+        state->computePipelinesBuilding.erase(key);
+        throw;
+    }
+    if (!queued) {
+        state->computePipelinesBuilding.erase(key);
+        counters.dropped.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 bool VulkanDevice::ImportGuestMemory(const GuestAllocations::Mapped& ranges, std::uint64_t generation, bool adoptDevice) {
@@ -2313,6 +2329,7 @@ void VulkanDevice::PrepareForReplacement() {
     {
         std::lock_guard pipelines(state->computePipelinesMutex);
         state->computePipelines.clear();
+        state->computePipelinesBuilding.clear();
         state->computePipelinesPrefetched.clear();
     }
     state->computePrefetch.Restart();
@@ -5199,7 +5216,7 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::computePipeline(const Grap
         {
             std::lock_guard pipelines(state->computePipelinesMutex);
             if (built != nullptr) built = state->computePipelines.try_emplace(pipelineKey, built).first->second;
-            state->computePipelinesBuilding.erase(pipelineKey);
+            if (error == nullptr) state->computePipelinesBuilding.erase(pipelineKey);
         }
         if (error != nullptr) building.set_exception(error);
         else building.set_value(built);
