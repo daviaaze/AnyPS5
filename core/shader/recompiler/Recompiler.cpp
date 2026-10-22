@@ -796,7 +796,7 @@ std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledSh
     }
     materialized = SpecializeFragmentOutputs(SpecializeSpirv(materialized), constants, specializedIds);
 #if ANYPS5_ENABLE_SPIRV_TOOLS
-    materialized = ValidateAndOptimizeSpirv(materialized, target.vulkanVersion, target.spirvVersion, target.nonConstantImageOffsets, true, true);
+    materialized = ValidateAndOptimizeSpirv(materialized, target.vulkanVersion, target.spirvVersion, target.nonConstantImageOffsets, true, true, false);
 #endif
     std::map<std::uint32_t, std::uint32_t> descriptorVariables;
     std::set<std::uint32_t> usedDescriptors;
