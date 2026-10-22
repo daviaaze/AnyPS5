@@ -103,7 +103,7 @@ std::vector<std::uint32_t> CollapseBlockBallots(std::span<const std::uint32_t> s
 
 }
 
-std::vector<std::uint32_t> ValidateAndOptimizeSpirv(std::span<const std::uint32_t> spirv, std::uint32_t vulkanVersion, std::uint32_t spirvVersion, bool allowOffsetTextureOperand, bool optimize, bool specialize, bool validateOptimized) {
+std::vector<std::uint32_t> ValidateAndOptimizeSpirv(std::span<const std::uint32_t> spirv, std::uint32_t vulkanVersion, std::uint32_t spirvVersion, bool allowOffsetTextureOperand, bool optimize, bool specialize) {
     spv_target_env environment;
     const auto apiVersion = vulkanVersion & ~0xfffu;
     std::uint32_t maxSpirvVersion = 0;
@@ -215,7 +215,7 @@ std::vector<std::uint32_t> ValidateAndOptimizeSpirv(std::span<const std::uint32_
     }
     optimized = CollapseBlockBallots(optimized);
     diagnostics.clear();
-    if (validateOptimized && !tools.Validate(optimized.data(), optimized.size(), validatorOptions)) {
+    if (!tools.Validate(optimized.data(), optimized.size(), validatorOptions)) {
         throw std::runtime_error("SPIR-V validation after optimization failed:\n" + diagnostics);
     }
     return optimized;
