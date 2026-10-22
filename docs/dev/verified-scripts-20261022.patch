@@ -1,9 +1,9 @@
 diff --git a/bounded-diagnostic.py b/bounded-diagnostic.py
 new file mode 100755
-index 000000000..b63a6d7b6
+index 000000000..c7dd49d38
 --- /dev/null
 +++ b/bounded-diagnostic.py
-@@ -0,0 +1,563 @@
+@@ -0,0 +1,566 @@
 +#!/usr/bin/env python3
 +import argparse
 +import json
@@ -91,6 +91,7 @@ index 000000000..b63a6d7b6
 +    expected_environment['APS5_TRACE_LABEL'] = trace_label or ''
 +    expected_environment['APS5_TRACE_SLOW_VULKAN_CALLS'] = '1'
 +    expected_environment['APS5_TRACE_SLOW_IMAGE_LOOKUPS'] = '1'
++    expected_environment['APS5_TRACE_CAUSAL'] = '1'
 +    if trace_environment != expected_environment:
 +        raise RuntimeError('Causal-trace settings differ from the fixed, parent-owned profile.')
 +    trace_dir = Path(trace_environment['APS5_TRACE_DIR']).resolve(strict=True)
@@ -202,6 +203,7 @@ index 000000000..b63a6d7b6
 +        *launch_guard.TRACE_LABEL_ENVIRONMENT,
 +        *launch_guard.TRACE_SLOW_IMAGE_ENVIRONMENT,
 +        *launch_guard.TRACE_SLOW_VULKAN_ENVIRONMENT,
++        *launch_guard.TRACE_CAUSAL_ENVIRONMENT,
 +    ):
 +        environment.pop(name, None)
 +    if pipeline_drain_fills:
@@ -470,6 +472,7 @@ index 000000000..b63a6d7b6
 +                'APS5_PROFILE_DRAW': '1',
 +                'APS5_TRACE_SLOW_VULKAN_CALLS': '1',
 +                'APS5_TRACE_SLOW_IMAGE_LOOKUPS': '1',
++                'APS5_TRACE_CAUSAL': '1',
 +            })
 +        if args.trace_waits:
 +            extra_environment.update({
@@ -4521,7 +4524,7 @@ index 000000000..772ab05d9
 +    raise SystemExit(main())
 diff --git a/headless-capture.py b/headless-capture.py
 new file mode 100755
-index 000000000..406d48e35
+index 000000000..095d3910a
 --- /dev/null
 +++ b/headless-capture.py
 @@ -0,0 +1,385 @@
@@ -4618,7 +4621,7 @@ index 000000000..406d48e35
 +        owner = json.loads(owner_text)
 +        check_owner(owner)
 +        bridge = ['systemd-run', '--user', '--wait', '--pipe', '--collect',
-+                  '--job-mode=fail', '--description=' + owner['bridge_description'],
++                  '--slice-inherit', '--job-mode=fail', '--description=' + owner['bridge_description'],
 +                  '-p', 'BindsTo=' + owner['unit'], '-p', 'After=' + owner['unit'],
 +                  '--unit=' + unit, '--working-directory=' + os.getcwd(),
 +                  '-p', 'PrivateTmp=no', '-p', 'PrivateUsers=no',
@@ -5152,10 +5155,10 @@ index 000000000..dbee3a9e0
 +    sys.exit(main())
 diff --git a/native_launch_guard.py b/native_launch_guard.py
 new file mode 100644
-index 000000000..6df972c0f
+index 000000000..ef0aba0c5
 --- /dev/null
 +++ b/native_launch_guard.py
-@@ -0,0 +1,2995 @@
+@@ -0,0 +1,2997 @@
 +import base64
 +import fcntl
 +import hashlib
@@ -5200,10 +5203,12 @@ index 000000000..6df972c0f
 +TRACE_LABEL_ENVIRONMENT = ('APS5_TRACE_LABEL',)
 +TRACE_SLOW_IMAGE_ENVIRONMENT = ('APS5_TRACE_SLOW_IMAGE_LOOKUPS',)
 +TRACE_SLOW_VULKAN_ENVIRONMENT = ('APS5_TRACE_SLOW_VULKAN_CALLS',)
++TRACE_CAUSAL_ENVIRONMENT = ('APS5_TRACE_CAUSAL',)
 +CAUSAL_TRACE_ENVIRONMENT = (
 +    'APS5_TRACE_SECONDS', 'APS5_TRACE_DIR', 'APS5_TRACE_SUMMARY_EVERY', 'APS5_TRACE_EVENTS',
 +    'APS5_PROFILE_GPU', 'APS5_PROFILE_DRAW', *TRACE_WAIT_ENVIRONMENT,
 +    *TRACE_LABEL_ENVIRONMENT, *TRACE_SLOW_IMAGE_ENVIRONMENT, *TRACE_SLOW_VULKAN_ENVIRONMENT,
++    *TRACE_CAUSAL_ENVIRONMENT,
 +)
 +TASKS_MAX = 256
 +STOP_SECONDS = 30
@@ -9903,3 +9908,1059 @@ index 000000000..faf942dca
 +  ],
 +  "game_launched": false
 +}
+diff --git a/causal-analyze.py b/causal-analyze.py
+new file mode 100755
+index 000000000..8125314db
+--- /dev/null
++++ b/causal-analyze.py
+@@ -0,0 +1,647 @@
++#!/usr/bin/env python3
++"""Offline same-window causal evidence analyzer. Never executes artifacts."""
++import argparse
++import importlib.util
++import hashlib
++import gzip
++import json
++import os
++from pathlib import Path
++import shutil
++import stat
++import subprocess
++import sys
++from decimal import Decimal, InvalidOperation
++
++MAX_FILE = 128 * 1024 * 1024
++MAX_PERF_OUTPUT = 64 * 1024 * 1024
++MAX_PERF_DATA = 512 * 1024 * 1024
++
++class AnalysisError(RuntimeError):
++    pass
++
++def _json(path, limit=MAX_FILE):
++    p = Path(path)
++    info = p.lstat()
++    if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
++        raise AnalysisError(f'not a bounded regular file: {p}')
++    opener = gzip.open if p.suffix == '.gz' else open
++    try:
++        with opener(p, 'rb') as f:
++            raw = f.read(limit + 1)
++    except (OSError, EOFError) as e:
++        raise AnalysisError(f'cannot read bounded JSON artifact {p}: {e}')
++    if len(raw) > limit:
++        raise AnalysisError(f'decompressed JSON artifact exceeds {limit} byte limit: {p}')
++    try:
++        return json.loads(raw.decode('utf-8'),parse_float=Decimal)
++    except (UnicodeError, json.JSONDecodeError) as e:
++        raise AnalysisError(f'invalid UTF-8 JSON artifact {p}: {e}')
++
++def _sha(path):
++    h = hashlib.sha256()
++    with open(path, 'rb') as f:
++        for chunk in iter(lambda: f.read(1024 * 1024), b''):
++            h.update(chunk)
++    return h.hexdigest()
++
++def _observer():
++    name='causal_observer_for_analyzer'
++    if name in sys.modules:
++        return sys.modules[name]
++    path = Path(__file__).with_name('causal-observer.py')
++    spec = importlib.util.spec_from_file_location(name, path)
++    if spec is None or spec.loader is None:
++        raise AnalysisError('cannot load adjacent causal observer parser')
++    module = importlib.util.module_from_spec(spec)
++    sys.modules[name]=module
++    try:
++        spec.loader.exec_module(module)
++    except Exception:
++        sys.modules.pop(name,None)
++        raise
++    return module
++
++def _perf_data(run_dir, sample):
++    window = sample.get('window', {})
++    fin = window.get('perf_finalization', {})
++    paths = fin.get('new_finalized_paths')
++    if fin.get('state') != 'finalized' or not isinstance(paths, list) or len(paths) != 1:
++        raise AnalysisError('capture lacks exactly one finalized perf split; sample coverage unavailable')
++    row = paths[0]
++    name = row.get('path') if isinstance(row, dict) else None
++    if not isinstance(name, str):
++        raise AnalysisError('finalized perf split path missing')
++    p = Path(name)
++    root = Path(run_dir).resolve(strict=True)
++    if not p.is_absolute() or p.parent.resolve(strict=True) != root:
++        raise AnalysisError('finalized perf split is not directly inside run_dir')
++    info = p.lstat()
++    verify = fin.get('sample_data_verification', {})
++    expected_hash = row.get('sha256')
++    if (not stat.S_ISREG(info.st_mode) or info.st_size <= 0 or info.st_size > MAX_PERF_DATA
++            or info.st_size != row.get('size_bytes')
++            or not isinstance(expected_hash, str) or _sha(p) != expected_hash
++            or verify.get('perf_data_path') != str(p)
++            or verify.get('perf_data_sha256') != expected_hash):
++        raise AnalysisError('finalized perf split size/hash identity does not match receipt')
++    return p
++
++def _select_trace(run_dir, explicit):
++    root = Path(run_dir).resolve(strict=True)
++    directory = root / 'aps5-trace'
++    try:
++        directory_info = directory.lstat()
++    except OSError as e:
++        raise AnalysisError(f'canonical aps5-trace directory is missing: {e}')
++    if not stat.S_ISDIR(directory_info.st_mode) or directory.resolve(strict=True) != root / 'aps5-trace':
++        raise AnalysisError('aps5-trace must be a real directory directly inside run_dir')
++    summary = directory / 'aps5-summary.jsonl'
++    try:
++        info = summary.lstat()
++        if not stat.S_ISREG(info.st_mode) or info.st_size > 64 * 1024 * 1024:
++            raise AnalysisError('aps5-summary.jsonl is not a bounded regular file')
++        rows = [json.loads(line) for line in summary.read_text(encoding='utf-8').splitlines() if line.strip()]
++    except FileNotFoundError:
++        raise AnalysisError('aps5-summary.jsonl missing; cannot establish a recorded completed trace')
++    names = set()
++    for row in rows:
++        if not isinstance(row, dict) or 'trace' not in row:
++            continue
++        name=row['trace']
++        window=row.get('window')
++        spec=window.get('spec') if isinstance(window,dict) else None
++        fields=spec.split() if isinstance(spec,str) else []
++        if (name == '' and len(fields)==2 and fields[0]=='summary_every'
++                and fields[1].isdigit() and int(fields[1]) > 0):
++            continue
++        if (not isinstance(name,str) or not name or Path(name).name != name
++                or name in ('.','..')):
++            raise AnalysisError('summary contains an invalid trace filename')
++        names.add(name)
++    if len(names) != 1:
++        raise AnalysisError(f'expected exactly one distinct recorded trace filename; found {len(names)}; no guessing')
++    name = next(iter(names))
++    recorded = directory / name
++    try:
++        file_info = recorded.lstat()
++    except OSError as e:
++        raise AnalysisError(f'recorded trace is missing/incomplete: {e}')
++    if not stat.S_ISREG(file_info.st_mode) or file_info.st_size <= 0:
++        raise AnalysisError('recorded trace is not a completed regular file')
++    canonical = recorded.resolve(strict=True)
++    if canonical.parent != directory.resolve(strict=True):
++        raise AnalysisError('recorded trace escapes canonical aps5-trace directory')
++    if explicit is not None:
++        requested=Path(explicit)
++        if not requested.is_absolute():
++            requested=(directory/requested if requested.parent==Path('.')
++                       else root/requested)
++        try:
++            requested_info=requested.lstat()
++            requested_canonical=requested.resolve(strict=True)
++        except OSError as e:
++            raise AnalysisError(f'explicit trace is missing or inaccessible: {e}')
++        if (not stat.S_ISREG(requested_info.st_mode)
++                or requested_info.st_dev != file_info.st_dev
++                or requested_info.st_ino != file_info.st_ino
++                or requested_canonical.parent != directory.resolve(strict=True)):
++            raise AnalysisError('explicit trace does not match the summary-recorded file')
++    matching_rows=[row for row in rows if isinstance(row,dict) and row.get('trace')==name]
++    coverage_known=bool(matching_rows) and all(type(row.get('trace_dropped')) is bool for row in matching_rows)
++    dropped_threads={}
++    for row in matching_rows:
++        per_thread=row.get('trace_dropped_threads',{})
++        if isinstance(per_thread,dict):
++            for thread_id, detail in per_thread.items():
++                if isinstance(detail,dict):
++                    entry=dropped_threads.setdefault(thread_id,{'causal_events_lost':0})
++                    count=detail.get('causal_events_lost',0)
++                    if type(count) is int and count > entry['causal_events_lost']:
++                        entry['causal_events_lost']=count
++    summary_coverage={'known':coverage_known,
++                      'trace_dropped':any(row.get('trace_dropped') is True for row in matching_rows),
++                      'trace_dropped_threads':dropped_threads}
++    return canonical, summary_coverage
++
++def _decode_perf(run_dir, sample, perf, start, end):
++    p = _perf_data(run_dir, sample)
++    initial=p.lstat()
++    initial_digest=_sha(p)
++    expected_digest=sample['window']['perf_finalization']['sample_data_verification']['perf_data_sha256']
++    if initial_digest != expected_digest:
++        raise AnalysisError('finalized perf split changed after receipt hash verification')
++    exe = perf or shutil.which('perf')
++    if not exe:
++        raise AnalysisError('no --perf provided and perf is not available on PATH')
++    exe = os.path.realpath(exe)
++    try:
++        st = os.stat(exe)
++    except OSError as e:
++        raise AnalysisError(f'cannot stat trusted perf executable: {e}')
++    if not stat.S_ISREG(st.st_mode) or not os.access(exe, os.X_OK):
++        raise AnalysisError('trusted perf path is not an executable regular file')
++    pid = sample.get('pid')
++    if type(pid) is not int or pid <= 1:
++        raise AnalysisError('sample-window has no valid matching target PID')
++    argv = [exe, 'script', '--ns', '-F', 'pid,tid,time,event,period,ip,sym,dso', '-i', str(p)]
++    try:
++        # Drain both pipes incrementally and fail closed before buffering exceeds limits.
++        import selectors
++        import time
++        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
++        selector = selectors.DefaultSelector()
++        selector.register(proc.stdout, selectors.EVENT_READ, 'out')
++        selector.register(proc.stderr, selectors.EVENT_READ, 'err')
++        stdout_parts, stderr_parts = [], []
++        stdout_size = stderr_size = 0
++        deadline = time.monotonic() + 15
++        while selector.get_map():
++            remaining = deadline - time.monotonic()
++            if remaining <= 0:
++                proc.kill()
++                proc.wait()
++                raise AnalysisError('trusted perf decoder exceeded 15 second bound')
++            for key, _ in selector.select(min(remaining, 0.25)):
++                data = os.read(key.fileobj.fileno(), 65536)
++                if not data:
++                    selector.unregister(key.fileobj)
++                elif key.data == 'out':
++                    stdout_size += len(data)
++                    if stdout_size > MAX_PERF_OUTPUT:
++                        proc.kill()
++                        proc.wait()
++                        raise AnalysisError('perf decoder output exceeds 64 MiB')
++                    stdout_parts.append(data)
++                else:
++                    stderr_size += len(data)
++                    if stderr_size <= 65536:
++                        stderr_parts.append(data)
++        try:
++            proc.wait(timeout=max(0.01, deadline-time.monotonic()))
++        except subprocess.TimeoutExpired:
++            proc.kill()
++            proc.wait()
++            raise AnalysisError('trusted perf decoder exceeded 15 second bound')
++        stdout = b''.join(stdout_parts).decode('utf-8', errors='replace')
++        stderr = b''.join(stderr_parts).decode('utf-8', errors='replace')
++        selector.close()
++    except (OSError, subprocess.SubprocessError) as e:
++        raise AnalysisError(f'cannot execute trusted perf decoder: {e}')
++    observer = _observer()
++    lines = stdout.splitlines()
++    samples = observer.parse_perf_sample_lines(lines, pid, start, end)
++    # Preserve only target PID samples strictly inside the requested interval, with callchains.
++    regex = observer.PERF_SAMPLE_RE
++    records = []
++    current = None
++    for line in lines:
++        m = regex.match(line)
++        if m:
++            if current is not None: records.append(current)
++            try: stamp = int(Decimal(m.group(3)) * Decimal(1_000_000_000))
++            except (InvalidOperation, ValueError): continue
++            current = {'pid': int(m.group(1)), 'tid': int(m.group(2)), 'monotonic_ns': stamp,
++                       'period': int(m.group(4)), 'frames': []}
++        elif current is not None and line[:1].isspace() and line.strip():
++            current['frames'].append(line.strip())
++    if current is not None: records.append(current)
++    selected = [r for r in records if r['pid'] == pid and start < r['monotonic_ns'] < end]
++    if not selected:
++        raise AnalysisError('decoded sample stream has no target samples strictly inside interval')
++    for record in selected:
++        record['stack_availability'] = {
++            'user': 'available' if record['frames'] else 'unavailable_or_empty',
++            'kernel': 'not_sampled_by_cpu-clock:u',
++        }
++    final=p.lstat()
++    if ((final.st_dev,final.st_ino,final.st_size,final.st_mtime_ns)
++            != (initial.st_dev,initial.st_ino,initial.st_size,initial.st_mtime_ns)
++            or not stat.S_ISREG(final.st_mode) or _sha(p)!=initial_digest):
++        raise AnalysisError('finalized perf split changed while being decoded')
++    return {'trusted_perf': exe, 'returncode': proc.returncode, 'stderr': stderr[-2048:],
++            'verified_parser': samples,'sample_period_semantics':'perf sample period; not wall-clock spacing or duration',
++            'samples': selected, 'perf_data_path': str(p),
++            'perf_data_sha256': initial_digest}
++
++def _time_alignment(resources):
++    if not resources:
++        return {'status':'unproven','reason':'no resource snapshots establish time-namespace offsets'}
++    for snapshot in resources:
++        entry=snapshot.get('time_namespace_offsets',{})
++        raw=entry.get('raw') if isinstance(entry,dict) else None
++        if not isinstance(entry,dict) or entry.get('availability')!='available' or not isinstance(raw,str):
++            return {'status':'unproven','reason':'time-namespace offsets unavailable'}
++        lines=[line.split() for line in raw.splitlines() if line.strip()]
++        if not lines or any(len(line)!=3 for line in lines):
++            return {'status':'unproven','reason':'time-namespace offset format unknown'}
++        try:
++            if any(int(value)!=0 for line in lines for value in line[1:]):
++                return {'status':'unproven','reason':'nonzero time-namespace offset without verified mapping'}
++        except ValueError:
++            return {'status':'unproven','reason':'time-namespace offset format unknown'}
++    return {'status':'aligned_zero_offsets','reason':None}
++
++def _lane_map(trace, resources, alignment):
++    lanes = {}
++    for ev in trace.get('traceEvents', []):
++        if ev.get('ph') != 'M' or ev.get('name') != 'thread_name':
++            continue
++        args = ev.get('args', {})
++        trace_pid = ev.get('pid') if type(ev.get('pid')) is int else None
++        trace_tid = ev.get('tid') if type(ev.get('tid')) is int else None
++        raw_tid = args.get('native_tid')
++        native_tid = raw_tid if type(raw_tid) is int and raw_tid > 0 else None
++        raw_birth = args.get('native_starttime_ticks')
++        birth = raw_birth if native_tid is not None and type(raw_birth) is int and raw_birth >= 0 else None
++        lanes.setdefault((trace_pid, trace_tid), set()).add((native_tid, birth))
++    known = {}
++    for snapshot in resources:
++        for thread in snapshot.get('threads', {}).get('items', []):
++            birth = thread.get('starttime_ticks')
++            namespace = thread.get('namespace_ids', {})
++            ids = namespace.get('ids', {}) if isinstance(namespace, dict) and namespace.get('availability') == 'available' else {}
++            nspids = ids.get('NSpid', []) if isinstance(ids, dict) else []
++            if type(birth) is int and birth >= 0 and isinstance(nspids, list):
++                host_tid = thread.get('tid')
++                if type(host_tid) is int and host_tid > 0:
++                    for namespace_tid in set(x for x in nspids if type(x) is int and x > 0):
++                        known.setdefault(namespace_tid, set()).add((host_tid, birth))
++    out = []
++    for (trace_pid, trace_tid), identities in lanes.items():
++        for native_tid, birth in identities:
++            candidates = known.get(native_tid, set()) if native_tid is not None else set()
++            matching = [pair for pair in candidates if pair[1] == birth] if birth is not None else []
++            verified = (alignment.get('status') == 'aligned_zero_offsets'
++                        and type(trace_pid) is int and type(trace_tid) is int
++                        and native_tid is not None and birth is not None and len(matching) == 1)
++            out.append({
++                'trace_pid': trace_pid,
++                'trace_tid': trace_tid,
++                'native_tid': native_tid,
++                'native_starttime_ticks': birth,
++                'resource_candidates': [
++                    {'tid': host_tid, 'starttime_ticks': start}
++                    for host_tid, start in sorted(candidates)
++                ],
++                'join': 'verified' if verified else 'unproven',
++                'reason': None if verified else (
++                    'clock alignment unproven' if alignment.get('status') != 'aligned_zero_offsets'
++                    else 'TID namespace/birth match absent or ambiguous'),
++            })
++    return out
++
++def _thread_identity(event):
++    if event is None:
++        return {
++            'trace_pid': None, 'trace_tid': None, 'native_tid': None,
++            'native_starttime_ticks': None, 'os_lane_join': 'unproven',
++            'os_lane_join_reason': 'trace participant event unavailable',
++        }
++    return {
++        'trace_pid': event.get('trace_pid'),
++        'trace_tid': event.get('trace_tid'),
++        'native_tid': event.get('native_tid'),
++        'native_starttime_ticks': event.get('native_starttime_ticks'),
++        'os_lane_join': event.get('os_lane_join', 'unproven'),
++        'os_lane_join_reason': event.get('os_lane_join_reason'),
++    }
++
++def _cpu_deltas(resources, start, end):
++    rows = []
++    grouped = {}
++    for s in resources:
++        a = s.get('snapshot_start', {}).get('monotonic_ns')
++        b = s.get('snapshot_end', {}).get('monotonic_ns')
++        if type(a) is not int or type(b) is not int or a < start or b > end or b < a: continue
++        for t in s.get('threads', {}).get('items', []):
++            tid, birth = t.get('tid'), t.get('starttime_ticks')
++            hz = t.get('cpu_tick_hz', {})
++            if (type(tid) is not int or tid <= 0 or type(birth) is not int or birth < 0
++                    or hz.get('availability') != 'available' or type(hz.get('value')) is not int
++                    or hz['value'] <= 0): continue
++            grouped.setdefault((tid, birth, hz['value']), []).append((a,b,t))
++    for (tid,birth,hz), obs in grouped.items():
++        obs.sort(key=lambda x:(x[0],x[1]))
++        for left,right in zip(obs,obs[1:]):
++            a,b,x=left; c,d,y=right
++            if b > c or a == c: continue
++            u0,s0=x.get('utime_ticks'),x.get('stime_ticks'); u1,s1=y.get('utime_ticks'),y.get('stime_ticks')
++            if any(type(v) is not int for v in (u0,s0,u1,s1)): continue
++            if u1 < u0 or s1 < s0: continue
++            rows.append({'tid':tid,'starttime_ticks':birth,'hz':hz,
++                         'snapshot_brackets_ns':[[a,b],[c,d]],'unobserved_gap_ns':[b,c],
++                         'utime_delta_ticks':u1-u0,'stime_delta_ticks':s1-s0,
++                         'thread_cpu_ns':((u1-u0+s1-s0)*1_000_000_000)//hz,
++                         'states':[x.get('state'),y.get('state')],
++                         'wchan':[x.get('wchan'),y.get('wchan')]})
++    return rows
++
++def _resource_observations(resources, start, end):
++    rows=[]
++    for s in resources:
++        a=s.get('snapshot_start',{}).get('monotonic_ns')
++        b=s.get('snapshot_end',{}).get('monotonic_ns')
++        if type(a) is not int or type(b) is not int or a < start or b > end or b < a: continue
++        for t in s.get('threads',{}).get('items',[]):
++            hz=t.get('cpu_tick_hz',{})
++            rows.append({'tid':t.get('tid'),'starttime_ticks':t.get('starttime_ticks'),
++                         'snapshot_bracket_ns':[a,b],
++                         'utime_ticks':t.get('utime_ticks'),'stime_ticks':t.get('stime_ticks'),
++                         'cpu_tick_hz':hz.get('value') if hz.get('availability')=='available' else None,
++                         'state':t.get('state'),'wchan':t.get('wchan')})
++    return rows
++
++def analyze_trace(trace, resources, start, end):
++    if not isinstance(trace,dict) or not isinstance(trace.get('traceEvents'),list):
++        raise AnalysisError('trace JSON lacks a traceEvents array')
++    for index,ev in enumerate(trace['traceEvents']):
++        if not isinstance(ev,dict) or not isinstance(ev.get('args',{}),dict):
++            raise AnalysisError(f'trace event {index} is not an object with object args')
++    if not isinstance(resources,list):
++        raise AnalysisError('resources data is not a JSONL snapshot list')
++    for index,snapshot in enumerate(resources):
++        if (not isinstance(snapshot,dict)
++                or not isinstance(snapshot.get('threads',{}),dict)
++                or not isinstance(snapshot.get('threads',{}).get('items',[]),list)
++                or not isinstance(snapshot.get('time_namespace_offsets',{}),dict)):
++            raise AnalysisError(f'resource snapshot {index} has invalid structure')
++        if any(not isinstance(t,dict) for t in snapshot.get('threads',{}).get('items',[])):
++            raise AnalysisError(f'resource snapshot {index} has a non-object thread')
++        if any(key in snapshot and not isinstance(snapshot[key],dict)
++               for key in ('snapshot_start','snapshot_end')):
++            raise AnalysisError(f'resource snapshot {index} has invalid clock pairs')
++        for thread in snapshot.get('threads',{}).get('items',[]):
++            if any(key in thread and not isinstance(thread[key],dict)
++                   for key in ('cpu_tick_hz','namespace_ids','wchan')):
++                raise AnalysisError(f'resource snapshot {index} has invalid thread metadata')
++    if not isinstance(trace.get('clock',{}),dict):
++        raise AnalysisError('trace clock is not an object')
++    origin = trace.get('clock', {}).get('origin_ns')
++    if type(origin) is not int: raise AnalysisError('trace clock.origin_ns must be integer monotonic ns')
++    selected=[]
++    for e in trace.get('traceEvents',[]):
++        ts=e.get('ts'); dur=e.get('dur',0)
++        if type(ts) not in (int,float,Decimal) or type(dur) not in (int,float,Decimal): continue
++        # Chrome trace ts/dur are microseconds; Decimal avoids an intermediate float conversion.
++        begin=origin+int(Decimal(str(ts))*1000)
++        finish=begin+int(Decimal(str(dur))*1000)
++        if finish < start or begin > end: continue
++        contained=begin >= start and finish <= end
++        overlap=max(0,min(finish,end)-max(begin,start))
++        complete_span=e.get('ph')=='X' and finish > begin
++        item={'name':e.get('name'),'cat':e.get('cat'),'ph':e.get('ph'),
++              'trace_pid':e.get('pid') if type(e.get('pid')) is int else None,
++              'trace_tid':e.get('tid') if type(e.get('tid')) is int else None,
++              'begin_ns':begin,'end_ns':finish,'wall_ns':finish-begin,
++              'overlap_wall_ns':overlap,'fully_contained':contained,
++              'complete_span':complete_span,'args':e.get('args',{})}
++        args=item['args']; cpu=args.get('thread_cpu_ns')
++        item['thread_cpu_ns']=cpu if type(cpu) is int else None
++        item['thread_cpu_scope']=('contained_span' if contained else 'full_span_not_attributed_to_interval') if complete_span else 'not_a_positive_duration_span'
++        selected.append(item)
++    lost=any(e.get('cat')=='causal' and e.get('name')=='causal coverage lost' for e in trace.get('traceEvents',[]))
++    coverage=trace.get('causal_coverage', trace.get('coverage', {}))
++    summary_lost = bool(trace.get('trace_dropped')) or bool(
++        isinstance(trace.get('trace_dropped_threads'), dict)
++        and any(isinstance(v, dict) and v.get('causal_events_lost', 0)
++                for v in trace['trace_dropped_threads'].values()))
++    causal_present=any(e.get('cat')=='causal' for e in trace.get('traceEvents',[]))
++    coverage_known=(type(trace.get('trace_dropped')) is bool
++                    or trace.get('summary_causal_coverage_known') is True)
++    complete=causal_present and coverage_known and not lost and not summary_lost and not (isinstance(coverage,dict) and (coverage.get('events_lost',0) or coverage.get('dropped',0)))
++    alignment=_time_alignment(resources)
++    edge_clock_aligned=alignment.get('status')=='aligned_zero_offsets'
++    lane_joins=_lane_map(trace,resources,alignment)
++    lane_by_key={}; ambiguous_lanes=set()
++    for lane in lane_joins:
++        key=(lane.get('trace_pid'),lane.get('trace_tid'))
++        if type(key[0]) is not int or type(key[1]) is not int: continue
++        if key in lane_by_key: ambiguous_lanes.add(key)
++        else: lane_by_key[key]=lane
++    for item in selected:
++        key=(item.get('trace_pid'),item.get('trace_tid'))
++        lane=lane_by_key.get(key) if key not in ambiguous_lanes else None
++        if lane is not None:
++            item.update({'native_tid':lane.get('native_tid'),
++                         'native_starttime_ticks':lane.get('native_starttime_ticks'),
++                         'os_lane_join':lane.get('join'),
++                         'os_lane_join_reason':lane.get('reason')})
++        else:
++            item.update({'native_tid':None,'native_starttime_ticks':None,
++                         'os_lane_join':'unproven',
++                         'os_lane_join_reason':('multiple thread_name identities share this trace lane'
++                                                if key in ambiguous_lanes
++                                                else 'trace thread_name metadata unavailable')})
++    mutex=[]; fences=[]
++    events=[e for e in selected if e.get('cat')=='causal']
++    releases={}
++    acquired={}
++    submissions={}
++    for e in events:
++        a=e.get('args',{})
++        if (e.get('name')=='vulkan.queue_submit' and e.get('ph')=='X' and e.get('complete_span') is True
++                and a.get('outcome') in (0,'VK_SUCCESS','success')):
++            submissions.setdefault((a.get('object'),a.get('batch')),[]).append(e)
++    for e in events:
++        a=e.get('args',{}); n=e.get('name')
++        if n in ('gpu_mutex.released','gpu_mutex_release','mutex.release','GpuMutex release'):
++            releases[(a.get('object'),a.get('generation'))]=e
++        if n in ('gpu_mutex.acquired','gpu_mutex.acquired', 'gpu_mutex_acquired'):
++            acquired[(a.get('object'),a.get('operation'))]=e
++    for e in events:
++        a=e.get('args',{}); n=e.get('name')
++        if n in ('gpu_mutex.wait','gpu_mutex_wait','mutex.wait','GpuMutex wait'):
++            rel=releases.get((a.get('object'),a.get('related')))
++            got=acquired.get((a.get('object'),a.get('operation')))
++            good=bool(edge_clock_aligned and complete and rel and got and a.get('operation') not in (None,0)
++                      and a.get('generation') == 0
++                      and got.get('args',{}).get('related') == a.get('related')
++                      and got.get('args',{}).get('generation') not in (None,0)
++                      and rel.get('args',{}).get('generation') not in (None,0)
++                      and e.get('complete_span') is True and rel.get('complete_span') is True
++                      and all(x.get('fully_contained') is True for x in (e,rel,got))
++                      and rel.get('begin_ns') >= e.get('begin_ns')
++                      and rel.get('end_ns') <= e.get('end_ns')
++                      and e.get('end_ns') <= got.get('begin_ns'))
++            mutex.append({'wait':e,'release':rel,'acquired':got,'confirmed':good,
++                          'wait_thread':_thread_identity(e),
++                          'release_thread':_thread_identity(rel),
++                          'acquired_thread':_thread_identity(got),
++                          'reason':None if good else ('window clock alignment unproven' if not edge_clock_aligned
++                                                      else 'missing release/acquire, identity mismatch, or dropped causal coverage')})
++        if n in ('vulkan.fence_wait','gpu.fence_wait') and e.get('ph')=='X':
++            obj=a.get('object'); gen=a.get('generation'); op=a.get('operation')
++            wait_success=a.get('outcome') in (0,'VK_SUCCESS','success')
++            producer=None; completion=None; submit=None
++            for p in events:
++                pa=p.get('args',{})
++                if (p.get('name')=='gpu.fence_submitted' and pa.get('object')==obj
++                        and pa.get('generation')==gen and gen not in (None,0)
++                        and (a.get('related') in (None,0) or pa.get('related')==a.get('related'))
++                        and (a.get('batch') in (None,0) or pa.get('batch')==a.get('batch'))):
++                    candidates=[s for s in submissions.get((pa.get('related'),pa.get('batch')),[])
++                                if pa.get('operation') not in (None,0)
++                                and s.get('args',{}).get('operation')==pa.get('operation')
++                                and s.get('args',{}).get('generation')==pa.get('generation')]
++                    if len(candidates)==1:
++                        producer=p; submit=candidates[0]; break
++            for c in events:
++                ca=c.get('args',{})
++                if (c.get('name')=='gpu.fence_observed_complete' and ca.get('object')==obj
++                        and ca.get('generation')==gen and ca.get('operation')==op
++                        and gen not in (None,0) and op not in (None,0)
++                        and ca.get('outcome') in (0,'VK_SUCCESS','success')
++                        and producer is not None
++                        and ca.get('related')==producer.get('args',{}).get('related')
++                        and ca.get('batch')==producer.get('args',{}).get('batch')):
++                    completion=c; break
++            good=bool(edge_clock_aligned and complete and wait_success and op not in (None,0)
++                      and producer and submit and submit.get('complete_span') is True and completion
++                      and e.get('complete_span') is True
++                      and all(x.get('fully_contained') is True
++                              for x in (e,producer,submit,completion))
++                      and submit.get('end_ns') <= producer.get('begin_ns') <= e.get('begin_ns')
++                      and completion.get('begin_ns') >= e.get('end_ns'))
++            fences.append({'event':e,'producer':producer,'submit':submit,'completion':completion,
++                           'wait_thread':_thread_identity(e),
++                           'producer_thread':_thread_identity(producer),
++                           'submit_thread':_thread_identity(submit),
++                           'completion_thread':_thread_identity(completion),
++                           'confirmed':good,'kernel_owner':'unresolved_not_inferred',
++                           'reason':None if good else ('window clock alignment unproven' if not edge_clock_aligned
++                                                       else 'successful wait, producer queue/batch and observed completion absent or coverage dropped')})
++    cpu_deltas=_cpu_deltas(resources,start,end)
++    observations=_resource_observations(resources,start,end)
++    return {'interval_ns':[start,end],'trace_origin_ns':origin,'trace_events':selected,
++            'mutex_edges':mutex,'fence_edges':fences,'causal_coverage_complete':complete,
++            'span_metric_scope':'all positive-duration X spans, including causal-category spans; boundaries excluded',
++            'pure_phase_wall_ns':[{'name':e['name'],'full_span_wall_ns':e['wall_ns'],
++                                   'interval_overlap_wall_ns':e['overlap_wall_ns'],
++                                   'fully_contained':e['fully_contained'],
++                                   'thread_cpu_ns':e['thread_cpu_ns'],
++                                   'thread_cpu_scope':e['thread_cpu_scope'],
++                                   **_thread_identity(e)}
++                                  for e in selected if e.get('complete_span') is True],
++            'resource_cpu_deltas':cpu_deltas,'resource_observations':observations,
++            'resource_cpu_coverage':{'status':'available' if cpu_deltas else 'insufficient_or_reset',
++                                     'reason':None if cpu_deltas else 'fewer than two wholly interior matching identity/hz snapshots or a counter reset',
++                                     'interior_snapshot_count':len(observations)},
++            'resource_clock_alignment':alignment,
++            'edge_window_clock_alignment':{'status':'aligned' if edge_clock_aligned else 'unproven'},
++            'os_lane_joins':lane_joins,
++            'causal_coverage_detail': {
++                'state': 'complete' if complete else ('incomplete' if lost or summary_lost else 'unproven'),
++                'loss_markers': [{'begin_ns':e['begin_ns'],'args':e['args']}
++                                 for e in selected if e.get('name')=='causal coverage lost'],
++                'trace_dropped': bool(trace.get('trace_dropped')),
++                'trace_dropped_threads':trace.get('trace_dropped_threads',{}),
++            },
++            'semantic_markers':{'source':'unverified','accepted':[],'transport_ACK_is_semantic':False}}
++
++def main(argv=None):
++    ap=argparse.ArgumentParser(description=__doc__)
++    ap.add_argument('run_dir'); ap.add_argument('--trace'); ap.add_argument('--start-ns',type=int,required=True); ap.add_argument('--end-ns',type=int,required=True); ap.add_argument('--perf'); ap.add_argument('--output')
++    args=ap.parse_args(argv)
++    try:
++        if args.end_ns <= args.start_ns: raise AnalysisError('interval must have start-ns < end-ns')
++        run=Path(args.run_dir).resolve(strict=True)
++        sample=_json(run/'sample-window.json')
++        w=sample.get('window',{}); en=w.get('enable',{}); dis=w.get('disable',{})
++        if (sample.get('state') not in ('disabled','finalized') or en.get('command')!='enable'
++                or dis.get('command')!='disable' or not isinstance(en.get('ack_observed'),dict)
++                or not isinstance(dis.get('ack_observed'),dict)):
++            raise AnalysisError('sample-window lacks acknowledged enable/disable and finalized state')
++        enable_ack=en.get('ack_observed',{}).get('monotonic_ns')
++        disable_ack=dis.get('ack_observed',{}).get('monotonic_ns')
++        if (type(enable_ack) is not int or type(disable_ack) is not int
++                or enable_ack >= disable_ack or args.start_ns < enable_ack or args.end_ns > disable_ack):
++            raise AnalysisError('requested interval is not wholly within acknowledged enable/disable bounds')
++        fin=w.get('perf_finalization',{})
++        verify=fin.get('sample_data_verification',{})
++        if (fin.get('state')!='finalized' or verify.get('state')!='verified'
++                or verify.get('usable_cpu_samples') is not True
++                or type(verify.get('actual_duration_ns')) is not int
++                or verify['actual_duration_ns'] <= 0):
++            raise AnalysisError('sample-window lacks finalized, verified usable perf samples')
++        trace_path,trace_summary=_select_trace(run,args.trace)
++        trace=_json(trace_path,512*1024*1024)
++        if not isinstance(trace,dict):
++            raise AnalysisError('trace JSON root must be an object')
++        if ('trace_dropped' in trace and type(trace['trace_dropped']) is not bool
++                or 'trace_dropped_threads' in trace and not isinstance(trace['trace_dropped_threads'],dict)):
++            raise AnalysisError('trace causal coverage summary has invalid structure')
++        trace['summary_causal_coverage_known']=trace_summary['known']
++        if trace_summary['known']:
++            trace['trace_dropped']=trace.get('trace_dropped') is True or trace_summary['trace_dropped']
++        if trace_summary['trace_dropped_threads']:
++            trace['trace_dropped_threads']=trace_summary['trace_dropped_threads']
++        resources=[]
++        rp=run/'resources.jsonl'
++        if rp.exists():
++            info=rp.lstat()
++            if not stat.S_ISREG(info.st_mode) or info.st_size>MAX_FILE: raise AnalysisError('resources.jsonl is not bounded regular file')
++            for line in rp.read_text(encoding='utf-8').splitlines():
++                if line.strip(): resources.append(json.loads(line))
++        out=analyze_trace(trace,resources,args.start_ns,args.end_ns)
++        out['trace_identity']={'path':str(trace_path),'recorded_in_summary':True,
++                               'summary_coverage_known':trace_summary['known']}
++        out['resource_capture']={'status':'available' if rp.exists() else 'missing',
++                                 'interior_thread_observation_count':len(out['resource_observations'])}
++        out['sample_coverage']={'capture_window':[w.get('window_start_monotonic_ns'),w.get('window_end_monotonic_ns')],
++                                'status':verify.get('coverage_status'),'requested_seconds':verify.get('requested_seconds'),
++                                'actual_duration_ns':verify.get('actual_duration_ns'),
++                                'ack_bounds':[en['ack_observed'].get('monotonic_ns'),dis['ack_observed'].get('monotonic_ns')]}
++        out['perf']=_decode_perf(run,sample,args.perf,args.start_ns,args.end_ns)
++        for record in out['perf']['samples']:
++            record['os_thread_join'] = {
++                'status': 'unproven',
++                'reason': 'perf script pid/tid/time format has no thread birth identity',
++            }
++        text=json.dumps(out,sort_keys=True,indent=2,default=str)
++        if args.output: Path(args.output).write_text(text+'\n',encoding='utf-8')
++        else: print(text)
++        return 0
++    except (AnalysisError,OSError,ValueError,OverflowError,KeyError,json.JSONDecodeError) as e:
++        print(f'causal-analyze: {e}',file=sys.stderr); return 2
++if __name__=='__main__': raise SystemExit(main())
+diff --git a/causal-analyze-fixture.py b/causal-analyze-fixture.py
+new file mode 100755
+index 000000000..9c050c697
+--- /dev/null
++++ b/causal-analyze-fixture.py
+@@ -0,0 +1,95 @@
++#!/usr/bin/env python3
++"""Focused pure-data semantic regressions for causal-analyze.py."""
++import importlib.util
++from pathlib import Path
++
++HERE = Path(__file__).resolve().parent
++SPEC = importlib.util.spec_from_file_location('causal_analyze_under_test', HERE / 'causal-analyze.py')
++A = importlib.util.module_from_spec(SPEC)
++SPEC.loader.exec_module(A)
++
++def snap(a,b,tid,birth,u,s,hz=100,state='S',wchan='futex_wait'):
++    return {'snapshot_start':{'monotonic_ns':a},'snapshot_end':{'monotonic_ns':b},
++      'time_namespace_offsets':{'availability':'available','raw':'monotonic 0 0\nboottime 0 0\n'},
++      'threads':{'items':[{'tid':tid,'starttime_ticks':birth,'utime_ticks':u,'stime_ticks':s,
++      'cpu_tick_hz':{'availability':'available','value':hz},'state':state,
++      'namespace_ids':{'availability':'available','ids':{'NSpid':[tid],'NStgid':[tid]}},
++      'wchan':{'availability':'available','raw':wchan}}]}}
++
++def event(name,ts,args,dur=0): return {'cat':'causal','name':name,'ph':'X','ts':ts,'dur':dur,'args':args}
++
++def check(ok,msg):
++    if not ok: raise RuntimeError(msg)
++
++def run():
++    base=1_000_000_000
++    resources=[snap(base+110,base+120,7,70,10,3),snap(base+130,base+140,7,70,15,5),
++               snap(base+150,base+160,7,71,1,1),snap(base+170,base+180,7,71,4,1),
++               snap(base+181,base+190,8,80,0,0),snap(base+140,base+145,9,90,10,2),
++               snap(base+155,base+165,9,90,5,4),snap(base+90,base+95,10,100,1,0),
++               snap(base+205,base+210,10,100,8,0)]
++    trace={'clock':{'origin_ns':1_000_000_000},'trace_dropped':False,'traceEvents':[
++      {'name':'thread_name','ph':'M','args':{'native_tid':7,'native_starttime_ticks':70}},
++      event('phase.outer',.12,{'thread_cpu_ns':30},.06),
++      event('phase.inner',.13,{'thread_cpu_ns':10},.02),
++      event('gpu_mutex.released',.151,{'object':1,'generation':9,'operation':0},.002),
++      event('gpu_mutex.wait',.15,{'object':1,'generation':0,'related':9,'operation':3},.01),
++      event('gpu_mutex.acquired',.16,{'object':1,'generation':10,'related':9,'operation':3}),
++      event('vulkan.queue_submit',.158,{'object':12,'generation':4,'batch':4,'operation':8,'outcome':0,'thread_cpu_ns':22},.001),
++      event('gpu.fence_submitted',.16,{'object':55,'generation':4,'operation':8,'related':12,'batch':4}),
++      event('vulkan.fence_wait',.17,{'object':55,'generation':4,'related':12,'batch':4,'operation':9,'outcome':0,'thread_cpu_ns':7},.005),
++      event('gpu.fence_observed_complete',.18,{'object':55,'generation':4,'related':12,'batch':4,'operation':9,'outcome':0}),
++      event('vulkan.fence_wait',.19,{'object':55,'generation':3,'related':12,'batch':3,'operation':10,'outcome':0},.001),
++      event('gpu.fence_observed_complete',.195,{'object':55,'generation':3,'related':12,'batch':3,'operation':10,'outcome':0}),
++    ]}
++    r=A.analyze_trace(trace,resources,1_000_000_100,1_000_000_200)
++    check(r['os_lane_joins'][0]['join']=='verified','matching TID birth did not join')
++    check(len(r['resource_cpu_deltas'])==2,'TID reuse or counters failed to form exactly valid brackets')
++    check(r['resource_cpu_deltas'][0]['thread_cpu_ns']==70_000_000,'CPU ticks conversion/reset guard failed')
++    check(all(base+100 <= x['snapshot_brackets_ns'][0][0] <= x['snapshot_brackets_ns'][0][1] <= base+200
++              and base+100 <= x['snapshot_brackets_ns'][1][0] <= x['snapshot_brackets_ns'][1][1] <= base+200
++              for x in r['resource_cpu_deltas']),'counter snapshot bracket escaped interval')
++    check(len(r['pure_phase_wall_ns'])==7 and r['pure_phase_wall_ns'][0]['full_span_wall_ns']==60,'nested or causal span wall metrics wrong')
++    check(r['pure_phase_wall_ns'][0]['thread_cpu_ns']==30,'thread CPU incorrectly summed/altered')
++    queue_span=[x for x in r['pure_phase_wall_ns'] if x['name']=='vulkan.queue_submit']
++    check(len(queue_span)==1 and queue_span[0]['full_span_wall_ns']==1
++          and queue_span[0]['thread_cpu_ns']==22,'causal submit X span missing from phase metrics')
++    check(not any(x['name']=='gpu.fence_submitted' for x in r['pure_phase_wall_ns'])
++          and any(x['name']=='gpu.fence_submitted' and not x['complete_span'] for x in r['trace_events']),
++          'zero-duration boundary incorrectly treated as a complete span')
++    check(r['fence_edges'][0]['confirmed'],'matching submitted fence generation not linked')
++    check(not r['fence_edges'][1]['confirmed'],'mismatched completion fence generation confirmed')
++    missing=A.analyze_trace({'clock':{'origin_ns':0},'traceEvents':[event('gpu_mutex_wait',.0000001,{'object':1,'generation':8,'related':7,'operation':2})]},[],0,1000)
++    check(not missing['mutex_edges'][0]['confirmed'],'missing mutex release confirmed')
++    lost={'clock':{'origin_ns':0},'traceEvents':[event('causal coverage lost',0,{'events_lost':2}),
++      event('vulkan.fence_wait',.1,{'object':1,'generation':2,'related':4,'batch':2})]}
++    dropped=A.analyze_trace(lost,[],0,1000)
++    check(not dropped['causal_coverage_complete'] and not dropped['fence_edges'][0]['confirmed'],'dropped coverage did not invalidate edge')
++    reused=A.analyze_trace({'clock':{'origin_ns':0},'traceEvents':[{'name':'thread_name','ph':'M','args':{'native_tid':7}}]},resources,0,200)
++    check(reused['os_lane_joins'][0]['join']=='unproven','missing native birth accepted on reused TID')
++    nested=snap(base+120,base+125,100,500,1,0)
++    nested['threads']['items'][0]['namespace_ids']['ids']['NSpid']=[100,5]
++    nested_join=A.analyze_trace({'clock':{'origin_ns':base},'traceEvents':[
++      {'name':'thread_name','ph':'M','args':{'native_tid':5,'native_starttime_ticks':500}}]},[nested],base,base+1000)
++    check(nested_join['os_lane_joins'][0]['join']=='verified','namespace PID mapping with matching birth failed')
++    nested['time_namespace_offsets']['raw']='monotonic 1 0\nboottime 1 0\n'
++    offset_join=A.analyze_trace({'clock':{'origin_ns':base},'traceEvents':[
++      {'name':'thread_name','ph':'M','args':{'native_tid':5,'native_starttime_ticks':500}}]},[nested],base,base+1000)
++    check(offset_join['os_lane_joins'][0]['join']=='unproven','nonzero time namespace offset accepted without mapping')
++    zero_birth=snap(base+120,base+125,101,0,1,0)
++    zero_join=A.analyze_trace({'clock':{'origin_ns':base},'trace_dropped':False,'traceEvents':[
++      {'name':'thread_name','ph':'M','args':{'native_tid':101,'native_starttime_ticks':0}}]},
++      [zero_birth],base,base+1000)
++    check(zero_join['os_lane_joins'][0]['join']=='verified','zero birth tick conflated with unavailable')
++    bounded=A.analyze_trace({'clock':{'origin_ns':0},'trace_dropped':False,
++      'traceEvents':[event('edge',.05,{'thread_cpu_ns':17},.1)]},[],100,200)
++    crossing=bounded['trace_events'][0]
++    check(not crossing['fully_contained'] and crossing['overlap_wall_ns']==50
++          and crossing['wall_ns']==100 and crossing['thread_cpu_ns']==17
++          and crossing['thread_cpu_scope']=='full_span_not_attributed_to_interval',
++          'overlapping phase wall/CPU was clipped or prorated')
++    return {'status':'passed','checks':['birth_identity','zero_birth_tick','tid_reuse','namespace_pid_mapping','time_namespace_offset','counter_reset','wholly_interior_brackets','nested_wall_cpu_independence','full_span_cpu_boundary','causal_spans_in_phase_metrics','zero_duration_boundary_excluded','fence_generation','missing_release','dropped_coverage','snapshot_bounds','missing_birth']}
++
++if __name__=='__main__':
++    import json
++    print(json.dumps(run(),sort_keys=True))
+diff --git a/causal-native-smoke.py b/causal-native-smoke.py
+new file mode 100755
+index 000000000..9ab2c24f7
+--- /dev/null
++++ b/causal-native-smoke.py
+@@ -0,0 +1,296 @@
++#!/usr/bin/env python3
++"""Exercise the owned SDK fixture, real perf FIFO ACKs and resource snapshots; never a game.
++
++Run in a bounded NoNewPrivileges user service with control-group teardown.
++"""
++import argparse
++import hashlib
++import importlib.util
++import json
++import os
++from pathlib import Path
++import select
++import shutil
++import signal
++import subprocess
++import sys
++import threading
++import time
++
++BASE = Path(__file__).resolve().parent
++spec = importlib.util.spec_from_file_location('sdk_smoke_observer', BASE / 'causal-observer.py')
++observer = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(observer)
++
++
++def save(path, value):
++    temporary = path.with_suffix('.tmp')
++    temporary.write_text(json.dumps(value, indent=2) + '\n')
++    temporary.replace(path)
++
++
++def digest(path):
++    with path.open('rb') as stream:
++        return hashlib.file_digest(stream, 'sha256').hexdigest()
++
++
++class Target:
++    def __init__(self, pid, birth, binary, cgroup):
++        self.pid, self.birth, self.binary, self.cgroup = pid, birth, binary, cgroup
++        self.verify_process()
++
++    def verify_process(self):
++        value = observer.proc_stat(self.pid)
++        if value['starttime_ticks'] != self.birth:
++            raise RuntimeError('SDK fixture PID was reused')
++        if Path(os.readlink(f'/proc/{self.pid}/exe')) != self.binary:
++            raise RuntimeError('SDK fixture executable identity changed')
++        if observer.proc_cgroup(self.pid) != self.cgroup:
++            raise RuntimeError('SDK fixture escaped its owned service cgroup')
++        return value
++
++
++def wait_until(predicate, deadline, description):
++    while time.monotonic() < deadline:
++        value = predicate()
++        if value:
++            return value
++        time.sleep(0.01)
++    raise TimeoutError(description)
++
++
++def command(control_fd, ack_fd, name, deadline):
++    if select.select([ack_fd], [], [], 0)[0]:
++        raise RuntimeError('Unexpected stale perf ACK before command')
++    request = observer.clock_pair()
++    payload = (name + '\n').encode()
++    if os.write(control_fd, payload) != len(payload):
++        raise RuntimeError('Short perf control write')
++    written = observer.clock_pair()
++    raw = bytearray()
++    while time.monotonic() < deadline:
++        if not select.select([ack_fd], [], [], min(0.1, deadline - time.monotonic()))[0]:
++            continue
++        raw.extend(os.read(ack_fd, 4096))
++        if len(raw) > 4096:
++            raise RuntimeError('Oversized perf ACK')
++        if b'\x00' in raw:
++            if bytes(raw).replace(b'\x00', b'').strip() != b'ack':
++                raise RuntimeError(f'Unexpected perf ACK {bytes(raw)!r}')
++            return {'command': name, 'request': request, 'write_returned': written,
++                    'ack_observed': observer.clock_pair(), 'ack_line': 'ack',
++                    'ack_raw_hex': bytes(raw).hex(), 'ack_protocol_terminator': 'nul'}
++    raise TimeoutError(f'No real perf {name} ACK')
++
++
++def split_closed(perf_pid, path):
++    try:
++        info = path.stat()
++        for entry in Path(f'/proc/{perf_pid}/fd').iterdir():
++            try:
++                opened = entry.stat()
++                if (opened.st_dev, opened.st_ino) == (info.st_dev, info.st_ino):
++                    return False
++            except FileNotFoundError:
++                continue
++        return info if info.st_size else False
++    except FileNotFoundError:
++        return False
++
++
++def capture(args):
++    binary = args.binary.resolve(strict=True)
++    expected = (BASE / 'AnyPS5-pad-ack/build-padack/tests/agc_gpu_mutex_causality_tests').resolve(strict=True)
++    if binary != expected or not os.access(binary, os.X_OK):
++        raise RuntimeError('Only the explicitly built SDK no-game fixture may be launched')
++    perf_name = args.perf or shutil.which('perf')
++    if not perf_name:
++        raise RuntimeError('A trusted perf CLI is required in PATH or --perf')
++    perf = Path(perf_name).resolve(strict=True)
++    if not perf.is_file() or not os.access(perf, os.X_OK):
++        raise RuntimeError('Selected perf CLI is not an executable regular file')
++    run = args.run_dir.absolute()
++    if run != run.resolve() or not run.is_relative_to(BASE / 'evidence'):
++        raise RuntimeError('Use a canonical fresh workbench evidence directory')
++    run.mkdir(mode=0o700, parents=True, exist_ok=False)
++    (run / 'aps5-trace').mkdir(mode=0o700)
++    control, ack = run / 'perf-control.fifo', run / 'perf-ack.fifo'
++    os.mkfifo(control, 0o600)
++    os.mkfifo(ack, 0o600)
++    control_fd = os.open(control, os.O_RDWR | os.O_NONBLOCK)
++    ack_fd = os.open(ack, os.O_RDWR | os.O_NONBLOCK)
++    started = time.monotonic()
++    deadline = started + 25
++    process = None
++    target = None
++    target_fd = None
++    stop_snapshots = threading.Event()
++    snapshot_thread = None
++    snapshot_errors = []
++    receipt = {'schema': 1, 'kind': 'owned-sdk-no-game-fixture',
++               'scope': 'SDK instrumentation/CPU/wait correlation only; not game loading or FPS proof',
++               'binary': str(binary), 'binary_sha256': digest(binary), 'perf_cli': str(perf),
++               'status': 'starting'}
++    environment = os.environ.copy()
++    environment.update(APS5_TRACE_CAUSAL='1', APS5_TRACE_FRAMES='0:1',
++                       APS5_TRACE_EVENTS='65536', APS5_TRACE_DIR=str(run / 'aps5-trace'))
++    environment.pop('APS5_TRACE_SECONDS', None)
++    environment.pop('LD_PRELOAD', None)
++    argv = [str(perf), 'record', '-D', '-1', '--user-callchains', '--switch-output=signal',
++            f'--control=fifo:{control},{ack}', '-e', 'cpu-clock:u', '-F', '5', '-P', '-k', 'mono',
++            '--call-graph', 'dwarf,4096', '-m', '128', '--no-buildid-cache', '--max-size', '16M',
++            '-o', str(run / 'perf.data'), '--', str(binary), '--capture-smoke', str(run)]
++    receipt['command'] = argv
++    try:
++        with (run / 'process.log').open('xb') as log:
++            process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=log,
++                                       stderr=subprocess.STDOUT, env=environment)
++        def ready():
++            if process.poll() is not None:
++                raise RuntimeError('perf/SDK fixture exited before readiness; see process.log')
++            path = run / 'ready.json'
++            if not path.exists():
++                return None
++            return json.loads(path.read_text())
++        identity = wait_until(ready, min(deadline, started + 6), 'SDK fixture did not become ready')
++        pid, birth = identity['pid'], identity['starttime_ticks']
++        if type(pid) is not int or pid <= 1 or type(birth) is not int or birth < 0:
++            raise RuntimeError('SDK fixture did not provide a real PID/birth identity')
++        cgroup = observer.proc_cgroup(os.getpid())
++        target = Target(pid, birth, binary, cgroup)
++        target_fd = os.pidfd_open(pid)
++        receipt['target'] = {'pid': pid, 'starttime_ticks': birth, 'cgroup': cgroup}
++        window = {'state': 'waiting', 'requested_seconds': 20,
++                  'coverage_status': 'partial', 'source': receipt['kind']}
++        def sampling_record():
++            save(run / 'sample-window.json', {'pid': pid, 'state': window['state'],
++                 'unit': 'owned-sdk-no-game-fixture', 'cgroup': cgroup,
++                 'updated': observer.clock_pair(), 'window': window})
++        window['enable'] = command(control_fd, ack_fd, 'enable', min(deadline, time.monotonic() + 3))
++        window['state'] = 'enabled'
++        sampling_record()
++        def snapshots():
++            previous = {}
++            number = 0
++            try:
++                with (run / 'resources.jsonl').open('x') as output:
++                    while not stop_snapshots.is_set():
++                        value, previous = observer.snapshot(target, previous)
++                        number += 1
++                        value['snapshot_number'] = number
++                        output.write(json.dumps(value) + '\n')
++                        output.flush()
++                        stop_snapshots.wait(0.1)
++            except Exception as error:
++                snapshot_errors.append(f'{type(error).__name__}: {error}')
++        snapshot_thread = threading.Thread(target=snapshots)
++        snapshot_thread.start()
++        (run / 'start').touch(exist_ok=False)
++        def completed():
++            if process.poll() is not None:
++                raise RuntimeError('SDK fixture exited before controlled finalization')
++            path = run / 'finished.json'
++            return json.loads(path.read_text()) if path.exists() else None
++        finished = wait_until(completed, min(deadline, time.monotonic() + 8), 'SDK CPU/block/CPU phases did not complete')
++        if finished.get('status') != 'completed':
++            raise RuntimeError('SDK fixture did not report completed phases')
++        phases = [json.loads(line) for line in (run / 'phases.jsonl').read_text().splitlines() if line.strip()]
++        if [phase.get('phase') for phase in phases] != ['cpu_before', 'gpu_mutex_wait', 'cpu_after']:
++            raise RuntimeError('SDK fixture did not emit the real ordered CPU/block/CPU phases')
++        target.verify_process()
++        window['disable'] = command(control_fd, ack_fd, 'disable', min(deadline, time.monotonic() + 3))
++        window['state'] = 'disabled'
++        window['disabled_reason'] = 'fixture_phases_completed'
++        window['actual_duration_ns'] = (window['disable']['ack_observed']['monotonic_ns'] -
++                                        window['enable']['ack_observed']['monotonic_ns'])
++        stop_snapshots.set()
++        snapshot_thread.join(timeout=2)
++        if snapshot_thread.is_alive() or snapshot_errors:
++            raise RuntimeError(f'Resource snapshot collection incomplete: {snapshot_errors}')
++        if process.poll() is not None:
++            raise RuntimeError('perf exited before split request')
++        os.kill(process.pid, signal.SIGUSR2)  # Unreaped direct child, never a process group.
++        def finalized():
++            paths = list(run.glob('perf.data.*'))
++            if len(paths) > 1:
++                raise RuntimeError('More than one finalized sample split')
++            if len(paths) != 1:
++                return None
++            info = split_closed(process.pid, paths[0])
++            return (paths[0], info) if info else None
++        path, info = wait_until(finalized, min(deadline, time.monotonic() + 3), 'No closed perf split after signal')
++        sha = digest(path)
++        decoded = subprocess.run([str(perf), 'script', '-i', str(path), '--ns', '-F',
++                                  'pid,tid,time,event,period'], capture_output=True, text=True,
++                                 timeout=min(6, max(0.1, deadline-time.monotonic())))
++        if decoded.returncode or len(decoded.stdout.encode()) > 8 * 1024 * 1024:
++            raise RuntimeError(f'Perf sample decoding failed or exceeded bounded fixture output: {decoded.stderr}')
++        verification = observer.parse_perf_sample_lines(decoded.stdout.splitlines(), pid,
++            window['enable']['ack_observed']['monotonic_ns'], window['disable']['ack_observed']['monotonic_ns'])
++        if not verification['usable_cpu_samples']:
++            raise RuntimeError('No actual matching-PID CPU samples inside acknowledged window')
++        verification.update(perf_data_sha256=sha, perf_data_path=str(path), perf_script_returncode=0,
++                            actual_duration_ns=window['actual_duration_ns'], coverage_status='partial',
++                            requested_seconds=20, parser_format='--ns -F pid,tid,time,event,period',
++                            window_start_monotonic_ns=window['enable']['ack_observed']['monotonic_ns'],
++                            window_end_monotonic_ns=window['disable']['ack_observed']['monotonic_ns'])
++        window['perf_finalization'] = {'state': 'finalized', 'target_pid': pid,
++            'target_starttime_ticks': birth, 'perf_argv': argv[0:argv.index('--')],
++            'signal_ack_status': 'SIGUSR2 syscall returned; no kernel-delivery ACK',
++            'new_finalized_paths': [{'path': str(path), 'device': info.st_dev, 'inode': info.st_ino,
++                                    'size_bytes': info.st_size, 'sha256': sha}],
++            'sample_data_verification': verification}
++        sampling_record()
++        target.verify_process()
++        (run / 'finish').touch(exist_ok=False)
++        code = process.wait(timeout=min(5, max(0.1, deadline-time.monotonic())))
++        if code:
++            raise RuntimeError(f'perf/SDK fixture exited {code}; see process.log')
++        if not select.select([target_fd], [], [], 2)[0]:
++            raise RuntimeError('SDK fixture identity remains alive after completion')
++        receipt.update(status='verified', process_exit=code, phases=phases, finished=finished,
++                       cpu_sampling=verification, target_identity_gone=True,
++                       elapsed_seconds=time.monotonic()-started)
++        save(run / 'result.json', receipt)
++        return receipt
++    except Exception as error:
++        receipt.update(status='failed', error=f'{type(error).__name__}: {error}',
++                       elapsed_seconds=time.monotonic()-started)
++        save(run / 'result.json', receipt)
++        raise
++    finally:
++        stop_snapshots.set()
++        if snapshot_thread is not None:
++            snapshot_thread.join(timeout=2)
++        if target_fd is not None:
++            if not select.select([target_fd], [], [], 0)[0]:
++                signal.pidfd_send_signal(target_fd, signal.SIGTERM)
++            os.close(target_fd)
++        if process is not None and process.poll() is None:
++            process.terminate()
++            try:
++                process.wait(timeout=2)
++            except subprocess.TimeoutExpired:
++                process.kill()
++                process.wait(timeout=2)
++        os.close(control_fd)
++        os.close(ack_fd)
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('run_dir', type=Path)
++    parser.add_argument('--binary', type=Path, default=BASE / 'AnyPS5-pad-ack/build-padack/tests/agc_gpu_mutex_causality_tests')
++    parser.add_argument('--perf', help='Trusted perf executable; never read from an artifact')
++    args = parser.parse_args()
++    try:
++        value = capture(args)
++    except Exception as error:
++        print(f'{type(error).__name__}: {error}', file=sys.stderr)
++        return 1
++    print(json.dumps(value, indent=2))
++    return 0
++
++
++if __name__ == '__main__':
++    raise SystemExit(main())
