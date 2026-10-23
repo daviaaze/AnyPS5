@@ -1026,6 +1026,14 @@ struct VulkanDevice::State {
 };
 
 ComputePipelineReplayResult VulkanDevice::ReplayComputePipeline(const ComputePipelineCapture& capture, std::span<const std::byte> initialCache) {
+    return replayComputePipeline(capture, initialCache, false);
+}
+
+ComputePipelineReplayResult VulkanDevice::PrecompileComputePipeline(const ComputePipelineCapture& capture) {
+    return replayComputePipeline(capture, {}, true);
+}
+
+ComputePipelineReplayResult VulkanDevice::replayComputePipeline(const ComputePipelineCapture& capture, std::span<const std::byte> initialCache, bool persistent) {
     require(state->compileOnly, "pipeline replay requires a compile-only device");
     const auto start = std::chrono::steady_clock::now();
     const auto elapsed = [](auto since) { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - since).count(); };
@@ -1095,10 +1103,13 @@ ComputePipelineReplayResult VulkanDevice::ReplayComputePipeline(const ComputePip
     std::copy_n(state->properties.pipelineCacheUUID, VK_UUID_SIZE, result.pipelineCacheUuid.begin());
     result.initialCacheBytes = initialCache.size();
     auto phase = std::chrono::steady_clock::now();
-    VkPipelineCacheCreateInfo cacheInfo{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
-    cacheInfo.initialDataSize = initialCache.size();
-    cacheInfo.pInitialData = initialCache.data();
-    check(state->DeviceFunction<PFN_vkCreatePipelineCache>("vkCreatePipelineCache")(state->device, &cacheInfo, nullptr, &replay.cache), "vkCreatePipelineCache replay");
+    require(!persistent || state->pipelineCache, "precompile requires the device pipeline cache");
+    if (!persistent) {
+        VkPipelineCacheCreateInfo cacheInfo{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+        cacheInfo.initialDataSize = initialCache.size();
+        cacheInfo.pInitialData = initialCache.data();
+        check(state->DeviceFunction<PFN_vkCreatePipelineCache>("vkCreatePipelineCache")(state->device, &cacheInfo, nullptr, &replay.cache), "vkCreatePipelineCache replay");
+    }
     result.cacheMilliseconds = elapsed(phase);
     phase = std::chrono::steady_clock::now();
     objects.module = Graphics::CreateShaderModule(state->DeviceFunction<PFN_vkCreateShaderModule>("vkCreateShaderModule"), state->device, state->graphicsPipelineLibrary, capture.spirv.data(), capture.spirv.size() * sizeof(std::uint32_t), "vkCreateShaderModule replay");
@@ -1162,8 +1173,12 @@ ComputePipelineReplayResult VulkanDevice::ReplayComputePipeline(const ComputePip
     check(state->DeviceFunction<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(state->device, &layoutInfo, nullptr, &objects.layout), "vkCreatePipelineLayout replay");
     result.layoutMilliseconds = elapsed(phase);
     phase = std::chrono::steady_clock::now();
-    CreateComputePipeline(state->device, state->DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines"), replay.cache, objects.module, objects.layout, capture.flags, capture.stageFlags, specialization.Info(), capture.requiredSubgroupSize, &objects.pipeline, nullptr, nullptr);
+    CreateComputePipeline(state->device, state->DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines"), persistent ? state->pipelineCache->Handle() : replay.cache, objects.module, objects.layout, capture.flags, capture.stageFlags, specialization.Info(), capture.requiredSubgroupSize, &objects.pipeline, persistent ? &state->pipelineCache->Synchronization() : nullptr, nullptr);
     result.pipelineMilliseconds = elapsed(phase);
+    if (persistent) {
+        result.totalMilliseconds = elapsed(start);
+        return result;
+    }
     phase = std::chrono::steady_clock::now();
     const auto getCache = state->DeviceFunction<PFN_vkGetPipelineCacheData>("vkGetPipelineCacheData");
     std::size_t cacheBytes = 0;

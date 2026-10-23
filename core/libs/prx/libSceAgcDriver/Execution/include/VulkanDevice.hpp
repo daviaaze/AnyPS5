@@ -55,6 +55,10 @@ public:
     struct CompileOnly {};
     explicit VulkanDevice(CompileOnly);
     ComputePipelineReplayResult ReplayComputePipeline(const ComputePipelineCapture& capture, std::span<const std::byte> initialCache = {});
+    // Compiles a captured compute pipeline into the device's persistent pipeline cache (the
+    // vk-pipelines-*.bin file the runtime loads from ANYPS5_SHADER_CACHE_DIR/<source version>);
+    // SavePipelineCache() then merges it into that file. Returns no exported cache bytes.
+    ComputePipelineReplayResult PrecompileComputePipeline(const ComputePipelineCapture& capture);
     // Builds the pipeline of a journaled compute result ahead of its first dispatch (the journal
     // replay's hook, on its threads): false when the device already holds a pipeline for the module.
     bool ReplayComputePipeline(const ShaderRecompiler::RecompileResult& shader, bool pushConstants);
@@ -367,6 +371,7 @@ public:
     bool copyWaitsOnCompletions(std::uint64_t address, std::size_t bytes) const;
 
 private:
+    ComputePipelineReplayResult replayComputePipeline(const ComputePipelineCapture& capture, std::span<const std::byte> initialCache, bool persistent);
     VulkanDevice(const PresentationWindow* window, bool compileOnly);
     friend struct VulkanDeviceTestAccess;
     VkPipeline splitComputePipeline(const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, ComputePipelineObjects& objects, const std::array<std::uint32_t, 3>& base);
