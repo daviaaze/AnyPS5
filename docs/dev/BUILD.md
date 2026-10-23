@@ -184,6 +184,7 @@ On Windows MinGW frees `thread_local` objects before their destructors run, so t
 Build `agc_compute_pipeline_replay` in the full build with `-DANYPS5_ENABLE_SPIRV_TOOLS=ON`; replay validates the captured module before calling Vulkan. Set `APS5_DUMP_COMPUTE_PIPELINES` to a dedicated empty directory before starting a title to save each uncached compute pipeline's final SPIR-V, descriptor layouts, push constant ranges, specialization values, subgroup size and creation flags before compilation. Files are named `compute-<identity>/capture.aps5cp`; identical records are deduplicated. Capture stops with an error at 128 records, 256 MiB total or 36 MiB per record (at most 8,388,608 SPIR-V words, or 32 MiB of shader code). Capture files contain shader code and device metadata, but no guest buffers or textures; review them before sharing.
 
 Set `APS5_DUMP_COMPUTE_MIN_WORDS` to capture only modules at or above that SPIR-V word count, for example `100000` when investigating large NVIDIA compilations. The default is `0` (all modules); values outside `0` through `8388608` fail. The filter applies only when capture is enabled.
+When compute capture is enabled, `APS5_DUMP_COMPUTE_SLOW_MS` also saves a full `.aps5cp` identity after `vkCreateComputePipelines` if the driver call reaches the threshold, regardless of SPIR-V word count. It uses `vk_ms` (excluding pipeline-cache wait); the bounded launcher sets 1000 ms. Use `0` only for fixtures that need to force the slow-capture path.
 
 ```sh
 cmake --build build --target agc_compute_pipeline_replay

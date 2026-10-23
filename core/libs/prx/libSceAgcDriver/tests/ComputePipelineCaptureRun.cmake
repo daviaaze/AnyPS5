@@ -8,7 +8,7 @@ set(runDirectory "${OUTPUT_ROOT}/compute-capture-${runId}")
 set(captureDirectory "${runDirectory}/captures")
 file(MAKE_DIRECTORY "${runDirectory}")
 execute_process(
-        COMMAND "${CMAKE_COMMAND}" -E env "ANYPS5_NO_SHADER_CACHE=1" "APS5_PIPELINE_STATS=0" "APS5_DUMP_COMPUTE_PIPELINES=" "APS5_DUMP_COMPUTE_MIN_WORDS=0" "${FIXTURE}"
+        COMMAND "${CMAKE_COMMAND}" -E env "ANYPS5_NO_SHADER_CACHE=1" "APS5_PIPELINE_STATS=0" "APS5_DUMP_COMPUTE_PIPELINES=" "APS5_DUMP_COMPUTE_MIN_WORDS=0" "APS5_DUMP_COMPUTE_SLOW_MS=" "${FIXTURE}"
         WORKING_DIRECTORY "${runDirectory}"
         RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error TIMEOUT 20
 )
@@ -25,7 +25,7 @@ if(NOT result STREQUAL "0" OR NOT output MATCHES "branch past endpgm tests passe
     message(FATAL_ERROR "Normal compute fixture failed: ${result}\n${output}\n${error}")
 endif()
 execute_process(
-        COMMAND "${CMAKE_COMMAND}" -E env "ANYPS5_REQUIRE_VULKAN=1" "ANYPS5_NO_SHADER_CACHE=1" "APS5_PIPELINE_STATS=0" "APS5_DUMP_COMPUTE_PIPELINES=${captureDirectory}" "APS5_DUMP_COMPUTE_MIN_WORDS=0" "${FIXTURE}"
+        COMMAND "${CMAKE_COMMAND}" -E env "ANYPS5_REQUIRE_VULKAN=1" "ANYPS5_NO_SHADER_CACHE=1" "APS5_PIPELINE_STATS=0" "APS5_DUMP_COMPUTE_PIPELINES=${captureDirectory}" "APS5_DUMP_COMPUTE_MIN_WORDS=0" "APS5_DUMP_COMPUTE_SLOW_MS=" "${FIXTURE}"
         WORKING_DIRECTORY "${runDirectory}"
         RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error TIMEOUT 20
 )
@@ -147,5 +147,49 @@ foreach(capture IN LISTS captures)
         message(FATAL_ERROR "Replayed pipeline did not resolve the captured content identity: ${capture}")
     endif()
 endforeach()
+set(slowCaptureDirectory "${runDirectory}/slow-captures")
+execute_process(
+        COMMAND "${CMAKE_COMMAND}" -E env "ANYPS5_REQUIRE_VULKAN=1" "ANYPS5_NO_SHADER_CACHE=1" "APS5_PIPELINE_STATS=0" "APS5_DUMP_COMPUTE_PIPELINES=${slowCaptureDirectory}" "APS5_DUMP_COMPUTE_MIN_WORDS=8388608" "APS5_DUMP_COMPUTE_SLOW_MS=0" "${FIXTURE}"
+        WORKING_DIRECTORY "${runDirectory}"
+        RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error TIMEOUT 20
+)
+set(slowOutputAndError "${output}\n${error}")
+file(WRITE "${runDirectory}/slow-capture.log" "${slowOutputAndError}")
+if(NOT result STREQUAL "0" OR NOT output MATCHES "branch past endpgm tests passed")
+    message(FATAL_ERROR "Slow-only compute capture fixture failed: ${result}\n${slowOutputAndError}")
+endif()
+if(NOT slowOutputAndError MATCHES "\\[compute-capture-context\\]" OR NOT slowOutputAndError MATCHES "\\[compute-create-timing\\]")
+    message(FATAL_ERROR "Slow-only capture omitted pipeline identity or timing diagnostics: ${slowOutputAndError}")
+endif()
+file(GLOB slowCaptures "${slowCaptureDirectory}/compute-*/capture.aps5cp")
+list(LENGTH slowCaptures slowCount)
+if(slowCount LESS 1)
+    message(FATAL_ERROR "Slow-only threshold produced no pipeline captures")
+endif()
+foreach(slowCapture IN LISTS slowCaptures)
+    string(FIND "${slowOutputAndError}" "${slowCapture}" capturePathOffset)
+    string(FIND "${slowOutputAndError}" "path=${slowCapture} cache_wait_ms=" timingPathOffset)
+    if(capturePathOffset LESS 0 OR timingPathOffset LESS 0)
+        message(FATAL_ERROR "Slow-only capture has no matching timing context: ${slowCapture}\n${slowOutputAndError}")
+    endif()
+    get_filename_component(slowRecordDirectory "${slowCapture}" DIRECTORY)
+    get_filename_component(slowRecordName "${slowRecordDirectory}" NAME)
+    string(REPLACE "compute-" "" slowIdentity "${slowRecordName}")
+    set(slowReport "${runDirectory}/slow-${slowIdentity}.json")
+    execute_process(
+            COMMAND "${CMAKE_COMMAND}" -E env "APS5_PIPELINE_STATS=0" "APS5_DUMP_COMPUTE_PIPELINES=" "${REPLAY}" "${slowCapture}" --output "${slowReport}"
+            WORKING_DIRECTORY "${runDirectory}"
+            RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error TIMEOUT 20
+    )
+    if(NOT result STREQUAL "0")
+        message(FATAL_ERROR "Slow-only pipeline replay failed: ${result}\n${output}\n${error}")
+    endif()
+    file(READ "${slowReport}" slowReportJson)
+    string(JSON slowReportIdentity GET "${slowReportJson}" capture_identity)
+    if(NOT slowReportIdentity STREQUAL slowIdentity)
+        message(FATAL_ERROR "Slow-only replay identity mismatch: ${slowReportJson}")
+    endif()
+endforeach()
+message(STATUS "Slow-threshold-only captures replayed with full identity.")
 message(STATUS "Normal and captured compute output verified; ${count} captured pipelines replayed without dispatch and timing phases validated")
 file(REMOVE_RECURSE "${runDirectory}")

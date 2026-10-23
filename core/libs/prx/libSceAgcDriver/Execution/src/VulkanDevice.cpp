@@ -187,12 +187,25 @@ const char* ComputePipelineDumpDirectory() { return std::getenv("APS5_DUMP_COMPU
 
 bool CaptureComputePipeline(std::size_t words) {
     const char* minimum = std::getenv("APS5_DUMP_COMPUTE_MIN_WORDS");
-    if (minimum == nullptr) return true;
-    std::uint32_t threshold = 0;
-    const auto end = minimum + std::strlen(minimum);
-    const auto parsed = std::from_chars(minimum, end, threshold);
-    require(parsed.ec == std::errc{} && parsed.ptr == end && threshold <= ComputePipelineCapture::MaxSpirvWords, "APS5_DUMP_COMPUTE_MIN_WORDS must be an integer from 0 through 8388608");
-    return words >= threshold;
+    if (minimum != nullptr) {
+        std::uint32_t threshold = 0;
+        const auto end = minimum + std::strlen(minimum);
+        const auto parsed = std::from_chars(minimum, end, threshold);
+        require(parsed.ec == std::errc{} && parsed.ptr == end && threshold <= ComputePipelineCapture::MaxSpirvWords, "APS5_DUMP_COMPUTE_MIN_WORDS must be an integer from 0 through 8388608");
+        if (words >= threshold) return true;
+    }
+    return false;
+}
+
+bool ComputePipelineSlowThresholdMilliseconds(double& threshold) {
+    const char* value = std::getenv("APS5_DUMP_COMPUTE_SLOW_MS");
+    if (value == nullptr || *value == '\0') return false;
+    std::uint32_t parsedThreshold = 0;
+    const auto end = value + std::strlen(value);
+    const auto parsed = std::from_chars(value, end, parsedThreshold);
+    require(parsed.ec == std::errc{} && parsed.ptr == end && parsedThreshold <= 3600000, "APS5_DUMP_COMPUTE_SLOW_MS must be an integer from 0 through 3600000");
+    threshold = static_cast<double>(parsedThreshold);
+    return true;
 }
 
 // The ShaderResources content cache dispatches share with recorded draws: Graphics::ResourceCache,
@@ -5320,7 +5333,11 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::createComputePipeline(cons
     PerformanceTimer timing("Vulkan.ComputePipeline");
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const char* directory = std::getenv("APS5_DUMP_COMPUTE_PIPELINES");
-    const bool captureEnabled = directory != nullptr && *directory != '\0' && ComputePipelineCapture::OptionalEnabled() && CaptureComputePipeline(shader.spirv.size());
+    const bool captureDirectoryEnabled = directory != nullptr && *directory != '\0' && ComputePipelineCapture::OptionalEnabled();
+    const bool sizeCaptureEnabled = captureDirectoryEnabled && CaptureComputePipeline(shader.spirv.size());
+    double slowCaptureThresholdMilliseconds = 0;
+    const bool slowCaptureEnabled = captureDirectoryEnabled && ComputePipelineSlowThresholdMilliseconds(slowCaptureThresholdMilliseconds);
+    const bool captureEnabled = sizeCaptureEnabled || slowCaptureEnabled;
     const bool diagnostics = profile || captureEnabled;
     const auto start = diagnostics ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     ComputePipelinePhaseTimes phaseTimes;
@@ -5344,7 +5361,8 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::createComputePipeline(cons
     const Graphics::PipelineSpecialization specialization(shader);
     const auto subgroupSize = computeSubgroupSize(shader);
     const auto stageFlags = computeStageFlags(shader);
-    if (captureEnabled) {
+    const auto writeCapture = [&] {
+        if (!capturePath.empty() || !ComputePipelineCapture::OptionalEnabled()) return;
         const auto captureStart = std::chrono::steady_clock::now();
         ComputePipelineCapture capture;
         capture.spirv = shader.spirv.Copy();
@@ -5374,10 +5392,12 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::createComputePipeline(cons
             std::fprintf(stderr, "[compute-capture] %s\n", capturePath.string().c_str());
             std::fprintf(stderr, "[compute-capture-context] program=0x%llx words=%zu path=%s capture_ms=%.6f\n", static_cast<unsigned long long>(programAddress), shader.spirv.size(), capturePath.string().c_str(), captureMilliseconds);
         }
-    }
+    };
+    if (sizeCaptureEnabled) writeCapture();
     if (profile && shader.spirv.size() > 100000) std::fprintf(stderr, "[dispatch] creating a pipeline for %zu SPIR-V words (program 0x%llx)\n", shader.spirv.size(), static_cast<unsigned long long>(programAddress));
     const auto create = state->DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines");
     CreateComputePipeline(state->device, create, context.pipelineCache, objects->module, objects->layout, pipelineFlags, stageFlags, specialization.Info(), subgroupSize, &objects->pipeline, context.pipelineCacheSynchronization, diagnostics ? &phaseTimes : nullptr);
+    if (slowCaptureEnabled && phaseTimes.driverCallMilliseconds >= slowCaptureThresholdMilliseconds) writeCapture();
     objects->destroyModule(objects->device, objects->module, nullptr);
     objects->module = VK_NULL_HANDLE;
     if (!state->probingFloatControls) {
