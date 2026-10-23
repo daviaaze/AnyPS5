@@ -57,10 +57,19 @@ BufferPool::~BufferPool() {
     for (auto& [memory, block] : slabBlocks) freeBlock(*block);
 }
 
-VkDeviceMemory BufferPool::AllocateMemory(const VkMemoryAllocateInfo& allocation, const char* operation, std::optional<std::uint32_t> hostType, std::uint32_t* allocatedType, bool newImage) {
+VkDeviceMemory BufferPool::AllocateMemory(const VkMemoryAllocateInfo& allocation, const char* operation, std::optional<std::uint32_t> hostType, std::uint32_t* allocatedType, bool newImage, ImageMemoryTiming* timing) {
     if (allocatedType != nullptr) *allocatedType = allocation.memoryTypeIndex;
     VkDeviceMemory memory = VK_NULL_HANDLE;
-    auto result = allocateMemory(device, &allocation, nullptr, &memory);
+    const auto allocate = [&](const VkMemoryAllocateInfo& request) {
+        const auto started = timing != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const auto value = allocateMemory(device, &request, nullptr, &memory);
+        if (timing != nullptr) {
+            timing->vkAllocateMilliseconds += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+            ++timing->vkAllocateCalls;
+        }
+        return value;
+    };
+    auto result = allocate(allocation);
     const auto initialResult = result;
     unsigned attempts = 1;
     VkDeviceSize reclaimed = 0;
@@ -70,7 +79,7 @@ VkDeviceMemory BufferPool::AllocateMemory(const VkMemoryAllocateInfo& allocation
         reclaimed = trim();
         if (reclaimed != 0) {
             memory = VK_NULL_HANDLE;
-            result = allocateMemory(device, &allocation, nullptr, &memory);
+            result = allocate(allocation);
             ++attempts;
         }
     }
@@ -79,7 +88,7 @@ VkDeviceMemory BufferPool::AllocateMemory(const VkMemoryAllocateInfo& allocation
         if (released != 0) {
             reclaimed += trim();
             memory = VK_NULL_HANDLE;
-            result = allocateMemory(device, &allocation, nullptr, &memory);
+            result = allocate(allocation);
             ++attempts;
         }
     }
@@ -87,7 +96,7 @@ VkDeviceMemory BufferPool::AllocateMemory(const VkMemoryAllocateInfo& allocation
         auto host = allocation;
         host.memoryTypeIndex = *hostType;
         memory = VK_NULL_HANDLE;
-        result = allocateMemory(device, &host, nullptr, &memory);
+        result = allocate(host);
         ++attempts;
         if (result == VK_SUCCESS) {
             if (allocatedType != nullptr) *allocatedType = *hostType;
@@ -146,7 +155,7 @@ bool BufferPool::heapOverBudget() {
     return heapOver;
 }
 
-VkDeviceMemory BufferPool::TakeImageMemory(const VkMemoryAllocateInfo& allocation, const char* operation, std::optional<std::uint32_t> hostType, std::uint32_t* allocatedType, bool newImage) {
+VkDeviceMemory BufferPool::TakeImageMemory(const VkMemoryAllocateInfo& allocation, const char* operation, std::optional<std::uint32_t> hostType, std::uint32_t* allocatedType, bool newImage, ImageMemoryTiming* timing) {
     const auto type = allocation.memoryTypeIndex;
     if (imagePooled(allocation.allocationSize, type)) {
         std::lock_guard lock(mutex);
@@ -162,13 +171,13 @@ VkDeviceMemory BufferPool::TakeImageMemory(const VkMemoryAllocateInfo& allocatio
             deviceTier.retainedBytes -= allocation.allocationSize;
             --imageSlots;
             imageBytes -= allocation.allocationSize;
-            ++imageHits;
+            if (timing != nullptr) ++timing->poolHits;
             if (allocatedType != nullptr) *allocatedType = type;
             return memory;
         }
         ++imageMisses;
     }
-    return AllocateMemory(allocation, operation, hostType, allocatedType, newImage);
+    return AllocateMemory(allocation, operation, hostType, allocatedType, newImage, timing);
 }
 
 void BufferPool::PutImageMemory(VkDeviceMemory memory, VkDeviceSize bytes, std::uint32_t memoryType) noexcept {
@@ -535,8 +544,8 @@ std::shared_ptr<BufferPool> GetBufferPool(const Context& context) {
     return context.bufferPool;
 }
 
-VkDeviceMemory AllocateImageMemory(const Context& context, const VkMemoryAllocateInfo& allocation, std::uint32_t mask, const char* operation, std::uint32_t* allocatedType, bool newImage) {
-    return GetBufferPool(context)->TakeImageMemory(allocation, operation, context.RefusedDeviceMemoryFallback(mask, allocation.memoryTypeIndex), allocatedType, newImage);
+VkDeviceMemory AllocateImageMemory(const Context& context, const VkMemoryAllocateInfo& allocation, std::uint32_t mask, const char* operation, std::uint32_t* allocatedType, bool newImage, ImageMemoryTiming* timing) {
+    return GetBufferPool(context)->TakeImageMemory(allocation, operation, context.RefusedDeviceMemoryFallback(mask, allocation.memoryTypeIndex), allocatedType, newImage, timing);
 }
 
 void ReleaseImageMemory(const Context& context, VkDeviceMemory memory, VkDeviceSize bytes, std::uint32_t memoryType) noexcept {

@@ -321,6 +321,9 @@ With `APS5_PROFILE_DRAW` set (any value), the driver prints a profile line on st
 | `[fill-sync]` | from the start |
 | `[buffers] descriptor elements bound` | from the start |
 
+
+The cumulative `[texture]` line is printed every 200 newly created sampled textures. Its `vkCreateImage` and `actual vkAllocateMemory` totals time only those Vulkan API calls; `image pool+allocate` includes image-memory-pool lookup, reuse, fallback/reclaim and any Vulkan allocations. A pool hit makes zero `vkAllocateMemory` calls; the reported pool-hit and API-call counts make that distinction explicit. `requirements+type` includes `vkGetImageMemoryRequirements` and memory-type selection. These are CPU-side wall durations, not GPU execution time.
+
 `[gputime]` is described above and needs `APS5_PROFILE_GPU`. Other profile lines state their window in their text or are not listed here because their counters were not checked.
 
 ## Driver thread priority

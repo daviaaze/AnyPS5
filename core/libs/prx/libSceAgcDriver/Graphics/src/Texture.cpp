@@ -48,17 +48,26 @@ OwnedImage::~OwnedImage() {
     ReleaseImageMemory(context, memory, memoryBytes, memoryType);
 }
 
-void OwnedImage::Allocate(const Context& device, const VkMemoryAllocateInfo& allocation, std::uint32_t mask, const char* operation, bool newImage) {
-    memory = AllocateImageMemory(device, allocation, mask, operation, &memoryType, newImage);
+void OwnedImage::Allocate(const Context& device, const VkMemoryAllocateInfo& allocation, std::uint32_t mask, const char* operation, bool newImage, ImageMemoryTiming* timing) {
+    memory = AllocateImageMemory(device, allocation, mask, operation, &memoryType, newImage, timing);
     memoryBytes = allocation.allocationSize;
     context.bufferPool = device.bufferPool;
 }
 
 namespace {
 
-// APS5_PROFILE_DRAW: accumulate texture setup phases and report every 200 textures.
+// Optional per-image breakdown for APS5_PROFILE_DRAW. vkAllocateMemory elapsed time is measured
+// around the actual driver entry point in BufferPool, while imageMemoryPool records the complete
+// allocator call (pool lookup, fallback/reclaim and any driver allocation).
+struct TextureImageTiming {
+    double createImage = 0, requirementsAndType = 0, imageMemoryPool = 0, vkAllocateMemory = 0, bindImage = 0;
+    std::uint64_t createCalls = 0, poolHits = 0, vkAllocateCalls = 0;
+};
+
 struct TextureProfile {
     double allocate = 0, read = 0, gpu = 0, view = 0;
+    double createImage = 0, requirementsAndType = 0, imageMemoryPool = 0, vkAllocateMemory = 0, bindImage = 0;
+    std::uint64_t imageCreateCalls = 0, imagePoolHits = 0, vkAllocateCalls = 0;
     std::uint64_t count = 0;
     std::uint64_t fromStorage = 0;
     double storageCreate = 0, storageWriteBack = 0, storageAlloc = 0, storageHostCopy = 0, storageGpu = 0, storageStore = 0;
@@ -261,7 +270,7 @@ struct ExpandImage {
     VkDeviceSize bytes = 0;
 };
 
-ExpandImage CreateExpandImage(const Context& context, const GuestTextureResource& descriptor, std::uint32_t depth, std::uint32_t layers) {
+ExpandImage CreateExpandImage(const Context& context, const GuestTextureResource& descriptor, std::uint32_t depth, std::uint32_t layers, TextureImageTiming* timing = nullptr) {
     ExpandImage result;
     VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     imageInfo.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | (descriptor.dimension == TextureDimension::kCube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0u);
@@ -275,15 +284,32 @@ ExpandImage CreateExpandImage(const Context& context, const GuestTextureResource
     imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    const auto createStarted = timing != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     Check(context.Function<PFN_vkCreateImage>("vkCreateImage")(context.device, &imageInfo, nullptr, &result.image), "vkCreateImage sRGB copy");
+    if (timing != nullptr) {
+        timing->createImage += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - createStarted).count();
+        ++timing->createCalls;
+    }
     result.owned = std::make_shared<OwnedImage>(context, result.image, VK_NULL_HANDLE);
     VkMemoryRequirements requirements{};
+    const auto requirementsStarted = timing != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     context.Function<PFN_vkGetImageMemoryRequirements>("vkGetImageMemoryRequirements")(context.device, result.image, &requirements);
     VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     allocation.allocationSize = requirements.size;
     allocation.memoryTypeIndex = context.DeviceMemoryType(requirements.memoryTypeBits, requirements.size, "texture");
-    result.owned->Allocate(context, allocation, requirements.memoryTypeBits, "vkAllocateMemory sRGB copy", true);
+    if (timing != nullptr) timing->requirementsAndType += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - requirementsStarted).count();
+    ImageMemoryTiming memoryTiming{};
+    const auto memoryStarted = timing != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    result.owned->Allocate(context, allocation, requirements.memoryTypeBits, "vkAllocateMemory sRGB copy", true, timing != nullptr ? &memoryTiming : nullptr);
+    if (timing != nullptr) {
+        timing->imageMemoryPool += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - memoryStarted).count();
+        timing->vkAllocateMemory += memoryTiming.vkAllocateMilliseconds;
+        timing->poolHits += memoryTiming.poolHits;
+        timing->vkAllocateCalls += memoryTiming.vkAllocateCalls;
+    }
+    const auto bindStarted = timing != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, result.image, result.owned->memory, 0), "vkBindImageMemory sRGB copy");
+    if (timing != nullptr) timing->bindImage += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - bindStarted).count();
     result.bytes = requirements.size;
     return result;
 }
@@ -316,6 +342,8 @@ std::uint64_t SampledTextureMemory() {
 Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare) : context(context) {
 
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    TextureImageTiming imageTiming{};
+    auto* imageTimingOutput = profile ? &imageTiming : nullptr;
     PhaseTimer timer;
     try {
         const auto colorFormat = SampledTextureFormat(context, descriptor.format);
@@ -357,22 +385,39 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
         imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | (srgbExpand ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0u);
         imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        const auto createImageStarted = imageTimingOutput != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         Check(context.Function<PFN_vkCreateImage>("vkCreateImage")(context.device, &imageInfo, nullptr, &image), "vkCreateImage");
+        if (imageTimingOutput != nullptr) {
+            imageTimingOutput->createImage += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - createImageStarted).count();
+            ++imageTimingOutput->createCalls;
+        }
         owned = std::make_shared<OwnedImage>(context, image, VK_NULL_HANDLE);
 
         VkMemoryRequirements requirements{};
+        const auto requirementsStarted = imageTimingOutput != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         context.Function<PFN_vkGetImageMemoryRequirements>("vkGetImageMemoryRequirements")(context.device, image, &requirements);
         VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         allocation.allocationSize = requirements.size;
         allocationBytes = requirements.size;
         allocation.memoryTypeIndex = context.DeviceMemoryType(requirements.memoryTypeBits, requirements.size, "texture");
-        owned->Allocate(context, allocation, requirements.memoryTypeBits, "vkAllocateMemory texture", true);
+        if (imageTimingOutput != nullptr) imageTimingOutput->requirementsAndType += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - requirementsStarted).count();
+        ImageMemoryTiming memoryTiming{};
+        const auto imageMemoryStarted = imageTimingOutput != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        owned->Allocate(context, allocation, requirements.memoryTypeBits, "vkAllocateMemory texture", true, imageTimingOutput != nullptr ? &memoryTiming : nullptr);
+        if (imageTimingOutput != nullptr) {
+            imageTimingOutput->imageMemoryPool += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - imageMemoryStarted).count();
+            imageTimingOutput->vkAllocateMemory += memoryTiming.vkAllocateMilliseconds;
+            imageTimingOutput->poolHits += memoryTiming.poolHits;
+            imageTimingOutput->vkAllocateCalls += memoryTiming.vkAllocateCalls;
+        }
+        const auto bindImageStarted = imageTimingOutput != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, owned->memory, 0), "vkBindImageMemory");
+        if (imageTimingOutput != nullptr) imageTimingOutput->bindImage += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - bindImageStarted).count();
 
         const VkImage uploadImage = image;
         std::shared_ptr<OwnedImage> uploadOwned;
         if (srgbExpand) {
-            auto expanded = CreateExpandImage(context, descriptor, geometry.imageDepth, geometry.imageLayers);
+            auto expanded = CreateExpandImage(context, descriptor, geometry.imageDepth, geometry.imageLayers, imageTimingOutput);
             uploadOwned = std::move(owned);
             owned = std::move(expanded.owned);
             image = expanded.image;
@@ -561,8 +606,15 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
         prepareSrgbView(descriptor, viewInfo);
         if (profile) {
             auto& totals = Profile();
-            totals.view += timer.lap();
-            if (++totals.count % 200 == 0) std::fprintf(stderr, "[texture] %llu textures (%llu copied from storage images, %llu uploads recorded): allocate+image %.0f ms, guest read %.0f ms, detile+copy %.0f ms, view+buffer release %.0f ms\n", static_cast<unsigned long long>(totals.count), static_cast<unsigned long long>(totals.fromStorage), static_cast<unsigned long long>(totals.recordedUploads), totals.allocate, totals.read, totals.gpu, totals.view);
+            totals.createImage += imageTiming.createImage;
+            totals.requirementsAndType += imageTiming.requirementsAndType;
+            totals.imageMemoryPool += imageTiming.imageMemoryPool;
+            totals.vkAllocateMemory += imageTiming.vkAllocateMemory;
+            totals.bindImage += imageTiming.bindImage;
+            totals.imageCreateCalls += imageTiming.createCalls;
+            totals.imagePoolHits += imageTiming.poolHits;
+            totals.vkAllocateCalls += imageTiming.vkAllocateCalls;
+            if (++totals.count % 200 == 0) std::fprintf(stderr, "[texture] %llu textures (%llu copied from storage images, %llu uploads recorded): allocate+image %.0f ms, vkCreateImage %.0f ms/%llu, requirements+type %.0f ms, image pool+allocate %.0f ms (%llu hits), actual vkAllocateMemory %.0f ms/%llu calls, bind %.0f ms, guest read %.0f ms, detile+copy %.0f ms, view+buffer release %.0f ms\n", static_cast<unsigned long long>(totals.count), static_cast<unsigned long long>(totals.fromStorage), static_cast<unsigned long long>(totals.recordedUploads), totals.allocate, totals.createImage, static_cast<unsigned long long>(totals.imageCreateCalls), totals.requirementsAndType, totals.imageMemoryPool, static_cast<unsigned long long>(totals.imagePoolHits), totals.vkAllocateMemory, static_cast<unsigned long long>(totals.vkAllocateCalls), totals.bindImage, totals.read, totals.gpu, totals.view);
         }
         countedBytes = allocationBytes;
         SampledMemoryCounter().fetch_add(countedBytes, std::memory_order_relaxed);
