@@ -8,6 +8,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Recipe.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include <memory>
+#include <array>
+#include <cstddef>
 #include <vector>
 
 namespace AgcDriver::Graphics {
@@ -112,6 +114,13 @@ const char* IndirectDrawPathName(IndirectDrawPath path);
 // Thrown (the decode or the build threw); `us` is the packet's time in the driver.
 enum class DrawSkip : std::uint8_t { Nothing, Prechecked, Thrown, Count };
 void CountDrawSkip(DrawSkip kind, double us);
+
+// Driver::commitDraw's parts on the draw committer (APS5_PROFILE_DRAW), in microseconds, added to
+// the [draws] line's "commit" section: the GpuMutex acquisition wait and the whole hold, and inside
+// the hold recordLabelsForPacket, noteDrawWriters, the VulkanDevice::Draw/DrawFromRecipe call
+// (Graphics::Draw plus its wrapper) and submitDueAfterCommit.
+enum class DrawCommitPart : std::size_t { MutexWait, MutexHold, Labels, Writers, DeviceDraw, SubmitDue, Count };
+void NoteDrawCommit(const std::array<double, static_cast<std::size_t>(DrawCommitPart::Count)>& us);
 
 // Recorded draws whose written guest buffers were copied (their results reach guest memory by a CPU
 // write-back when their batch completes), listed until that write-back ran. It is the draw

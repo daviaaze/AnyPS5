@@ -413,6 +413,8 @@ struct DrawProfile {
     std::uint64_t partialLookups = 0;
     std::uint64_t pagesWalked = 0;
     double lookupUs = 0;
+    std::array<double, static_cast<std::size_t>(DrawCommitPart::Count)> commitUs{};
+    std::uint64_t commitSamples = 0;
     std::array<double, PhaseCount> totalsUs{};
     // The longest single draw's time per phase, and the longest draw: the [lock] line's 'draw'
     // hold max (tens of ms against an average well under a millisecond) needs a phase name.
@@ -581,9 +583,19 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     for (std::size_t i = 1; i < profile.recipeMisses.size() && room(); ++i) {
         n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %llu", DrawRecipeMissName(static_cast<DrawRecipeMiss>(i)), static_cast<unsigned long long>(profile.recipeMisses[i]));
     }
+    if (profile.commitSamples != 0 && room()) {
+        static constexpr const char* CommitPartNames[] = {"mutex wait", "mutex hold", "labels", "writers", "device draw", "submit due"};
+        static_assert(std::size(CommitPartNames) == static_cast<std::size_t>(DrawCommitPart::Count));
+        n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; commit (%llu, avg us):", static_cast<unsigned long long>(profile.commitSamples));
+        for (std::size_t i = 0; i < profile.commitUs.size() && room(); ++i) {
+            n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %.1f", CommitPartNames[i], profile.commitUs[i] / static_cast<double>(profile.commitSamples));
+        }
+    }
     std::fprintf(stderr, "%s\n", line);
     std::fprintf(stderr, "[rescache] draws: %llu hits, %llu misses, %llu invalidated, %llu uncacheable; validation memo %llu hits / %llu misses (which key words the misses differ in: the miss churn line)\n", static_cast<unsigned long long>(profile.cacheHits), static_cast<unsigned long long>(profile.cacheMisses), static_cast<unsigned long long>(profile.cacheInvalidated), static_cast<unsigned long long>(profile.uncacheable), static_cast<unsigned long long>(profile.validateHits), static_cast<unsigned long long>(profile.validateMisses));
     profile.totalsUs.fill(0);
+    profile.commitUs.fill(0);
+    profile.commitSamples = 0;
     profile.maxUs.fill(0);
     profile.maxDrawUs = profile.hookWaitUs = profile.maxHookWaitUs = profile.ownSyncUs = 0;
     profile.bindingsUs = profile.uploadUs = profile.descriptorsUs = profile.otherUs = profile.addressOtherUs = 0;
@@ -921,6 +933,15 @@ std::array<DrawPassCounts, 2> DrawPassTotals() {
     auto& stats = Profile();
     std::lock_guard lock(stats.mutex);
     return stats.passTotals;
+}
+
+void NoteDrawCommit(const std::array<double, static_cast<std::size_t>(DrawCommitPart::Count)>& us) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile) return;
+    auto& totals = Profile();
+    std::lock_guard lock(totals.mutex);
+    for (std::size_t i = 0; i < us.size(); ++i) totals.commitUs[i] += us[i];
+    ++totals.commitSamples;
 }
 
 void CountDrawSkip(DrawSkip kind, double us) {

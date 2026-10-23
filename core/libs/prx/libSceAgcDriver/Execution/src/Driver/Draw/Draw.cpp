@@ -1075,18 +1075,51 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
 }
 
 void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    using Clock = std::chrono::steady_clock;
+    using CommitTimes = std::array<double, static_cast<std::size_t>(Graphics::DrawCommitPart::Count)>;
+    const auto part = [](Graphics::DrawCommitPart value) { return static_cast<std::size_t>(value); };
+    const auto micros = [](Clock::time_point from, Clock::time_point to) { return std::chrono::duration<double, std::micro>(to - from).count(); };
+    CommitTimes us{};
+    Clock::time_point lap{};
+    Clock::time_point locked{};
+    if (profile) lap = Clock::now();
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
-    std::lock_guard gpuLock(GuestMemory::GpuMutex());
-    if (auto current = device.Load(); current != nullptr && current != localDevice) localDevice = std::move(current);
+    std::unique_lock gpuLock(GuestMemory::GpuMutex());
+    if (profile) {
+        locked = Clock::now();
+        us[part(Graphics::DrawCommitPart::MutexWait)] = micros(lap, locked);
+        lap = locked;
+    }
+    // Runs submitDueAfterCommit under the lock on every normal exit; when profiling it also
+    // closes the timing record, then releases the lock before handing the totals over.
     struct SubmitDue {
         Driver& driver;
         const std::shared_ptr<VulkanDevice>& device;
+        std::unique_lock<std::remove_reference_t<decltype(GuestMemory::GpuMutex())>>& held;
+        bool profile;
+        CommitTimes& us;
+        Clock::time_point& lap;
+        Clock::time_point locked;
         ~SubmitDue() noexcept(false) {
+            const auto before = profile ? Clock::now() : Clock::time_point{};
+            if (profile) us[static_cast<std::size_t>(Graphics::DrawCommitPart::DeviceDraw)] += std::chrono::duration<double, std::micro>(before - lap).count();
             if (std::uncaught_exceptions() == 0) driver.submitDueAfterCommit(device.get());
+            if (profile) {
+                const auto after = Clock::now();
+                us[static_cast<std::size_t>(Graphics::DrawCommitPart::SubmitDue)] += std::chrono::duration<double, std::micro>(after - before).count();
+                us[static_cast<std::size_t>(Graphics::DrawCommitPart::MutexHold)] = std::chrono::duration<double, std::micro>(after - locked).count();
+                held.unlock();
+                Graphics::NoteDrawCommit(us);
+            }
         }
-    } submitDue{*this, localDevice};
+    } submitDue{*this, localDevice, gpuLock, profile, us, lap, locked};
+    if (auto current = device.Load(); current != nullptr && current != localDevice) localDevice = std::move(current);
+    if (profile) lap = Clock::now();
     recordLabelsForPacket(localDevice.get(), queue);
+    if (profile) { const auto now = Clock::now(); us[static_cast<std::size_t>(Graphics::DrawCommitPart::Labels)] += std::chrono::duration<double, std::micro>(now - lap).count(); lap = now; }
     noteDrawWriters(stages, queue);
+    if (profile) { const auto now = Clock::now(); us[static_cast<std::size_t>(Graphics::DrawCommitPart::Writers)] += std::chrono::duration<double, std::micro>(now - lap).count(); lap = now; }
     if (recipe != nullptr) {
         if (localDevice->DrawFromRecipe(graphics, drawParameters, stages, snapshots, recipe) == RecipeOutcome::Recorded) return;
         VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
