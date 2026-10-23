@@ -166,3 +166,102 @@ foreach(validatorTarget IN ITEMS SPIRV-Tools-static SPIRV-Tools-shared)
     endif()
     set_property(TARGET ${validatorTarget} PROPERTY SOURCES "${patchedValidatorSources}")
 endforeach()
+
+set(spirvToolsBlockSource "${spirvToolsValidatorSourceDir}/val/basic_block.cpp")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${spirvToolsBlockSource}")
+file(READ "${spirvToolsBlockSource}" spirvToolsBlock)
+set(spirvToolsOldDominates [=[
+bool BasicBlock::dominates(const BasicBlock& other) const {
+  return (this == &other) ||
+         !(other.dom_end() ==
+           std::find(other.dom_begin(), other.dom_end(), this));
+}
+]=])
+set(spirvToolsOldStructuralDominates [=[
+bool BasicBlock::structurally_dominates(const BasicBlock& other) const {
+  return (this == &other) || !(other.structural_dom_end() ==
+                               std::find(other.structural_dom_begin(),
+                                         other.structural_dom_end(), this));
+}
+]=])
+set(spirvToolsOldStructuralPostdominates [=[
+bool BasicBlock::structurally_postdominates(const BasicBlock& other) const {
+  return (this == &other) || !(other.structural_pdom_end() ==
+                               std::find(other.structural_pdom_begin(),
+                                         other.structural_pdom_end(), this));
+}
+]=])
+set(spirvToolsNewDominates [=[
+bool BasicBlock::dominates(const BasicBlock& other) const {
+  const BasicBlock* block = &other;
+  while (block) {
+    if (block == this) return true;
+    const BasicBlock* next = block->immediate_dominator_;
+    if (next == block) break;
+    block = next;
+  }
+  return false;
+}
+]=])
+set(spirvToolsNewStructuralDominates [=[
+bool BasicBlock::structurally_dominates(const BasicBlock& other) const {
+  const BasicBlock* block = &other;
+  while (block) {
+    if (block == this) return true;
+    const BasicBlock* next = block->immediate_structural_dominator_;
+    if (next == block) break;
+    block = next;
+  }
+  return false;
+}
+]=])
+set(spirvToolsNewStructuralPostdominates [=[
+bool BasicBlock::structurally_postdominates(const BasicBlock& other) const {
+  const BasicBlock* block = &other;
+  while (block) {
+    if (block == this) return true;
+    const BasicBlock* next = block->immediate_structural_post_dominator_;
+    if (next == block) break;
+    block = next;
+  }
+  return false;
+}
+]=])
+foreach(relation IN ITEMS Dominates StructuralDominates StructuralPostdominates)
+    set(oldBody "${spirvToolsOld${relation}}")
+    string(FIND "${spirvToolsBlock}" "${oldBody}" bodyPosition)
+    if(bodyPosition EQUAL -1)
+        message(FATAL_ERROR "SPIRV-Tools ${relation} has changed; review the local traversal fix")
+    endif()
+    string(LENGTH "${oldBody}" bodyLength)
+    math(EXPR afterBody "${bodyPosition} + ${bodyLength}")
+    string(SUBSTRING "${spirvToolsBlock}" ${afterBody} -1 remainingBlock)
+    string(FIND "${remainingBlock}" "${oldBody}" duplicatePosition)
+    if(NOT duplicatePosition EQUAL -1)
+        message(FATAL_ERROR "SPIRV-Tools ${relation} is duplicated; review the local traversal fix")
+    endif()
+    string(REPLACE "${oldBody}" "${spirvToolsNew${relation}}" spirvToolsBlock "${spirvToolsBlock}")
+endforeach()
+set(spirvToolsPatchedBlock "${spirvToolsPatchedDir}/basic_block.cpp")
+file(CONFIGURE OUTPUT "${spirvToolsPatchedBlock}" CONTENT "${spirvToolsBlock}" @ONLY)
+foreach(validatorTarget IN ITEMS SPIRV-Tools-static SPIRV-Tools-shared)
+    if(NOT TARGET ${validatorTarget})
+        continue()
+    endif()
+    get_target_property(validatorSources ${validatorTarget} SOURCES)
+    set(patchedValidatorSources)
+    set(blockReplacements 0)
+    foreach(source IN LISTS validatorSources)
+        get_filename_component(sourcePath "${source}" ABSOLUTE BASE_DIR "${spirvToolsValidatorSourceDir}")
+        if(sourcePath STREQUAL spirvToolsBlockSource)
+            list(APPEND patchedValidatorSources "${spirvToolsPatchedBlock}")
+            math(EXPR blockReplacements "${blockReplacements} + 1")
+        else()
+            list(APPEND patchedValidatorSources "${source}")
+        endif()
+    endforeach()
+    if(NOT blockReplacements EQUAL 1)
+        message(FATAL_ERROR "SPIRV-Tools validator sources have changed; review the local traversal fix")
+    endif()
+    set_property(TARGET ${validatorTarget} PROPERTY SOURCES "${patchedValidatorSources}")
+endforeach()

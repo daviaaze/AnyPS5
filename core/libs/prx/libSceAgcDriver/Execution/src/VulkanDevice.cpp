@@ -5092,18 +5092,36 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     const bool completionNeeded = resources.NeedsCompletion() || record.htileClear.has_value();
     if (completionNeeded && resources.Reusable()) {
         auto kept = record.resources;
-        recorder.OnComplete([kept, htileClear = record.htileClear] {
-            kept->CheckFaults();
+        const auto spirv = record.shader->program->spirv;
+        const auto programAddress = record.programAddress;
+        recorder.OnComplete([kept, spirv, programAddress, htileClear = record.htileClear] {
+            try {
+                kept->CheckFaults();
+            } catch (const std::exception& error) {
+                char context[128];
+                const auto identity = spirv.ContentHash();
+                std::snprintf(context, sizeof(context), "compute fault context: program=0x%llx spirv-hash=%016llx%016llx: ", static_cast<unsigned long long>(programAddress), static_cast<unsigned long long>(identity.high), static_cast<unsigned long long>(identity.low));
+                throw std::runtime_error(std::string(context) + error.what());
+            }
             if (htileClear.has_value()) Graphics::CompleteHtileDepthClear(htileClear->first, htileClear->second);
         });
     } else if (completionNeeded) {
         // Listed for DispatchIndirect until the write-back ran (a non-reusable object, so once).
         auto writers = state->copiedWriters;
         auto kept = record.resources;
-        recorder.OnComplete([kept, writers, htileClear = record.htileClear] {
+        const auto spirv = record.shader->program->spirv;
+        const auto programAddress = record.programAddress;
+        recorder.OnComplete([kept, writers, spirv, programAddress, htileClear = record.htileClear] {
             // Delisted before the write-back: one that fails must not keep indirect dispatches on the CPU.
             writers->erase(std::remove(writers->begin(), writers->end(), kept), writers->end());
-            kept->WriteBackBuffers();
+            try {
+                kept->WriteBackBuffers();
+            } catch (const std::exception& error) {
+                char context[128];
+                const auto identity = spirv.ContentHash();
+                std::snprintf(context, sizeof(context), "compute fault context: program=0x%llx spirv-hash=%016llx%016llx: ", static_cast<unsigned long long>(programAddress), static_cast<unsigned long long>(identity.high), static_cast<unsigned long long>(identity.low));
+                throw std::runtime_error(std::string(context) + error.what());
+            }
             if (htileClear.has_value()) Graphics::CompleteHtileDepthClear(htileClear->first, htileClear->second);
         });
         // Listed after the registration: a throw there leaves nothing that would pin the CPU path forever.
