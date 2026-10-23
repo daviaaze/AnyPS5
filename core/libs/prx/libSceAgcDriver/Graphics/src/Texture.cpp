@@ -5762,14 +5762,22 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     DeviceBuffer tiled(context, original.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     Buffer host(context, original.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     if (profile) Profile().storageAlloc += timer.lap();
-    // Start from the uploaded bytes so padding and untouched texels keep their guest values.
-    std::memcpy(host.Bytes().data(), original.data(), original.size());
+    // Only the kept ranges are read back and stored below, so only they travel: start them from the
+    // uploaded bytes so padding and untouched texels keep their guest values. The rest of `tiled`
+    // is retiler output nobody reads (the retile writes tiled bytes from linear texels only).
+    std::vector<VkBufferCopy> keptRegions;
+    keptRegions.reserve(keep.size());
+    for (const auto& [from, to] : keep) {
+        const auto offset = from - descriptor.baseAddress;
+        keptRegions.push_back({offset, offset, to - from});
+        std::memcpy(host.Bytes().data() + offset, original.data() + offset, static_cast<std::size_t>(to - from));
+    }
     if (profile) Profile().storageHostCopy += timer.lap();
     detiler.BeginBatch();
     CommandBatch batch(context);
     const auto commands = batch.Handle();
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-    CopyBuffer(context, commands, host.Handle(), 0, tiled.Handle(), 0, original.size());
+    context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, host.Handle(), tiled.Handle(), static_cast<std::uint32_t>(keptRegions.size()), keptRegions.data());
     VkImageMemoryBarrier toSource{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     toSource.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     toSource.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
@@ -5808,7 +5816,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     backToGeneral.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     backToGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
     context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 1, &toCopy, 1, &backToGeneral);
-    CopyBuffer(context, commands, tiled.Handle(), 0, host.Handle(), 0, original.size());
+    context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, tiled.Handle(), host.Handle(), static_cast<std::uint32_t>(keptRegions.size()), keptRegions.data());
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
     APS5_LOG_CHARS_OUT("StorageTexture writeback submit");
     batch.SubmitAndWait();

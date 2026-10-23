@@ -1653,6 +1653,9 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME agc_storage_write_back COMMAND agc_driver_recorder_tests --storage-write-back-only)
     set_tests_properties(agc_storage_write_back PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120 ENVIRONMENT "APS5_PIN_WAIT_MS=3000")
+    add_test(NAME agc_storage_write_back_unimported COMMAND agc_driver_recorder_tests --storage-write-back-only)
+    set_tests_properties(agc_storage_write_back_unimported PROPERTIES
+            SKIP_RETURN_CODE 77 TIMEOUT 120 ENVIRONMENT "APS5_PIN_WAIT_MS=3000;APS5_NO_HOST_IMPORT=1")
     if(WIN32)
         set_tests_properties(agc_storage_write_back PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
