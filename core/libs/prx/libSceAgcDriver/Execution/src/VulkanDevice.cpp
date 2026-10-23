@@ -920,6 +920,9 @@ struct VulkanDevice::State {
                 computePipelines.clear();
                 computePipelinesBuilding.clear();
             }
+            // A precompiling device opened the runtime pipeline cache; it saves and destroys its
+            // handle on reset, which needs the device.
+            pipelineCache.reset();
             reinterpret_cast<PFN_vkDestroyDevice>(deviceProc(device, "vkDestroyDevice"))(device, nullptr);
             device = VK_NULL_HANDLE;
         }
@@ -1103,6 +1106,17 @@ ComputePipelineReplayResult VulkanDevice::replayComputePipeline(const ComputePip
     std::copy_n(state->properties.pipelineCacheUUID, VK_UUID_SIZE, result.pipelineCacheUuid.begin());
     result.initialCacheBytes = initialCache.size();
     auto phase = std::chrono::steady_clock::now();
+    // A compile-only device stops before the runtime's pipeline cache is made; precompiling
+    // opens the same file-backed cache (same directory, source version and device keys).
+    if (persistent && !state->pipelineCache) {
+        // The cache's own saver resolves functions through the context's device table, which a
+        // compile-only device has not filled.
+        if (!state->functionsReady) {
+            Graphics::FillDeviceFunctions(graphicsContext(), state->deviceFunctions);
+            state->functionsReady = true;
+        }
+        state->pipelineCache = std::make_unique<Graphics::PipelineCache>(graphicsContext(), state->properties, true);
+    }
     require(!persistent || state->pipelineCache, "precompile requires the device pipeline cache");
     if (!persistent) {
         VkPipelineCacheCreateInfo cacheInfo{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
