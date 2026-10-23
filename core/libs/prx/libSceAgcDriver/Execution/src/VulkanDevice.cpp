@@ -150,7 +150,12 @@ bool CoreVulkanCapability(std::uint32_t capability) {
     }
 }
 
-void CreateComputePipeline(VkDevice device, PFN_vkCreateComputePipelines create, VkPipelineCache cache, VkShaderModule module, VkPipelineLayout layout, VkPipelineCreateFlags flags, VkPipelineShaderStageCreateFlags stageFlags, const VkSpecializationInfo* specialization, std::uint32_t subgroupSize, VkPipeline* pipeline, Graphics::PipelineCacheSynchronization* synchronization = nullptr) {
+struct ComputePipelinePhaseTimes {
+    double cacheWaitMilliseconds = 0;
+    double driverCallMilliseconds = 0;
+};
+
+void CreateComputePipeline(VkDevice device, PFN_vkCreateComputePipelines create, VkPipelineCache cache, VkShaderModule module, VkPipelineLayout layout, VkPipelineCreateFlags flags, VkPipelineShaderStageCreateFlags stageFlags, const VkSpecializationInfo* specialization, std::uint32_t subgroupSize, VkPipeline* pipeline, Graphics::PipelineCacheSynchronization* synchronization, ComputePipelinePhaseTimes* timings) {
     VkComputePipelineCreateInfo info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     info.flags = flags;
     info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -163,8 +168,13 @@ void CreateComputePipeline(VkDevice device, PFN_vkCreateComputePipelines create,
     subgroup.requiredSubgroupSize = subgroupSize;
     if (subgroupSize != 0) info.stage.pNext = &subgroup;
     info.layout = layout;
+    const auto waitStart = timings != nullptr && synchronization != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto cacheLock = synchronization != nullptr ? synchronization->LockForPipelineUse() : Graphics::PipelineCacheSynchronization::PipelineUseLock{};
-    check(create(device, cache, 1, &info, nullptr, pipeline), "vkCreateComputePipelines");
+    if (timings != nullptr && synchronization != nullptr) timings->cacheWaitMilliseconds = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count();
+    const auto driverStart = timings != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto result = create(device, cache, 1, &info, nullptr, pipeline);
+    if (timings != nullptr) timings->driverCallMilliseconds = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - driverStart).count();
+    check(result, "vkCreateComputePipelines");
     PerformanceCounters::CountPipeline();
 }
 
@@ -1151,7 +1161,7 @@ ComputePipelineReplayResult VulkanDevice::ReplayComputePipeline(const ComputePip
     check(state->DeviceFunction<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(state->device, &layoutInfo, nullptr, &objects.layout), "vkCreatePipelineLayout replay");
     result.layoutMilliseconds = elapsed(phase);
     phase = std::chrono::steady_clock::now();
-    CreateComputePipeline(state->device, state->DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines"), replay.cache, objects.module, objects.layout, capture.flags, capture.stageFlags, specialization.Info(), capture.requiredSubgroupSize, &objects.pipeline);
+    CreateComputePipeline(state->device, state->DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines"), replay.cache, objects.module, objects.layout, capture.flags, capture.stageFlags, specialization.Info(), capture.requiredSubgroupSize, &objects.pipeline, nullptr, nullptr);
     result.pipelineMilliseconds = elapsed(phase);
     phase = std::chrono::steady_clock::now();
     const auto getCache = state->DeviceFunction<PFN_vkGetPipelineCacheData>("vkGetPipelineCacheData");
@@ -5202,7 +5212,12 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
 std::shared_ptr<ComputePipelineObjects> VulkanDevice::createComputePipeline(const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, VkDescriptorSetLayout setLayout, std::span<const std::uint32_t> layoutKey, VkShaderStageFlags pushStages, std::uint64_t programAddress) {
     PerformanceTimer timing("Vulkan.ComputePipeline");
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    const auto start = std::chrono::steady_clock::now();
+    const char* directory = std::getenv("APS5_DUMP_COMPUTE_PIPELINES");
+    const bool captureEnabled = directory != nullptr && *directory != '\0' && ComputePipelineCapture::OptionalEnabled() && CaptureComputePipeline(shader.spirv.size());
+    const bool diagnostics = profile || captureEnabled;
+    const auto start = diagnostics ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    ComputePipelinePhaseTimes phaseTimes;
+    std::filesystem::path capturePath;
     auto objects = std::make_shared<ComputePipelineObjects>();
     objects->device = state->device;
     objects->destroyModule = state->DeviceFunction<PFN_vkDestroyShaderModule>("vkDestroyShaderModule");
@@ -5222,7 +5237,8 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::createComputePipeline(cons
     const Graphics::PipelineSpecialization specialization(shader);
     const auto subgroupSize = computeSubgroupSize(shader);
     const auto stageFlags = computeStageFlags(shader);
-    if (const char* directory = std::getenv("APS5_DUMP_COMPUTE_PIPELINES"); directory != nullptr && *directory != '\0' && ComputePipelineCapture::OptionalEnabled() && CaptureComputePipeline(shader.spirv.size())) {
+    if (captureEnabled) {
+        const auto captureStart = std::chrono::steady_clock::now();
         ComputePipelineCapture capture;
         capture.spirv = shader.spirv.Copy();
         ComputeDescriptorSetLayout resourcesLayout;
@@ -5245,11 +5261,16 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::createComputePipeline(cons
         capture.driverVersion = state->properties.driverVersion;
         capture.apiVersion = state->properties.apiVersion;
         std::copy_n(state->properties.pipelineCacheUUID, VK_UUID_SIZE, capture.pipelineCacheUuid.begin());
-        const auto path = capture.WriteOptional(directory);
-        if (!path.empty()) std::fprintf(stderr, "[compute-capture] %s\n", path.string().c_str());
+        capturePath = capture.WriteOptional(directory);
+        const double captureMilliseconds = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - captureStart).count();
+        if (!capturePath.empty()) {
+            std::fprintf(stderr, "[compute-capture] %s\n", capturePath.string().c_str());
+            std::fprintf(stderr, "[compute-capture-context] program=0x%llx words=%zu path=%s capture_ms=%.6f\n", static_cast<unsigned long long>(programAddress), shader.spirv.size(), capturePath.string().c_str(), captureMilliseconds);
+        }
     }
     if (profile && shader.spirv.size() > 100000) std::fprintf(stderr, "[dispatch] creating a pipeline for %zu SPIR-V words (program 0x%llx)\n", shader.spirv.size(), static_cast<unsigned long long>(programAddress));
-    CreateComputePipeline(state->device, state->DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines"), context.pipelineCache, objects->module, objects->layout, pipelineFlags, stageFlags, specialization.Info(), subgroupSize, &objects->pipeline, context.pipelineCacheSynchronization);
+    const auto create = state->DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines");
+    CreateComputePipeline(state->device, create, context.pipelineCache, objects->module, objects->layout, pipelineFlags, stageFlags, specialization.Info(), subgroupSize, &objects->pipeline, context.pipelineCacheSynchronization, diagnostics ? &phaseTimes : nullptr);
     objects->destroyModule(objects->device, objects->module, nullptr);
     objects->module = VK_NULL_HANDLE;
     if (!state->probingFloatControls) {
@@ -5259,6 +5280,7 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::createComputePipeline(cons
     }
     Graphics::LogPipelineStatistics_nid_no_patch(context, objects->pipeline);
     if (profile && shader.spirv.size() > 100000) std::fprintf(stderr, "[dispatch] created a pipeline for %zu SPIR-V words in %.0f ms (program 0x%llx)\n", shader.spirv.size(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(), static_cast<unsigned long long>(programAddress));
+    if (diagnostics) std::fprintf(stderr, "[compute-create-timing] program=0x%llx words=%zu path=%s cache_wait_ms=%.6f vk_ms=%.6f total_ms=%.6f\n", static_cast<unsigned long long>(programAddress), shader.spirv.size(), capturePath.empty() ? "-" : capturePath.string().c_str(), phaseTimes.cacheWaitMilliseconds, phaseTimes.driverCallMilliseconds, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
     return objects;
 }
 
@@ -5271,7 +5293,7 @@ VkPipeline VulkanDevice::splitComputePipeline(const Graphics::Context& context, 
     VkShaderModule module = Graphics::CreateShaderModule(state->DeviceFunction<PFN_vkCreateShaderModule>("vkCreateShaderModule"), state->device, state->graphicsPipelineLibrary, shader.spirv.data(), shader.spirv.size() * sizeof(std::uint32_t), "vkCreateShaderModule");
     VkPipeline pipeline = VK_NULL_HANDLE;
     try {
-        CreateComputePipeline(state->device, state->DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines"), context.pipelineCache, module, objects.layout, computePipelineFlags(), computeStageFlags(shader), specialization.Info(), computeSubgroupSize(shader), &pipeline, context.pipelineCacheSynchronization);
+        CreateComputePipeline(state->device, state->DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines"), context.pipelineCache, module, objects.layout, computePipelineFlags(), computeStageFlags(shader), specialization.Info(), computeSubgroupSize(shader), &pipeline, context.pipelineCacheSynchronization, nullptr);
     } catch (...) {
         objects.destroyModule(objects.device, module, nullptr);
         throw;
