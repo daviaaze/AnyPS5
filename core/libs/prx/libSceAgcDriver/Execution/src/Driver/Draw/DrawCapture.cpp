@@ -29,6 +29,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     };
     const auto waitedBefore = traceCapSync() || profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
     auto invocation = InvocationFor(*program.snapshot, program.codeOffset, request);
+    if (profile) phaseTiming.Phase(DrawRowCaptureLookup);
     timing.Mark("prepared_invocation");
     auto& stageCapture = stageCaptures[i];
     stageCapture.forgetSerial = GuestMemory::ForgetSerial();
@@ -57,6 +58,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
             throw named(error, shaderMemory.Regions());
         }
     }();
+    if (profile) phaseTiming.Phase(DrawRowCapture);
 
     stageCapture.regions = shaderMemory.TakeRecentRegions();
     stageCapture.supplied = shaderMemory.SuppliedBlocks();
@@ -71,7 +73,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     if (traceCapSync()) traceCapture("draw-capture", program.binary.codeAddress, submission.queue, memory, Graphics::Recorder::ThreadWaitedMs() - waitedBefore);
     if (profile) {
         ++captures;
-        phaseTiming.Phase(DrawRowCapture);
+        phaseTiming.Phase(DrawRowCaptureRegions);
 
         const auto waited = std::min(Graphics::Recorder::ThreadWaitedMs() - waitedBefore, phaseMs[DrawRowCapture]);
         phaseMs[DrawRowCapture] -= waited;
