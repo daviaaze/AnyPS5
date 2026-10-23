@@ -1,6 +1,9 @@
 #include "../tools/ComputePipelineFixture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include <chrono>
 #include <cmath>
+#include <filesystem>
+#include <string>
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
@@ -19,6 +22,14 @@ void CheckResult(const AgcDriver::ComputePipelineReplayResult& result) {
         Require(std::isfinite(duration) && duration >= 0, "replay reported an invalid duration");
     }
     Require(result.totalMilliseconds >= result.pipelineMilliseconds, "pipeline duration exceeds replay duration");
+}
+
+void SetCacheDirectory(const char* path) {
+#ifdef _WIN32
+    Require(_putenv_s("ANYPS5_SHADER_CACHE_DIR", path) == 0, "cannot set ANYPS5_SHADER_CACHE_DIR");
+#else
+    Require((*path == '\0' ? unsetenv("ANYPS5_SHADER_CACHE_DIR") : setenv("ANYPS5_SHADER_CACHE_DIR", path, 1)) == 0, "cannot set ANYPS5_SHADER_CACHE_DIR");
+#endif
 }
 
 }
@@ -112,6 +123,36 @@ int main() {
         } catch (const std::exception& error) {
             Require(std::string_view(error.what()).find("captured required subgroup size is unsupported") != std::string_view::npos, "required subgroup replay failed without an explicit support refusal");
             std::puts("compute pipeline replay: device explicitly refused required subgroup size 32");
+        }
+        {
+            const auto root = std::filesystem::temp_directory_path() / ("aps5-precompile-test-" + std::to_string(static_cast<unsigned long long>(std::chrono::steady_clock::now().time_since_epoch().count())));
+            std::filesystem::create_directories(root);
+            struct Remove {
+                std::filesystem::path path;
+                ~Remove() {
+                    std::error_code error;
+                    std::filesystem::remove_all(path, error);
+                }
+            } remove{root};
+            SetCacheDirectory(root.string().c_str());
+            {
+                AgcDriver::VulkanDevice precompiler(AgcDriver::VulkanDevice::CompileOnly{});
+                const auto result = precompiler.PrecompileComputePipeline(decoded);
+                Require(result.cache.empty() && std::isfinite(result.pipelineMilliseconds) && result.pipelineMilliseconds >= 0, "precompile exported cache bytes or an invalid duration");
+                precompiler.SavePipelineCache();
+            }
+            std::size_t files = 0;
+            for (const auto& entry : std::filesystem::recursive_directory_iterator(root)) {
+                const auto name = entry.path().filename().string();
+                if (entry.is_regular_file() && name.starts_with("vk-pipelines-") && name.ends_with(".bin")) {
+                    Require(entry.file_size() > 56, "precompiled vk-pipelines file holds no Vulkan cache data");
+                    Require(entry.path().parent_path().parent_path() == root, "vk-pipelines file is not under the source version directory");
+                    ++files;
+                }
+            }
+            Require(files == 1, "precompile did not write exactly one runtime vk-pipelines file");
+            SetCacheDirectory("");
+            std::puts("compute pipeline replay: precompile wrote the runtime vk-pipelines file");
         }
         std::printf("compute pipeline replay: fresh %.6f ms, imported %.6f ms, GPU %s; no dispatch\n", fresh.pipelineMilliseconds, imported.pipelineMilliseconds, fresh.deviceName.c_str());
         return 0;
