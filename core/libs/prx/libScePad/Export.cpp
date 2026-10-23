@@ -923,18 +923,18 @@ bool APS5_VABI scePadIsValidHandle(std::int32_t handle, std::int32_t portType) {
 }
 
 bool APS5_VABI scePadIsDS4Connected(std::int32_t handle) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    (void)handle;
+    return false;
 }
 
 bool APS5_VABI scePadIsBlasterConnected(std::int32_t handle) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    (void)handle;
+    return false;
 }
 
 bool APS5_VABI scePadIsMoveConnected(std::int32_t handle) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    (void)handle;
+    return false;
 }
 
 int APS5_VABI scePadGetBluetoothAddress(std::int32_t handle, std::uint64_t* address) {

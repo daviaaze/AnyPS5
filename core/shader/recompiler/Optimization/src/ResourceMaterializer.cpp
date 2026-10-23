@@ -250,7 +250,8 @@ ImageDecode inspectImageDescriptor(const DescriptorValue& descriptor, const Imag
         }
     }
     const bool nativeRepacked = format == IrBufferFormat::Format10_11_11Float && !storage && !base.packed;
-    decoded.conversionFormat = RemapTextureFormat(format) != format && !nativeRepacked ? format : IrBufferFormat::Invalid;
+    const auto remappedFormat = storage ? RemapStorageTextureFormat(format) : RemapTextureFormat(format);
+    decoded.conversionFormat = remappedFormat != format && !nativeRepacked ? format : IrBufferFormat::Invalid;
     if (format == IrBufferFormat::Format11_11_10UNorm || (format == IrBufferFormat::Format10_11_11Float && !nativeRepacked)) {
         const bool floating = format == IrBufferFormat::Format10_11_11Float;
         if (!base.srgbDecodeCompatible) {
@@ -275,7 +276,7 @@ ImageDecode inspectImageDescriptor(const DescriptorValue& descriptor, const Imag
     const bool wideSint = format == IrBufferFormat::Format32SInt || format == IrBufferFormat::Format32_32SInt || format == IrBufferFormat::Format32_32_32_32SInt;
     const bool narrowSint = format == IrBufferFormat::Format16SInt || format == IrBufferFormat::Format8_8SInt || format == IrBufferFormat::Format16_16SInt || format == IrBufferFormat::Format8_8_8_8SInt || format == IrBufferFormat::Format16_16_16_16SInt;
     const bool rawSintStorage = storage && (wideSint || (narrowSint && !base.packed)) && base.written && !base.read && !base.atomic;
-    decoded.numericClass = base.atomic || decoded.fmask ? IrTextureNumericClass::Uint : nativeRepacked ? IrTextureNumericClass::Float : SampledTextureNumericClass(format);
+    decoded.numericClass = base.atomic || decoded.fmask ? IrTextureNumericClass::Uint : nativeRepacked ? IrTextureNumericClass::Float : SampledTextureNumericClass(remappedFormat);
     if (!storage && !base.depthCompare && IsDepthBitsTexture(descriptor.dwords[1], descriptor.dwords[3])) {
         decoded.depthBits = true;
         if (!base.depthBitsCompatible) return rejectImage(PoisonReason::DepthBits16, "runtime image reads depth bits as unsupported 16-bit results");
@@ -1954,6 +1955,11 @@ std::vector<ImageResource> ResourceMaterializer::RuntimeImageModes(const ImageRe
             append(IrTextureNumericClass::Uint, IrBufferFormat::Format11_11_10UInt, IrBufferFormat::Invalid, false, false);
             if ((image.srgbDecodeCompatible || (image.convertedSamples && convertedSampleCompatible(image))) && image.depthBitsCompatible) append(IrTextureNumericClass::Uint, IrBufferFormat::Format11_11_10UNorm, IrBufferFormat::Invalid, false, false);
             if (image.srgbDecodeCompatible && image.depthBitsCompatible) append(IrTextureNumericClass::Uint, IrBufferFormat::Format10_11_11Float, IrBufferFormat::Invalid, false, false);
+            if (storage) {
+                for (const auto format : {IrBufferFormat::Format5_6_5UNorm, IrBufferFormat::Format5_5_5_1UNorm, IrBufferFormat::Format4_4_4_4UNorm}) {
+                    append(IrTextureNumericClass::Uint, format, IrBufferFormat::Invalid, false, false);
+                }
+            }
             if (!storage) {
                 if (image.depthBitsCompatible) {
                     append(IrTextureNumericClass::Float, IrBufferFormat::Invalid, IrBufferFormat::Invalid, true, false);

@@ -10,6 +10,7 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <poll.h>
 #include <unistd.h>
@@ -232,6 +233,7 @@ constexpr int NET_EBADF = 9;
 constexpr int NET_EACCES = 13;
 constexpr int NET_EFAULT = 14;
 constexpr int NET_EINVAL = 22;
+constexpr int NET_ENOTTY = 25;
 constexpr int NET_ENOSPC = 28;
 constexpr int NET_EDOM = 33;
 constexpr int NET_EAGAIN = 35;
@@ -2467,8 +2469,35 @@ int APS5_VABI sceNetInetPtonEx(int af, const char* src, void* dst, int) {
     return 1;
 }
 
+extern "C" int APS5_VABI ioctl_nid_postfix(int descriptor, std::uint64_t request, void* argument);
+
 int APS5_VABI sceNetIoctl(int socketId, std::uint32_t command, void* argument) {
-    NotImplemented_nid_no_patch(__func__);
+    constexpr std::uint32_t nonblockingRequest = 0x8004667e;
+    constexpr std::uint32_t readableRequest = 0x4004667f;
+    std::shared_ptr<NativeSocketHandle> native;
+    {
+        std::lock_guard lk(g_mutex);
+        const auto it = g_socks.find(socketId);
+        if (it != g_socks.end()) native = it->second.native;
+    }
+    if (!native) {
+        if (!GuestSocketIsOpen_nid_no_patch(socketId)) return fail(NET_EBADF);
+        return ioctl_nid_postfix(socketId, command, argument) == 0 ? 0 : fail(*__error_nid_postfix());
+    }
+    if (command != nonblockingRequest && command != readableRequest) return fail(NET_ENOTTY);
+    if (!argument) return fail(NET_EFAULT);
+    if (command == nonblockingRequest) {
+        const int enabled = *static_cast<const int*>(argument) != 0;
+        return sceNetSetsockopt(socketId, NET_SOL_SOCKET, NET_SO_NBIO, &enabled, sizeof(enabled));
+    }
+#ifdef _WIN32
+    u_long available = 0;
+    if (ioctlsocket(native->value, FIONREAD, &available) != 0) return fail(native_error());
+#else
+    int available = 0;
+    if (::ioctl(native->value, FIONREAD, &available) != 0) return fail(native_error());
+#endif
+    *static_cast<int*>(argument) = static_cast<int>(available);
     return 0;
 }
 

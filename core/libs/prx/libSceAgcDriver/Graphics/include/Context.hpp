@@ -182,6 +182,8 @@ struct Context {
     bool drawInputsInPlace = true;
     bool dmaBufImport = false;
     bool sparseBinding = false;
+    bool sparseResidencyBuffer = false;
+    bool sparseResidencyAliased = false;
     std::uint32_t queueFamily = 0;
     std::uint32_t sparseFamily = VK_QUEUE_FAMILY_IGNORED;
     VkQueue sparseQueue = VK_NULL_HANDLE;
@@ -239,6 +241,7 @@ struct Context {
     bool imageTableUpdateAfterBind = false;
     bool samplerTableUpdateAfterBind = false;
     bool geometryShader = false;
+    bool largePoints = false;
     bool sampleRateShading = false;
     bool fillModeNonSolid = false;
     bool maintenance5 = false;

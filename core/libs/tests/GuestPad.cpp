@@ -30,6 +30,9 @@ int APS5_VABI scePadSetAngularVelocityDeadbandState(int, bool);
 int APS5_VABI scePadSetAngularVelocityBiasCorrectionState(int, bool);
 int APS5_VABI scePadIsRemoteController(int, bool*);
 int APS5_VABI scePadGetAccessibilityControllerState(int, std::uint32_t*);
+bool APS5_VABI scePadIsDS4Connected(std::int32_t);
+bool APS5_VABI scePadIsBlasterConnected(std::int32_t);
+bool APS5_VABI scePadIsMoveConnected(std::int32_t);
 int APS5_VABI scePadGetControllerInformation(int, PadControllerInformation*);
 int APS5_VABI scePadGetExtControllerInformation(int, void*);
 int APS5_VABI scePadResetLightBar(int);
@@ -353,6 +356,14 @@ static void CheckRemoteController(int handle) {
     Require(!remote);
 }
 
+static void CheckTrackerDevices(int handle) {
+    for (const int candidate : {handle, handle + 1}) {
+        Require(!scePadIsDS4Connected(candidate));
+        Require(!scePadIsBlasterConnected(candidate));
+        Require(!scePadIsMoveConnected(candidate));
+    }
+}
+
 static void CheckAccessibilityControllerState(int handle) {
     std::uint32_t state = 7;
     Require(scePadGetAccessibilityControllerState(handle + 1, nullptr) == PAD_ERROR_INVALID_ARG);
@@ -517,6 +528,7 @@ int main() {
     CheckLatchedPressLifetime(handle);
     CheckReadStateHandle(handle);
     CheckRemoteController(handle);
+    CheckTrackerDevices(handle);
     CheckAccessibilityControllerState(handle);
     CheckInjectedState(commandPath, ackPath);
     PadLightBarParam lightBar{255, 128, 64};

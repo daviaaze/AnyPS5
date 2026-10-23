@@ -11,6 +11,7 @@
 #include <string_view>
 #include <system_error>
 #include <sys/stat.h>
+#include <ctime>
 #ifndef _WIN32
 #include <cerrno>
 #include <fcntl.h>
@@ -19,12 +20,16 @@
 #endif
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/ApplicationHeap.hpp"
+#include "prx/libkernel/KernelErrors.hpp"
 #include "prx/libc/include/FilesystemError.hpp"
+#include "prx/libkernel/KernelErrors.hpp"
+#include "prx/libkernel/Pthread/include/Pthread.hpp"
 #include "prx/libkernel/File/include/DirectoryDescriptor.hpp"
 #include "prx/libkernel/File/include/DescriptorControl.hpp"
 #include "prx/libc/include/CreationMask.hpp"
 #include "prx/libkernel/File/include/FileFlags.hpp"
-#include "prx/libkernel/KernelErrors.hpp"
+extern "C" int APS5_VABI getpid_nid_postfix(void);
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -255,6 +260,13 @@ int RenamePath(const std::filesystem::path& source, const std::filesystem::path&
 
 extern "C" {
 
+int APS5_VABI sceKernelGetCompiledSdkVersion(std::int32_t* version) {
+    if (version == nullptr) return SCE_KERNEL_ERROR_EINVAL;
+    static const auto* parameters = static_cast<const std::byte*>(ApplicationProcessParameters_nid_no_patch());
+    std::memcpy(version, parameters + 0x10, sizeof(*version));
+    return 0;
+}
+
 int APS5_VABI fork_nid_postfix(void) {
     NotImplemented_nid_no_patch("fork: child processes");
     return -1;
@@ -272,6 +284,23 @@ int APS5_VABI _fstatfs_nid_postfix(int d, void* buf);
 
 int APS5_VABI fstatfs_nid_postfix(int d, void* buf) {
     return _fstatfs_nid_postfix(d, buf);
+}
+
+int GetModuleInfoExByHandle_nid_no_patch(KernelModule handle, ModuleInfoEx* info);
+int APS5_VABI sceKernelGetModuleList(KernelModule* handles, std::size_t count, std::size_t* actual);
+
+int APS5_VABI sceKernelGetModuleInfoInternal(KernelModule handle, ModuleInfoEx* info) {
+    return GetModuleInfoExByHandle_nid_no_patch(handle, info);
+}
+
+int APS5_VABI sceKernelGetModuleListInternal(KernelModule* handles, std::size_t count, std::size_t* actual) {
+    return sceKernelGetModuleList(handles, count, actual);
+}
+
+std::int64_t APS5_VABI _fstat_nid_postfix(int d, FileStat* sb);
+
+int APS5_VABI fstat_nid_postfix(int d, FileStat* sb) {
+    return static_cast<int>(_fstat_nid_postfix(d, sb));
 }
 
 std::int64_t APS5_VABI readlink_nid_postfix(const char* path, char* buffer, std::size_t size) {
@@ -569,6 +598,23 @@ int APS5_VABI fchmodat_nid_postfix(int fd, const char* path, int mode, int flag)
     return 0;
 }
 
+int APS5_VABI lchmod_nid_postfix(const char* path, std::uint16_t mode) {
+#ifndef __APPLE__
+    std::filesystem::path native;
+    if (path != nullptr && *path != '\0' && ResolvePathError_nid_no_patch(path, native) == 0) {
+#ifdef _WIN32
+        const DWORD attributes = GetFileAttributesW(native.wstring().c_str());
+        const bool symbolic = attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+#else
+        std::error_code status;
+        const bool symbolic = std::filesystem::is_symlink(std::filesystem::symlink_status(native, status));
+#endif
+        if (symbolic) NotImplemented_nid_no_patch("lchmod: the mode of a symbolic link on a host that cannot change it");
+    }
+#endif
+    return fchmodat_nid_postfix(GuestAtFdcwd, path, mode, GuestAtSymlinkNofollow);
+}
+
 int APS5_VABI fchown_nid_postfix(int fd, std::uint32_t uid, std::uint32_t gid) {
     constexpr std::uint32_t Unchanged = 0xFFFFFFFFu;
     if (uid != 0 && uid != Unchanged) NotImplemented_nid_no_patch("fchown: an owner other than the guest user");
@@ -579,6 +625,16 @@ int APS5_VABI fchown_nid_postfix(int fd, std::uint32_t uid, std::uint32_t gid) {
     struct stat status{};
     if (::fstat(fd, &status) != 0) return static_cast<int>(Fail(GuestEbadf));
 #endif
+    return 0;
+}
+
+int APS5_VABI sched_rr_get_interval_nid_postfix(int pid, KernelTimespec* interval) {
+    constexpr int GuestEsrch = 3;
+    const int self = getpid_nid_postfix();
+    if (pid != 0 && pid != self) return static_cast<int>(Fail(GuestEsrch));
+    if (interval == nullptr) return static_cast<int>(Fail(GuestEfault));
+    interval->tv_sec = 0;
+    interval->tv_nsec = 94000000;
     return 0;
 }
 
@@ -666,6 +722,13 @@ int APS5_VABI unlinkat_nid_postfix(int fd, const char* path, int flag) {
 #endif
     }
     RecordWrittenPath_nid_no_patch(native);
+    return 0;
+}
+
+int APS5_VABI scePthreadCondattrGetclock(const PthreadCondattr* attr, KernelClockid* clockId) {
+    if (!attr || !*attr) return SCE_KERNEL_ERROR_EINVAL;
+    if (!clockId) throw std::runtime_error("scePthreadCondattrGetclock: null clock id");
+    *clockId = (*attr)->_clockid;
     return 0;
 }
 

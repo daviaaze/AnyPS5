@@ -365,11 +365,6 @@ int APS5_VABI sceAudioOut2GetSystemStateEx(void) {
     return 0;
 }
 
-int APS5_VABI sceAudioOut2MasteringInitEx(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
 int APS5_VABI sceAudioOut2SetDebugHeadphoneMode(void) {
     NotImplemented_nid_no_patch(__func__);
     return 0;

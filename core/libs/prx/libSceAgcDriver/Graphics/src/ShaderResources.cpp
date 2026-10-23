@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
@@ -128,7 +129,7 @@ struct CachedTexture {
 // eviction takes the back. APS5_NO_TEXTURE_HASH=1 finds entries by scanning the list (the index is
 // still kept), the linear lookup of before.
 struct TextureCache {
-    std::mutex mutex;
+    AgcDriver::Mutex mutex;
     std::list<CachedTexture> entries;
     std::unordered_map<TextureKey, std::list<CachedTexture>::iterator, TextureKeyHash> index;
     std::unordered_multimap<const StorageTexture*, std::list<CachedTexture>::iterator> views;
@@ -170,7 +171,7 @@ struct CacheHold {
     CacheHold& operator=(const CacheHold&) = delete;
 };
 
-bool AcquireCache(std::mutex& mutex) {
+bool AcquireCache(AgcDriver::Mutex& mutex) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(20);
     do {
         if (mutex.try_lock()) return true;
@@ -180,7 +181,7 @@ bool AcquireCache(std::mutex& mutex) {
 }
 
 struct UncachedImages {
-    std::mutex mutex;
+    AgcDriver::Mutex mutex;
     std::vector<std::weak_ptr<StorageTexture>> images;
     std::atomic<bool> any{false};
 };
@@ -514,7 +515,7 @@ std::uint64_t DepthCopyMinBytes() {
 // they were when it failed (the allocation generation): pages committed later, or another surface
 // at the address, get a fresh attempt.
 struct StorageFailures {
-    std::mutex mutex;
+    AgcDriver::Mutex mutex;
     std::map<std::pair<std::uint64_t, std::uint64_t>, std::uint64_t> generations;
 };
 
@@ -576,7 +577,7 @@ std::uint64_t storageBudget(const Context& context) {
     if (forced != 0) return forced;
     if (context.memoryProperties2 == nullptr || context.physical == VK_NULL_HANDLE) return TextureCacheBudget(context.memory);
     static struct {
-        std::mutex mutex;
+        AgcDriver::Mutex mutex;
         VkPhysicalDevice device{VK_NULL_HANDLE};
         std::chrono::steady_clock::time_point read{};
         std::uint64_t budget{0};
@@ -1010,7 +1011,7 @@ struct CachedStorageTexture {
 
 // As TextureCache: use order with a hash index by key, plus one by image for StorageImageCached.
 struct StorageTextureCache {
-    std::mutex mutex;
+    AgcDriver::Mutex mutex;
     std::list<CachedStorageTexture> entries;
     std::unordered_map<StorageKey, std::list<CachedStorageTexture>::iterator, StorageKeyHash> index;
     std::unordered_map<const StorageTexture*, std::list<CachedStorageTexture>::iterator> byImage;
@@ -1069,7 +1070,7 @@ std::array<std::uint32_t, 8> SurfaceKey(const Context& context, const GuestTextu
 }
 
 struct ExtendedSurfaces {
-    std::mutex mutex;
+    AgcDriver::Mutex mutex;
     std::map<std::array<std::uint32_t, 8>, std::uint32_t> levels;
     std::atomic<bool> any{false};
 };
@@ -1641,7 +1642,7 @@ constexpr std::size_t BuildPhaseCount = static_cast<std::size_t>(ShaderResources
 constexpr std::array<const char*, BuildPhaseCount> BuildPhaseNames{"bindings", "precollect", "guest memory upload", "descriptors", "stage A", "images", "bda", "stage B"};
 
 struct BuildProfile {
-    std::mutex mutex;
+    AgcDriver::Mutex mutex;
     std::array<double, BuildPhaseCount> ms{};
     std::uint64_t builds = 0;
 };
@@ -2562,7 +2563,7 @@ bool ShaderResources::NeverReusable(std::span<const CompiledShader> shaders) {
 
 // APS5_PROFILE_DRAW: the per-device descriptor caches' counters, every 10 s.
 void ShaderResources::reportDescriptorCaches() const {
-    static std::mutex reportMutex;
+    static AgcDriver::Mutex reportMutex;
     static auto lastReport = std::chrono::steady_clock::now();
     const auto now = std::chrono::steady_clock::now();
     std::lock_guard lock(reportMutex);
@@ -3290,7 +3291,54 @@ const ShaderRecompiler::DescriptorBinding* ShaderResources::tableImages(std::spa
     return nullptr;
 }
 
+bool ShaderResources::EpochProofs() {
+    return DrawPipelineEnabled();
+}
+
+namespace {
+void noteEpochProof(bool reused, bool verified, bool failed) {
+    static std::atomic<std::uint64_t> reuses{0}, proofs{0}, checks{0}, failures{0};
+    if (verified) checks.fetch_add(1, std::memory_order_relaxed);
+    if (failed) failures.fetch_add(1, std::memory_order_relaxed);
+    const auto count = (reused ? reuses : proofs).fetch_add(1, std::memory_order_relaxed) + 1u;
+    static const bool report = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_VERIFY_DRAW_PIPELINE") != nullptr;
+    if (!report) return;
+    if (count % 262144u == 0u || (count & (count - 1u)) == 0u) std::fprintf(stderr, "[epoch-proofs] resource proofs: %llu reused the epoch's, %llu proved; verify: %llu checked, %llu failed; storage refreshes reused %llu\n", static_cast<unsigned long long>(reuses.load()), static_cast<unsigned long long>(proofs.load()), static_cast<unsigned long long>(checks.load()), static_cast<unsigned long long>(failures.load()), static_cast<unsigned long long>(StorageTexture::epochRefreshes.load()));
+}
+}
+
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
+    if (EpochProofs()) {
+        const auto epoch = GuestMemory::CollectEpoch();
+        const auto proof = GuestMemory::ProofSerial();
+        const auto pending = StorageTexture::PendingSerial();
+        if (epoch != 0 && provedEpoch == epoch && provedProof == proof && provedPending == pending) {
+            static const bool verify = std::getenv("APS5_VERIFY_DRAW_PIPELINE") != nullptr;
+            thread_local std::uint64_t reuses = 0;
+            if (verify && ++reuses % 64u == 0u) {
+                const bool ok = revalidateFull(shaders, report);
+                noteEpochProof(true, true, !ok);
+                return ok;
+            }
+            if (report != nullptr) *report = {ProofPath::Full, ProofFailure::None};
+            noteEpochProof(true, false, false);
+            return true;
+        }
+        const bool ok = revalidateFull(shaders, report);
+        noteEpochProof(false, false, false);
+        if (ok) {
+            provedEpoch = epoch;
+            provedProof = proof;
+            provedPending = pending;
+        } else {
+            provedEpoch = 0;
+        }
+        return ok;
+    }
+    return revalidateFull(shaders, report);
+}
+
+bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report) {
     if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
     if (!reusable || shaders.empty()) return false;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -3561,7 +3609,7 @@ struct ChurnCounts {
 
 // Dispatch keys and draw keys are counted apart: what churns a draw's key decides the draw steps.
 struct ChurnProfile {
-    std::mutex mutex;
+    AgcDriver::Mutex mutex;
     std::unordered_map<std::uint64_t, ResourceCache::Key> lastByVariant;
     ChurnCounts dispatch;
     ChurnCounts draws;
@@ -5604,6 +5652,7 @@ void ShaderResources::WriteBack() {
     } catch (const BdaUnalignedAccess&) {
         unaligned = std::current_exception();
     }
+    if (!guestMemory.Writes().empty() || std::find(storageWritten.begin(), storageWritten.end(), true) != storageWritten.end() || (usesBda && !bdaReadOnly)) GuestMemory::BreakProofs();
     if (!SkipWriteBack()) {
         for (std::size_t index = 0; index < storageTextures.size(); ++index) {
             if (!storageWritten[index] || storageTextures[index] == nullptr) continue;

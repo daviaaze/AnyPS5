@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/SampleOrder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -348,6 +349,7 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
     Require(!state.negativeOneToOne || context.depthClipControl, "negative-one-to-one depth clipping requires VK_EXT_depth_clip_control with depthClipControl enabled");
     Require(!state.perSampleShading || context.sampleRateShading, "per-sample pixel shading requires the sampleRateShading device feature");
     Require(!state.mergedCoverage || (context.mergedCoverageSampleCounts & state.samples) != 0, "an overrasterized draw (a multisampled rasterizer into one-sample color targets) requires VK_NV_framebuffer_mixed_samples with merged coverage reduction");
+    Require(!(state.vertexPoints || (state.stages.mesh.has_value() && state.stages.mesh->outputPrimitiveSize == 1u)) || context.largePoints || (state.pointSize == 1.0f && ((state.paClVsOutCntl & (1u << 16u)) == 0 || (state.pointSizeMin == 1.0f && state.pointSizeMax == 1.0f))), "points of a size other than one pixel require the largePoints device feature");
     Require(!state.truncatedCoverage || (context.truncatedCoverageSampleCounts & state.samples) != 0, "one-sample color targets beside a multisampled depth target require VK_AMD_mixed_attachment_samples or VK_NV_framebuffer_mixed_samples with truncated coverage reduction");
     Require(state.conservativeRasterization == VK_CONSERVATIVE_RASTERIZATION_MODE_DISABLED_EXT || context.conservativeRasterization, "conservative rasterization requires VK_EXT_conservative_rasterization with at most 1/256 pixel of overestimation and degenerate triangles rasterized");
     ValidateProvokingVertex(context, state, shaders);
@@ -991,7 +993,7 @@ struct PipelineStore {
         Pending(const Context& context, const std::vector<std::byte>& key) : device(context.device), pool(context.bufferPool), key(key) {}
     };
     std::list<Pending> pending;
-    std::mutex mutex;
+    AgcDriver::Mutex mutex;
     // Least recently used first.
     std::list<Entry> entries;
     std::unordered_map<std::uint64_t, std::list<Entry>::iterator> index;

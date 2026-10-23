@@ -10,6 +10,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "RdnaDecoder/include/RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include <algorithm>
 #include <array>
@@ -1920,7 +1921,7 @@ bool SampleLocationsCompatibleDepth(const Context& context, VkFormat format, std
 
 VkFormat HostDepthFormat(const Context& context, VkFormat format) {
     if (format != VK_FORMAT_D16_UNORM_S8_UINT) return format;
-    static std::mutex mutex;
+    static AgcDriver::Mutex mutex;
     static std::map<VkPhysicalDevice, VkFormat> chosen;
     std::lock_guard lock(mutex);
     if (const auto found = chosen.find(context.physical); found != chosen.end()) return found->second;
