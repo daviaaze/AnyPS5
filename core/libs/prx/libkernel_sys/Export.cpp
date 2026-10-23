@@ -44,6 +44,7 @@ extern "C" int APS5_VABI getpid_nid_postfix(void);
 #endif
 
 extern "C" int* APS5_VABI __error_nid_postfix();
+extern "C" int APS5_VABI getpid_nid_postfix();
 
 namespace {
 #ifdef _WIN32
@@ -401,7 +402,13 @@ int APS5_VABI link_nid_postfix(const char* existing, const char* created) {
     if (const int error = ResolvePathError_nid_no_patch(created, destination)) return static_cast<int>(Fail(error));
     std::error_code error;
     const auto status = std::filesystem::status(source, error);
-    if (!std::filesystem::exists(status)) return static_cast<int>(Fail(HasNonDirectoryPrefix(source) ? GuestEnotdir : GuestEnoent));
+    if (!std::filesystem::exists(status)) {
+#ifdef _WIN32
+        std::filesystem::path target;
+        if (const int followError = FollowLinkPath(source, target)) return static_cast<int>(Fail(followError));
+#endif
+        return static_cast<int>(Fail(HasNonDirectoryPrefix(source) ? GuestEnotdir : GuestEnoent));
+    }
     if (std::filesystem::is_directory(status)) return static_cast<int>(Fail(GuestEperm));
     if (std::filesystem::exists(std::filesystem::symlink_status(destination, error))) return static_cast<int>(Fail(GuestEexist));
     if (!std::filesystem::is_directory(destination.parent_path(), error)) return static_cast<int>(Fail(HasNonDirectoryPrefix(destination) ? GuestEnotdir : GuestEnoent));
@@ -804,6 +811,24 @@ int APS5_VABI scePthreadSetDefaultstacksize(std::size_t size) {
 
 void APS5_VABI scePthreadSetName(void* thread, const char* name) {
     pthread_set_name_np_nid_postfix(thread, name);
+}
+
+struct KernelTitleWorkaround {
+    std::int32_t version;
+    std::int32_t align;
+    std::uint64_t ids[2];
+};
+
+int APS5_VABI sceKernelTitleWorkaroundIsEnabled(const KernelTitleWorkaround* workaround, std::int32_t bit, std::int32_t* enabled) {
+    if (!workaround || !enabled) return static_cast<int>(0x8002000E);
+    if (static_cast<std::uint32_t>(bit) >= 0x3A) return static_cast<int>(0x80020016);
+    *enabled = static_cast<std::int32_t>((workaround->ids[bit >> 6] >> (bit & 0x3F)) & 1);
+    return 0;
+}
+
+int APS5_VABI sceKernelGetProcessType(int pid) {
+    if (pid != getpid_nid_postfix() && pid != -1 && pid != 0) return static_cast<int>(0x80020003);
+    return 0;
 }
 
 }

@@ -726,7 +726,7 @@ int APS5_VABI nmount_nid_postfix(const KernelIovec* iov, unsigned int niov, int 
 }
 
 int APS5_VABI close_nid_postfix(int d) {
-    if (File::IsHostStream(d)) return PosixFailure(GUEST_EBADF);
+    if (File::IsHostStream(d)) return PosixFailure(GUEST_EPERM);
     int socketError = 0;
     if (KernelCloseSocket_nid_no_patch(d, &socketError)) {
         if (socketError == 0) return 0;
@@ -1242,6 +1242,10 @@ int APS5_VABI sceKernelGetdents(int fd, char* buf, int nbytes) {
 
 int APS5_VABI getdirentries_nid_postfix(int fd, char* buf, int nbytes, int64_t* basep) {
     return PosixResult(sceKernelGetdirentries(fd, buf, nbytes, basep));
+}
+
+int APS5_VABI _getdirentries_nid_postfix(int fd, char* buf, int nbytes, int64_t* basep) {
+    return getdirentries_nid_postfix(fd, buf, nbytes, basep);
 }
 
 int APS5_VABI getdents_nid_postfix(int fd, char* buf, int nbytes) {
