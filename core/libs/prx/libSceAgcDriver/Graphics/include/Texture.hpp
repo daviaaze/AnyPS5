@@ -27,6 +27,7 @@ class ResidentColor;
 class CommandBatch;
 class StorageTexture;
 struct HostImport;
+struct ImageMemoryTiming;
 
 // The Vulkan format storage images of a guest format use (sRGB formats store as their UNORM form).
 // Throws when the format has no storage form; the query is cached per format (a lookup cost a
@@ -47,7 +48,7 @@ struct OwnedImage {
     OwnedImage(const OwnedImage&) = delete;
     OwnedImage& operator=(const OwnedImage&) = delete;
     ~OwnedImage();
-    void Allocate(const Context& device, const VkMemoryAllocateInfo& allocation, std::uint32_t mask, const char* operation, bool newImage = false);
+    void Allocate(const Context& device, const VkMemoryAllocateInfo& allocation, std::uint32_t mask, const char* operation, bool newImage = false, ImageMemoryTiming* timing = nullptr);
     Context context;
     VkImage image;
     VkDeviceMemory memory;
