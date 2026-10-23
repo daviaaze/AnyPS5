@@ -140,8 +140,12 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         ++outcomes.atEntry;
         return;
     }
-    if (heldAtSubmit) return;
+    if (heldAtSubmit) {
+        ++outcomes.heldAtSubmit;
+        return;
+    }
     if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, &writer)) {
+        ++outcomes.trackedWrite;
         if (writer != queue) notePendingWait(packet, queue, received);
         else epochPoint.bump = false;
         return;
@@ -181,6 +185,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             if (trace) traceLate("trusted", hit, refusal);
         }
         ++(polling ? outcomes.fromRecorderPolling : outcomes.fromRecorder);
+        ++outcomes.labelFlushes;
         if (unlockedHit) ++outcomes.fromRecorderUnlocked;
         if (hit->queue == queue) {
             ++outcomes.fromRecorderSameQueue;
@@ -220,10 +225,15 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
 
             if (labelTable) {
                 Graphics::Recorder::LabelRefusal refusal{};
-                if (takeLabel(localDevice->PendingLabel(awaited, awaitedBytes, received, &refusal), refusal, false, false)) return;
+                if (takeLabel(localDevice->PendingLabel(awaited, awaitedBytes, received, &refusal), refusal, false, false)) {
+                    ++outcomes.labelFlushes;
+                    return;
+                }
             }
-
-            if (!overlapSubmit || localDevice->OpenWriteOverlaps(awaited, awaitedBytes)) localDevice->SubmitRecorded(false);
+            if (!overlapSubmit || localDevice->OpenWriteOverlaps(awaited, awaitedBytes)) {
+                localDevice->SubmitRecorded(false);
+                ++outcomes.mutexSubmits;
+            }
         }
     }
 
@@ -319,6 +329,12 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         }
         return false;
     };
+    const auto pollingStart = std::chrono::steady_clock::now();
+    struct PollTime {
+        WaitOutcomes& outcomes;
+        std::chrono::steady_clock::time_point start;
+        ~PollTime() { outcomes.pollMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(); }
+    } pollTime{outcomes, pollingStart};
 
     if (entryTryFailed && pollService(false)) return;
 
@@ -337,6 +353,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     StallWatch stall(queue);
     while (!Pm4::WaitSatisfiedUnchecked(packet)) {
         if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, &writer)) {
+            ++outcomes.trackedWrite;
             if (writer != queue) notePendingWait(packet, queue, received);
             else epochPoint.bump = false;
             return;
