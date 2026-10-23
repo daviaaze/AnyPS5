@@ -1,3 +1,22 @@
+foreach(variable TOOL CAPTURE CACHE)
+    if(NOT DEFINED ${variable})
+        message(FATAL_ERROR "${variable} is not set")
+    endif()
+endforeach()
+
+file(REMOVE_RECURSE "${CACHE}")
+execute_process(COMMAND "${CMAKE_COMMAND}" -E env --unset=ANYPS5_NO_SHADER_CACHE "${TOOL}" --precompile "${CACHE}" "${CAPTURE}/inactive.req" RESULT_VARIABLE code OUTPUT_VARIABLE output ERROR_VARIABLE errors)
+if(NOT code STREQUAL "0" OR NOT output MATCHES "variants: [0-9]+ already cached, [1-9][0-9]* written" OR NOT output MATCHES "resource plans: [0-9]+ already cached, [1-9][0-9]* written")
+    message(FATAL_ERROR "initial precompile did not populate variant and plan entries: ${code}\n${output}${errors}")
+endif()
+
+execute_process(COMMAND "${CMAKE_COMMAND}" -E env --unset=ANYPS5_NO_SHADER_CACHE "${TOOL}" --precompile "${CACHE}" "${CAPTURE}/inactive.req" RESULT_VARIABLE code OUTPUT_VARIABLE output ERROR_VARIABLE errors)
+if(NOT code STREQUAL "0" OR NOT output MATCHES "variants: [1-9][0-9]* already cached, 0 written" OR NOT output MATCHES "resource plans: [1-9][0-9]* already cached, 0 written")
+    message(FATAL_ERROR "resumed precompile did not load the cached variant and plan: ${code}\n${output}${errors}")
+endif()
+
+file(REMOVE_RECURSE "${CACHE}")
+
 foreach(variable TOOL CAPTURE)
     if(NOT DEFINED ${variable})
         message(FATAL_ERROR "${variable} is not set")

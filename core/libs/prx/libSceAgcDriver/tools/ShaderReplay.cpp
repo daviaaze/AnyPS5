@@ -7,18 +7,27 @@
 #include "Optimization/ResourceProgram.hpp"
 #include "Optimization/RequestMemoryView.hpp"
 #include "Recompiler.hpp"
+#include "ShaderDiskCache.hpp"
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
 
 #if ANYPS5_ENABLE_SPIRV_TOOLS
 #include "spirv-tools/libspirv.hpp"
 #endif
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <exception>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <vector>
 
 namespace {
 
@@ -182,12 +191,121 @@ bool Replay(const char* path) {
     }
 }
 
+bool CacheDisabledByEnvironment() {
+    const char* disabled = std::getenv("ANYPS5_NO_SHADER_CACHE");
+    return disabled != nullptr && *disabled != '\0' && std::strcmp(disabled, "0") != 0;
+}
+
+void SetCacheDirectory(const std::filesystem::path& directory) {
+#ifdef _WIN32
+    _putenv_s("ANYPS5_SHADER_CACHE_DIR", directory.string().c_str());
+#else
+    setenv("ANYPS5_SHADER_CACHE_DIR", directory.string().c_str(), 1);
+#endif
+}
+
+std::vector<std::filesystem::path> RequestFiles(const std::vector<std::string>& inputs) {
+    std::vector<std::filesystem::path> files;
+    for (const auto& input : inputs) {
+        std::error_code error;
+        if (!std::filesystem::is_directory(input, error)) {
+            files.emplace_back(input);
+            continue;
+        }
+        for (std::filesystem::directory_iterator it(input, error), end; !error && it != end; it.increment(error)) {
+            if (it->is_regular_file(error) && it->path().extension() == ".req") files.push_back(it->path());
+        }
+    }
+    std::sort(files.begin(), files.end());
+    files.erase(std::unique(files.begin(), files.end()), files.end());
+    return files;
+}
+
+// --precompile <cache dir>: prepares every request through the driver's PrepareShader path with the
+// shader disk cache rooted at <cache dir>, so the compiled variants and resource plans land under the
+// same source version and keys the game looks up. Entries already on disk load instead of compiling.
+int Precompile(const std::filesystem::path& cacheDirectory, unsigned threads, const std::vector<std::string>& inputs) {
+    if (CacheDisabledByEnvironment()) {
+        std::fprintf(stderr, "--precompile: ANYPS5_NO_SHADER_CACHE disables the cache to fill\n");
+        return 2;
+    }
+    std::error_code error;
+    std::filesystem::create_directories(cacheDirectory, error);
+    SetCacheDirectory(std::filesystem::absolute(cacheDirectory, error));
+    if (!ShaderRecompiler::ShaderDiskCache::Enabled()) {
+        std::fprintf(stderr, "--precompile: the shader disk cache at %s is not usable\n", cacheDirectory.string().c_str());
+        return 2;
+    }
+    const auto files = RequestFiles(inputs);
+    if (files.empty()) {
+        std::fprintf(stderr, "--precompile: no .req files found in the supplied inputs\n");
+        return 2;
+    }
+    std::printf("precompile: %zu requests into %s (source version %016llx, format %u), %u threads\n", files.size(), ShaderRecompiler::ShaderDiskCache::EntryDirectory().string().c_str(),
+                static_cast<unsigned long long>(ShaderRecompiler::ShaderDiskCache::SourceVersion()), ShaderRecompiler::ShaderDiskCache::FormatVersion, threads);
+    std::fflush(stdout);
+    const auto started = std::chrono::steady_clock::now();
+    std::atomic<std::size_t> next{0}, failed{0}, compute{0}, graphics{0}, other{0}, done{0};
+    const auto work = [&] {
+        for (auto index = next.fetch_add(1); index < files.size(); index = next.fetch_add(1)) {
+            const auto path = files[index].string();
+            try {
+                const auto request = ShaderRecompiler::RequestSerializer{}.Deserialize(ReadText(path.c_str()));
+                if (request.request.graphics.has_value()) ++graphics;
+                else if (request.request.context.compute.has_value()) ++compute;
+                else ++other;
+                ShaderRecompiler::ShaderPreparationContext preparation;
+                const auto begin = std::chrono::steady_clock::now();
+                const auto handle = ShaderRecompiler::PrepareShader(request.request, &preparation);
+                const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+                if (ms >= 1000.0) std::printf("  %s: %zu SPIR-V words in %.0f ms\n", path.c_str(), ShaderRecompiler::GetPreparedArtifact(*handle).spirv.size(), ms);
+            } catch (const std::exception& failure) {
+                ++failed;
+                std::printf("  %s: failed: %s\n", path.c_str(), FirstLine(failure.what()).c_str());
+            }
+            const auto finished = ++done;
+            if (finished % 100 == 0) std::printf("precompile: %zu/%zu\n", finished, files.size());
+            std::fflush(stdout);
+        }
+    };
+    std::vector<std::thread> workers;
+    const auto count = std::max(1u, std::min<unsigned>(threads, static_cast<unsigned>(std::max<std::size_t>(files.size(), 1))));
+    for (unsigned i = 1; i < count; ++i) workers.emplace_back(work);
+    work();
+    for (auto& worker : workers) worker.join();
+    ShaderRecompiler::ShaderDiskCache::Flush();
+    const auto totals = ShaderRecompiler::ShaderDiskCache::Totals();
+    const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    std::printf("precompile: %zu requests (%zu compute, %zu graphics, %zu other), %zu failed; variants: %llu already cached, %llu written; resource plans: %llu already cached, %llu written; %llu load failures, %llu write failures; %.1f s\n",
+                files.size(), compute.load(), graphics.load(), other.load(), failed.load(), static_cast<unsigned long long>(totals.hits), static_cast<unsigned long long>(totals.writes),
+                static_cast<unsigned long long>(totals.planHits), static_cast<unsigned long long>(totals.planWrites), static_cast<unsigned long long>(totals.loadFailures + totals.planLoadFailures),
+                static_cast<unsigned long long>(totals.writeFailures), seconds);
+    return failed == 0 && totals.writeFailures == 0 ? 0 : 1;
+}
+
 }
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--prepare] [--materialize] [--code] [--maintenance8] [--robust2] [--wave-lds-memory-barriers] <shader.req>...\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set; shader_<address>.prepare.req holds a request whose preparation failed before any resource capture, so replay it with --prepare\n");
+        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--prepare] [--materialize] [--code] [--maintenance8] [--robust2] [--wave-lds-memory-barriers] <shader.req>...\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set; shader_<address>.prepare.req holds a request whose preparation failed before any resource capture, so replay it with --prepare\n"
+                             "       agc_shader_replay --precompile <shader cache dir> [--threads N] <shader.req or directory>...\n  fills the shader disk cache the game reads (ANYPS5_SHADER_CACHE_DIR) with every request's compiled shader and resource plan; cached entries are loaded, not recompiled\n");
         return 2;
+    }
+    if (std::string(argv[1]) == "--precompile") {
+        if (argc < 4) {
+            std::fprintf(stderr, "--precompile needs a cache directory and at least one request or directory\n");
+            return 2;
+        }
+        unsigned threads = std::max(1u, std::thread::hardware_concurrency() / 2u);
+        std::vector<std::string> inputs;
+        for (int i = 3; i < argc; ++i) {
+            if (std::string(argv[i]) == "--threads" && i + 1 < argc) {
+                threads = static_cast<unsigned>(std::max(1l, std::strtol(argv[++i], nullptr, 10)));
+                continue;
+            }
+            inputs.emplace_back(argv[i]);
+        }
+        return Precompile(argv[2], threads, inputs);
     }
     int failures = 0;
     for (int i = 1; i < argc; ++i) {

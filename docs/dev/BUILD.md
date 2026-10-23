@@ -60,6 +60,30 @@ therefore tests the previous binaries and can show no effect at all.
 
 [Relinker usage and runtime layout](../user/USAGE.md).
 
+## Offline shader-cache precompilation
+
+Build `agc_shader_replay` from the same configured build tree as the runtime PRX, then pass the runtime shader-cache root and one or more request files/directories:
+
+```sh
+cmake --build build --target agc_shader_replay
+ANYPS5_SHADER_CACHE_DIR=/path/to/runtime/shader_cache \
+  build/core/libs/prx/libSceAgcDriver/agc_shader_replay \
+  --precompile /path/to/runtime/shader_cache --threads 8 /path/to/request-snapshots
+```
+
+`--precompile` writes the same source-version directory and shader/resource-plan entries used by runtime compilation. It processes requests concurrently (default: half of reported hardware threads, minimum one); use `--threads` to bound concurrency. Existing valid entries are loaded instead of recompiled, so rerunning after interruption resumes naturally. The cache writer is flushed before exit. Do not run the game concurrently against this cache while precompiling.
+
+The request directory should contain captured `shader_*.req` files. Captures provide the request's compiler target, code, layout, and captured resource inputs; exact request keys are required. The tool warms compiled shader variants and resource plans only. It does not create Vulkan pipelines: `.req` lacks the runtime-created Vulkan device objects and full pipeline recipes (graphics render state/attachments and layouts, and compute specialization/layout state). The opaque `vk-pipelines-*.bin` is driver-owned and can only be populated by pipeline creation on the actual runtime device; `pipelines.journal` records/replays recipes captured by the game. Consequently precompilation can prevent shader translation/resource-analysis misses but cannot guarantee driver pipeline-cache hits on the next run. Check the tool's reported source version and cache path, then verify runtime `[shader-disk-cache]` hit totals in `systemd-client.stderr`; pipeline creation may still occur on first use.
+
+For the captured gameplay snapshot on the AnyPS5 workbench, with a build at `/home/daviaaze/Games/anyps5-workbench/build` and the runtime cache at `/home/daviaaze/Games/anyps5-workbench/DemonSouls-candidate/shader_cache`, run:
+
+```sh
+ANYPS5_SHADER_CACHE_DIR=/home/daviaaze/Games/anyps5-workbench/DemonSouls-candidate/shader_cache \
+  /home/daviaaze/Games/anyps5-workbench/build/core/libs/prx/libSceAgcDriver/agc_shader_replay \
+  --precompile /home/daviaaze/Games/anyps5-workbench/DemonSouls-candidate/shader_cache --threads 8 \
+  /home/daviaaze/Games/anyps5-workbench/evidence/t1-gameplay-20261023/request-snapshots/native-game-d677f4637daa
+```
+
 ## Windows setup and troubleshooting
 
 The full build also requires Python 3 for glslang and Git for Windows with Bash for libusb's version-header generation. A minimal Git installation without Bash is insufficient for the full build.
