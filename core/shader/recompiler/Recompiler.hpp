@@ -652,6 +652,13 @@ private:
 
 [[nodiscard]] SharedSpirv InternSpirv(std::vector<std::uint32_t> words);
 
+struct SpecializedModuleBindings {
+    std::vector<std::uint32_t> bindings;
+    bool pushData = false;
+};
+
+[[nodiscard]] SpecializedModuleBindings ScanSpecializedModuleBindings(std::span<const std::uint32_t> words);
+
 struct VertexInput {
     std::uint32_t location;
     std::uint32_t components;
@@ -700,6 +707,15 @@ struct CompiledShaderArtifact {
     std::uint32_t stencilReferenceDword = 0xffffffffu;
     std::uint64_t variantId = 0;
 };
+
+struct SpecializedModuleCacheData {
+    SharedSpirv spirv;
+    std::vector<std::uint32_t> bindings;
+    bool pushData = false;
+    std::uint64_t specializationId = 0;
+};
+
+[[nodiscard]] SpecializedModuleCacheData BuildSpecializedModuleForCache(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target);
 
 struct ShaderInvocation {
     std::vector<PipelineSpecializationConstant> specialization;

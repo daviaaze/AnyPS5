@@ -742,6 +742,30 @@ struct SpecializedModule {
     bool pushData = false;
 };
 
+void scanSpecializedBindings(SpecializedModule& module, std::span<const std::uint32_t> words) {
+    std::map<std::uint32_t, std::uint32_t> bindingNumbers;
+    std::unordered_set<std::uint32_t> functionLdsBuffer;
+    for (std::size_t cursor = 5; cursor < words.size();) {
+        const auto count = words[cursor] >> 16u;
+        const auto op = static_cast<spv::Op>(words[cursor] & 0xffffu);
+        if (op == spv::OpDecorate && count == 4u && words[cursor + 2u] == spv::DecorationBinding) bindingNumbers.emplace(words[cursor + 1u], words[cursor + 3u]);
+        if (op == spv::OpDecorate && count == 4u && words[cursor + 2u] == spv::DecorationDescriptorSet && words[cursor + 3u] == PixelFunctionLdsDescriptorSet) functionLdsBuffer.insert(words[cursor + 1u]);
+        if (op == spv::OpVariable && count >= 4u && !functionLdsBuffer.contains(words[cursor + 2u])) {
+            if (const auto found = bindingNumbers.find(words[cursor + 2u]); found != bindingNumbers.end()) module.bindings.push_back(found->second);
+            module.pushData |= words[cursor + 3u] == spv::StorageClassPushConstant;
+        }
+        cursor += count;
+    }
+}
+
+std::shared_ptr<const SpecializedModule> specializedModuleFromWords(std::vector<std::uint32_t> words, std::span<const PipelineSpecializationConstant> constants) {
+    auto module = std::make_shared<SpecializedModule>();
+    scanSpecializedBindings(*module, words);
+    module->spirv = InternSpirv(std::move(words));
+    module->specializationId = constants.empty() ? 0u : nextVariantId();
+    return module;
+}
+
 std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
     auto source = SpecializeVertexInputTypes(artifact, classes);
     std::map<std::uint32_t, std::uint32_t> supplied;
@@ -838,23 +862,7 @@ std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledSh
     }
 #endif
     materialized = std::move(compact);
-    auto module = std::make_shared<SpecializedModule>();
-    std::map<std::uint32_t, std::uint32_t> bindingNumbers;
-    std::unordered_set<std::uint32_t> functionLdsBuffer;
-    for (std::size_t cursor = 5; cursor < materialized.size();) {
-        const auto count = materialized[cursor] >> 16u;
-        const auto op = static_cast<spv::Op>(materialized[cursor] & 0xffffu);
-        if (op == spv::OpDecorate && count == 4u && materialized[cursor + 2u] == spv::DecorationBinding) bindingNumbers.emplace(materialized[cursor + 1u], materialized[cursor + 3u]);
-        if (op == spv::OpDecorate && count == 4u && materialized[cursor + 2u] == spv::DecorationDescriptorSet && materialized[cursor + 3u] == PixelFunctionLdsDescriptorSet) functionLdsBuffer.insert(materialized[cursor + 1u]);
-        if (op == spv::OpVariable && count >= 4u && !functionLdsBuffer.contains(materialized[cursor + 2u])) {
-            if (const auto found = bindingNumbers.find(materialized[cursor + 2u]); found != bindingNumbers.end()) module->bindings.push_back(found->second);
-            module->pushData |= materialized[cursor + 3u] == spv::StorageClassPushConstant;
-        }
-        cursor += count;
-    }
-    module->spirv = InternSpirv(std::move(materialized));
-    module->specializationId = constants.empty() ? 0u : nextVariantId();
-    return module;
+    return specializedModuleFromWords(std::move(materialized), constants);
 }
 
 struct SpecializedModuleEntry {
@@ -1035,36 +1043,85 @@ void reportSpecializationChurn(std::uint64_t variantId, std::span<const Pipeline
 }
 
 std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
+    std::vector<std::byte> diskKey;
+    ShaderDiskCache::BuildSpecializationKey({
+        .source = artifact.spirv.ContentHash(),
+        .sourceWords = artifact.spirv.size(),
+        .vertexInputPatches = artifact.vertexInputPatches,
+        .stencilReferences = !artifact.stencilReferences.empty(),
+        .classes = classes,
+        .constants = constants,
+        .vulkanVersion = target.vulkanVersion,
+        .spirvVersion = target.spirvVersion,
+        .nonConstantImageOffsets = target.nonConstantImageOffsets,
+        .spirvTools = ANYPS5_ENABLE_SPIRV_TOOLS != 0
+    }, diskKey);
     struct ModuleKeyStorage {};
-    auto& key = HostThreadLocal<std::vector<std::uint64_t>, ModuleKeyStorage>();
-    key.clear();
-    key.push_back(artifact.variantId);
-    for (const auto& constant : constants) key.push_back((static_cast<std::uint64_t>(constant.id) << 32u) | constant.value);
+    auto& key = HostThreadLocal<std::vector<std::byte>, ModuleKeyStorage>();
+    key = diskKey;
     static PrimedSharedMutex mutex;
-    static std::map<std::vector<std::uint64_t>, std::shared_ptr<SpecializedModuleEntry>> modules;
+    static std::map<std::vector<std::byte>, std::shared_ptr<SpecializedModuleEntry>> modules;
     std::shared_ptr<SpecializedModuleEntry> entry;
+    bool inserted = false;
     {
         std::shared_lock lock(mutex);
         if (const auto found = modules.find(key); found != modules.end()) entry = found->second;
     }
     if (entry == nullptr) {
-        bool inserted = false;
-        {
-            std::unique_lock lock(mutex);
-            const auto found = modules.find(key);
-            inserted = found == modules.end();
-            entry = !inserted ? found->second : modules.emplace(key, std::make_shared<SpecializedModuleEntry>()).first->second;
-        }
-        static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-        if (profile && inserted) reportSpecializationChurn(artifact.variantId, constants);
+        std::unique_lock lock(mutex);
+        const auto found = modules.find(key);
+        inserted = found == modules.end();
+        entry = !inserted ? found->second : modules.emplace(key, std::make_shared<SpecializedModuleEntry>()).first->second;
     }
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (profile && inserted) reportSpecializationChurn(artifact.variantId, constants);
+    static std::atomic<std::uint64_t> builtCount{0}, builtNs{0}, builtMaxNs{0}, builtMaxWords{0};
+    static std::atomic<std::uint64_t> diskCount{0}, diskNs{0}, memoryHits{0};
+    static std::atomic<std::int64_t> lastReportNs{0};
+    static std::mutex reportMutex;
     std::call_once(entry->ready, [&] {
         try {
-            entry->module = buildSpecializedModule(artifact, classes, constants, target);
+            const auto started = std::chrono::steady_clock::now();
+            std::vector<std::uint32_t> words;
+            const bool diskHit = ShaderDiskCache::LoadSpecialized(diskKey, words);
+            if (diskHit) {
+                entry->module = specializedModuleFromWords(std::move(words), constants);
+            } else {
+                entry->module = buildSpecializedModule(artifact, classes, constants, target);
+                ShaderDiskCache::StoreSpecialized(diskKey, entry->module->spirv);
+            }
+            if (profile) {
+                const auto ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
+                if (diskHit) {
+                    diskCount.fetch_add(1, std::memory_order_relaxed);
+                    diskNs.fetch_add(ns, std::memory_order_relaxed);
+                } else {
+                    builtCount.fetch_add(1, std::memory_order_relaxed);
+                    builtNs.fetch_add(ns, std::memory_order_relaxed);
+                    auto maxNs = builtMaxNs.load(std::memory_order_relaxed);
+                    while (maxNs < ns && !builtMaxNs.compare_exchange_weak(maxNs, ns, std::memory_order_relaxed)) {}
+                    auto maxWords = builtMaxWords.load(std::memory_order_relaxed);
+                    while (maxWords < entry->module->spirv.size() && !builtMaxWords.compare_exchange_weak(maxWords, entry->module->spirv.size(), std::memory_order_relaxed)) {}
+                }
+            }
         } catch (...) {
             entry->failure = std::current_exception();
         }
     });
+    if (profile) {
+        if (!inserted) memoryHits.fetch_add(1, std::memory_order_relaxed);
+        const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        auto last = lastReportNs.load(std::memory_order_relaxed);
+        if (last == 0) lastReportNs.compare_exchange_strong(last, now, std::memory_order_relaxed);
+        else if (now - last >= std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::seconds(10)).count() && lastReportNs.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+            std::lock_guard lock(reportMutex);
+            std::fprintf(stderr, "[specialize] (10 s): %llu built in %.1f ms (max %.1f ms, %llu words max), %llu disk hits in %.1f ms, %llu memory hits\n",
+                static_cast<unsigned long long>(builtCount.exchange(0, std::memory_order_relaxed)), builtNs.exchange(0, std::memory_order_relaxed) / 1e6,
+                builtMaxNs.exchange(0, std::memory_order_relaxed) / 1e6, static_cast<unsigned long long>(builtMaxWords.exchange(0, std::memory_order_relaxed)),
+                static_cast<unsigned long long>(diskCount.exchange(0, std::memory_order_relaxed)), diskNs.exchange(0, std::memory_order_relaxed) / 1e6,
+                static_cast<unsigned long long>(memoryHits.exchange(0, std::memory_order_relaxed)));
+        }
+    }
     if (entry->failure) std::rethrow_exception(entry->failure);
     return entry->module;
 }
@@ -1258,6 +1315,17 @@ bool sameLayout(const BindingLayout& left, const BindingLayout& right) {
     return left.descriptorSet == right.descriptorSet && left.firstBinding == right.firstBinding && left.pushConstantOffsetBytes == right.pushConstantOffsetBytes && left.pushConstantSizeBytes == right.pushConstantSizeBytes;
 }
 
+}
+
+SpecializedModuleBindings ScanSpecializedModuleBindings(std::span<const std::uint32_t> words) {
+    SpecializedModule module;
+    scanSpecializedBindings(module, words);
+    return {std::move(module.bindings), module.pushData};
+}
+
+SpecializedModuleCacheData BuildSpecializedModuleForCache(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
+    const auto module = buildSpecializedModule(artifact, classes, constants, target);
+    return {module->spirv, module->bindings, module->pushData, module->specializationId};
 }
 
 SharedSpirv InternSpirv(std::vector<std::uint32_t> words) {

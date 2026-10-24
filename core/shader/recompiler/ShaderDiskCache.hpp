@@ -13,7 +13,7 @@
 
 namespace ShaderRecompiler::ShaderDiskCache {
 
-inline constexpr std::uint32_t FormatVersion = 45;
+inline constexpr std::uint32_t FormatVersion = 46;
 
 enum class LoadStatus {
     Loaded,
@@ -44,6 +44,10 @@ struct Counters {
     std::uint64_t maxLoadNanoseconds = 0;
     std::uint64_t prebuiltBytesRead = 0;
     std::uint64_t prebuiltLoadNanoseconds = 0;
+    std::uint64_t specializedHits = 0;
+    std::uint64_t specializedMisses = 0;
+    std::uint64_t specializedWrites = 0;
+    std::uint64_t specializedLoadFailures = 0;
 };
 
 [[nodiscard]] std::uint64_t SourceVersion();
@@ -64,6 +68,24 @@ void BuildPlanKey(const RecompileRequest& request, std::uint32_t hostSubgroupSiz
 [[nodiscard]] std::vector<std::byte> EncodePlanEntry(std::span<const std::byte> key, const IrResourcePlan& plan);
 [[nodiscard]] LoadStatus DecodePlanEntry(std::span<const std::byte> file, std::span<const std::byte> key, IrResourcePlan& plan);
 
+// Everything buildSpecializedModule's output depends on. The source is identified by content, never by the
+// per-process variant ID.
+struct SpecializationKeyInput {
+    SpirvContentHash source;
+    std::size_t sourceWords = 0;
+    std::span<const VertexInputPatch> vertexInputPatches;
+    bool stencilReferences = false;
+    std::span<const std::uint32_t> classes;
+    std::span<const PipelineSpecializationConstant> constants;
+    std::uint32_t vulkanVersion = 0;
+    std::uint32_t spirvVersion = 0;
+    bool nonConstantImageOffsets = false;
+    bool spirvTools = false;
+};
+void BuildSpecializationKey(const SpecializationKeyInput& input, std::vector<std::byte>& key);
+[[nodiscard]] std::vector<std::byte> EncodeSpecializedEntry(std::span<const std::byte> key, std::span<const std::uint32_t> spirv);
+[[nodiscard]] LoadStatus DecodeSpecializedEntry(std::span<const std::byte> file, std::span<const std::byte> key, std::vector<std::uint32_t>& spirv);
+
 [[nodiscard]] bool Enabled();
 [[nodiscard]] std::filesystem::path EntryDirectory();
 
@@ -72,6 +94,8 @@ void Store(std::vector<std::byte> key, std::shared_ptr<const CompiledVariant> va
 [[nodiscard]] std::shared_ptr<const CompiledVariant> Persist(std::span<const std::byte> key, const CompiledVariant& variant);
 [[nodiscard]] bool LoadPlan(std::span<const std::byte> key, IrResourcePlan& plan);
 void StorePlan(std::vector<std::byte> key, std::shared_ptr<const IrResourcePlan> plan);
+[[nodiscard]] bool LoadSpecialized(std::span<const std::byte> key, std::vector<std::uint32_t>& spirv);
+void StoreSpecialized(std::vector<std::byte> key, SharedSpirv spirv);
 void Flush();
 void Shutdown();
 [[nodiscard]] unsigned Writers();
