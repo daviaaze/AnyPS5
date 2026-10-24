@@ -123,6 +123,7 @@ struct CachedTexture {
     // write watch; zero when none was taken.
     std::array<std::uint64_t, 4> untracked{};
     std::uint64_t surfaceBytes = 0;
+    bool overflow = false;
 };
 
 // Entries in use order (front = most recent) with a hash index by key: a lookup is O(1) and the
@@ -133,6 +134,10 @@ struct TextureCache {
     std::list<CachedTexture> entries;
     std::unordered_map<TextureKey, std::list<CachedTexture>::iterator, TextureKeyHash> index;
     std::unordered_multimap<const StorageTexture*, std::list<CachedTexture>::iterator> views;
+    std::list<CachedTexture> overflowEntries;
+    std::unordered_map<TextureKey, std::list<CachedTexture>::iterator, TextureKeyHash> overflowIndex;
+    std::unordered_multimap<const StorageTexture*, std::list<CachedTexture>::iterator> overflowViews;
+    std::uint64_t overflowBytes = 0;
     std::vector<std::pair<std::vector<std::byte>, std::uint64_t>> spare;
     std::uint64_t spareBytes = 0;
     std::uint64_t bytes = 0;
@@ -212,33 +217,50 @@ bool TextureHashEnabled() {
     static const bool disabled = std::getenv("APS5_NO_TEXTURE_HASH") != nullptr;
     return !disabled;
 }
+struct CacheRef {
+    std::list<CachedTexture>::iterator entry;
+    bool overflow = false;
+};
 
-std::list<CachedTexture>::iterator findTexture(TextureCache& cache, const TextureKey& key) {
-    if (TextureHashEnabled()) {
-        const auto found = cache.index.find(key);
-        return found == cache.index.end() ? cache.entries.end() : found->second;
-    }
-    for (auto it = cache.entries.begin(); it != cache.entries.end(); ++it) {
-        if (it->key == key) return it;
-    }
-    return cache.entries.end();
+CacheRef findTexture(TextureCache& cache, const TextureKey& key) {
+    const auto find = [&](auto& entries, auto& index) {
+        if (TextureHashEnabled()) {
+            const auto found = index.find(key);
+            return found == index.end() ? entries.end() : found->second;
+        }
+        for (auto it = entries.begin(); it != entries.end(); ++it) if (it->key == key) return it;
+        return entries.end();
+    };
+    auto it = find(cache.entries, cache.index);
+    if (it != cache.entries.end()) return {it, false};
+    it = find(cache.overflowEntries, cache.overflowIndex);
+    return it == cache.overflowEntries.end() ? CacheRef{cache.entries.end(), false} : CacheRef{it, true};
 }
 
-void eraseTexture(TextureCache& cache, std::list<CachedTexture>::iterator it) {
-    cache.bytes -= it->accounted;
+auto& cacheEntries(TextureCache& cache, bool overflow) { return overflow ? cache.overflowEntries : cache.entries; }
+auto& cacheIndex(TextureCache& cache, bool overflow) { return overflow ? cache.overflowIndex : cache.index; }
+auto& cacheViews(TextureCache& cache, bool overflow) { return overflow ? cache.overflowViews : cache.views; }
+
+void eraseTexture(TextureCache& cache, CacheRef ref) {
+    auto& entries = cacheEntries(cache, ref.overflow);
+    auto& index = cacheIndex(cache, ref.overflow);
+    auto& views = cacheViews(cache, ref.overflow);
+    auto it = ref.entry;
+    if (ref.overflow) cache.overflowBytes -= it->accounted;
+    else cache.bytes -= it->accounted;
     if (it->source != nullptr) {
-        for (auto [view, last] = cache.views.equal_range(it->source.get()); view != last; ++view) {
-            if (view->second == it) {
-                cache.views.erase(view);
-                break;
-            }
+        for (auto [view, last] = views.equal_range(it->source.get()); view != last; ++view) {
+            if (view->second == it) { views.erase(view); break; }
         }
     }
     if (it->texture.use_count() > 1) noteReleased(it->texture);
-    cache.index.erase(it->key);
-    cache.entries.erase(it);
+    index.erase(it->key);
+    entries.erase(it);
     ++cache.erasures;
 }
+
+void eraseTexture(TextureCache& cache, std::list<CachedTexture>::iterator it) { eraseTexture(cache, {it, it->overflow}); }
+
 
 void dropUncachedViews(TextureCache& cache) {
     auto& uncached = Uncached();
@@ -253,6 +275,30 @@ void dropUncachedViews(TextureCache& cache) {
         const auto image = weak.lock();
         if (image == nullptr) continue;
         for (auto view = cache.views.find(image.get()); view != cache.views.end(); view = cache.views.find(image.get())) eraseTexture(cache, view->second);
+        for (auto view = cache.overflowViews.find(image.get()); view != cache.overflowViews.end(); view = cache.overflowViews.find(image.get())) eraseTexture(cache, {view->second, true});
+    }
+}
+
+
+void expireOverflow(TextureCache& cache) {
+    const auto present = Recorder::Presents();
+    for (auto it = cache.overflowEntries.begin(); it != cache.overflowEntries.end();) {
+        if (it->present != present) { auto erase = it++; eraseTexture(cache, {erase, true}); }
+        else ++it;
+    }
+}
+
+void trimOverflowToBudget(TextureCache& cache, std::uint64_t budget) {
+    const auto ceiling = budget + budget / 4u;
+    while (cache.bytes > ceiling || cache.overflowBytes > ceiling - std::min(cache.bytes, ceiling)) {
+        auto candidate = cache.overflowEntries.end();
+        while (candidate != cache.overflowEntries.begin()) {
+            --candidate;
+            if (candidate->texture.use_count() == 1 && (candidate->source == nullptr || !candidate->source->Dirty())) break;
+        }
+        if (candidate == cache.overflowEntries.end() || candidate->texture.use_count() != 1 || (candidate->source != nullptr && candidate->source->Dirty())) break;
+        eraseTexture(cache, {candidate, true});
+        ++cache.counts.evicted;
     }
 }
 
@@ -260,6 +306,10 @@ void dropUncachedViews(TextureCache& cache) {
 void touchTexture(TextureCache& cache, std::list<CachedTexture>::iterator it) {
     cache.entries.splice(cache.entries.begin(), cache.entries, it);
     it->present = Recorder::Presents();
+}
+void touchTexture(TextureCache& cache, CacheRef ref) {
+    if (!ref.overflow) { touchTexture(cache, ref.entry); return; }
+    cache.overflowEntries.splice(cache.overflowEntries.begin(), cache.overflowEntries, ref.entry);
 }
 
 constexpr std::uint64_t SpareSnapshotBytes = 256ull << 20;
@@ -296,7 +346,14 @@ std::vector<std::byte> spareSnapshot(TextureCache& cache, std::size_t bytes) {
 }
 
 bool admitTexture(TextureCache& cache, const TextureKey& key, std::uint64_t incoming, std::uint64_t budget) {
-    if (cache.bytes + incoming <= budget) return true;
+    const auto ceiling = budget + budget / 4u;
+    const auto fits = [&](std::uint64_t limit) { return cache.bytes <= limit && incoming <= limit - cache.bytes; };
+    const auto fitsCombined = [&](std::uint64_t limit) {
+        if (cache.bytes > limit || incoming > limit - cache.bytes) return false;
+        return cache.overflowBytes <= limit - cache.bytes - incoming;
+    };
+    if (fits(budget)) return fitsCombined(ceiling);
+    if (incoming > ceiling) return false;
     if (const auto now = std::chrono::steady_clock::now(); now - cache.passedSince >= std::chrono::seconds(1)) {
         cache.passed = 0;
         cache.passedSince = now;
@@ -308,13 +365,11 @@ bool admitTexture(TextureCache& cache, const TextureKey& key, std::uint64_t inco
     }
     const bool scan = incoming != 0 && present != 0;
     const bool firstUse = scan && !cache.firstUses.contains(key);
-    const auto ceiling = budget + budget / 4u;
-    while (!cache.entries.empty() && cache.bytes + incoming > budget) {
+    while (!cache.entries.empty() && !fits(budget)) {
         const auto back = std::prev(cache.entries.end());
-        const bool over = cache.bytes + incoming > ceiling;
+        const bool over = !fits(ceiling);
         if (scan && !over && (firstUse ? back->present + 1u >= present : back->present == present)) {
             cache.firstUses.insert(key);
-            ++cache.counts.uncached;
             return false;
         }
         const bool keep = back->accounted == 0 || (!over && back->texture.use_count() > 1);
@@ -329,7 +384,7 @@ bool admitTexture(TextureCache& cache, const TextureKey& key, std::uint64_t inco
             ++cache.counts.evicted;
         }
     }
-    return true;
+    return fits(ceiling) && fitsCombined(ceiling);
 }
 
 void reportCacheCounts(TextureCache& cache, std::uint64_t budget) {
@@ -339,7 +394,7 @@ void reportCacheCounts(TextureCache& cache, std::uint64_t budget) {
     if (now - cache.countsReported < std::chrono::seconds(10)) return;
     cache.countsReported = now;
     const auto counts = std::exchange(cache.counts, {});
-    AgcDriver::ProfilePrint_nid_no_patch("[texture-cache] (10 s): %llu textures cached, %llu used uncached (first use this frame with the least recently used entry used this frame or the last, or a later use with it used this frame), %llu evicted, %llu held ones passed over, %llu found changed; %llu MiB in %zu entries, budget %llu MiB, frame %llu\n", static_cast<unsigned long long>(counts.inserted), static_cast<unsigned long long>(counts.uncached), static_cast<unsigned long long>(counts.evicted), static_cast<unsigned long long>(counts.passed), static_cast<unsigned long long>(counts.stale), static_cast<unsigned long long>(cache.bytes >> 20u), cache.entries.size(), static_cast<unsigned long long>(budget >> 20u), static_cast<unsigned long long>(Recorder::Presents()));
+    AgcDriver::ProfilePrint_nid_no_patch("[texture-cache] (10 s): %llu textures cached, %llu used uncached (first use this frame with the least recently used entry used this frame or the last, or a later use with it used this frame), %llu evicted, %llu held ones passed over, %llu found changed; main %llu MiB in %zu entries, overflow %llu MiB in %zu entries, budget %llu MiB, frame %llu\n", static_cast<unsigned long long>(counts.inserted), static_cast<unsigned long long>(counts.uncached), static_cast<unsigned long long>(counts.evicted), static_cast<unsigned long long>(counts.passed), static_cast<unsigned long long>(counts.stale), static_cast<unsigned long long>(cache.bytes >> 20u), cache.entries.size(), static_cast<unsigned long long>(cache.overflowBytes >> 20u), cache.overflowEntries.size(), static_cast<unsigned long long>(budget >> 20u), static_cast<unsigned long long>(Recorder::Presents()));
 }
 
 struct ImageMemoEntry {
@@ -380,7 +435,9 @@ std::list<CachedTexture>::iterator findSampledEntry(TextureCache& cache, VkDevic
     auto& slot = imageMemoSlot(words);
     const bool same = slot.device == device && slot.words == words && slot.components.r == components.r && slot.components.g == components.g && slot.components.b == components.b && slot.components.a == components.a;
     if (same && slot.hasEntry && slot.erasures == cache.erasures) return slot.entry;
-    const auto it = findTexture(cache, MakeTextureKey(device, words, components));
+    const auto key = MakeTextureKey(device, words, components);
+    const auto found = cache.index.find(key);
+    const auto it = found == cache.index.end() ? cache.entries.end() : found->second;
     if (same) {
         slot.hasEntry = it != cache.entries.end();
         slot.entry = it;
@@ -913,9 +970,14 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     const auto key = MakeTextureKey(context.device, words, components, depthCompare);
     std::lock_guard lock(cache.mutex);
     const CacheHold held(sampledCacheHeld);
+    expireOverflow(cache);
     dropUncachedViews(cache);
+    const auto budget = sampledBudget(context, cache);
+    trimOverflowToBudget(cache, budget);
     std::vector<std::byte> recycled;
-    if (auto it = findTexture(cache, key); it != cache.entries.end()) {
+    const auto ref = findTexture(cache, key);
+    auto it = ref.entry;
+    if (it != cacheEntries(cache, ref.overflow).end()) {
         if (it->source != nullptr) {
             // The view follows the storage image, whatever the GPU wrote to it since; guest memory
             // written meanwhile is taken in by refreshing the image. A fast clear the image cannot
@@ -924,7 +986,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 if (!GuestMemory::UnchangedSince(address, bytes, it->source->GenerationFor(address, bytes))) refreshForView(*it->source, resource);
                 if (it->texture->IsDepthCopy()) it->texture->RefreshDepthCopy();
                 it->keys = *keys;
-                touchTexture(cache, it);
+                touchTexture(cache, ref);
                 logLookup({it->texture.get(), resource, guestBytes, *keys, 0, it->source.get()});
                 reportTextureCounters();
                 if (profile) LookupOutcomes::Add(*keys != DccKeys::Uncompressed ? LookupOutcomes::SampledHitClearedView : LookupOutcomes::SampledHitView, start);
@@ -954,7 +1016,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 it->generation = snapshotGeneration;
                 it->committed = std::move(committed);
                 it->untracked = untracked;
-                touchTexture(cache, it);
+                touchTexture(cache, ref);
                 logLookup({it->texture.get(), resource, guestBytes, *keys, generation, nullptr});
                 reportTextureCounters();
                 if (profile) LookupOutcomes::Add(LookupOutcomes::SampledHitSnapshot, start);
@@ -1013,10 +1075,25 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         if (entry.bytes.size() > SnapshotCompareBytes && (entry.generation != 0 || entry.untracked[0] != 0)) parkSnapshot(cache, entry.bytes);
         counters.snapshots.fetch_add(1, std::memory_order_relaxed);
     }
-    const auto budget = sampledBudget(context, cache);
     auto texture = entry.texture;
-    if (!admitTexture(cache, key, entry.accounted, budget)) {
-        noteReleased(texture);
+    const bool admitted = admitTexture(cache, key, entry.accounted, budget);
+    const auto ceiling = budget + budget / 4u;
+    if (!admitted) {
+        if (entry.accounted == 0 || entry.accounted > ceiling || cache.overflowIndex.contains(key) || cache.bytes > ceiling - entry.accounted || cache.overflowBytes > ceiling - entry.accounted - cache.bytes) {
+            ++cache.counts.uncached;
+            noteReleased(texture);
+            logLookup({texture.get(), resource, guestBytes, *keys, generation, source.get()});
+            reportCacheCounts(cache, budget);
+            reportTextureCounters();
+            if (profile) LookupOutcomes::Add(source != nullptr ? LookupOutcomes::SampledMadeView : LookupOutcomes::SampledMadeSnapshot, start);
+            return texture;
+        }
+        entry.overflow = true;
+        cache.overflowBytes += entry.accounted;
+        entry.present = Recorder::Presents();
+        cache.overflowEntries.push_front(std::move(entry));
+        cache.overflowIndex[key] = cache.overflowEntries.begin();
+        if (source != nullptr) cache.overflowViews.emplace(source.get(), cache.overflowEntries.begin());
         logLookup({texture.get(), resource, guestBytes, *keys, generation, source.get()});
         reportCacheCounts(cache, budget);
         reportTextureCounters();
@@ -1324,8 +1401,11 @@ TextureCacheUse TextureCacheUsage() {
         auto& sampled = Textures();
         std::lock_guard lock(sampled.mutex);
         dropUncachedViews(sampled);
+        expireOverflow(sampled);
         use.sampledEntries = sampled.entries.size();
+        use.overflowEntries = sampled.overflowEntries.size();
         use.sampledBytes = sampled.bytes;
+        use.overflowBytes = sampled.overflowBytes;
         use.spareEntries = sampled.spare.size();
         use.spareBytes = sampled.spareBytes;
     }
@@ -1371,6 +1451,10 @@ void ClearCachedTextures(VkDevice device) {
         const CacheHold held(sampledCacheHeld);
         for (auto it = sampled.entries.begin(); it != sampled.entries.end();) {
             if (it->key.device == device) eraseTexture(sampled, it++);
+            else ++it;
+        }
+        for (auto it = sampled.overflowEntries.begin(); it != sampled.overflowEntries.end();) {
+            if (it->key.device == device) eraseTexture(sampled, {it++, true});
             else ++it;
         }
         sampled.spare.clear();
@@ -1428,6 +1512,19 @@ std::uint64_t ReleaseTextureCaches(std::uint64_t bytes, bool newImage) {
         if ((inherited && (!newImage || sampledCacheReclaimable == 0)) || (!inherited && !lock.try_lock())) {
             sampledSkipped = true;
         } else {
+            for (auto it = cache.overflowEntries.end(); it != cache.overflowEntries.begin() && freed < bytes;) {
+                --it;
+                if (it->texture.use_count() != 1 || (it->source != nullptr && it->source->Dirty())) continue;
+                const auto allocated = it->texture->AllocationBytes();
+                const auto sourceBytes = it->source != nullptr ? it->source->AllocationBytes() : 0u;
+                const std::weak_ptr<StorageTexture> source = it->source;
+                const auto next = std::next(it);
+                eraseTexture(cache, {it, true});
+                ++sampledEntries;
+                freed += allocated;
+                if (source.expired()) freed += sourceBytes;
+                it = next;
+            }
             for (auto it = cache.entries.end(); it != cache.entries.begin() && freed < bytes;) {
                 --it;
                 if (it->texture.use_count() != 1 || (it->source != nullptr && it->source->Dirty())) continue;
@@ -1880,18 +1977,19 @@ bool TableCurrent(ReusedTable& table) {
 bool CachedTableTextures(const ReusedTable& table, std::vector<std::shared_ptr<Texture>>& cached) {
     auto& cache = Textures();
     std::lock_guard lock(cache.mutex);
-    std::vector<std::list<CachedTexture>::iterator> entries;
+    expireOverflow(cache);
+    std::vector<CacheRef> entries;
     entries.reserve(table.queries.size());
     for (const auto& element : table.elements) {
         if (element.rejected) continue;
-        const auto it = findTexture(cache, element.key);
-        if (it == cache.entries.end() || it->texture != element.texture.lock()) return false;
-        entries.push_back(it);
+        const auto ref = findTexture(cache, element.key);
+        if (ref.entry == cacheEntries(cache, ref.overflow).end() || ref.entry->texture != element.texture.lock()) return false;
+        entries.push_back(ref);
     }
     cached.reserve(entries.size());
-    for (const auto it : entries) {
-        cached.push_back(it->texture);
-        touchTexture(cache, it);
+    for (const auto ref : entries) {
+        cached.push_back(ref.entry->texture);
+        touchTexture(cache, ref);
     }
     return true;
 }

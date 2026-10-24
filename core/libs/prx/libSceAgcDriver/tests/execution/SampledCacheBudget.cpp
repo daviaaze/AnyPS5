@@ -836,7 +836,9 @@ void frameTests(const Context& context) {
     std::vector<std::weak_ptr<Texture>> made(frame);
     for (std::size_t surface = 0; surface < frame; ++surface) made[surface] = Sampled(context, block.Surface(surface));
     Require(TextureCacheUsage().sampledEntries == capacity, "a frame of " + std::to_string(frame) + " textures left " + std::to_string(TextureCacheUsage().sampledEntries) + " cached, not the " + std::to_string(capacity) + " the budget holds");
-    for (std::size_t surface = capacity; surface < frame; ++surface) Require(made[surface].expired(), "surface " + std::to_string(surface) + ", used once in a frame whose textures fill the cache, was cached in place of an earlier one");
+    Require(!made[capacity].expired() && made[capacity + 1u].expired(), "the one-present overflow tier did not retain exactly one snapshot within its 25% allowance");
+    const auto filled = TextureCacheUsage();
+    Require(filled.overflowEntries == 1u && filled.sampledBytes + filled.overflowBytes <= Ceiling, "the overflow tier exceeded its separate accounting or hard ceiling");
     Recorder::CountPresent();
     std::size_t hits = 0;
     for (std::size_t surface = 0; surface < frame; ++surface) {
@@ -846,14 +848,18 @@ void frameTests(const Context& context) {
     Require(hits == capacity, "the next frame over the same " + std::to_string(frame) + " textures found " + std::to_string(hits) + " of them cached, not the " + std::to_string(capacity) + " the cache kept");
     auto refused = Sampled(context, block.Surface(frame - 1u));
     Require(Sampled(context, block.Surface(frame - 1u)) != refused, "a texture used a second time in the frame was cached in place of one of the frame's textures");
-    Require(TextureCacheUsage().sampledEntries == capacity && TextureCacheUsage().sampledBytes <= Budget, "the texture used a second time left the cache over its budget");
+    const auto afterRepeat = TextureCacheUsage();
+    Require(afterRepeat.sampledEntries == capacity && afterRepeat.sampledBytes <= Budget && afterRepeat.sampledBytes + afterRepeat.overflowBytes <= Ceiling, "the texture used a second time exceeded its main budget or combined ceiling");
     refused.reset();
     Recorder::CountPresent();
     std::vector<std::weak_ptr<Texture>> moved(frame);
     for (std::size_t surface = 0; surface < frame; ++surface) moved[surface] = Sampled(context, block.Surface(frame + surface));
-    for (std::size_t surface = 0; surface < frame; ++surface) Require(moved[surface].expired(), "surface " + std::to_string(frame + surface) + ", first used in the frame after the cached textures were, was cached in place of one of them");
-    Require(TextureCacheUsage().sampledEntries == capacity, "a frame over other textures left " + std::to_string(TextureCacheUsage().sampledEntries) + " of the previous frame's textures cached");
+    Require(!moved[0].expired(), "the first surface in the new working set was not retained in current-present overflow");
+    for (std::size_t surface = 1; surface < frame; ++surface) Require(moved[surface].expired(), "surface " + std::to_string(frame + surface) + " displaced a main-cache or overflow entry in the current present");
+    Require(TextureCacheUsage().sampledEntries == capacity && TextureCacheUsage().overflowEntries == 1u, "a frame over other textures changed main entries or did not retain exactly one overflow entry");
+    for (std::size_t surface = 0; surface < capacity; ++surface) Require(!made[surface].expired(), "overflow admission displaced a main-cache entry");
     Recorder::CountPresent();
+    Require(TextureCacheUsage().overflowEntries == 0u && TextureCacheUsage().overflowBytes == 0u, "the previous present's overflow was not expired");
     for (std::size_t surface = 0; surface < frame; ++surface) moved[surface] = Sampled(context, block.Surface(frame + surface));
     for (std::size_t surface = 0; surface < capacity; ++surface) Require(!moved[surface].expired(), "surface " + std::to_string(frame + surface) + " of a second frame over other textures did not replace the textures last used two frames before");
     Require(TextureCacheUsage().sampledEntries == capacity, "a second frame over other textures left " + std::to_string(TextureCacheUsage().sampledEntries) + " entries cached");
@@ -918,10 +924,62 @@ void secondUseTests(const Context& context) {
     for (std::size_t surface = 1; surface < capacity; ++surface) Sampled(context, block.Surface(surface));
     Recorder::CountPresent();
     auto first = Sampled(context, block.Surface(capacity));
-    Require(TextureCacheUsage().sampledEntries == capacity && first.use_count() == 1, "the first use in a frame of a texture the cache does not hold was cached in place of one the last frame used");
-    const auto second = Sampled(context, block.Surface(capacity));
-    Require(Sampled(context, block.Surface(capacity)) == second, "a texture used a second time in a frame whose least recently used entry is from the last frame was not cached");
-    Require(TextureCacheUsage().sampledEntries == capacity && TextureCacheUsage().sampledBytes <= Budget, "the texture admitted on its second use left the cache over its budget");
+    const auto overflow = TextureCacheUsage();
+    Require(overflow.sampledEntries == capacity && overflow.overflowEntries == 1u && overflow.sampledBytes + overflow.overflowBytes <= Ceiling, "the overflow tier changed main-cache accounting or exceeded the combined ceiling");
+    Require(Sampled(context, block.Surface(capacity)) == first, "a same-present lookup did not reuse the overflow texture");
+    Recorder::CountPresent();
+    Require(TextureCacheUsage().overflowEntries == 0u && TextureCacheUsage().overflowBytes == 0u, "overflow survived the next present");
+    const auto afterExpiry = Sampled(context, block.Surface(capacity));
+    Require(afterExpiry != first, "a next-present lookup reused an expired overflow texture");
+}
+
+void overflowInvalidationTests(const Context& context) {
+    Block block(context);
+    ClearCachedTextures(context.device);
+    OverrideCacheBudgetForTest(Budget);
+    Recorder::CountPresent();
+    const auto allocation = Sampled(context, block.Surface(0))->AllocationBytes();
+    const auto capacity = static_cast<std::size_t>(Budget / allocation);
+    for (std::size_t surface = 1; surface < capacity; ++surface) Sampled(context, block.Surface(surface));
+    Recorder::CountPresent();
+    const auto address = block.Surface(capacity);
+    const auto first = Sampled(context, address);
+    Require(TextureCacheUsage().overflowEntries == 1u, "the saturated main cache did not admit one overflow snapshot");
+    std::memset(reinterpret_cast<void*>(address), 0xa1, SurfaceBytes);
+    const auto changed = Sampled(context, address);
+    Require(changed != first, "an overflow snapshot survived a guest write");
+    const auto usage = TextureCacheUsage();
+    Require(usage.sampledBytes + usage.overflowBytes <= Ceiling, "a guest write left combined sampled-cache accounting above the hard ceiling");
+    ClearCachedTextures(context.device);
+    OverrideCacheBudgetForTest(0);
+}
+
+void overflowDccInvalidationTests(const Context& context) {
+    Block block(context);
+    const auto keyBytes = SurfaceBytes / 256u;
+    WatchedSurface keys(context, 65536u);
+    ClearCachedTextures(context.device);
+    OverrideCacheBudgetForTest(Budget);
+    std::fill(reinterpret_cast<std::uint8_t*>(keys.Address()), reinterpret_cast<std::uint8_t*>(keys.Address()) + keyBytes, std::uint8_t{0});
+    AgcDriver::GuestMemory::CollectWritesUncached(keys.Address(), keyBytes);
+    Recorder::CountPresent();
+    const auto allocation = Sampled(context, block.Surface(0))->AllocationBytes();
+    const auto capacity = static_cast<std::size_t>(Budget / allocation);
+    for (std::size_t surface = 1; surface < capacity; ++surface) Sampled(context, block.Surface(surface));
+    Recorder::CountPresent();
+    auto words = Descriptor(block.Surface(capacity));
+    const auto keyAddress = keys.Address();
+    words[6] |= (1u << 19u) | (1u << 21u) | (static_cast<std::uint32_t>((keyAddress >> 8u) & 0xffu) << 24u);
+    words[7] = static_cast<std::uint32_t>(keyAddress >> 16u);
+    const auto clear = CachedSampledTexture(context, words);
+    Require(TextureCacheUsage().overflowEntries == 1u, "DCC snapshot did not enter the overflow tier");
+    std::fill(reinterpret_cast<std::uint8_t*>(keyAddress), reinterpret_cast<std::uint8_t*>(keyAddress) + keyBytes, std::uint8_t{0xff});
+    AgcDriver::GuestMemory::CollectWritesUncached(keyAddress, keyBytes);
+    const auto stored = CachedSampledTexture(context, words);
+    Require(stored != clear, "an overflow snapshot survived a DCC key change");
+    Require(TextureCacheUsage().sampledBytes + TextureCacheUsage().overflowBytes <= Ceiling, "DCC invalidation exceeded the combined hard ceiling");
+    ClearCachedTextures(context.device);
+    OverrideCacheBudgetForTest(0);
 }
 
 void earlyMissTests(const Context& context) {
@@ -1264,6 +1322,8 @@ int main(int argc, char** argv) {
             frameTests(context);
             shrinkTests(context);
             secondUseTests(context);
+            overflowInvalidationTests(context);
+            overflowDccInvalidationTests(context);
             earlyMissTests(context);
             collidingKeyTests(context);
             spareAgeTests(context);

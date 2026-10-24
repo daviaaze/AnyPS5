@@ -40,8 +40,10 @@ std::uint64_t StorageTextureCacheBudget(const Context& context);
 inline constexpr std::uint64_t SpareSnapshotPresents = 16;
 struct TextureCacheUse {
     std::size_t sampledEntries = 0;
+    std::size_t overflowEntries = 0;
     std::size_t spareEntries = 0;
     std::uint64_t sampledBytes = 0;
+    std::uint64_t overflowBytes = 0;
     std::uint64_t spareBytes = 0;
     std::uint64_t storageBytes = 0;
 };
