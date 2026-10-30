@@ -1709,12 +1709,11 @@ int main(int argc, char** argv) {
         const std::string_view abiMode = argc == 2 ? argv[1] : "";
         const bool abiDeferred = abiMode == "--abi-deferred-compute" || abiMode == "--abi-deferred-concurrent" || abiMode == "--abi-deferred-pixel" || abiMode == "--abi-deferred-stages" || abiMode == "--abi-deferred-rectangle" || abiMode == "--abi-deferred-undecodable-state" || abiMode == "--abi-deferred-registration-failure" || abiMode == "--abi-deferred-vertex-inputs" || abiMode == "--abi-deferred-rectangle-pairs";
         const bool committedAbis = abiMode == "--committed-abis";
-        Require(argc == 1 || abiDeferred || committedAbis || (argc == 2 && (abiMode == "--retired-source-lifetime" || std::string_view(argv[1]) == "--indirect" || std::string_view(argv[1]) == "--fail-before-registration" || std::string_view(argv[1]) == "--deferred" || std::string_view(argv[1]) == "--deferred-undecodable" || std::string_view(argv[1]) == "--registered-workgroup" || std::string_view(argv[1]) == "--lazy")), "invalid test arguments");
+        Require(argc == 1 || abiDeferred || committedAbis || (argc == 2 && (abiMode == "--retired-source-lifetime" || abiMode == "--dispatch-ahead-prewarm" || abiMode == "--indirect" || abiMode == "--fail-before-registration" || abiMode == "--deferred" || abiMode == "--deferred-undecodable" || abiMode == "--registered-workgroup" || abiMode == "--lazy")), "invalid test arguments");
         if (abiMode == "--retired-source-lifetime") {
             RetiredSourceLifetime();
             return 0;
         }
-        Require(argc == 1 || abiDeferred || (argc == 2 && (std::string_view(argv[1]) == "--indirect" || std::string_view(argv[1]) == "--fail-before-registration" || std::string_view(argv[1]) == "--deferred" || std::string_view(argv[1]) == "--deferred-undecodable" || std::string_view(argv[1]) == "--registered-workgroup" || std::string_view(argv[1]) == "--dispatch-ahead-prewarm" || std::string_view(argv[1]) == "--lazy")), "invalid test arguments");
         if (abiDeferred) {
             if (!OpenVulkanTestDevice()) return VulkanTestSkipped;
             if (abiMode == "--abi-deferred-compute") AbiDeferredCompute();

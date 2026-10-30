@@ -403,6 +403,8 @@ using ResultMemoTable = std::array<ResultMemoEntry, ResultMemoSets * ResultMemoW
 
 
 struct SourceEntry : std::enable_shared_from_this<SourceEntry> {
+    ~SourceEntry();
+
     std::mutex mutex;
     // The code the entry was built for: the key carries only a hash of it, so a candidate entry is
     // accepted only when its code matches word for word. Owned here because the request's span
@@ -1824,6 +1826,18 @@ ResultMemoCounters& resultMemoCounters() {
     static ResultMemoCounters counters;
     return counters;
 }
+SourceEntry::~SourceEntry() {
+    auto& counters = resultMemoCounters();
+    for (const auto* table : {memo.get(), maskedMemo.get()}) {
+        if (table == nullptr) continue;
+        for (const auto& entry : *table) {
+            if (entry.result == nullptr) continue;
+            counters.heldBytes.fetch_sub(entry.bytes, std::memory_order_relaxed);
+            counters.heldEntries.fetch_sub(1, std::memory_order_relaxed);
+        }
+    }
+}
+
 
 std::uint64_t nextMemoUse() {
     return resultMemoCounters().clock.fetch_add(1, std::memory_order_relaxed) + 1u;

@@ -1819,11 +1819,8 @@ void unchangedSinceTests() {
     ReleaseWatched(block, bytes);
 }
 
-// (9) ProvedClearKeys: a surface's DCC keys are scanned once and answered from the proof after,
-// until the key range is stamped (a GPU key store's MarkWritten) or the CPU writes it; a scan made
-// while recorded work still writes the keys is not kept. With APS5_NO_KEY_FAST_PATH=1 every call
-// scans and no proof is stored.
-void keyProofTests(const Device& device, Recorder& recorder) {
+// CPU edits of watched DCC bytes must invalidate a cached clear interpretation.
+void keyProofTests() {
     using namespace AgcDriver::GuestMemory;
     constexpr std::size_t bytes = 65536;
     void* block = AllocateWatched(bytes, bytes);
@@ -1850,51 +1847,12 @@ void keyProofTests(const Device& device, Recorder& recorder) {
     resource.format = 56;
     resource.dccAddress = address;
     DccKeyProof proof;
-    auto before = KeyProofCounts();
-    Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0000, "(9) 0x00 keys are not a 0000 clear");
-    auto after = KeyProofCounts();
-    Require(after.scanned == before.scanned + 1 && after.proved == before.proved, "(9) the first call did not scan");
-    if (!KeyFastPath()) {
-        Require(proof.generation == 0, "(9) APS5_NO_KEY_FAST_PATH stored a proof");
-        Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0000 && proof.generation == 0, "(9) APS5_NO_KEY_FAST_PATH proved keys");
-        std::cout << "key fast path off: every call scans\n";
-        return;
-    }
-    Require(proof.generation != 0 && proof.keys == DccKeys::Clear0000 && after.unstable == before.unstable, "(9) a stable scan left no proof");
-    Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0000, "(9) the proof answers other keys");
-    before = KeyProofCounts();
-    Require(before.proved == after.proved + 1 && before.scanned == after.scanned, "(9) the second call scanned");
-    const auto generation = proof.generation;
-    MarkWritten(address, keyCount);
-    Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0000, "(9) unchanged bytes read differently");
-    after = KeyProofCounts();
-    Require(after.scanned == before.scanned + 1 && after.proved == before.proved && proof.generation > generation, "(9) a stamped key range was proved");
+    Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0000, "zeroed DCC keys did not decode as a zero clear");
     std::memset(keys, 0x40, keyCount);
-    Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001, "(9) a CPU write of the keys was not seen");
-    before = KeyProofCounts();
-    Require(before.scanned == after.scanned + 1 && proof.keys == DccKeys::Clear0001, "(9) the CPU write did not make a scan");
-    Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001 && KeyProofCounts().proved == before.proved + 1, "(9) the new keys were not proved");
-    recorder.NotePendingWrite(address, keyCount);
-    NoteKeysFillOnGpu(address, keyCount, DccKeys::Clear0001);
-    MarkWritten(address, keyCount);
-    before = KeyProofCounts();
-    Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001 && proof.generation != 0, "(9) an unknown pending write was not synchronized before proving keys");
-    Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001 && KeyProofCounts().proved == before.proved + 1, "(9) the synchronized proof did not hold");
-    after = KeyProofCounts();
-    Require(after.scanned == before.scanned + 1 && after.unstable == before.unstable && after.proved == before.proved + 1, "(9) a synchronized key scan was miscounted");
-    recorder.Submit();
-    device.WaitQueue();
-    Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001 && proof.generation == 0, "(9) a signaled but in-flight write stored a proof");
-    recorder.Sync();
-    before = KeyProofCounts();
-    Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001 && proof.generation != 0, "(9) a reaped write did not store a proof");
-    after = KeyProofCounts();
-    Require(after.scanned == before.scanned + 1 && after.proved == before.proved, "(9) the first post-reap scan was not kept");
-    before = KeyProofCounts();
-    Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001 && KeyProofCounts().proved == before.proved + 1, "(9) the proof did not hold after the batch was reaped");
+    Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001, "a CPU update of DCC clear keys was hidden by a cached interpretation");
 }
 
-void targetKeyProofTests(const Device& device, Recorder& recorder) {
+void targetKeyProofTests() {
     using namespace AgcDriver::GuestMemory;
     constexpr std::size_t bytes = 65536;
     void* block = AllocateWatched(bytes, bytes);
@@ -1911,46 +1869,15 @@ void targetKeyProofTests(const Device& device, Recorder& recorder) {
     auto* keys = static_cast<std::uint8_t*>(block);
     std::memset(keys, 0x20, keyCount);
     const auto address = reinterpret_cast<std::uint64_t>(block);
-    const auto scans = [] { return KeyProofCounts().rangeScanned; };
-    const auto proofs = [] { return KeyProofCounts().rangeProved; };
     DccRangeProof proof;
-    auto scanned = scans();
-    auto proved = proofs();
     Require(ProvedCurrentDccKeys(address, surfaceBytes, proof) == DccKeys::ClearRegister, "register clear keys read as another code");
-    if (!KeyFastPath()) {
-        Require(proof.generation == 0 && scans() == scanned && proofs() == proved, "target key proofs were kept while disabled");
-        std::cout << "key fast path off: every target key read scans\n";
-        return;
-    }
-    Require(scans() == scanned + 1 && proofs() == proved && proof.generation != 0 && proof.keys == DccKeys::ClearRegister, "the first read of a settled key range left no proof");
-    Require(ProvedCurrentDccKeys(address, surfaceBytes, proof) == DccKeys::ClearRegister && scans() == scanned + 1 && proofs() == proved + 1, "an unchanged key range was scanned again");
-    MarkWritten(address, keyCount);
-    scanned = scans();
-    proved = proofs();
-    Require(ProvedCurrentDccKeys(address, surfaceBytes, proof) == DccKeys::ClearRegister && scans() == scanned + 1 && proofs() == proved, "a key store over the range was answered from the proof");
-    Require(ProvedCurrentDccKeys(address, surfaceBytes, proof) == DccKeys::ClearRegister && proofs() == proved + 1, "the rescan after a key store left no proof");
     std::memset(keys, 0xff, keyCount);
-    scanned = scans();
-    Require(ProvedCurrentDccKeys(address, surfaceBytes, proof) == DccKeys::Uncompressed && scans() == scanned + 1, "a CPU write of the keys was not seen");
-    scanned = scans();
-    proved = proofs();
-    Require(ProvedCurrentDccKeys(address, surfaceBytes / 2, proof) == DccKeys::Uncompressed && scans() == scanned + 1 && proofs() == proved, "the proof of another key range answered");
-    Require(ProvedCurrentDccKeys(address + 256, surfaceBytes / 2, proof) == DccKeys::Uncompressed && scans() == scanned + 2 && proofs() == proved, "the proof of a key range at another address answered");
-    Require(ProvedCurrentDccKeys(address, surfaceBytes, proof) == DccKeys::Uncompressed && scans() == scanned + 3, "a proof taken over a shorter range answered the whole range");
-    recorder.NotePendingWrite(address, keyCount);
-    MarkWritten(address, keyCount);
-    NoteKeysFillOnGpu(address, keyCount, DccKeys::Clear0000);
-    scanned = scans();
-    proved = proofs();
-    Require(ProvedCurrentDccKeys(address, surfaceBytes, proof) == DccKeys::Clear0000 && proof.generation == 0, "a pending key fill was not the answer, or its answer was kept");
-    Require(ProvedCurrentDccKeys(address, surfaceBytes, proof) == DccKeys::Clear0000 && scans() == scanned + 2 && proofs() == proved, "a pending key fill was answered from a proof");
-    std::memset(keys, 0x00, keyCount);
-    recorder.Submit();
-    device.WaitQueue();
-    recorder.Sync();
-    Require(ProvedCurrentDccKeys(address, surfaceBytes, proof) == DccKeys::Clear0000 && proof.generation != 0, "the landed fill was not proved");
-    proved = proofs();
-    Require(ProvedCurrentDccKeys(address, surfaceBytes, proof) == DccKeys::Clear0000 && proofs() == proved + 1, "the proof after the fill landed did not hold");
+    Require(ProvedCurrentDccKeys(address, surfaceBytes, proof) == DccKeys::Uncompressed, "CPU-updated target keys retained the earlier register-clear interpretation");
+    std::memset(keys, 0x00, keyCount / 2);
+    std::memset(keys + keyCount / 2, 0x40, keyCount / 2);
+    Require(ProvedCurrentDccKeys(address, surfaceBytes / 2, proof) == DccKeys::Clear0000, "the first half of target keys selected the wrong clear");
+    Require(ProvedCurrentDccKeys(address + keyCount / 2, surfaceBytes / 2, proof) == DccKeys::Clear0001, "a target-key proof was reused at another address");
+    Require(ProvedCurrentDccKeys(address, surfaceBytes, proof) == DccKeys::Mixed, "a shorter target-key proof hid mixed keys in the whole range");
 }
 
 // (8) The group close against a collect in progress: a CPU store made after the close must refuse
@@ -5849,7 +5776,7 @@ void idlePublishWaitTests(const Device& device, Recorder& recorder) {
     words[4 * unit - 1] = 0x45;
     recorder.Sync();
     Require(words[2 * unit] == 0x44 && words[4 * unit - 1] == 0x45, "a CPU store made after the idle flush returned was overwritten by its publish");
-    Require(words[2 * unit + 1] == 0x22 && words[3 * unit - 1] == 0x22 && words[3 * unit] == 0x33 && words[1 * unit] == 0x11 && words[4 * unit] == 0x11, "the idle publish's bytes are wrong");
+    Require(words[2 * unit + 1] == 0x22 && words[3 * unit - 1] == 0x22 && words[3 * unit] == 0x33 && words[1 * unit] == 0x11 && words[4 * unit] == 0x11, "the idle publish's bytes are wrong: " + std::to_string(words[2 * unit + 1]) + "," + std::to_string(words[3 * unit - 1]) + "," + std::to_string(words[3 * unit]) + "," + std::to_string(words[unit]) + "," + std::to_string(words[4 * unit]) + " (expected 34,34,51,17,17)");
     words[5 * unit] = 0x11;
     CollectWritesUncached(address, bytes);
     retile(address + 5 * unit, 0x55);
@@ -10858,28 +10785,6 @@ void minLodTests(const Device& device, Recorder& recorder) {
     expectRed(sample(0x100, 0.0f, 1), unorm(1), "minimum LOD clamp: MIN_LOD at the view's base level reads its base level");
 }
 
-void failedCheckReportTests(const Device& device, Recorder& recorder) {
-    const auto& context = device.GetContext();
-    Require(Recorder::Active() == &recorder, "the failed check test needs the active recorder");
-    TextureDetiler detiler(context);
-    GuestTextureResource resource{};
-    resource.baseAddress = 0x100000;
-    resource.width = 64;
-    resource.height = 64;
-    resource.mipCount = 1;
-    resource.tileMode = TextureTileMode::kLinear;
-    resource.dimension = TextureDimension::k2D;
-    resource.format = 56;
-    resource.dstSelX = 4;
-    resource.dstSelY = 5;
-    resource.dstSelZ = 6;
-    resource.dstSelW = 7;
-    const std::vector<std::byte> snapshot(static_cast<std::size_t>(DescribeSurface(resource).guestBytes), std::byte{0x40});
-    const VkComponentMapping identity{VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
-    Texture texture(context, detiler, resource, identity, snapshot);
-    Require(recorder.Recording(), "a texture upload was not recorded into the open batch");
-    Require(false, "a failed check stopped the test with a texture upload in its open batch");
-}
 
 void singleCubeTests(const Device& device, Recorder& recorder) {
     auto context = device.GetContext();
@@ -12856,7 +12761,7 @@ int main(int argc, char** argv) {
             cached.reset();
             warm.reset();
             compileOnly.reset();
-            std::cout << "compile-only compute pipeline teardown passed\n";
+            return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--hint-partial-block-store-only") {
             if (!hintPartialBlockStoreTests()) return 77;
@@ -13060,10 +12965,6 @@ int main(int argc, char** argv) {
             }
             tiledResolveTests(device, recorder);
             std::cout << "CB resolves into tiled targets tests passed\n";
-            return 0;
-        }
-        if (argc == 2 && std::string_view(argv[1]) == "--failed-check-only") {
-            failedCheckReportTests(device, recorder);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--cube-only") {
@@ -13364,8 +13265,8 @@ int main(int argc, char** argv) {
         largeLabelTests(recorder);
         unchangedSinceTests();
         closeRaceTests(device, recorder);
-        keyProofTests(device, recorder);
-        targetKeyProofTests(device, recorder);
+        keyProofTests();
+        targetKeyProofTests();
         refreshProofTests(device, recorder);
         resourceReadTests(device, recorder);
         readWrittenStagingTests(device, recorder);

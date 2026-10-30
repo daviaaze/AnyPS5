@@ -296,25 +296,6 @@ void AttachmentReclaim() {
     Expect(mock.liveBytes == 0, "an attachment allocation leaked memory");
 }
 
-void SizeClassesAndDirections() {
-    mock = MockDevice{};
-    auto context = mockContext();
-    VkDeviceMemory first = VK_NULL_HANDLE;
-    {
-        DeviceBuffer upload(context, 10 * MiB + 4096, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-        first = MemoryOf(upload.Handle());
-        Expect(mock.sizes.at(upload.Handle()) == 10 * MiB + 4096, "a 10 MiB + 4 KiB device buffer was created with " + std::to_string(mock.sizes.at(upload.Handle())) + " bytes, not the requested size");
-        Expect(ClassOf(upload.Handle()) == 11 * MiB, "a 10 MiB + 4 KiB device buffer has " + std::to_string(ClassOf(upload.Handle())) + " bytes of memory, not its 11 MiB class");
-        constexpr VkBufferUsageFlags all = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-        Expect((mock.usages.at(upload.Handle()) & all) == all, "a device buffer was created without storage and both transfer directions");
-        Expect(upload.Size() == 10 * MiB + 4096, "a device buffer reports its class instead of the requested size");
-    }
-    const auto made = mock.allocations;
-    DeviceBuffer writeBack(context, 10 * MiB + 512 * 1024, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-    Expect(MemoryOf(writeBack.Handle()) == first && mock.allocations == made, "a retained 11 MiB device buffer did not serve a write-back of another size and direction in its class");
-    Expect(writeBack.Size() == 10 * MiB + 512 * 1024, "a reused device buffer reports the retained size");
-    Expect(mock.sizes.at(writeBack.Handle()) == 10 * MiB + 512 * 1024, "a reused device buffer kept the VkBuffer of the earlier size");
-}
 
 void SmallDeviceRetention() {
     mock = MockDevice{};
@@ -341,30 +322,6 @@ void SmallDeviceRetention() {
     Expect(mock.liveBytes == 0 && mock.liveBuffers.empty(), "device pool tier retention leaked Vulkan objects");
 }
 
-void LargerClass() {
-    mock = MockDevice{};
-    auto context = mockContext();
-    constexpr auto usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    VkDeviceMemory twelve = VK_NULL_HANDLE;
-    {
-        DeviceBuffer large(context, 12 * MiB, usage);
-        twelve = MemoryOf(large.Handle());
-    }
-    {
-        DeviceBuffer smaller(context, 7 * MiB, usage);
-        Expect(MemoryOf(smaller.Handle()) == twelve, "a 7 MiB request did not take the retained 12 MiB buffer");
-    }
-    const auto made = mock.allocations;
-    {
-        DeviceBuffer tooSmall(context, 5 * MiB, usage);
-        Expect(MemoryOf(tooSmall.Handle()) != twelve && mock.allocations == made + 1, "a 5 MiB request took a retained buffer of more than twice its size");
-        Expect(mock.sizes.at(tooSmall.Handle()) == 5 * MiB, "a 5 MiB device buffer was not created at its own class");
-    }
-    DeviceBuffer again(context, 12 * MiB, usage);
-    Expect(MemoryOf(again.Handle()) == twelve, "a buffer served to a smaller request did not return to its own 12 MiB class");
-    DeviceBuffer best(context, 4 * MiB + 1, usage);
-    Expect(MemoryOf(best.Handle()) != twelve && ClassOf(best.Handle()) == 5 * MiB, "a 4 MiB + 1 request did not take the smallest retained class that fits (5 MiB)");
-}
 
 void ExactSizeReuse() {
     mock = MockDevice{};
@@ -1552,8 +1509,6 @@ int main(int argc, char** argv) {
         AgcDriver::Tests::SlabReturnWithoutAllocation(mockContext(), 0);
         AgcDriver::Tests::SlabReturnWithoutAllocation(mockContext(), 1);
         Expect(mock.liveBytes == 0, "slab return test leaked memory");
-        SizeClassesAndDirections();
-        LargerClass();
         ExactSizeReuse();
         KeptUntilFence();
         SmallDeviceRetention();

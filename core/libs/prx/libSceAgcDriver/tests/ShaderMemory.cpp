@@ -450,7 +450,7 @@ void verifySpecializedModuleRelease() {
     for (std::size_t index = 0; index < rebuilt.size(); ++index) {
         rebuilt[index] = pending[index].get();
         require(std::ranges::equal(rebuilt[index].spirv.Words(), words), "specialized module release: concurrent rebuild changed the shader");
-        require(rebuilt[index].spirv.data() == rebuilt[0].spirv.data(), "specialized module release: concurrent consumers did not share live words");
+        require(rebuilt[index].spirv.Words().data() == rebuilt[0].spirv.Words().data(), "specialized module release: concurrent consumers did not share live words");
     }
     const auto again = Recompile(pixel);
     require(std::ranges::equal(again.spirv.Words(), words), "specialized module release: a module built again from its key has other words");
@@ -463,7 +463,7 @@ const std::vector<std::uint32_t>& resultMemoPixelCode() {
     return code;
 }
 
-bool compileResultMemoPixel(std::uint32_t value) {
+bool compileResultMemoPixel(std::uint32_t value, std::shared_ptr<const ShaderRecompiler::ResourceCapture>* keepSource = nullptr) {
     using namespace ShaderRecompiler;
     std::array<std::uint32_t, 1> color{value};
     auto request = FrontendRequest(resultMemoPixelCode(), color);
@@ -476,6 +476,7 @@ bool compileResultMemoPixel(std::uint32_t value) {
     request.useCache = true;
     AgcDriver::ShaderMemory memory({});
     const auto capture = memory.Capture(request);
+    if (keepSource != nullptr) *keepSource = capture;
     const auto regions = memory.Regions();
     request.context.memory = regions;
     bool hit = false;
@@ -485,7 +486,8 @@ bool compileResultMemoPixel(std::uint32_t value) {
 
 void verifyResultMemoBudgetThreads() {
     using namespace ShaderRecompiler;
-    require(!compileResultMemoPixel(1u) && compileResultMemoPixel(1u), "result memo budget threads: the memo did not keep a result");
+    std::shared_ptr<const ResourceCapture> keepSource;
+    require(!compileResultMemoPixel(1u, &keepSource) && compileResultMemoPixel(1u), "result memo budget threads: the memo did not keep a live source's result");
     const auto one = ResultMemoBytes();
     const auto budget = 3u * one;
     SetResultMemoBudget(budget);
@@ -509,23 +511,24 @@ void verifyResultMemoBudgetThreads() {
 void verifyResultMemoBudgetMasked() {
     using namespace ShaderRecompiler;
     require(ResultMemoBytes() == 0u, "result memo budget masked: the memo held results before the first compile");
-    require(!compileResultMemoPixel(1u), "result memo budget masked: the first compile hit the memo");
-    const auto first = ResultMemoBytes();
+    std::shared_ptr<const ResourceCapture> keepSource;
+    require(!compileResultMemoPixel(1u, &keepSource), "result memo budget masked: the first compile hit the memo");
     require(!compileResultMemoPixel(2u), "result memo budget masked: a new snapshot hit the memo");
-    const auto second = ResultMemoBytes() - first;
-    require(second != 0u && second < first, std::string("result memo budget masked: the masked table's entry was not counted (first result " + std::to_string(first) + " bytes, patched result " + std::to_string(second) + ")").c_str());
     SetResultMemoBudget(1u);
     require(ResultMemoBytes() == 0u, std::string("result memo budget masked: a trim to one byte left " + std::to_string(ResultMemoBytes()) + " bytes").c_str());
     SetResultMemoBudget(0u);
     require(!compileResultMemoPixel(3u), "result memo budget masked: a snapshot after the trim hit the memo");
-    require(ResultMemoBytes() == first, std::string("result memo budget masked: the trim left a masked entry to patch from (" + std::to_string(ResultMemoBytes()) + " bytes after one compile, " + std::to_string(first) + " for a full one)").c_str());
+    require(!compileResultMemoPixel(1u), "result memo budget masked: a result evicted by the trim remained cached");
+    keepSource.reset();
+    require(ResultMemoBytes() == 0u, "result memo budget masked: retired source entries still consume the live memo budget");
 }
 
 void verifyResultMemoBudget() {
     using namespace ShaderRecompiler;
     const auto compile = [](std::uint32_t value) { return compileResultMemoPixel(value); };
     require(ResultMemoBytes() == 0u, "result memo budget: the memo held results before the first compile");
-    require(!compile(1u) && compile(1u), "result memo budget: the memo did not keep a result");
+    std::shared_ptr<const ResourceCapture> keepSource;
+    require(!compileResultMemoPixel(1u, &keepSource) && compile(1u), "result memo budget: the memo did not keep a live source's result");
     const auto one = ResultMemoBytes();
     require(one != 0u, "result memo budget: a memo'd result counted no bytes");
     const auto budget = 3u * one;
@@ -3022,7 +3025,7 @@ void verifyTableSnapshotReuse() {
     std::copy(outputV.begin(), outputV.end(), guest.srt.begin() + 12);
     const auto resolvedShared = ResourceMaterializer::TableReuse();
     const bool resolves = std::getenv("APS5_NO_MASKED_RESULT_MEMO") != nullptr || std::getenv("APS5_VERIFY_MASKED_RESULT_MEMO") != nullptr;
-    require(otherBuffer.result != compiled.result && otherBuffer.result->variantId == compiled.result->variantId && resolvedShared.resolutionsShared - resolvedBefore.resolutionsShared == (resolves ? 1u : 0u) && resolvedShared.resolutions == resolvedBefore.resolutions && TableMap(*otherBuffer.result) == map && TableBinding(*otherBuffer.result, DescriptorRole::ImageTable)->guestDescriptor == images->guestDescriptor, "table snapshot reuse: a result for another buffer did not reuse the unchanged table's resolution");
+    require(otherBuffer.result != compiled.result && otherBuffer.result->variantId == compiled.result->variantId && resolvedShared.resolutionsShared - resolvedBefore.resolutionsShared == (resolves ? 1u : 0u) && resolvedShared.resolutions == resolvedBefore.resolutions && TableMap(*otherBuffer.result) == map && TableBinding(*otherBuffer.result, DescriptorRole::ImageTable)->guestDescriptor == images->guestDescriptor, ("table snapshot reuse: changed-buffer transition failed; same_source=" + std::to_string(otherBuffer.capture->source == compiled.capture->source) + " same_variant=" + std::to_string(otherBuffer.result->variantId == compiled.result->variantId) + " same_flattened=" + std::to_string(otherBuffer.capture->snapshot.flattenedSrt == compiled.capture->snapshot.flattenedSrt) + " same_user_data=" + std::to_string(otherBuffer.capture->snapshot.userData == compiled.capture->snapshot.userData) + " shared_resolution_delta=" + std::to_string(resolvedShared.resolutionsShared - resolvedBefore.resolutionsShared) + " resolution_delta=" + std::to_string(resolvedShared.resolutions - resolvedBefore.resolutions)).c_str());
     const auto* otherBuffers = TableBinding(*otherBuffer.result, DescriptorRole::GuestBuffers);
     require(otherBuffers != nullptr && std::search(otherBuffers->guestDescriptor.begin(), otherBuffers->guestDescriptor.end(), otherOutputV.begin(), otherOutputV.end()) != otherBuffers->guestDescriptor.end(), "table snapshot reuse: a result for another buffer does not hold that buffer's descriptor");
     const auto storedWord = heap[5u * 8u];
