@@ -13,8 +13,9 @@
 
 namespace ShaderRecompiler::ShaderDiskCache {
 
-// Union of local format 48 and upstream format 35; neither old payload layout is compatible.
-inline constexpr std::uint32_t FormatVersion = 49;
+// Union of local format 48 and upstream format 35, plus complete nested mesh
+// barycentric/fragment metadata. Reject format 49's incomplete mesh payloads too.
+inline constexpr std::uint32_t FormatVersion = 50;
 
 enum class LoadStatus {
     Loaded,

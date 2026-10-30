@@ -87,7 +87,10 @@ namespace ShaderRecompiler::ShaderDiskCache {
 #if defined(__linux__) && defined(__x86_64__) && defined(__GLIBCXX__)
 static_assert(sizeof(CompiledShaderArtifact) == 288, "CompiledShaderArtifact changed: update the artifact encoder");
 static_assert(sizeof(ShaderInvocation) == 216, "ShaderInvocation changed: update the invocation encoder");
-static_assert(sizeof(RecompileResult) == 576, "RecompileResult changed: audit runtime-only cache owners and the explicit result encoder");
+// Result audit: both bases are encoded below; workgroupMemoryDwords and shaderDataUserWords
+// follow them. drawKeyMemo (AtomicSharedPtr storage), cacheHit and both lifetime owners
+// are process-local, as are artifact.variantId and invocation.specializationId.
+static_assert(sizeof(RecompileResult) == 584, "RecompileResult changed: audit runtime-only cache owners and the explicit result encoder");
 static_assert(sizeof(DescriptorBinding) == 664, "DescriptorBinding changed: update the binding encoder");
 static_assert(sizeof(VertexAttribute) == 32, "VertexAttribute changed: update the attribute encoder");
 static_assert(sizeof(VertexInput) == 16, "VertexInput changed: update the vertex input encoder");
@@ -106,7 +109,11 @@ static_assert(sizeof(BindingAllocationResult) == 184, "BindingAllocationResult c
 static_assert(sizeof(CompiledBindingLayout) == 88, "CompiledBindingLayout changed: update the allocation encoder");
 static_assert(sizeof(BindingLayout) == 16, "BindingLayout changed: update BuildKey");
 static_assert(sizeof(IrResourcePlan) == 752, "IrResourcePlan changed: update EncodePlan and DecodePlan");
-static_assert(sizeof(IrValue) == 128, "IrValue changed: update the plan value encoder");
+// Value audit: opcode/type/id/flags/register/immediate/arguments/phiBlocks are encoded.
+// parent and operandUses are intentionally absent from detached resource plans. The
+// IrUseAllocator arena pointer and IrOperands inline/heap capacity are runtime storage,
+// not additional IR semantics; their merged storage layout accounts for this size.
+static_assert(sizeof(IrValue) == 144, "IrValue changed: update the plan value encoder");
 static_assert(sizeof(GuestRegister) == 8, "GuestRegister changed: update the plan value encoder");
 static_assert(sizeof(MemoryInfo) == 80, "MemoryInfo changed: update the plan encoder");
 static_assert(sizeof(DescriptorSource) == 192, "DescriptorSource changed: update the plan encoder");
@@ -605,10 +612,16 @@ void encodeArtifact(Writer& writer, const CompiledShaderArtifact& result) {
         writer.Value(result.meshBarycentrics->emulation.active);
         writer.Value(result.meshBarycentrics->emulation.smooth);
         writer.Value(result.meshBarycentrics->emulation.linear);
+        writer.Value(result.meshBarycentrics->emulation.smoothOffset);
         writer.List(result.meshBarycentrics->parameters, [](Writer& out, const FragmentParameter& parameter) {
             out.Value(parameter.location);
             out.Value(parameter.sourceLocation);
+            out.Value(parameter.flat);
             out.Value(parameter.perVertex);
+            out.Value(parameter.custom);
+            out.Value(parameter.flatP10);
+            out.Value(parameter.vertexOrder);
+            out.Value(parameter.flatP20);
         });
     }
     writer.Values(std::span<const std::uint32_t>(result.stencilReferences));
@@ -673,10 +686,16 @@ void decodeArtifact(Reader& reader, CompiledShaderArtifact& result) {
         reader.Value(layout.emulation.active);
         reader.Value(layout.emulation.smooth);
         reader.Value(layout.emulation.linear);
-        reader.List(layout.parameters, 9, [](Reader& in, FragmentParameter& parameter) {
+        reader.Value(layout.emulation.smoothOffset);
+        reader.List(layout.parameters, 14, [](Reader& in, FragmentParameter& parameter) {
             in.Value(parameter.location);
             in.Value(parameter.sourceLocation);
+            in.Value(parameter.flat);
             in.Value(parameter.perVertex);
+            in.Value(parameter.custom);
+            in.Value(parameter.flatP10);
+            in.Value(parameter.vertexOrder);
+            in.Value(parameter.flatP20);
         });
         result.meshBarycentrics = std::move(layout);
     }
@@ -2092,7 +2111,8 @@ std::string EntryName(std::span<const std::byte> key) {
     return hex(HashBytes(key, 0x5eed0001ull)) + hex(HashBytes(key, 0x5eed0002ull)) + ".bin";
 }
 
-// sourceOwner and preparedPlanOwner are runtime-only and intentionally omitted; the wire payload remains artifact, invocation and auxiliary result fields.
+// drawKeyMemo, cacheHit, sourceOwner and preparedPlanOwner are runtime-only. A reused
+// destination must discard its memo as well as its lifetime owners before decoding.
 void EncodeResult(const RecompileResult& result, std::vector<std::byte>& out) {
     Writer writer(out);
     encodeArtifact(writer, result);
@@ -2102,6 +2122,7 @@ void EncodeResult(const RecompileResult& result, std::vector<std::byte>& out) {
 }
 
 bool DecodeResult(std::span<const std::byte> bytes, RecompileResult& result, std::shared_ptr<const void> owner) {
+    result.drawKeyMemo.key.store(nullptr, std::memory_order_relaxed);
     result.preparedPlanOwner.reset();
     result.sourceOwner.reset();
     Reader reader(bytes, std::move(owner));

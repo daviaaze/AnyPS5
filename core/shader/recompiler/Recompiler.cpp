@@ -1759,22 +1759,43 @@ struct ResultMemoCounters {
 };
 
 void applyMemoPatch(RecompileResult& result, const MemoPatch& patch, const ResourceSnapshot& snapshot) {
+    std::map<std::uint32_t, std::vector<std::uint32_t>> descriptorUpdates;
+    const auto mutableWords = [&](std::uint32_t binding) -> std::vector<std::uint32_t>& {
+        if (const auto found = descriptorUpdates.find(binding); found != descriptorUpdates.end()) return found->second;
+        return descriptorUpdates.emplace(binding, result.bindings.at(binding).guestDescriptor.Copy()).first->second;
+    };
     for (const auto& [binding, resources] : patch.buffers) {
-        auto& words = result.bindings.at(binding).guestDescriptor;
-        if (words.size() != resources.size() * 4u) throw std::runtime_error("a patched guest buffer binding changed its width");
-        for (std::size_t element = 0; element < resources.size(); ++element) std::copy_n(snapshot.buffers.at(resources[element]).dwords.begin(), 4u, words.begin() + element * 4u);
+        const auto& shared = result.bindings.at(binding).guestDescriptor;
+        if (shared.size() != resources.size() * 4u) throw std::runtime_error("a patched guest buffer binding changed its width");
+        auto& words = mutableWords(binding);
+        for (std::size_t element = 0; element < resources.size(); ++element) {
+            const auto& descriptor = snapshot.buffers.at(resources[element]);
+            if (descriptor.dwordCount < 4u) throw std::runtime_error("a patched guest buffer descriptor changed its width");
+            std::copy_n(descriptor.dwords.begin(), 4u, words.begin() + element * 4u);
+        }
     }
     if (!patch.userWords.empty()) {
         if (patch.pushData) {
             if (patch.userWords.size() * sizeof(std::uint32_t) > result.pushConstants.size()) throw std::runtime_error("patched user data lies outside the push data");
             for (std::size_t word = 0; word < patch.userWords.size(); ++word) std::memcpy(result.pushConstants.data() + word * sizeof(std::uint32_t), &snapshot.userData.at(patch.userWords[word]), sizeof(std::uint32_t));
         } else {
-            auto& words = result.bindings.at(patch.shaderData).guestDescriptor;
-            if (patch.userWords.size() > words.size()) throw std::runtime_error("patched user data lies outside the shader data");
+            const auto binding = patch.shaderData;
+            const auto& shared = result.bindings.at(binding).guestDescriptor;
+            if (patch.userWords.size() > shared.size()) throw std::runtime_error("patched user data lies outside the shader data");
+            auto& words = mutableWords(binding);
             for (std::size_t word = 0; word < patch.userWords.size(); ++word) words[word] = snapshot.userData.at(patch.userWords[word]);
         }
     }
-    if (patch.flattenedSrt != MemoPatch::NoBinding) result.bindings.at(patch.flattenedSrt).guestDescriptor = snapshot.flattenedSrt;
+    for (auto& [binding, words] : descriptorUpdates) {
+        auto& descriptor = result.bindings.at(binding).guestDescriptor;
+        if (descriptor == words) continue;
+        descriptor = SharedValues<std::uint32_t>(std::move(words));
+    }
+    if (patch.flattenedSrt != MemoPatch::NoBinding) {
+        auto& descriptor = result.bindings.at(patch.flattenedSrt).guestDescriptor;
+        if (descriptor.size() != snapshot.flattenedSrt.size()) throw std::runtime_error("a patched flattened SRT changed its width");
+        if (!(descriptor == snapshot.flattenedSrt)) descriptor = SharedValues<std::uint32_t>(snapshot.flattenedSrt);
+    }
     result.poisonedSrtReads = static_cast<std::uint32_t>(snapshot.srtPoison.size()) + snapshot.nullRootReads;
 }
 
@@ -1804,6 +1825,13 @@ ResultMemoCounters& resultMemoCounters() {
 
 std::uint64_t nextMemoUse() {
     return resultMemoCounters().clock.fetch_add(1, std::memory_order_relaxed) + 1u;
+}
+
+template <typename T>
+std::uint64_t vectorBytes(const SharedValues<T>& values) {
+    // Count each shared allocation in full for every memo entry: conservative on aliases,
+    // but never lets sharing understate the result-memo budget.
+    return static_cast<std::uint64_t>(values.size()) * sizeof(T);
 }
 
 template <typename T>
