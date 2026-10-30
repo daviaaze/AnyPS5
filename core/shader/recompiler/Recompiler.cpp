@@ -1826,7 +1826,11 @@ ResultMemoCounters& resultMemoCounters() {
     static ResultMemoCounters counters;
     return counters;
 }
+
+}
+
 SourceEntry::~SourceEntry() {
+    if (memo == nullptr && maskedMemo == nullptr) return;
     auto& counters = resultMemoCounters();
     for (const auto* table : {memo.get(), maskedMemo.get()}) {
         if (table == nullptr) continue;
@@ -1838,6 +1842,7 @@ SourceEntry::~SourceEntry() {
     }
 }
 
+namespace {
 
 std::uint64_t nextMemoUse() {
     return resultMemoCounters().clock.fetch_add(1, std::memory_order_relaxed) + 1u;
