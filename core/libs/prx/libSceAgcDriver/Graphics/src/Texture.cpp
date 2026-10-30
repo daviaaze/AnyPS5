@@ -1484,7 +1484,7 @@ void Texture::CaptureSampledStorageRoi(Recorder& recorder, VkCommandBuffer comma
     const auto& guest = sourceDescriptor;
     if (source->Image() == VK_NULL_HANDLE ||
             (source->ImageUsage() & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) == 0 ||
-            source->ImageFormat() != VK_FORMAT_R8G8B8A8_UNORM ||
+            source->PhysicalImageFormat() != VK_FORMAT_R8G8B8A8_UNORM ||
             BytesPerElement(guest.format) != 4 || BlockWidth(guest.format) != 1 ||
             guest.dimension == TextureDimension::k3D || guest.dimension == TextureDimension::k2DMsaa) {
         std::fprintf(stderr, "[texture] sampled GPU ROI rejected: unsupported retained storage image route\n");
@@ -1569,7 +1569,7 @@ void Texture::CaptureSampledStorageRoi(Recorder& recorder, VkCommandBuffer comma
     const auto serial = static_cast<unsigned long long>(recorder.Submissions() + 1);
     const auto imageHandle = reinterpret_cast<std::uintptr_t>(source->Image());
     const auto viewHandle = reinterpret_cast<std::uintptr_t>(info.imageView);
-    const auto sourceFormat = static_cast<unsigned>(source->ImageFormat());
+    const auto sourceFormat = static_cast<unsigned>(source->PhysicalImageFormat());
     const auto guestCopy = guest;
     recorder.OnComplete([readback, source, guestCopy, layers = std::move(layers), roi, oneLayerBytes, ordinal,
                          serial, imageHandle, viewHandle, sourceFormat, sampledViewFormat, firstLayerViewSelected,

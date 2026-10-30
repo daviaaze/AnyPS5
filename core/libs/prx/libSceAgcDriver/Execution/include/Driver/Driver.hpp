@@ -68,7 +68,7 @@ public:
     void ResetCommandStorageAcquisitionsForTesting();
     std::uint64_t CommandStorageAcquisitionsForTesting();
     std::uint64_t DispatchesRejectedAhead() const;
-    void SetAheadAdoptHook(void (*hook)())
+    void SetAheadAdoptHook(void (*hook)());
     void CheckFailure();
     void ReportFailure(std::exception_ptr error);
     void Submit(const Packet* packet, std::uint32_t queue, bool cpuFlip = false);

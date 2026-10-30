@@ -72,7 +72,7 @@ public:
     bool ReplayComputePipeline(const ShaderRecompiler::RecompileResult& shader, bool pushConstants);
     void PrefetchComputePipeline(std::shared_ptr<const ShaderRecompiler::RecompileResult> shader);
     bool HasComputePipeline(const ShaderRecompiler::RecompileResult& shader) const;
-    void PrebuildComputePipeline(const ShaderRecompiler::RecompileResult& shader, std::uint64_t programAddress = 0)
+    void PrebuildComputePipeline(const ShaderRecompiler::RecompileResult& shader, std::uint64_t programAddress = 0);
     // Starts the journal replay if the device has not (a headless device starts it at its first
     // draw or dispatch) and joins it (tests; the teardown joins it anyway).
     void WaitForPipelineJournalReplay();
