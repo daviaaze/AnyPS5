@@ -2542,6 +2542,7 @@ private:
     std::vector<const IrValue*> m_tablePlanningReads;
     std::vector<std::uint32_t> m_tablePlanningMemory;
     std::vector<const IrValue*> m_unselectedHandles;
+    std::unordered_map<const IrValue*, std::string> m_splitFailures;
     struct EdgeSelectorEntry {
         IrBlock* block = nullptr;
         std::vector<bool> edges;

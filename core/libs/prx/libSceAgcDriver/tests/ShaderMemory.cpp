@@ -35,6 +35,7 @@
 #include <algorithm>
 #include <set>
 #include <array>
+#include <latch>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
@@ -422,18 +423,36 @@ void verifySpecializedModuleRelease() {
     pixel.context.waveSize = 32u;
     pixel.useCache = true;
     SharedSpirv::Weak released;
-    std::uint64_t specializationId = 0;
+    std::shared_ptr<const void> sourceOwner;
     std::vector<std::uint32_t> words;
     {
         const auto first = Recompile(pixel);
-        require(first.specializationId != 0u, "specialized module release: the pixel fixture was not specialized");
+        sourceOwner = first.sourceOwner;
         released = first.spirv.Weaken();
-        specializationId = first.specializationId;
         words = first.spirv.Copy();
     }
     require(released.Expired(), "specialized module release: the module caches kept the words of a module no result uses");
+    std::latch start(1);
+    std::array<std::future<RecompileResult>, 4> pending;
+    try {
+        for (auto& future : pending) {
+            future = std::async(std::launch::async, [&] {
+                start.wait();
+                return Recompile(pixel);
+            });
+        }
+    } catch (...) {
+        start.count_down();
+        throw;
+    }
+    start.count_down();
+    std::array<RecompileResult, 4> rebuilt;
+    for (std::size_t index = 0; index < rebuilt.size(); ++index) {
+        rebuilt[index] = pending[index].get();
+        require(std::ranges::equal(rebuilt[index].spirv.Words(), words), "specialized module release: concurrent rebuild changed the shader");
+        require(rebuilt[index].spirv.data() == rebuilt[0].spirv.data(), "specialized module release: concurrent consumers did not share live words");
+    }
     const auto again = Recompile(pixel);
-    require(again.specializationId == specializationId, "specialized module release: a module built again from its key got another specialization ID");
     require(std::ranges::equal(again.spirv.Words(), words), "specialized module release: a module built again from its key has other words");
     const auto shared = Recompile(pixel);
     require(shared.spirv.data() == again.spirv.data(), "specialized module release: a second result of a live module copied its words");

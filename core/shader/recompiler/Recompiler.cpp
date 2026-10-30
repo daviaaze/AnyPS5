@@ -1009,7 +1009,8 @@ SpecializedSpirv registrationModule(std::uint64_t variantId, std::span<const std
     if (entry->failure) std::rethrow_exception(entry->failure);
     if (built.empty()) built = lockedWords(*entry->module);
     if (built.empty()) {
-        auto specialized = specialize(entry->moduleCacheOwner);
+        auto moduleCacheOwner = entry->moduleCacheOwner;
+        auto specialized = specialize(moduleCacheOwner);
         if (specialized.module->hash != entry->module->hash || specialized.module->specializationId != entry->module->specializationId ||
             specialized.module->bindings != entry->module->bindings || specialized.module->pushData != entry->module->pushData) {
             throw std::runtime_error("ShaderRecompiler: a registration module rebuilt from its key differs from its first build");
@@ -1488,7 +1489,8 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         const auto& module = entry->module;
         if (built.empty()) built = lockedWords(*module);
         if (built.empty()) {
-            auto specialized = specialize(entry->moduleCacheOwner);
+            auto moduleCacheOwner = entry->moduleCacheOwner;
+            auto specialized = specialize(moduleCacheOwner);
             if (specialized.module->hash != module->hash || specialized.module->specializationId != module->specializationId ||
                 specialized.module->bindings != module->bindings || specialized.module->pushData != module->pushData) {
                 throw std::runtime_error("ShaderRecompiler: a prepared module rebuilt from its key differs from its first build");
