@@ -531,7 +531,7 @@ void CommandBatch::Submit() {
         [&] {
             DestroyDeferredAtIdle(context);
             return context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.queue, 1, &submission, fence);
-        }), "vkQueueSubmit graphics")
+        }), "vkQueueSubmit graphics");
     pending = true;
     submitted = true;
     timing.Mark("queue_submit");

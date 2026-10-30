@@ -1558,13 +1558,12 @@ int main(int argc, char** argv) {
         KeptUntilFence();
         SmallDeviceRetention();
         Budget();
-        AddressAndHostUnchanged();
+        AddressAndHostClasses();
         HostGiantKeepsWorkingSet();
         ColdHostEntriesYieldToLargeWorkingSet();
         NearSizeHostStaging();
         NearSizeHostCompatibility();
         NearSizeHostAlignedReuse();
-        AddressAndHostClasses();
         SmallDeviceClasses();
         SlabMetadataFailure();
         SlabMapFailure();

@@ -2372,12 +2372,12 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
         } else {
             if (!pressure) state.allocationFailures = 0;
             std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx failed at %s (%d); falling back to copies, requested by %s\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), step, static_cast<int>(result), ImportRequesterName(requester));
-        }
-        if (pressure)
-            state.allocationFailed = true;
-            if (exhausted && (++state.allocationFailures >= 3 || state.liveBytes + bytes + budget / 8 >= budget)) {
-                state.ceiling = std::max<std::uint64_t>(state.liveBytes, 1);
-                std::fprintf(stderr, "[gpu] host import budget lowered to the %.1f MiB live after vkAllocateMemory failed %s\n", state.liveBytes / 1048576.0, state.allocationFailures >= 3 ? "3 times in a row" : "within an eighth of the budget");
+            if (pressure) {
+                state.allocationFailed = true;
+                if (++state.allocationFailures >= 3 || state.liveBytes + bytes + budget / 8 >= budget) {
+                    state.ceiling = std::max<std::uint64_t>(state.liveBytes, 1);
+                    std::fprintf(stderr, "[gpu] host import budget lowered to the %.1f MiB live after vkAllocateMemory failed %s\n", state.liveBytes / 1048576.0, state.allocationFailures >= 3 ? "3 times in a row" : "within an eighth of the budget");
+                }
             }
         }
 #ifdef _WIN32

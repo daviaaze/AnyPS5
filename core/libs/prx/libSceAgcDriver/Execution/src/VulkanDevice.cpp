@@ -4261,7 +4261,7 @@ void VulkanDevice::QueuePresent() {
             std::unique_lock presentQueueLock(state->presentQueueMutex, std::defer_lock);
             if (state->presentQueue != VK_NULL_HANDLE) presentQueueLock.lock();
             return presentFunction(state->presentQueue != VK_NULL_HANDLE ? state->presentQueue : state->queue, &present);
-        })
+        });
     if (presented == VK_ERROR_OUT_OF_DATE_KHR || presented == VK_SUBOPTIMAL_KHR) state->extent = {0, 0};
     else check(presented, "vkQueuePresentKHR");
     timing.Mark("queue_present");

@@ -1912,7 +1912,6 @@ void CheckUnwatchedImport() {
 #endif
 }
 
-@both
 
 class PartlyCommitted {
 public:

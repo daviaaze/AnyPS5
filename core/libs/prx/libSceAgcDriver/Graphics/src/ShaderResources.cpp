@@ -5664,7 +5664,9 @@ void ShaderResources::finishImageTables() {
             poison.resource = index;
             poison.reason = static_cast<std::uint32_t>(Abi::PoisonReason::HeapWritten);
             table.poison.push_back(poison);
-            table.messages.push_back("the table at 0x" + HexText(base) + " is written by its own dispatch");
+            const auto message = "the table at 0x" + HexText(base) + " is written by its own dispatch";
+            const bool repeated = !table.messages.empty() && table.messages.back() != nullptr && *table.messages.back() == message;
+            table.messages.push_back(repeated ? table.messages.back() : std::make_shared<const std::string>(message));
             table.SetMapValue(header + Abi::TableFault, Abi::PoisonCode(static_cast<std::uint32_t>(table.poison.size() - 1u)));
             faultChecks = true;
         }

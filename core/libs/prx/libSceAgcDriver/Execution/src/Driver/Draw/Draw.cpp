@@ -646,7 +646,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     const auto& programs = *tail.programs;
     tail.spatialDiagnosticOrdinal = LogDrawStateDiagnostic(queue, graphics, programs, decode->roles);
     if (drawPayloadEnabled && tail.spatialDiagnosticOrdinal != 0 && traceToken == 0) traceToken = NextDrawTraceToken().fetch_add(1, std::memory_order_relaxed) + 1;
-    if (std::any_of(programs.begin(), programs.end(), [](const DrawProgram& program) { return SkippedShader(program.binary.codeAddress); })) return drawn()
+    if (std::any_of(programs.begin(), programs.end(), [](const DrawProgram& program) { return SkippedShader(program.binary.codeAddress); })) return drawn();
     const bool emptyIndirectSkip = EmptyIndirectSkip();
     auto& cpuIndirectPrograms = CpuIndirectPrograms();
     const auto recordDraws = [&](const Pm4::DrawArguments& arguments) { return arguments.count != 0 && arguments.instances != 0 && (!drawParameters.indexed || !drawParameters.indirect->indexLimitKnown || arguments.firstVertexOrIndex < drawParameters.indexCount); };

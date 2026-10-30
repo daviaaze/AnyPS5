@@ -1557,7 +1557,7 @@ struct DrawInputs {
     bool payloadIndexUnsupported = false;
     const char* payloadIndexUnsupportedStatus = "unsupported-input-path";
     std::optional<std::uint32_t> indexCount;
-    std::uint32_t listRestartPrimitive = 0
+    std::uint32_t listRestartPrimitive = 0;
     VertexInputLayout vertexInput;
     std::shared_ptr<const VertexInputLayout> retainedVertexInput;
     std::vector<std::shared_ptr<Buffer>> vertexBuffers;

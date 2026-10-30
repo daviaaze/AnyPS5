@@ -1381,7 +1381,7 @@ public:
             owned->Allocate(context, allocation, requirements.memoryTypeBits, "vkAllocateMemory depth plane copy");
             memory = owned->memory;
             Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, memory, 0), "vkBindImageMemory depth plane copy");
-            imageBytes = requirements.size
+            imageBytes = requirements.size;
         } catch (...) {
             release();
             throw;
@@ -1398,7 +1398,7 @@ public:
         const auto geometry = DescribeSurface(resource);
         Require(!geometry.levelMajor, "depth planes of a PS4 layered surface with several mip levels (stored level by level) are not implemented");
         const bool guestFill = std::any_of(slices.begin(), slices.end(), [](const auto& slice) { return slice.image == VK_NULL_HANDLE; });
-        if (guestFill && (geometry.layers != requested || geometry.sliceLinearBytes < sliceBytes() || geometry.mips.empty()))
+        if (guestFill && (geometry.layers != requested || geometry.sliceLinearBytes < sliceBytes() || geometry.mips.empty())) {
             char text[320];
             std::snprintf(text, sizeof(text), "AGC graphics: depth plane copy geometry does not match its layers (copy %ux%u, %u layers, %llu bytes a slice; texture %ux%u guest format %u, dimension %d, tile mode %u, %u layers, %llu bytes a slice, %zu mips)", extent.width, extent.height, layers, static_cast<unsigned long long>(sliceBytes()), resource.width, resource.height, resource.format, static_cast<int>(resource.dimension), resource.tileMode, geometry.layers, static_cast<unsigned long long>(geometry.sliceLinearBytes), geometry.mips.size());
             throw std::runtime_error(text);
@@ -1423,7 +1423,7 @@ public:
             const bool sameLayer = held.address == current.address && held.bytes == current.bytes && held.tileMode == current.tileMode && held.thick == current.thick;
             const bool pendingWrite = sameLayer && Recorder::SnapshotWriteOverlaps(current.address, static_cast<std::size_t>(current.bytes));
             const bool unchanged = current.uncommitted ? held.uncommitted : held.generation != 0 && GuestMemory::UnchangedSince(current.address, static_cast<std::size_t>(current.bytes), held.generation);
-            if (sameLayer && !pendingWrite && unchanged)
+            if (sameLayer && !pendingWrite && unchanged) {
                 held.generation = current.generation;
                 countGuestLayer(GuestLayerOutcome::Unchanged);
                 continue;

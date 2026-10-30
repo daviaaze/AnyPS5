@@ -6394,7 +6394,7 @@ void descriptorSnapshotTests() {
                     Require(descriptor.buffer == item.buffer->Handle() && descriptor.offset == item.offset && descriptor.range == moved[snapshot].size, "snapshot descriptor used another element's buffer or range");
                     std::array<std::uint32_t, 6> expected;
                     expected.fill(static_cast<std::uint32_t>(0x12340000u + index));
-                    Require(sameBytes(bufferBytes(descriptor.buffer).subspan(descriptor.offset), expected.data(), moved[snapshot].size), "snapshot descriptor lost words after their source owner was destroyed")
+                    Require(sameBytes(bufferBytes(descriptor.buffer).subspan(descriptor.offset), expected.data(), moved[snapshot].size), "snapshot descriptor lost words after their source owner was destroyed");
                     ++snapshot;
                 }
             }
@@ -6750,7 +6750,7 @@ void resourceTests() {
     Require(mock.live == 0, "the strided buffer's moved check leaked Vulkan objects");
     expectSingleAccepted(changed([](auto& binding) { binding.count = 3; setGuestDescriptor(binding, join(join(vsharp(guestFirst.data(), 16), vsharp(guestSecond.data(), 32)), vsharp(reinterpret_cast<const void*>(0x1000), 8))); }), "an unmapped V# element");
     expectSingleFailure(changed([&](auto& binding) { binding.count = 2; setGuestDescriptor(binding, join(vsharp(guestFirst.data(), 16), vsharp(reinterpret_cast<const void*>(state.color.address), 64))); }), "aliases the render target");
-    expectSingleFailure(changed([](auto& binding) { binding.count = 17; setGuestDescriptor(binding, std::vector<std::uint32_t>(68, 0)); }), "per-stage limits")
+    expectSingleFailure(changed([](auto& binding) { binding.count = 17; setGuestDescriptor(binding, std::vector<std::uint32_t>(68, 0)); }), "per-stage limits");
     {
         ShaderRecompiler::RecompileResult vertex;
         ShaderRecompiler::RecompileResult fragment;
@@ -7569,17 +7569,18 @@ void imageTableTemplateRefreshTests() {
     {
         ShaderRecompiler::RecompileResult compute;
         auto map = makeBinding(Role::ImageTableMap, static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::ImageTableMap), 1, std::vector<std::uint32_t>(Abi::HeaderWords));
-        map.guestDescriptor[Abi::HeaderVersion] = Abi::Version;
-        map.guestDescriptor[Abi::HeaderElementFaults] = Abi::HeaderWords;
-        map.guestDescriptor[Abi::HeaderSamplerFaults] = Abi::HeaderWords;
+        mutateGuestDescriptor(map, [](auto& words) {
+            words[Abi::HeaderVersion] = Abi::Version;
+            words[Abi::HeaderElementFaults] = Abi::HeaderWords;
+            words[Abi::HeaderSamplerFaults] = Abi::HeaderWords;
+        });
         compute.bindings.push_back(map);
         auto images = makeBinding(Role::ImageTable, ShaderRecompiler::RuntimeAbi::ImageTableBinding, 0, {});
         images.kind = Kind::SampledImage;
         compute.bindings.push_back(images);
         compute.bindings.push_back(makeBinding(Role::ShaderData, 1, 1, ShaderDataWords({0x11, 0x22})));
-        compute.shaderDataDwords = ShaderRecompiler::RuntimeAbi::ShaderDataDwords;
         auto live = compute;
-        live.bindings[2].guestDescriptor = ShaderDataWords({0x33, 0x44});
+        setGuestDescriptor(live.bindings[2], ShaderDataWords({0x33, 0x44}));
         const AgcDriver::Graphics::CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &compute, 0};
         const AgcDriver::Graphics::CompiledShader liveShader{ShaderRecompiler::ShaderStage::Compute, &live, 0};
         AgcDriver::Graphics::ShaderResources resources(context, shader);
@@ -12832,7 +12833,7 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--pipeline-store-touch") {
             pipelineStoreTouchTests();
-            std::cout << "a touched pipeline is returned as a hit and stays recently used"
+            std::cout << "a touched pipeline is returned as a hit and stays recently used\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--pipeline-store-lazy-buffer-pool") {
