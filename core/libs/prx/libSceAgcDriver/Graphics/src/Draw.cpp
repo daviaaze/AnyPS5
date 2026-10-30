@@ -2675,7 +2675,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const bool fenced = state.depth.has_value() || !record.proxies.empty();
     const bool payload = trace != nullptr && trace->payloadOrdinal != 0;
     if (UsesMeshWindow(shaders)) PrepareMeshWindow(context);
-    const auto start = recorder->StartDrawPass(passKey, capture || payload || readsTarget || gpuIndirect || meshIndirect || captured || PixelFunctionLdsSubgroup(shaders) != 0u, fenced, passAccess)
+    const auto start = recorder->StartDrawPass(passKey, capture || payload || readsTarget || gpuIndirect || meshIndirect || captured || PixelFunctionLdsSubgroup(shaders) != 0u, fenced, passAccess);
     for (const auto& target : record.multisampleTargets) KeepMultisampleTarget_nid_no_patch(target);
     const bool continued = start.continued;
     outcome.passContinued = continued;

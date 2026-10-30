@@ -179,7 +179,7 @@ void requireSameArtifact(const CompiledShaderArtifact& left, const CompiledShade
     for (std::size_t i = 0; i < left.fragmentParameters.size(); ++i) {
         const auto& a = left.fragmentParameters[i];
         const auto& b = right.fragmentParameters[i];
-        require(a.location == b.location && a.sourceLocation == b.sourceLocation && a.flat == b.flat && a.perVertex == b.perVertex && a.custom == b.custom, prefix + "fragment parameter differs");
+        require(a == b, prefix + "fragment parameter differs");
     }
 }
 
@@ -207,7 +207,7 @@ void requireSameResult(const RecompileResult& left, const RecompileResult& right
         const auto& b = right.vertexAttributes[i];
         require(a.location == b.location && a.components == b.components && a.resource.fields == b.resource.fields && a.fetchIndex == b.fetchIndex && a.formatComponents == b.formatComponents, prefix + "vertex attribute differs");
     }
-    require(left.barycentricEmulation.active == right.barycentricEmulation.active && left.barycentricEmulation.smooth == right.barycentricEmulation.smooth && left.barycentricEmulation.linear == right.barycentricEmulation.linear, prefix + "barycentric emulation differs");
+    require(left.barycentricEmulation == right.barycentricEmulation, prefix + "barycentric emulation differs");
     require(left.meshBarycentrics == right.meshBarycentrics, prefix + "mesh barycentric layout differs");
 }
 
@@ -286,15 +286,15 @@ RecompileResult sampleResult() {
     result.vertexOffsetConflict = false;
     result.instanceOffsetConflict = true;
     result.parameterExports = {0, 3, 7};
-    result.fragmentParameters = {{0, 1, true, false, true}, {2, 3, false, true}};
+    result.fragmentParameters = {{0, 1, true, false, true, true, false, true}, {2, 3, false, true, false, false, true, false}};
     result.stencilReferences = {0u, 17u, 255u};
     result.stencilReplaySafe = true;
     result.bdaWrites = true;
     result.stencilReferenceDword = 23u;
     result.poisonedSrtReads = 3;
     result.shaderDataUserWords = {2u, 0xffffffffu, 9u};
-    result.barycentricEmulation = {true, false, true};
-    result.meshBarycentrics = MeshBarycentricLayout{{true, true, false}, {FragmentParameter{0, 2, false, true}, FragmentParameter{3, 3, false, false}}};
+    result.barycentricEmulation = {true, false, true, true};
+    result.meshBarycentrics = MeshBarycentricLayout{{true, true, false, true}, {FragmentParameter{0, 2, false, true, true, false, true, false}, FragmentParameter{3, 3, true, false, true, true, false, true}}};
     result.variantId = 99;
     result.imageTablePoison = {{{1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u}, 8u, 2u, 6u}, {{9u, 0u, 0u, 0u, 0u, 0u, 0u, 0u}, 4u, 0xffffffffu, 19u}};
     result.imageTableRanges = {{0x1000u, 0x200u}, {0x5000000000ull, 48u}};

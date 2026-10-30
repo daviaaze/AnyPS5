@@ -1912,6 +1912,118 @@ void CheckUnwatchedImport() {
 #endif
 }
 
+#if defined(__linux__)
+void CheckHostImportUffdUnwatch() {
+    constexpr std::size_t PageBytes = 4096;
+    void* memory = AllocateWatched(3 * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    auto* bytes = static_cast<volatile std::uint8_t*>(memory);
+    std::memset(memory, 0x11, 3 * Block);
+    const auto synced = CollectWritesUncached(base, 3 * Block);
+    Require(synced != 0, "the host-import UFFD range was not initially collected");
+
+    const auto imported = base + Block / 2 + 17;
+    constexpr std::size_t importBytes = 3 * PageBytes - 34;
+    const auto firstPage = imported & ~(std::uint64_t{PageBytes} - 1);
+    const auto end = (imported + importBytes + PageBytes - 1) & ~(std::uint64_t{PageBytes} - 1);
+    const auto released = firstPage + PageBytes;
+    const auto writeAddress = released + 17;
+    Require(UffdWriteProtected(released), "the host-import page was not UFFD-WP armed");
+    bytes[writeAddress - base] = 0x22;
+    const auto collected = CollectWritesUncached(writeAddress, 1);
+    Require(collected > synced && !UnchangedSince(writeAddress, 1, synced), "a write before host import was not collected");
+    Require(UffdWriteProtected(released), "collecting the pre-import write did not re-arm its page");
+
+    Require(ImportWatched(imported, importBytes, [] { return true; }, false), "the host import failed");
+    Require(!Watched(released, PageBytes), "the host-import page remained watched");
+    Require(!UffdWriteProtected(released), "the host-import page remained UFFD-WP protected");
+    Require(UffdWriteProtected(firstPage) && UffdWriteProtected(end - PageBytes), "partial-page overlap lost its neighboring UFFD-WP protection");
+    Require(UffdWriteProtected(base + 3 * Block - PageBytes), "unrelated UFFD-WP protection was removed");
+
+    GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(reinterpret_cast<void*>(released), PageBytes);
+    Require(Watched(released, PageBytes), "the host-import page could not be watched again");
+    Require(CollectWritesUncached(released, PageBytes) != 0 && UffdWriteProtected(released), "the re-registered host-import page was not armed");
+    Require(ImportWatched(released, PageBytes, [] { return true; }), "the stays-watched import failed");
+    Require(Watched(released, PageBytes) && UffdWriteProtected(released), "a stays-watched import released UFFD-WP");
+    Unwatch(base, 3 * Block);
+    Require(munmap(memory, 3 * Block) == 0, "cannot unmap the host-import UFFD range");
+}
+#endif
+
+struct HookCall {
+    std::uint64_t address;
+    std::size_t bytes;
+    bool watched;
+};
+
+std::vector<HookCall> hookCalls;
+std::uint64_t hookProbe = 0;
+std::size_t hookProbeBytes = 0;
+
+void RecordHook(std::uint64_t address, std::size_t bytes) {
+    hookCalls.push_back({address, bytes, Watched(hookProbe, hookProbeBytes)});
+}
+
+struct RecordedHook {
+    RecordedHook() {
+        hookCalls.clear();
+        SetUnwatchHook(&RecordHook);
+    }
+    ~RecordedHook() { SetUnwatchHook(nullptr); }
+    RecordedHook(const RecordedHook&) = delete;
+    RecordedHook& operator=(const RecordedHook&) = delete;
+};
+
+void RequireHookOver(std::uint64_t address, std::size_t bytes, const std::string& path) {
+    Require(hookCalls.size() == 1, path + " did not run the unwatch hook once");
+    const auto& call = hookCalls.front();
+    Require(call.address <= address && address + bytes <= call.address + call.bytes, path + " gave the unwatch hook a range that misses its own");
+    Require(call.watched, path + " ran the unwatch hook after its range left the write watch");
+}
+
+void CheckUnwatchHooks() {
+    void* memory = AllocateWatched(8 * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x11, 8 * Block);
+    Require(CollectWritesUncached(base, 8 * Block) != 0, "the hooked block is not collected");
+    const RecordedHook recorded;
+    hookProbe = base;
+    hookProbeBytes = Block;
+    Unwatch(base, Block);
+    RequireHookOver(base, Block, "Unwatch");
+    Require(!Watched(base, Block), "Unwatch left its range watched");
+
+    hookCalls.clear();
+    hookProbe = base + Block;
+    bool hookedBeforeImport = false;
+    Require(ImportWatched(base + Block, Block, [&] {
+        hookedBeforeImport = hookCalls.size() == 1;
+        return true;
+    }, false), "an import that does not stay watched failed");
+    RequireHookOver(base + Block, Block, "an import that does not stay watched");
+    Require(hookedBeforeImport, "an import that does not stay watched ran the unwatch hook after the import");
+    Require(!Watched(base + Block, Block), "an import that does not stay watched left its range watched");
+
+    hookCalls.clear();
+    Require(ImportWatched(base + 2 * Block, Block, [] { return true; }), "an import that stays watched failed");
+    Require(hookCalls.empty() && Watched(base + 2 * Block, Block), "an import whose page walk vouched for its pages ran the unwatch hook or gave up its range");
+
+#ifndef _WIN32
+    hookCalls.clear();
+    const auto late = base + 4 * Block;
+    hookProbe = late;
+    bool hookedBeforeLoss = false;
+    Require(ImportWatched(late, 3 * Block, [&] {
+        GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(reinterpret_cast<const void*>(late + 2 * Block), Block);
+        hookedBeforeLoss = !hookCalls.empty();
+        return true;
+    }), "an import whose range lost a block during the import failed");
+    RequireHookOver(late, 3 * Block, "an import whose page walk failed after the import");
+    Require(!hookedBeforeLoss, "an import whose page walk failed after the import ran the unwatch hook before it");
+    Require(!Watched(late, Block), "an import whose page walk failed after the import left its range watched");
+#endif
+}
+
 
 class PartlyCommitted {
 public:
