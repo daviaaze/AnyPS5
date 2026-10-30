@@ -27,7 +27,7 @@ public:
     void SetImageTables(std::vector<ImageTableFaults> tables, std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges);
     struct SrtGuardFaults {
         std::uint32_t stage = 0;
-        std::vector<std::uint32_t> flattenedSrt;
+        ShaderRecompiler::SharedValues<std::uint32_t> flattenedSrt;
     };
     void SetSrtGuards(std::vector<SrtGuardFaults> guards);
     // APS5_PROFILE_DRAW: page tables served from the per-device cache and built anew (cumulative),

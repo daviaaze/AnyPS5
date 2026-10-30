@@ -73,7 +73,8 @@ std::size_t Compile(bool nativeFloat16) {
     request.context.compute = ShaderComputeStageInfo{{32u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
     request.context.memory = memory;
     request.useCache = false;
-    return ZeroPairs(Recompile(request).spirv.Words());
+    const auto result = Recompile(request);
+    return ZeroPairs(result.spirv.Words());
 }
 
 }

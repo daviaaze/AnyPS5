@@ -3,6 +3,7 @@
 #include "Optimization/ResourceMaterializer.hpp"
 #include "SpirvBackend/SpirvBufferFormat.hpp"
 #include "IntermediateRepresentation/IrBuilder.hpp"
+#include "Optimization/SrtWalker/SrtEvaluator.hpp"
 #include "Optimization/SrtWalker/SrtInstructionPredicates.hpp"
 
 #include <algorithm>
@@ -132,10 +133,18 @@ public:
                 Collect(*inst);
             }
         }
+        if (m_unknownBdaAccess) {
+            for (auto& accessPlan : m_program.Resources().bufferAccessPlans) {
+                accessPlan.complete = false;
+                accessPlan.failed = true;
+                accessPlan.accesses.clear();
+            }
+        }
         m_currentBlock = std::numeric_limits<std::uint32_t>::max();
         PlanResourceControlFlow();
         if (m_bdaTraces > bdaTraceLimit) std::fprintf(stderr, "[bda] %u more address accesses in this program not shown\n", m_bdaTraces - bdaTraceLimit);
         CheckTableStores();
+        ValidateBufferFootprintSources();
         AssignTables();
         LinkImageAliases();
         for (const auto& patch : m_handlePatches) {
@@ -1748,6 +1757,52 @@ private:
         }
         return false;
     }
+    bool CapturedSlotMayBeWritten(std::uint32_t slot) const {
+        const auto& resources = m_program.Resources();
+        if (std::ranges::any_of(m_info.images, [](const ImageResource& image) { return image.written || image.atomic; })) return true;
+        if (slot >= resources.srtReads.size() || resources.srtReads[slot].value == nullptr) return true;
+        std::vector<const IrValue*> pending{resources.srtReads[slot].value};
+        std::vector<const IrValue*> seen;
+        while (!pending.empty()) {
+            const IrValue* current = pending.back()->Resolve();
+            pending.pop_back();
+            if (std::ranges::find(seen, current) != seen.end()) continue;
+            seen.push_back(current);
+            if (current->Opcode() == IrOpcode::ReadConst && current->ArgumentCount() == 2u) {
+                const IrValue* readSlot = current->Argument(1)->Resolve();
+                if (readSlot->HasImmediate() && readSlot->Type() == IrType::U32 && readSlot->ImmediateU32() < resources.srtReads.size()) {
+                    pending.push_back(resources.srtReads[readSlot->ImmediateU32()].value);
+                }
+            }
+            if (current->Opcode() == IrOpcode::LoadAddressU32 && Detail::IsRawRead(resources, *current) && m_info.bdaWrites) return true;
+            if (current->Opcode() == IrOpcode::ReadConstBuffer && Detail::IsRawRead(resources, *current)) {
+                if (m_info.bdaWrites) return true;
+                const IrValue* handle = current->ArgumentCount() != 0u ? current->Argument(0)->Resolve() : nullptr;
+                if (handle != nullptr && std::ranges::any_of(m_info.buffers, [&](const BufferResource& buffer) {
+                    return (buffer.written || buffer.atomic) && SameBufferSource(*handle, buffer.source);
+                })) return true;
+            }
+            for (const auto* argument : current->Arguments()) if (argument != nullptr) pending.push_back(argument);
+        }
+        return false;
+    }
+
+    void ValidateBufferFootprintSources() {
+        auto& plans = m_program.Resources().bufferAccessPlans;
+        for (auto& plan : plans) {
+            if (!plan.complete || plan.failed) continue;
+            const bool mutableSource = std::ranges::any_of(plan.accesses, [&](const BufferAccessRecord& access) {
+                return (access.index.kind == BufferUniformSource::Kind::CapturedFlatSlot && CapturedSlotMayBeWritten(access.index.value)) ||
+                    (access.offset.kind == BufferUniformSource::Kind::CapturedFlatSlot && CapturedSlotMayBeWritten(access.offset.value)) ||
+                    (access.soffset.kind == BufferUniformSource::Kind::CapturedFlatSlot && CapturedSlotMayBeWritten(access.soffset.value));
+            });
+            if (mutableSource) {
+                plan.complete = false;
+                plan.failed = true;
+                plan.accesses.clear();
+            }
+        }
+    }
 
     void CheckTableStores() {
         for (auto& source : m_sources) {
@@ -1801,6 +1856,7 @@ private:
     }
 
     bool TakeGpuDescriptor(IrValue& inst, std::uint32_t memoryIndex) {
+        const auto access = BufferAccessOf(inst.Opcode());
         const IrValue* handle = inst.Argument(0)->Resolve();
         if (handle->Opcode() != IrOpcode::GetBufferResource || handle->ArgumentCount() != 4u) {
             return false;
@@ -1809,17 +1865,75 @@ private:
         MakeSource(*handle, 4u, false, false, descriptor);
         std::uint32_t badDword = 0;
         auto& memory = m_program.Resources().memoryInfo[memoryIndex];
-        const auto access = BufferAccessOf(inst.Opcode());
         if (ValidateSource(descriptor, badDword)) {
             const auto source = InternSource(descriptor);
-            const auto resource = AddBuffer(source, memory, inst.Opcode(), inst.Flags<MemoryFlags>().pc);
-            if (resource == std::numeric_limits<std::uint32_t>::max()) fail("buffer resource limit exceeded");
-            AddMemoryPatch(memoryIndex, resource, 0u, false);
+            const auto resourceIndex = AddBuffer(source, memory, inst.Opcode(), inst.Flags<MemoryFlags>().pc);
+            if (resourceIndex == std::numeric_limits<std::uint32_t>::max()) fail("buffer resource limit exceeded");
+            AddMemoryPatch(memoryIndex, resourceIndex, 0u, false);
+            auto& plans = m_program.Resources().bufferAccessPlans;
+            if (plans.size() < m_info.buffers.size()) plans.resize(m_info.buffers.size());
+            auto& accessPlan = plans.at(resourceIndex);
+            BufferAccessRecord accessRecord{};
+            const auto decodeUniformSource = [&](const IrValue* raw, const IrValue* mask, BufferUniformSource& result) {
+                const IrValue* value = raw != nullptr ? raw->Resolve() : nullptr;
+                while (value != nullptr && Detail::IsRuntimeSelect(value->Opcode()) && value->ArgumentCount() == 3u &&
+                       mask != nullptr && Detail::ActiveMaskImplies(mask, value->Argument(0))) {
+                    value = value->Argument(1)->Resolve();
+                }
+                if (value == nullptr || value->Type() != IrType::U32) return false;
+                if (value->HasImmediate()) {
+                    result = {BufferUniformSource::Kind::Constant, value->ImmediateU32()};
+                    return true;
+                }
+                if (value->Opcode() == IrOpcode::ReadConst && value->ArgumentCount() == 2u) {
+                    const IrValue* slot = value->Argument(1)->Resolve();
+                    if (slot->HasImmediate() && slot->Type() == IrType::U32 &&
+                        slot->ImmediateU32() < m_program.Resources().srtReads.size()) {
+                        result = {BufferUniformSource::Kind::CapturedFlatSlot, slot->ImmediateU32()};
+                        return true;
+                    }
+                }
+                if (value->Opcode() == IrOpcode::GetUserData && value->ArgumentCount() == 1u) {
+                    const IrValue* reg = value->Argument(0)->Resolve();
+                    if (reg->Type() == IrType::ScalarReg && reg->Register().bank == RegisterBank::UserData &&
+                        reg->Register().index >= m_program.Resources().userDataBase &&
+                        reg->Register().index - m_program.Resources().userDataBase < m_program.Resources().userDataCount) {
+                        result = {BufferUniformSource::Kind::UserData, reg->Register().index - m_program.Resources().userDataBase};
+                        return true;
+                    }
+                }
+                return false;
+            };
+            // Loads have five operands; stores and atomics append their data before EXEC.
+            const auto argumentCount = inst.ArgumentCount();
+            const auto* exec = argumentCount >= 5u ? inst.Argument(argumentCount - 1u)->Resolve() : nullptr;
+            const auto width = BufferComponentCount(inst.Opcode()) * 4u;
+            const auto& metadata = m_program.Resources().memoryInfo[memoryIndex];
+            const bool supported = !metadata.formatted && !metadata.offen && metadata.dataBits == 32u && !metadata.d16 &&
+                argumentCount >= 5u && width != 0u && width <= 16u &&
+                decodeUniformSource(inst.Argument(1), exec, accessRecord.index) &&
+                decodeUniformSource(inst.Argument(2), exec, accessRecord.offset) &&
+                decodeUniformSource(inst.Argument(3), exec, accessRecord.soffset);
+            if (!accessPlan.failed) {
+                if (!supported || accessPlan.accesses.size() >= 256u) {
+                    accessPlan.failed = true;
+                    accessPlan.complete = false;
+                    accessPlan.accesses.clear();
+                } else {
+                    accessRecord.byteWidth = width;
+                    accessRecord.immediateOffset = metadata.offset;
+                    accessRecord.access = access == BufferAccess::Read ? BufferAccessClass::Read :
+                        access == BufferAccess::Write ? BufferAccessClass::Write : BufferAccessClass::Atomic;
+                    accessPlan.accesses.push_back(accessRecord);
+                    accessPlan.complete = true;
+                }
+            }
             memory.gpuDescriptor = false;
             m_info.usesFaultBuffer = m_info.usesFaultBuffer || access == BufferAccess::Atomic;
             return true;
         }
         memory.gpuDescriptor = true;
+        m_unknownBdaAccess = true;
         m_info.usesDma = true;
         m_info.bdaWrites = m_info.bdaWrites || access == BufferAccess::Write || access == BufferAccess::Atomic;
         return true;
@@ -2018,6 +2132,7 @@ private:
         const auto op = inst.Opcode();
         if (op == IrOpcode::ImageBvhIntersectRay) {
             m_info.usesDma = true;
+            m_unknownBdaAccess = true;
             return;
         }
         const auto buffer = BufferAccessOf(op);
@@ -2046,6 +2161,7 @@ private:
             return;
         }
         if (addressInfo.access != AddressAccess::None) {
+            m_unknownBdaAccess = true;
             if (!IsAddressResourceKind(memory.kind)) {
                 fail("address operation has invalid resource kind");
             }
@@ -2166,6 +2282,7 @@ private:
         IrValue* value = nullptr;
     };
     std::vector<EdgeSelectorEntry> m_edgeSelectors;
+    bool m_unknownBdaAccess = false;
 };
 
 }

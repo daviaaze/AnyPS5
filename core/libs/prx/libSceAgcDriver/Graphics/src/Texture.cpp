@@ -29,7 +29,9 @@
 #include <cstring>
 #include <cstdlib>
 #include <string>
+#include <string_view>
 #include <stdexcept>
+#include <iterator>
 #include <vector>
 #include <atomic>
 #include <mutex>
@@ -41,6 +43,102 @@
 #include <unordered_map>
 #include <utility>
 
+namespace {
+
+bool TextureDumpSelectorMatchesExact(std::string_view selectors, std::string_view address, std::string_view extent) {
+    for (std::size_t begin = 0; begin <= selectors.size();) {
+        const auto end = selectors.find(',', begin);
+        auto entry = selectors.substr(begin, end == std::string_view::npos ? selectors.size() - begin : end - begin);
+        if (entry == address || entry == extent || (entry.size() == address.size() + 2 && entry.substr(0, 2) == "0x" && entry.substr(2) == address)) return true;
+        if (end == std::string_view::npos) break;
+        begin = end + 1;
+    }
+    return false;
+}
+
+struct TextureDumpRoi {
+    std::uint32_t x = 0, y = 0, width = 0, height = 0;
+};
+
+bool ParseTextureDumpUnsigned(const char*& cursor, std::uint32_t& value) {
+    if (*cursor < '0' || *cursor > '9') return false;
+    std::uint64_t parsed = 0;
+    do {
+        parsed = parsed * 10 + static_cast<unsigned>(*cursor - '0');
+        if (parsed > std::numeric_limits<std::uint32_t>::max()) return false;
+        ++cursor;
+    } while (*cursor >= '0' && *cursor <= '9');
+    value = static_cast<std::uint32_t>(parsed);
+    return true;
+}
+
+bool ParseTextureDumpRoi(const char* text, TextureDumpRoi& roi) {
+    if (text == nullptr || *text == '\0') return false;
+    const char* cursor = text;
+    std::uint32_t* fields[] = {&roi.x, &roi.y, &roi.width, &roi.height};
+    for (std::size_t i = 0; i < std::size(fields); ++i) {
+        if (!ParseTextureDumpUnsigned(cursor, *fields[i])) return false;
+        if (i + 1 != std::size(fields)) {
+            if (*cursor++ != ',') return false;
+        } else if (*cursor != '\0') return false;
+    }
+    return roi.width != 0 && roi.height != 0;
+}
+
+bool ParseTextureDumpLayers(const char* text, std::vector<std::uint32_t>& layers) {
+    if (text == nullptr || *text == '\0') return false;
+    const char* cursor = text;
+    while (*cursor != '\0') {
+        std::uint32_t layer = 0;
+        if (!ParseTextureDumpUnsigned(cursor, layer) || layer >= 2048 || layers.size() >= 64 ||
+            std::find(layers.begin(), layers.end(), layer) != layers.end()) return false;
+        layers.push_back(layer);
+        if (*cursor == '\0') break;
+        if (*cursor++ != ',' || *cursor == '\0') return false;
+    }
+    return !layers.empty();
+}
+
+bool TextureDumpRoiFormat(VkFormat format) {
+    switch (format) {
+    case VK_FORMAT_R8G8B8A8_UNORM:
+    case VK_FORMAT_R8G8B8A8_SRGB:
+    case VK_FORMAT_B8G8R8A8_UNORM:
+    case VK_FORMAT_B8G8R8A8_SRGB:
+    case VK_FORMAT_R32_SFLOAT:
+    case VK_FORMAT_R32_UINT:
+    case VK_FORMAT_R32_SINT:
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+    case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
+    case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
+    case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32:
+        return true;
+    default:
+        return false;
+    }
+}
+
+struct TextureDumpReservation {
+    static constexpr std::uint64_t Limit = 2 * 1024 * 1024;
+    std::mutex mutex;
+    std::map<std::uint64_t, bool> bases;
+    std::uint64_t bytes = 0;
+    bool Reserve(std::uint64_t base, std::uint64_t amount) {
+        std::lock_guard lock(mutex);
+        if (bases.contains(base) || amount > Limit - bytes) return false;
+        bases.emplace(base, true);
+        bytes += amount;
+        return true;
+    }
+};
+
+TextureDumpReservation& TextureDumpBudget() {
+    static TextureDumpReservation budget;
+    return budget;
+}
+
+}
+
 namespace AgcDriver::Graphics {
 
 OwnedImage::~OwnedImage() {
@@ -48,17 +146,25 @@ OwnedImage::~OwnedImage() {
     ReleaseImageMemory(context, memory, memoryBytes, memoryType);
 }
 
-void OwnedImage::Allocate(const Context& device, const VkMemoryAllocateInfo& allocation, std::uint32_t mask, const char* operation, bool newImage) {
-    memory = AllocateImageMemory(device, allocation, mask, operation, &memoryType, newImage);
-    memoryBytes = allocation.allocationSize;
+void OwnedImage::Allocate(const Context& device, const VkMemoryAllocateInfo& allocation, std::uint32_t mask, const char* operation, bool newImage, ImageMemoryTiming* timing) {
+    memory = AllocateImageMemory(device, allocation, mask, operation, &memoryType, newImage, timing, &memoryBytes);
     context.bufferPool = device.bufferPool;
 }
 
 namespace {
 
-// APS5_PROFILE_DRAW: accumulate texture setup phases and report every 200 textures.
+// Optional per-image breakdown for APS5_PROFILE_DRAW. vkAllocateMemory elapsed time is measured
+// around the actual driver entry point in BufferPool, while imageMemoryPool records the complete
+// allocator call (pool lookup, fallback/reclaim and any driver allocation).
+struct TextureImageTiming {
+    double createImage = 0, requirementsAndType = 0, imageMemoryPool = 0, vkAllocateMemory = 0, bindImage = 0;
+    std::uint64_t createCalls = 0, poolHits = 0, vkAllocateCalls = 0;
+};
+
 struct TextureProfile {
-    double allocate = 0, read = 0, gpu = 0, view = 0;
+    double allocate = 0, read = 0, gpu = 0, view = 0, tail = 0;
+    double createImage = 0, requirementsAndType = 0, imageMemoryPool = 0, vkAllocateMemory = 0, bindImage = 0;
+    std::uint64_t imageCreateCalls = 0, imagePoolHits = 0, vkAllocateCalls = 0;
     std::uint64_t count = 0;
     std::uint64_t fromStorage = 0;
     double storageCreate = 0, storageWriteBack = 0, storageAlloc = 0, storageHostCopy = 0, storageGpu = 0, storageStore = 0;
@@ -261,7 +367,7 @@ struct ExpandImage {
     VkDeviceSize bytes = 0;
 };
 
-ExpandImage CreateExpandImage(const Context& context, const GuestTextureResource& descriptor, std::uint32_t depth, std::uint32_t layers) {
+ExpandImage CreateExpandImage(const Context& context, const GuestTextureResource& descriptor, std::uint32_t depth, std::uint32_t layers, TextureImageTiming* timing = nullptr) {
     ExpandImage result;
     VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     imageInfo.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | (descriptor.dimension == TextureDimension::kCube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0u);
@@ -275,15 +381,32 @@ ExpandImage CreateExpandImage(const Context& context, const GuestTextureResource
     imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    const auto createStarted = timing != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     Check(context.Function<PFN_vkCreateImage>("vkCreateImage")(context.device, &imageInfo, nullptr, &result.image), "vkCreateImage sRGB copy");
+    if (timing != nullptr) {
+        timing->createImage += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - createStarted).count();
+        ++timing->createCalls;
+    }
     result.owned = std::make_shared<OwnedImage>(context, result.image, VK_NULL_HANDLE);
     VkMemoryRequirements requirements{};
+    const auto requirementsStarted = timing != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     context.Function<PFN_vkGetImageMemoryRequirements>("vkGetImageMemoryRequirements")(context.device, result.image, &requirements);
     VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     allocation.allocationSize = requirements.size;
     allocation.memoryTypeIndex = context.DeviceMemoryType(requirements.memoryTypeBits, requirements.size, "texture");
-    result.owned->Allocate(context, allocation, requirements.memoryTypeBits, "vkAllocateMemory sRGB copy", true);
+    if (timing != nullptr) timing->requirementsAndType += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - requirementsStarted).count();
+    ImageMemoryTiming memoryTiming{};
+    const auto memoryStarted = timing != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    result.owned->Allocate(context, allocation, requirements.memoryTypeBits, "vkAllocateMemory sRGB copy", true, timing != nullptr ? &memoryTiming : nullptr);
+    if (timing != nullptr) {
+        timing->imageMemoryPool += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - memoryStarted).count();
+        timing->vkAllocateMemory += memoryTiming.vkAllocateMilliseconds;
+        timing->poolHits += memoryTiming.poolHits;
+        timing->vkAllocateCalls += memoryTiming.vkAllocateCalls;
+    }
+    const auto bindStarted = timing != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, result.image, result.owned->memory, 0), "vkBindImageMemory sRGB copy");
+    if (timing != nullptr) timing->bindImage += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - bindStarted).count();
     result.bytes = requirements.size;
     return result;
 }
@@ -313,10 +436,19 @@ std::uint64_t SampledTextureMemory() {
     return SampledMemoryCounter().load(std::memory_order_relaxed);
 }
 
-Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare) : context(context) {
+Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare, double readTextureSurfaceMs) : Texture(context, detiler, descriptor, components, snapshot, nullptr, depthCompare, readTextureSurfaceMs, 0.0) {}
+
+Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::shared_ptr<Buffer> staging, bool depthCompare, double readTextureSurfaceMs, double providedStagingMs) : Texture(context, detiler, descriptor, components, {}, std::move(staging), depthCompare, readTextureSurfaceMs, providedStagingMs) {}
+
+Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, std::shared_ptr<Buffer> staging, bool depthCompare, double readTextureSurfaceMs, double providedStagingMs) : context(context) {
 
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    PhaseTimer timer;
+    TextureImageTiming imageTiming{};
+    auto* imageTimingOutput = profile ? &imageTiming : nullptr;
+    const auto constructorStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    PhaseTimer timer{constructorStart};
+    PhaseTimer stageTimer{constructorStart};
+    double setupMs = 0, imageMs = 0, uploadSetupMs = 0, stagingMs = 0, memcpyMs = 0, tiledMs = 0, linearMs = 0, gpuRecordMs = 0;
     try {
         const auto colorFormat = SampledTextureFormat(context, descriptor.format);
         const bool srgbExpand = !depthCompare && SrgbExpandsToRgba8(context, descriptor.format);
@@ -337,7 +469,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
         for (const auto& mip : mips) AGC_LOG_DEFERRED(stdout, "  mip %ux%u tiled=0x%llx+0x%llx linear=0x%llx+0x%llx blocksPerRow=%u pitch=%u tail=%d", mip.width, mip.height, static_cast<unsigned long long>(mip.tiledOffset), static_cast<unsigned long long>(mip.tiledSize), static_cast<unsigned long long>(mip.linearOffset), static_cast<unsigned long long>(mip.linearSize), mip.blocksPerRow, mip.pitchBytes, mip.tail ? 1 : 0);
 
         const auto guestBytes = geometry.guestBytes;
-        Require(snapshot.size() == guestBytes, "texture snapshot size mismatch");
+        Require((staging != nullptr ? staging->Bytes().size() : snapshot.size()) == guestBytes, "texture snapshot size mismatch");
 
         const auto sliceLinearBytes = geometry.sliceLinearBytes;
         Require(arrayLayers == 0 || sliceLinearBytes <= UINT64_MAX / arrayLayers, "detiled texture buffer size overflows");
@@ -357,27 +489,46 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
         imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | (srgbExpand ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0u);
         imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        if (profile) setupMs = stageTimer.lap();
+        const auto createImageStarted = imageTimingOutput != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         Check(context.Function<PFN_vkCreateImage>("vkCreateImage")(context.device, &imageInfo, nullptr, &image), "vkCreateImage");
+        if (imageTimingOutput != nullptr) {
+            imageTimingOutput->createImage += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - createImageStarted).count();
+            ++imageTimingOutput->createCalls;
+        }
         owned = std::make_shared<OwnedImage>(context, image, VK_NULL_HANDLE);
 
         VkMemoryRequirements requirements{};
+        const auto requirementsStarted = imageTimingOutput != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         context.Function<PFN_vkGetImageMemoryRequirements>("vkGetImageMemoryRequirements")(context.device, image, &requirements);
         VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         allocation.allocationSize = requirements.size;
         allocationBytes = requirements.size;
         allocation.memoryTypeIndex = context.DeviceMemoryType(requirements.memoryTypeBits, requirements.size, "texture");
-        owned->Allocate(context, allocation, requirements.memoryTypeBits, "vkAllocateMemory texture", true);
+        if (imageTimingOutput != nullptr) imageTimingOutput->requirementsAndType += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - requirementsStarted).count();
+        ImageMemoryTiming memoryTiming{};
+        const auto imageMemoryStarted = imageTimingOutput != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        owned->Allocate(context, allocation, requirements.memoryTypeBits, "vkAllocateMemory texture", true, imageTimingOutput != nullptr ? &memoryTiming : nullptr);
+        if (imageTimingOutput != nullptr) {
+            imageTimingOutput->imageMemoryPool += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - imageMemoryStarted).count();
+            imageTimingOutput->vkAllocateMemory += memoryTiming.vkAllocateMilliseconds;
+            imageTimingOutput->poolHits += memoryTiming.poolHits;
+            imageTimingOutput->vkAllocateCalls += memoryTiming.vkAllocateCalls;
+        }
+        const auto bindImageStarted = imageTimingOutput != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, owned->memory, 0), "vkBindImageMemory");
+        if (imageTimingOutput != nullptr) imageTimingOutput->bindImage += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - bindImageStarted).count();
 
         const VkImage uploadImage = image;
         std::shared_ptr<OwnedImage> uploadOwned;
         if (srgbExpand) {
-            auto expanded = CreateExpandImage(context, descriptor, geometry.imageDepth, geometry.imageLayers);
+            auto expanded = CreateExpandImage(context, descriptor, geometry.imageDepth, geometry.imageLayers, imageTimingOutput);
             uploadOwned = std::move(owned);
             owned = std::move(expanded.owned);
             image = expanded.image;
             allocationBytes = expanded.bytes;
         }
+        if (profile) imageMs = stageTimer.lap();
 
         {
             // Debug aid: APS5_DUMP_TEXTURE=<hex addresses, comma separated> saves the detiled first mip
@@ -393,11 +544,101 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
                 // Entries may also be extents ("3840x2160"), since heap addresses change between runs.
                 dumpWanted = dumpList.find(address) != std::string::npos || dumpList.find(extent) != std::string::npos;
             }
-            auto staging = std::make_shared<Buffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-            std::memcpy(staging->Bytes().data(), snapshot.data(), snapshot.size());
+            static const auto layersText = []() -> std::optional<std::string> {
+                const auto* text = std::getenv("APS5_DUMP_TEXTURE_LAYERS");
+                return text != nullptr ? std::optional<std::string>(text) : std::nullopt;
+            }();
+            static const auto roiText = []() -> std::optional<std::string> {
+                const auto* text = std::getenv("APS5_DUMP_TEXTURE_ROI");
+                return text != nullptr ? std::optional<std::string>(text) : std::nullopt;
+            }();
+            const bool roiOptionsRequested = layersText.has_value() || roiText.has_value();
+            static const auto roiSourceText = []() -> std::optional<std::string> {
+                const auto* text = std::getenv("APS5_DUMP_TEXTURE_SOURCE");
+                return text != nullptr ? std::optional<std::string>(text) : std::nullopt;
+            }();
+            const bool roiSourceValid = !roiSourceText ||
+                *roiSourceText == "sampled_storage";
+            if (!roiSourceValid && roiOptionsRequested)
+                std::fprintf(stderr, "[texture] ROI dump rejected: unknown APS5_DUMP_TEXTURE_SOURCE\n");
+            const bool cpuRoiEnabled = !roiSourceText;
+            if (!roiSourceValid) dumpWanted = false;
+            if (!cpuRoiEnabled && roiOptionsRequested) dumpWanted = false;
+            if (roiOptionsRequested && !dumpList.empty()) {
+                char address[32];
+                std::snprintf(address, sizeof(address), "%llx", static_cast<unsigned long long>(descriptor.baseAddress));
+                char extent[32];
+                std::snprintf(extent, sizeof(extent), "%ux%u", descriptor.width, descriptor.height);
+                dumpWanted = roiSourceValid && cpuRoiEnabled && TextureDumpSelectorMatchesExact(dumpList, address, extent);
+            }
+
+            bool roiDumpWanted = false;
+            TextureDumpRoi dumpRoi{};
+            std::vector<std::uint32_t> dumpLayers;
+            if (roiOptionsRequested && dumpWanted) {
+                if (!layersText || !roiText ||
+                    !ParseTextureDumpLayers(layersText->c_str(), dumpLayers) || !ParseTextureDumpRoi(roiText->c_str(), dumpRoi)) {
+                    std::fprintf(stderr, "[texture] ROI dump requires valid APS5_DUMP_TEXTURE_LAYERS and APS5_DUMP_TEXTURE_ROI; capture skipped\n");
+                    dumpWanted = false;
+                } else if (dumpWanted) {
+                    bool valid = dumpRoi.x <= 16384 && dumpRoi.y <= 16384 && dumpRoi.width <= 16384 && dumpRoi.height <= 16384 &&
+                        dumpRoi.x <= mips[0].width && dumpRoi.width <= mips[0].width - dumpRoi.x &&
+                        dumpRoi.y <= mips[0].height && dumpRoi.height <= mips[0].height - dumpRoi.y &&
+                        !geometry.thick && geometry.imageDepth == 1 && descriptor.dimension != TextureDimension::k2DMsaa &&
+                        BlockWidth(descriptor.format) == 1 && elementBytes == 4 && TextureDumpRoiFormat(vkFormat) &&
+                        mips[0].pitchBytes >= (static_cast<std::uint64_t>(dumpRoi.x) + dumpRoi.width) * 4 &&
+                        geometry.sliceLinearBytes % 4 == 0 && mips[0].linearOffset % 4 == 0;
+                    for (const auto layer : dumpLayers) valid = valid && layer < arrayLayers && geometry.HasLayer(0, layer);
+                    if (valid) {
+                        const auto relativeEnd = static_cast<std::uint64_t>(dumpRoi.y + dumpRoi.height - 1) * mips[0].pitchBytes +
+                            (static_cast<std::uint64_t>(dumpRoi.x) + dumpRoi.width) * 4;
+                        valid = mips[0].linearOffset <= geometry.sliceLinearBytes &&
+                            mips[0].linearSize <= geometry.sliceLinearBytes - mips[0].linearOffset &&
+                            relativeEnd <= mips[0].linearSize && mips[0].pitchBytes % 4 == 0;
+                        for (const auto layer : dumpLayers) {
+                            const auto sourceEnd = geometry.LinearLayerOffset(layer) + mips[0].linearOffset + relativeEnd;
+                            valid = valid && sourceEnd <= linearBytes;
+                        }
+                    }
+                    const std::uint64_t rowBytes = static_cast<std::uint64_t>(dumpRoi.width) * 4;
+                    const std::uint64_t layerBytes = static_cast<std::uint64_t>(dumpRoi.height) * rowBytes;
+                    const std::uint64_t headerBytes = static_cast<std::uint64_t>(dumpLayers.size()) * 12;
+                    if (dumpLayers.size() > 0 && layerBytes <= (TextureDumpReservation::Limit - headerBytes) / dumpLayers.size()) {
+                        const std::uint64_t totalBytes = layerBytes * dumpLayers.size() + headerBytes;
+                        valid = valid && TextureDumpBudget().Reserve(descriptor.baseAddress, totalBytes);
+                        if (!valid) std::fprintf(stderr, "[texture] ROI dump rejected: invalid geometry, format, layers, or process budget\n");
+                        else roiDumpWanted = true;
+                    } else {
+                        std::fprintf(stderr, "[texture] ROI dump rejected: byte count exceeds process budget\n");
+                        valid = false;
+                    }
+                    if (!valid) dumpWanted = false;
+                }
+            }
+            if (roiOptionsRequested && !roiDumpWanted) dumpWanted = false;
+            std::unique_ptr<Buffer> roiDump;
+            if (roiDumpWanted) {
+                const auto rawBytes = static_cast<std::uint64_t>(dumpRoi.width) * dumpRoi.height * 4 * dumpLayers.size();
+                try {
+                    roiDump = std::make_unique<Buffer>(context, static_cast<std::size_t>(rawBytes), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+                } catch (const std::exception& error) {
+                    roiDumpWanted = false;
+                    dumpWanted = false;
+                    std::fprintf(stderr, "[texture] ROI dump buffer allocation failed; capture skipped: %s\n", error.what());
+                }
+            }
+            if (profile) uploadSetupMs = stageTimer.lap();
+            if (staging == nullptr) {
+                staging = std::make_shared<Buffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+                if (profile) stagingMs = stageTimer.lap();
+                std::memcpy(staging->Bytes().data(), snapshot.data(), snapshot.size());
+                if (profile) memcpyMs = stageTimer.lap();
+            }
             auto tiled = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+            if (profile) tiledMs = stageTimer.lap();
             auto linear = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(linearBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-            if (profile) Profile().allocate += timer.lap();
+            if (profile) linearMs = stageTimer.lap();
+            if (profile) Profile().allocate += timer.lap() + providedStagingMs;
             if (profile) Profile().read += timer.lap();
 
             detiler.BeginBatch();
@@ -498,7 +739,22 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
                 RecordExpandBlit(context, commands, uploadImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image, descriptor, geometry.imageDepth, geometry.imageLayers);
             }
             std::unique_ptr<Buffer> dump;
-            if (dumpWanted) {
+            if (roiDump != nullptr) {
+                const std::uint64_t rowBytes = static_cast<std::uint64_t>(dumpRoi.width) * 4;
+                RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+                std::uint64_t destinationOffset = 0;
+                for (const auto layer : dumpLayers) {
+                    const std::uint64_t sourceLayerOffset = geometry.LinearLayerOffset(layer) + mips[0].linearOffset;
+                    for (std::uint32_t row = 0; row < dumpRoi.height; ++row) {
+                        const std::uint64_t sourceOffset = sourceLayerOffset +
+                            static_cast<std::uint64_t>(dumpRoi.y + row) * mips[0].pitchBytes +
+                            static_cast<std::uint64_t>(dumpRoi.x) * 4;
+                        CopyBuffer(context, commands, linear->Handle(), sourceOffset, roiDump->Handle(), destinationOffset, rowBytes);
+                        destinationOffset += rowBytes;
+                    }
+                }
+                RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+            } else if (dumpWanted) {
                 dump = std::make_unique<Buffer>(context, static_cast<std::size_t>(mips[0].linearSize), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
                 RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
                 CopyBuffer(context, commands, linear->Handle(), mips[0].linearOffset, dump->Handle(), 0, mips[0].linearSize);
@@ -519,6 +775,66 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
             if (batch) batch->SubmitAndWait();
             else ++Profile().recordedUploads;
             if (profile) Profile().gpu += timer.lap();
+            if (profile) gpuRecordMs = stageTimer.lap();
+            if (roiDump) {
+                roiDump->Invalidate();
+                const std::uint32_t header[3] = {dumpRoi.width, dumpRoi.height, static_cast<std::uint32_t>(vkFormat)};
+                const std::uint64_t oneLayerBytes = static_cast<std::uint64_t>(dumpRoi.width) * dumpRoi.height * 4;
+                for (std::size_t i = 0; i < dumpLayers.size(); ++i) {
+                    const auto layer = dumpLayers[i];
+                    char name[160];
+                    std::snprintf(name, sizeof(name), "texture_%llx_0_layer%u_roi%u_%u_%u_%u.raw",
+                        static_cast<unsigned long long>(descriptor.baseAddress), layer, dumpRoi.x, dumpRoi.y, dumpRoi.width, dumpRoi.height);
+                    bool rawCreated = false;
+                    bool written = false;
+                    if (std::FILE* file = std::fopen(name, "wbx")) {
+                        rawCreated = true;
+                        written = std::fwrite(header, sizeof(header), 1, file) == 1 &&
+                            std::fwrite(roiDump->Bytes().data() + i * oneLayerBytes, 1, static_cast<std::size_t>(oneLayerBytes), file) == oneLayerBytes;
+                        written = std::fclose(file) == 0 && written;
+                    }
+                    if (!written) {
+                        if (rawCreated) std::remove(name);
+                        std::fprintf(stderr, "[texture] ROI dump write failed for %s\n", name);
+                        continue;
+                    }
+                    char metadata[768];
+                    std::snprintf(metadata, sizeof(metadata), "%s.json", name);
+                    if (std::FILE* file = std::fopen(metadata, "wbx")) {
+                        std::uint64_t sampledImageHandle = 0, uploadImageHandle = 0;
+                        static_assert(sizeof(image) <= sizeof(sampledImageHandle));
+                        static_assert(sizeof(uploadImage) <= sizeof(uploadImageHandle));
+                        std::memcpy(&sampledImageHandle, &image, sizeof(image));
+                        std::memcpy(&uploadImageHandle, &uploadImage, sizeof(uploadImage));
+                        const auto sampledFormat = srgbExpand ? VK_FORMAT_R8G8B8A8_SRGB : vkFormat;
+                        const int result = std::fprintf(file,
+                            "{\"capture_kind\":\"post_detile_upload_bytes\",\"source_guest_base\":\"0x%llx\","
+                            "\"source_guest_width\":%u,\"source_guest_height\":%u,\"guest_dimension\":%u,"
+                            "\"guest_tile_mode\":%u,\"guest_mip_count\":%u,\"guest_base_array\":%u,"
+                            "\"guest_depth_or_last_array\":%u,\"guest_format\":%u,\"format\":%u,\"sampled_format\":%u,"
+                            "\"sampled_image_handle\":\"0x%llx\",\"upload_image_handle\":\"0x%llx\","
+                            "\"mip\":0,\"layer\":%u,\"roi\":{\"x\":%u,\"y\":%u,\"width\":%u,\"height\":%u},"
+                            "\"bytes\":%llu,\"file_bytes\":%llu,\"rawpath\":\"%s\",\"timing_perturbed\":1}\n",
+                            static_cast<unsigned long long>(descriptor.baseAddress), descriptor.width, descriptor.height,
+                            static_cast<unsigned>(descriptor.dimension), static_cast<unsigned>(descriptor.tileMode),
+                            descriptor.mipCount, descriptor.baseArray, descriptor.depthOrLastArray, descriptor.format,
+                            static_cast<unsigned>(vkFormat), static_cast<unsigned>(sampledFormat),
+                            static_cast<unsigned long long>(sampledImageHandle), static_cast<unsigned long long>(uploadImageHandle),
+                            layer, dumpRoi.x, dumpRoi.y, dumpRoi.width, dumpRoi.height,
+                            static_cast<unsigned long long>(oneLayerBytes), static_cast<unsigned long long>(oneLayerBytes + sizeof(header)), name);
+                        const bool writtenMetadata = result >= 0;
+                        const bool closedMetadata = std::fclose(file) == 0;
+                        if (!writtenMetadata || !closedMetadata) {
+                            std::remove(metadata);
+                            std::remove(name);
+                            std::fprintf(stderr, "[texture] ROI metadata write failed for %s\n", metadata);
+                        }
+                    } else {
+                        std::remove(name);
+                        std::fprintf(stderr, "[texture] ROI metadata open failed for %s\n", metadata);
+                    }
+                }
+            }
             if (dump) {
                 static AgcDriver::Mutex dumpMutex;
                 static std::map<std::uint64_t, int> dumped;
@@ -559,13 +875,33 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
         createFirstLayerView(descriptor, viewInfo);
         prepareBaseLevelView(descriptor, viewInfo);
         prepareSrgbView(descriptor, viewInfo);
+        const auto tailMs = profile ? stageTimer.lap() : 0.0;
         if (profile) {
             auto& totals = Profile();
-            totals.view += timer.lap();
-            if (++totals.count % 200 == 0) std::fprintf(stderr, "[texture] %llu textures (%llu copied from storage images, %llu uploads recorded): allocate+image %.0f ms, guest read %.0f ms, detile+copy %.0f ms, view+buffer release %.0f ms\n", static_cast<unsigned long long>(totals.count), static_cast<unsigned long long>(totals.fromStorage), static_cast<unsigned long long>(totals.recordedUploads), totals.allocate, totals.read, totals.gpu, totals.view);
+            totals.createImage += imageTiming.createImage;
+            totals.requirementsAndType += imageTiming.requirementsAndType;
+            totals.imageMemoryPool += imageTiming.imageMemoryPool;
+            totals.vkAllocateMemory += imageTiming.vkAllocateMemory;
+            totals.bindImage += imageTiming.bindImage;
+            totals.imageCreateCalls += imageTiming.createCalls;
+            totals.imagePoolHits += imageTiming.poolHits;
+            totals.vkAllocateCalls += imageTiming.vkAllocateCalls;
+            totals.tail += tailMs;
+            if (++totals.count % 200 == 0) std::fprintf(stderr, "[texture] %llu textures (%llu copied from storage images, %llu uploads recorded): allocate+image %.0f ms, vkCreateImage %.0f ms/%llu, requirements+type %.0f ms, image pool+allocate %.0f ms (%llu hits), actual vkAllocateMemory %.0f ms/%llu calls, bind %.0f ms, guest read %.0f ms, detile+copy %.0f ms, view+buffer release %.0f ms, constructor tail %.0f ms\n", static_cast<unsigned long long>(totals.count), static_cast<unsigned long long>(totals.fromStorage), static_cast<unsigned long long>(totals.recordedUploads), totals.allocate, totals.createImage, static_cast<unsigned long long>(totals.imageCreateCalls), totals.requirementsAndType, totals.imageMemoryPool, static_cast<unsigned long long>(totals.imagePoolHits), totals.vkAllocateMemory, static_cast<unsigned long long>(totals.vkAllocateCalls), totals.bindImage, totals.read, totals.gpu, totals.view, totals.tail);
         }
         countedBytes = allocationBytes;
         SampledMemoryCounter().fetch_add(countedBytes, std::memory_order_relaxed);
+        if (profile) {
+            const auto totalMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - constructorStart).count();
+            if (totalMs + readTextureSurfaceMs + providedStagingMs > 50) {
+                // Disjoint constructor intervals; image internals are nested within imageMs,
+                // and driver allocation is nested within imagePoolMs.
+                AgcDriver::ProfilePrint_nid_no_patch("[texture-snapshot] address=0x%llx size=%ux%u dim=%d depthOrLastArray=%u mips=%u format=%u tile=%d guestBytes=%llu linearBytes=%llu totalMs=%.3f readTextureSurfaceMs=%.3f providedStagingMs=%.3f ctorMs=%.3f disjointCtorMs{setup=%.3f image=%.3f uploadSetup=%.3f stagingAlloc=%.3f memcpy=%.3f tiledAlloc=%.3f linearAlloc=%.3f detileRecordOrWait=%.3f tailViewRelease=%.3f} imageNestedMs{create=%.3f requirementsType=%.3f imagePool=%.3f driverAllocInPool=%.3f bind=%.3f}\n",
+                    static_cast<unsigned long long>(descriptor.baseAddress), descriptor.width, descriptor.height, static_cast<int>(descriptor.dimension), descriptor.depthOrLastArray, descriptor.mipCount, descriptor.format, static_cast<int>(descriptor.tileMode),
+                    static_cast<unsigned long long>(guestBytes), static_cast<unsigned long long>(linearBytes), totalMs + readTextureSurfaceMs + providedStagingMs, readTextureSurfaceMs, providedStagingMs, totalMs, setupMs, imageMs, uploadSetupMs, stagingMs, memcpyMs, tiledMs, linearMs, gpuRecordMs, tailMs,
+                    imageTiming.createImage, imageTiming.requirementsAndType, imageTiming.imageMemoryPool, imageTiming.vkAllocateMemory, imageTiming.bindImage);
+            }
+        }
     } catch (...) {
         release();
         throw;
@@ -1020,7 +1356,7 @@ bool Texture::CanCopyFrom(const StorageTexture& source, const GuestTextureResour
     return descriptor.baseAddress == from.baseAddress && descriptor.pipeBankXor == from.pipeBankXor && descriptor.width == from.width && descriptor.height == from.height && ArrayLayersServeView(from, descriptor) && descriptor.tileMode == from.tileMode && descriptor.mipCount <= from.mipCount && BytesPerElement(descriptor.format) == BytesPerElement(from.format) && BlockWidth(descriptor.format) == BlockWidth(from.format);
 }
 
-Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& source, const GuestTextureResource& descriptor, VkComponentMapping components) : context(context), storageSource(source) {
+Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& source, const GuestTextureResource& descriptor, VkComponentMapping components) : context(context), storageSource(source), sourceDescriptor(descriptor) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PhaseTimer timer;
     try {
@@ -1064,6 +1400,200 @@ Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& 
         release();
         throw;
     }
+}
+
+void Texture::CaptureSampledStorageRoi(Recorder& recorder, VkCommandBuffer commands, const VkDescriptorImageInfo& info,
+        std::span<const std::uint32_t> words, bool firstLayer, std::uint64_t ordinal,
+        std::uint32_t descriptorSet, std::uint32_t binding, std::size_t element, std::uint64_t shader) const {
+    if (storageSource == nullptr) return;
+    const char* sourceText = std::getenv("APS5_DUMP_TEXTURE_SOURCE");
+    if (sourceText != nullptr && std::strcmp(sourceText, "sampled_storage") != 0) {
+        std::fprintf(stderr, "[texture] sampled GPU ROI rejected: unknown APS5_DUMP_TEXTURE_SOURCE\n");
+        return;
+    }
+    const char* selectorsText = std::getenv("APS5_DUMP_TEXTURE");
+    const char* layersText = std::getenv("APS5_DUMP_TEXTURE_LAYERS");
+    const char* roiText = std::getenv("APS5_DUMP_TEXTURE_ROI");
+    if (selectorsText == nullptr || *selectorsText == '\0' || layersText == nullptr || roiText == nullptr) return;
+    const std::string_view selectors(selectorsText);
+    char address[32], extent[32];
+    std::snprintf(address, sizeof(address), "%llx", static_cast<unsigned long long>(sourceDescriptor.baseAddress));
+    std::snprintf(extent, sizeof(extent), "%ux%u", sourceDescriptor.width, sourceDescriptor.height);
+    if (!TextureDumpSelectorMatchesExact(selectors, address, extent)) return;
+    if (words.size() != 8) {
+        std::fprintf(stderr, "[texture] sampled GPU ROI rejected: guest descriptor words unavailable\n");
+        return;
+    }
+    if (image != VK_NULL_HANDLE || owned != nullptr) {
+        std::fprintf(stderr, "[texture] sampled GPU ROI rejected: sampled texture owns a copy, not the retained storage image\n");
+        return;
+    }
+    if (info.imageView == VK_NULL_HANDLE || info.imageLayout != VK_IMAGE_LAYOUT_GENERAL) {
+        std::fprintf(stderr, "[texture] sampled GPU ROI rejected: descriptor image is null or not in GENERAL layout\n");
+        return;
+    }
+    const bool firstLayerViewSelected = info.imageView == firstLayerView;
+    const bool baseLevelViewSelected = baseLevelView != VK_NULL_HANDLE && info.imageView == baseLevelView;
+    bool srgbViewSelected = false;
+    for (const auto candidate : srgbViews) srgbViewSelected = srgbViewSelected || (candidate != VK_NULL_HANDLE && info.imageView == candidate);
+    const bool descriptorViewMatches = info.imageView == view || firstLayerViewSelected || baseLevelViewSelected || srgbViewSelected;
+    if (!descriptorViewMatches) {
+        std::fprintf(stderr, "[texture] sampled GPU ROI rejected: descriptor view does not match retained storage texture\n");
+        return;
+    }
+    const auto sampledViewFormat = static_cast<unsigned>(srgbViewSelected && srgbInfo ? srgbInfo->format : viewFormat);
+    auto source = storageSource;
+    const auto& guest = sourceDescriptor;
+    if (source->Image() == VK_NULL_HANDLE ||
+            (source->ImageUsage() & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) == 0 ||
+            source->ImageFormat() != VK_FORMAT_R8G8B8A8_UNORM ||
+            BytesPerElement(guest.format) != 4 || BlockWidth(guest.format) != 1 ||
+            guest.dimension == TextureDimension::k3D || guest.dimension == TextureDimension::k2DMsaa) {
+        std::fprintf(stderr, "[texture] sampled GPU ROI rejected: unsupported retained storage image route\n");
+        return;
+    }
+    TextureDumpRoi roi{};
+    std::vector<std::uint32_t> layers;
+    if (!ParseTextureDumpLayers(layersText, layers) || !ParseTextureDumpRoi(roiText, roi)) {
+        std::fprintf(stderr, "[texture] sampled GPU ROI rejected: invalid ROI or layer selector\n");
+        return;
+    }
+    const auto& storage = source->Descriptor();
+    const auto mip = guest.baseLevel;
+    if (mip >= guest.mipCount || mip >= storage.mipCount || mip >= 32) {
+        std::fprintf(stderr, "[texture] sampled GPU ROI rejected: mip outside retained image\n");
+        return;
+    }
+    const auto width = std::max(storage.width >> mip, 1u);
+    const auto height = std::max(storage.height >> mip, 1u);
+    const auto imageLayerCount = std::min(source->ImageLayers(), DescribeSurface(guest).imageLayers);
+    if (guest.baseArray >= imageLayerCount) {
+        std::fprintf(stderr, "[texture] sampled GPU ROI rejected: base layer outside retained image\n");
+        return;
+    }
+    const auto viewLayerCount = imageLayerCount - guest.baseArray;
+    if (roi.x > width || roi.width > width - roi.x ||
+            roi.y > height || roi.height > height - roi.y || (firstLayer && (layers.size() > 1 || layers.front() != 0))) {
+        std::fprintf(stderr, "[texture] sampled GPU ROI rejected: ROI, mip, or selected view range is invalid\n");
+        return;
+    }
+    for (const auto layer : layers) {
+        if (layer >= viewLayerCount || guest.baseArray + layer >= source->ImageLayers()) {
+            std::fprintf(stderr, "[texture] sampled GPU ROI rejected: layer outside retained sampled view\n");
+            return;
+        }
+    }
+    const std::uint64_t oneLayerBytes = static_cast<std::uint64_t>(roi.width) * roi.height * 4;
+    const std::uint64_t headerBytes = static_cast<std::uint64_t>(layers.size()) * 12;
+    if (oneLayerBytes > (TextureDumpReservation::Limit - headerBytes) / layers.size()) {
+        std::fprintf(stderr, "[texture] sampled GPU ROI rejected: byte count exceeds process budget\n");
+        return;
+    }
+    const auto totalBytes = oneLayerBytes * layers.size() + headerBytes;
+    if (!TextureDumpBudget().Reserve(guest.baseAddress, totalBytes)) {
+        std::fprintf(stderr, "[texture] sampled GPU ROI rejected: duplicate base reservation or shared process budget\n");
+        return;
+    }
+    std::shared_ptr<Buffer> readback;
+    try {
+        readback = std::make_shared<Buffer>(context, static_cast<std::size_t>(oneLayerBytes * layers.size()), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "[texture] sampled GPU ROI readback allocation failed: %s\n", error.what());
+        return;
+    }
+    VkImageMemoryBarrier imageBarrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    imageBarrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    imageBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    imageBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    imageBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    imageBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    imageBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    imageBarrier.image = source->Image();
+    imageBarrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 1, guest.baseArray, viewLayerCount};
+    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands,
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &imageBarrier);
+    for (std::size_t i = 0; i < layers.size(); ++i) {
+        VkBufferImageCopy copy{};
+        copy.bufferOffset = i * oneLayerBytes;
+        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip, guest.baseArray + layers[i], 1};
+        copy.imageOffset = {static_cast<std::int32_t>(roi.x), static_cast<std::int32_t>(roi.y), 0};
+        copy.imageExtent = {roi.width, roi.height, 1};
+        context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, source->Image(), VK_IMAGE_LAYOUT_GENERAL, readback->Handle(), 1, &copy);
+    }
+    imageBarrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    imageBarrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &imageBarrier);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+    recorder.Keep(readback, static_cast<std::size_t>(oneLayerBytes * layers.size()));
+    recorder.Keep(source);
+    const auto serial = static_cast<unsigned long long>(recorder.Submissions() + 1);
+    const auto imageHandle = reinterpret_cast<std::uintptr_t>(source->Image());
+    const auto viewHandle = reinterpret_cast<std::uintptr_t>(info.imageView);
+    const auto sourceFormat = static_cast<unsigned>(source->ImageFormat());
+    const auto guestCopy = guest;
+    recorder.OnComplete([readback, source, guestCopy, layers = std::move(layers), roi, oneLayerBytes, ordinal,
+                         serial, imageHandle, viewHandle, sourceFormat, sampledViewFormat, firstLayerViewSelected,
+                         baseLevelViewSelected, srgbViewSelected, descriptorSet, binding, element, shader,
+                         words = std::vector<std::uint32_t>(words.begin(), words.end()), mip, selectorsPerturbed = true] {
+        readback->Invalidate();
+        if (source->Image() == VK_NULL_HANDLE) return;
+        const auto bytes = readback->Bytes();
+        for (std::size_t i = 0; i < layers.size(); ++i) {
+            const auto layer = guestCopy.baseArray + layers[i];
+            char name[192];
+            std::snprintf(name, sizeof(name), "sampled_gpu_%llx_%llu_%llu_s%u_b%u_e%zu_sh%llx_layer%u_roi%u_%u_%u_%u.raw",
+                static_cast<unsigned long long>(guestCopy.baseAddress), static_cast<unsigned long long>(ordinal), serial,
+                descriptorSet, binding, element, static_cast<unsigned long long>(shader),
+                layer, roi.x, roi.y, roi.width, roi.height);
+            bool rawCreated = false, written = false;
+            if (std::FILE* file = std::fopen(name, "wbx")) {
+                rawCreated = true;
+                const std::uint32_t header[3] = {roi.width, roi.height, sourceFormat};
+                written = std::fwrite(header, sizeof(header), 1, file) == 1 &&
+                    std::fwrite(bytes.data() + i * oneLayerBytes, 1, static_cast<std::size_t>(oneLayerBytes), file) == oneLayerBytes;
+                written = std::fclose(file) == 0 && written;
+            }
+            if (!written) {
+                if (rawCreated) std::remove(name);
+                std::fprintf(stderr, "[texture] sampled GPU ROI write failed for %s\n", name);
+                continue;
+            }
+            char metadata[768];
+            std::snprintf(metadata, sizeof(metadata), "%s.json", name);
+            if (std::FILE* file = std::fopen(metadata, "wbx")) {
+                const int result = std::fprintf(file,
+                    "{\"capture_kind\":\"gpu_sampled_storage_image\",\"source_guest_base\":\"0x%llx\","
+                    "\"source_guest_width\":%u,\"source_guest_height\":%u,\"guest_format\":%u,"
+                    "\"guest_dimension\":%u,\"guest_tile_mode\":%u,\"guest_mip_count\":%u,\"guest_depth_or_last_array\":%u,"
+                    "\"source_image\":\"0x%llx\",\"source_view\":\"0x%llx\",\"source_layout\":%u,"
+                    "\"source_format\":%u,\"sampled_view_format\":%u,\"first_layer_view\":%u,\"base_level_view\":%u,\"srgb_view\":%u,"
+                    "\"descriptor_set\":%u,\"binding\":%u,\"element\":%zu,\"shader\":\"0x%llx\",\"draw_ordinal\":%llu,"
+                    "\"base_layer\":%u,\"mip\":%u,\"layer\":%u,\"descriptor_words\":[",
+                    static_cast<unsigned long long>(guestCopy.baseAddress), guestCopy.width, guestCopy.height, guestCopy.format,
+                    static_cast<unsigned>(guestCopy.dimension), static_cast<unsigned>(guestCopy.tileMode), guestCopy.mipCount, guestCopy.depthOrLastArray,
+                    static_cast<unsigned long long>(imageHandle), static_cast<unsigned long long>(viewHandle),
+                    static_cast<unsigned>(VK_IMAGE_LAYOUT_GENERAL), sourceFormat, sampledViewFormat,
+                    static_cast<unsigned>(firstLayerViewSelected), static_cast<unsigned>(baseLevelViewSelected), static_cast<unsigned>(srgbViewSelected),
+                    descriptorSet, binding, element, static_cast<unsigned long long>(shader), static_cast<unsigned long long>(ordinal),
+                    guestCopy.baseArray, mip, layer);
+                bool ok = result >= 0;
+                for (std::size_t word = 0; word < words.size() && ok; ++word)
+                    ok = std::fprintf(file, "%s%u", word == 0 ? "" : ",", words[word]) >= 0;
+                if (ok) ok = std::fprintf(file,
+                    "],\"roi\":{\"x\":%u,\"y\":%u,\"width\":%u,\"height\":%u},\"bytes\":%llu,"
+                    "\"file_bytes\":%llu,\"rawpath\":\"%s\",\"timing_perturbed\":%u}\n",
+                    roi.x, roi.y, roi.width, roi.height, static_cast<unsigned long long>(oneLayerBytes),
+                    static_cast<unsigned long long>(oneLayerBytes + 12), name, selectorsPerturbed ? 1u : 0u) >= 0;
+                ok = std::fclose(file) == 0 && ok;
+                if (!ok) { std::remove(metadata); std::remove(name); }
+            } else {
+                std::remove(name);
+                std::fprintf(stderr, "[texture] sampled GPU ROI metadata open failed for %s\n", metadata);
+            }
+        }
+    });
 }
 
 Texture::Texture(const Context& context, VkImage depthImage, VkFormat depthFormat, VkImageAspectFlags aspect, VkComponentMapping components, VkImageViewType viewType, std::uint32_t baseLayer, std::shared_ptr<OwnedImage> owner, VkImageUsageFlags usage) : context(context), owned(std::move(owner)) {
@@ -1453,10 +1983,9 @@ StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, 
         context.Function<PFN_vkGetImageMemoryRequirements>("vkGetImageMemoryRequirements")(context.device, image, &requirements);
         VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         allocation.allocationSize = requirements.size;
-        memoryBytes = requirements.size;
-        allocation.memoryTypeIndex = context.DeviceMemoryType(requirements.memoryTypeBits, requirements.size, "storage texture");
-        memory = AllocateImageMemory(context, allocation, requirements.memoryTypeBits, "vkAllocateMemory storage texture", &memoryType, true);
+        memory = AllocateImageMemory(context, allocation, requirements.memoryTypeBits, "vkAllocateMemory storage texture", &memoryType, true, nullptr, &memoryBytes);
         Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, memory, 0), "vkBindImageMemory storage");
+        imageUsage = imageInfo.usage;
     } catch (...) {
         release();
         throw;
@@ -5807,14 +6336,22 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     DeviceBuffer tiled(context, original.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     Buffer host(context, original.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     if (profile) Profile().storageAlloc += timer.lap();
-    // Start from the uploaded bytes so padding and untouched texels keep their guest values.
-    std::memcpy(host.Bytes().data(), original.data(), original.size());
+    // Only the kept ranges are read back and stored below, so only they travel: start them from the
+    // uploaded bytes so padding and untouched texels keep their guest values. The rest of `tiled`
+    // is retiler output nobody reads (the retile writes tiled bytes from linear texels only).
+    std::vector<VkBufferCopy> keptRegions;
+    keptRegions.reserve(keep.size());
+    for (const auto& [from, to] : keep) {
+        const auto offset = from - descriptor.baseAddress;
+        keptRegions.push_back({offset, offset, to - from});
+        std::memcpy(host.Bytes().data() + offset, original.data() + offset, static_cast<std::size_t>(to - from));
+    }
     if (profile) Profile().storageHostCopy += timer.lap();
     detiler.BeginBatch();
     CommandBatch batch(context);
     const auto commands = batch.Handle();
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-    CopyBuffer(context, commands, host.Handle(), 0, tiled.Handle(), 0, original.size());
+    context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, host.Handle(), tiled.Handle(), static_cast<std::uint32_t>(keptRegions.size()), keptRegions.data());
     VkImageMemoryBarrier toSource{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     toSource.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     toSource.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
@@ -5853,7 +6390,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     backToGeneral.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     backToGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
     context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 1, &toCopy, 1, &backToGeneral);
-    CopyBuffer(context, commands, tiled.Handle(), 0, host.Handle(), 0, original.size());
+    context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, tiled.Handle(), host.Handle(), static_cast<std::uint32_t>(keptRegions.size()), keptRegions.data());
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
     APS5_LOG_CHARS_OUT("StorageTexture writeback submit");
     batch.SubmitAndWait();

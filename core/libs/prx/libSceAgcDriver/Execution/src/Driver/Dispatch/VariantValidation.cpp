@@ -22,10 +22,11 @@ void Driver::appendEntryRegions(const DispatchVariant& variant, std::vector<Shad
 
 std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::patchDataWords(const DispatchVariant& variant, const std::vector<std::uint32_t>& words) {
     auto patched = std::make_shared<ShaderRecompiler::RecompileResult>(*variant.compiled);
-    auto& descriptor = patched->bindings[variant.flatBinding].guestDescriptor;
+    auto descriptor = patched->bindings[variant.flatBinding].guestDescriptor.Copy();
     for (std::size_t k = 0; k < variant.dataPositions.size(); ++k) {
         if (variant.dataSlots[k] < descriptor.size()) descriptor[variant.dataSlots[k]] = words[variant.dataPositions[k]];
     }
+    patched->bindings[variant.flatBinding].guestDescriptor = ShaderRecompiler::SharedValues<std::uint32_t>(std::move(descriptor));
     return patched;
 }
 

@@ -21,6 +21,8 @@
 
 namespace AgcDriver::DriverDetail {
 
+struct SelectedRequestBacking;
+
 inline constexpr std::size_t MaxDispatchVariants = 8;
 
 struct DispatchVariant {
@@ -52,6 +54,7 @@ struct DispatchVariant {
     std::vector<ShaderRecompiler::MemoryRegion> captured;
     std::vector<std::pair<std::uint64_t, std::size_t>> spans;
     std::atomic<std::uint64_t> generation{0};
+    std::shared_ptr<const SelectedRequestBacking> selectedRequest;
 };
 
 struct DispatchEntry {

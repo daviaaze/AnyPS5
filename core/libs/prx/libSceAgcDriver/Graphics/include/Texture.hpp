@@ -27,7 +27,9 @@ class Buffer;
 class ResidentColor;
 class CommandBatch;
 class StorageTexture;
+class Recorder;
 struct HostImport;
+struct ImageMemoryTiming;
 
 // The Vulkan format storage images of a guest format use (sRGB formats store as their UNORM form).
 // Throws when the format has no storage form; the query is cached per format (a lookup cost a
@@ -44,11 +46,11 @@ bool ClearColorForTexel(VkFormat format, std::uint32_t elementBytes, std::span<c
 // A sampled texture's own VkImage with its memory, shared with the recorder while a recorded upload
 // still writes it (see the snapshot constructor), so the texture may go before the batch completes.
 struct OwnedImage {
-    OwnedImage(const Context& context, VkImage image, VkDeviceMemory memory) : context(context), image(image), memory(memory) {}
+    OwnedImage(const Context& context, VkImage image, VkDeviceMemory memory, VkDeviceSize memoryBytes = 0, std::uint32_t memoryType = 0) : context(context), image(image), memory(memory), memoryBytes(memoryBytes), memoryType(memoryType) {}
     OwnedImage(const OwnedImage&) = delete;
     OwnedImage& operator=(const OwnedImage&) = delete;
     ~OwnedImage();
-    void Allocate(const Context& device, const VkMemoryAllocateInfo& allocation, std::uint32_t mask, const char* operation, bool newImage = false);
+    void Allocate(const Context& device, const VkMemoryAllocateInfo& allocation, std::uint32_t mask, const char* operation, bool newImage = false, ImageMemoryTiming* timing = nullptr);
     Context context;
     VkImage image;
     VkDeviceMemory memory;
@@ -58,7 +60,8 @@ struct OwnedImage {
 
 class Texture {
 public:
-    Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare = false);
+    Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare = false, double readTextureSurfaceMs = 0.0);
+    Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::shared_ptr<Buffer> staging, bool depthCompare = false, double readTextureSurfaceMs = 0.0, double providedStagingMs = 0.0);
     Texture(const Context& context, const std::shared_ptr<ResidentColor>& source, const GuestTextureResource& descriptor, VkComponentMapping components);
     // A view of a storage image's own VkImage: the sampled texture follows the image's content, so a
     // compute pass writing it and the next pass sampling it share one image and copy nothing.
@@ -90,6 +93,8 @@ public:
     Texture(const Texture&) = delete;
     Texture& operator=(const Texture&) = delete;
 
+    // Snapshot/copy image only; null for a view borrowing a resident/storage image.
+    VkImage OwnedImageHandle() const { return image; }
     VkImageView View() const;
     VkImageView FirstLayerView() const { return firstLayerView; }
     VkImageView BaseLevelView() const;
@@ -109,6 +114,9 @@ public:
     bool ViewsStorageImage() const { return storageSource != nullptr; }
     const StorageTexture* StorageSource() const { return storageSource.get(); }
     const std::shared_ptr<StorageTexture>& SharedStorageSource() const { return storageSource; }
+    void CaptureSampledStorageRoi(Recorder& recorder, VkCommandBuffer commands, const VkDescriptorImageInfo& info,
+        std::span<const std::uint32_t> words, bool firstLayer, std::uint64_t ordinal,
+        std::uint32_t descriptorSet, std::uint32_t binding, std::size_t element, std::uint64_t shader) const;
     // The last key scan of the sampled surface (ProvedClearKeys), for surfaces whose keys are not
     // the source image's own (snapshots, views over other metadata); one per cache entry, so every
     // object binding the texture shares it. Under GuestMemory::GpuMutex only.
@@ -121,6 +129,7 @@ public:
     void MarkReleased() { released.store(true, std::memory_order_release); }
 
 private:
+    Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, std::shared_ptr<Buffer> staging, bool depthCompare, double readTextureSurfaceMs, double providedStagingMs);
     void release() noexcept;
     bool refreshBlockCopy();
     bool refreshSrgbExpand();
@@ -349,6 +358,8 @@ public:
     bool CopyFrom(StorageTexture& source, const char*& refusal);
     static const char* CopyRefusal(const Context& context, const StorageTexture* destination, const StorageTexture& source, std::uint64_t address);
     VkImage Image() const { return image; }
+    VkFormat ImageFormat() const { return storageFormat; }
+    VkImageUsageFlags ImageUsage() const { return imageUsage; }
     const GuestTextureResource& Descriptor() const { return descriptor; }
     std::uint32_t ImageLayers() const { return geometry.imageLayers; }
     std::uint32_t ImageDepth() const { return geometry.imageDepth; }
@@ -621,6 +632,7 @@ private:
     // write here bumps the pending serial although the image was pending already.
     bool lent = false;
     VkImage image = VK_NULL_HANDLE;
+    VkImageUsageFlags imageUsage = 0;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkDeviceSize memoryBytes = 0;
     std::uint32_t memoryType = 0;

@@ -62,13 +62,14 @@ using SrtMemoryStamper = SrtWriteStamp (*)(void* userData, std::uint64_t address
 using SrtMemoryUnchanged = bool (*)(void* userData, std::uint64_t address, std::uint64_t bytes, const SrtWriteStamp& stamp);
 using SrtMemorySupplier = bool (*)(void* userData, const std::shared_ptr<const SrtGuestWords>& words);
 
-// The guest addresses a walk dereferenced (Detail::Evaluator::EvaluateRawRead): the leaf read of
-// each pure flat slot (IrResourcePlan::pureFlatSlots) as (flat offset, address), set by the
-// flattened loop through `leaf`/`leafSlot` around that slot's evaluation, and every other raw read
-// address.
+// The guest addresses a walk dereferenced (Detail::Evaluator::EvaluateRawRead): each
+// flattened leaf as (flat offset, address), and every structural raw read address.
+// Transfer-footprint leaves belong to both sets: materialization needs their values,
+// but changing them must invalidate data-only cache reuse.
 struct SrtReadTrace {
     const IrValue* leaf = nullptr;
     std::uint32_t leafSlot = 0;
+    bool leafStructural = false;
     std::vector<std::pair<std::uint32_t, std::uint64_t>> leaves;
     std::vector<std::uint64_t> otherReads;
 };

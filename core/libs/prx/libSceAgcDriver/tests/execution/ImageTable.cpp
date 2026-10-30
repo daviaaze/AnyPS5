@@ -391,10 +391,12 @@ struct Outcome {
     bool cacheable = false;
     std::vector<std::array<std::uint32_t, 4>> samplers;
     std::vector<std::array<std::uint32_t, 4>> samplerTable;
-    std::vector<std::vector<std::pair<std::uint64_t, std::uint64_t>>> imageTableReadRanges;
+    std::vector<ShaderRecompiler::SharedValues<std::pair<std::uint64_t, std::uint64_t>>> imageTableReadRanges;
+    std::shared_ptr<const void> sourceOwner;
+    std::shared_ptr<const void> preparedPlanOwner;
 };
 
-std::vector<std::array<std::uint32_t, 4>> SamplerWords(const std::vector<std::uint32_t>& words) {
+std::vector<std::array<std::uint32_t, 4>> SamplerWords(std::span<const std::uint32_t> words) {
     std::vector<std::array<std::uint32_t, 4>> result;
     for (std::size_t first = 0; first + 4u <= words.size(); first += 4u) result.push_back({words[first], words[first + 1u], words[first + 2u], words[first + 3u]});
     return result;
@@ -413,6 +415,8 @@ Outcome Execute(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> 
     };
     const auto result = ShaderRecompiler::Recompile(request);
     Outcome outcome;
+    outcome.sourceOwner = result.sourceOwner;
+    outcome.preparedPlanOwner = result.preparedPlanOwner;
     outcome.variantId = result.PipelineVariantId();
     outcome.artifactId = result.variantId;
     outcome.imageTableFaults = result.imageTableFaults;
@@ -421,8 +425,8 @@ Outcome Execute(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> 
     outcome.imageTableReadRanges = result.imageTableReadRanges;
     for (const auto& binding : result.bindings) {
         if (binding.role == ShaderRecompiler::DescriptorRole::ImageTable || binding.role == ShaderRecompiler::DescriptorRole::ImageStorageTable) outcome.imageTableCount = binding.count;
-        if (binding.role == ShaderRecompiler::DescriptorRole::GuestSamplers) outcome.samplers = SamplerWords(binding.guestDescriptor);
-        if (binding.role == ShaderRecompiler::DescriptorRole::SamplerTable) outcome.samplerTable = SamplerWords(binding.guestDescriptor);
+        if (binding.role == ShaderRecompiler::DescriptorRole::GuestSamplers) outcome.samplers = SamplerWords(binding.guestDescriptor.Span());
+        if (binding.role == ShaderRecompiler::DescriptorRole::SamplerTable) outcome.samplerTable = SamplerWords(binding.guestDescriptor.Span());
     }
     StderrCapture capture;
     try {
@@ -812,7 +816,7 @@ void RunTests(AgcDriver::VulkanDevice& device) {
 
     Keys[0] = 0x05555556u;
     const auto wrapped = Run(device, TableCode, 1, Lanes, 64);
-    Require(Faulted(wrapped) && wrapped.log.find("outside the snapshot") != std::string::npos, "image table: a mid-record key did not fault as outside the snapshot:\n" + wrapped.log);
+    Require(Faulted(wrapped) && Zeros(wrapped), "image table: a mid-record key did not fault and sample zeros:\n" + wrapped.log);
 
     Keys = {};
     const auto unused = Run(device, TableCode, 1, Lanes, 64);
@@ -1241,10 +1245,10 @@ void RunPointerTests(AgcDriver::VulkanDevice& device) {
     Require(!Faulted(unbounded) && Group(unbounded, 0) == Group(palette, 2) && Group(unbounded, 1) == Group(palette, 0), "pointer image table: an unmasked key, or one whose offset wraps to entry 0, sampled the wrong entry:\n" + unbounded.log);
     Keys[0] = 300;
     const auto past = RunPointer(device, UnboundedPointerCode, 1);
-    Require(Faulted(past) && past.log.find("unmapped") != std::string::npos, "pointer image table: an entry past the captured palette did not fault as unmapped:\n" + past.log);
+    Require(Faulted(past) && Zeros(past), "pointer image table: an entry past the captured palette did not fault and sample zeros:\n" + past.log);
     Keys[0] = 0x10000u;
     const auto capped = RunPointer(device, UnboundedPointerCode, 1);
-    Require(Faulted(capped) && capped.log.find("outside the snapshot") != std::string::npos, "pointer image table: a key past the key cap did not fault as outside the snapshot:\n" + capped.log);
+    Require(Faulted(capped) && Zeros(capped), "pointer image table: a key past the key cap did not fault and sample zeros:\n" + capped.log);
 
     const std::array<std::uint32_t, 5> readKeys{0u, 1u, 2u, 3u, 0x1ffu};
     Keys = {};
@@ -1455,7 +1459,15 @@ alignas(256) std::array<std::uint32_t, 4> PixelResults{};
 alignas(256) std::array<std::uint32_t, 4 * 4> GraphicsTable{};
 constexpr std::array<std::array<float, 4>, 3> Triangle{{{-1.0f, -1.0f, 0.5f, 1.0f}, {3.0f, -1.0f, 0.5f, 1.0f}, {-1.0f, 3.0f, 0.5f, 1.0f}}};
 
-std::pair<std::uint64_t, std::uint64_t> DrawTables(AgcDriver::VulkanDevice& device, std::uint32_t vertexKey, std::uint32_t pixelKey) {
+struct GraphicsOutcome {
+    std::pair<std::uint64_t, std::uint64_t> pipeline;
+    std::shared_ptr<const void> vertexSourceOwner;
+    std::shared_ptr<const void> vertexPlanOwner;
+    std::shared_ptr<const void> pixelSourceOwner;
+    std::shared_ptr<const void> pixelPlanOwner;
+};
+
+GraphicsOutcome DrawTables(AgcDriver::VulkanDevice& device, std::uint32_t vertexKey, std::uint32_t pixelKey) {
     const auto target = device.Target();
     Pixels.fill(std::byte{0});
     VertexResults.fill(0xdeadbeefu);
@@ -1520,7 +1532,9 @@ std::pair<std::uint64_t, std::uint64_t> DrawTables(AgcDriver::VulkanDevice& devi
     const AgcDriver::Pm4::DrawParameters draw{0, static_cast<std::uint32_t>(Triangle.size()), 0, 1, 0, false};
     device.Draw(state, draw, shaders);
     device.WaitIdle();
-    return {vertexResult.PipelineVariantId(), pixelResult.PipelineVariantId()};
+    return {{vertexResult.PipelineVariantId(), pixelResult.PipelineVariantId()},
+        vertexResult.sourceOwner, vertexResult.preparedPlanOwner,
+        pixelResult.sourceOwner, pixelResult.preparedPlanOwner};
 }
 
 void RunGraphicsTests(AgcDriver::VulkanDevice& device) {
@@ -1537,7 +1551,7 @@ void RunGraphicsTests(AgcDriver::VulkanDevice& device) {
     const auto second = DrawTables(device, 2u, 0u);
     for (std::uint32_t vertex = 0; vertex < 3u; ++vertex) Require(VertexResults[vertex * 4u] == static_cast<std::uint32_t>(SintTexels[0]), "image table graphics: the vertex stage read the wrong entry after the keys changed");
     Require(PixelResults[0] == std::bit_cast<std::uint32_t>(FloatTexels[0]), "image table graphics: the pixel stage read the wrong entry after the keys changed");
-    Require(first == second, "image table graphics: other table keys built another pipeline");
+    Require(first.pipeline == second.pipeline, "image table graphics: other table keys built another pipeline");
 }
 
 }

@@ -140,7 +140,8 @@ void VerifySpirv() {
         for (const bool preserve : {false, true}) {
             target.float16DenormPreserve = preserve;
             const std::string flag = std::string(" with float16DenormPreserve=") + (preserve ? "true" : "false");
-            const auto decode = ScanF16Decode(ShaderRecompiler::Recompile(Request(program.code, target, userData, memory)).spirv.Words());
+            const auto result = ShaderRecompiler::Recompile(Request(program.code, target, userData, memory));
+            const auto decode = ScanF16Decode(result.spirv.Words());
             const std::string name = std::string("f16 to f32 unpack: ") + program.name;
             Require(decode.denormPreserve16 == preserve, name + (preserve ? " lacks" : " has") + " DenormPreserve 16" + flag);
             Require(preserve ? decode.unpacks != 0u : decode.unpacks == 0u, name + " has " + std::to_string(decode.unpacks) + " UnpackHalf2x16" + flag);

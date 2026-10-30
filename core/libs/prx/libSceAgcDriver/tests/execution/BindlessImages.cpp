@@ -33,6 +33,7 @@ void Run(AgcDriver::VulkanDevice& device) {
     textures[1].fill(0x40400000u);
     const auto threads = std::min(32u, device.Target().subgroupSize);
     CompiledShaderArtifact artifact;
+    std::shared_ptr<const void> sourceOwner;
     for (std::uint32_t iteration = 0u; iteration < guest.size(); ++iteration) {
         auto& data = guest[iteration];
         const auto table = Buffer(data.heap.data(), 32u, 4u);
@@ -58,13 +59,17 @@ void Run(AgcDriver::VulkanDevice& device) {
         const ShaderComputeStageInfo compute{{threads, 1u, 1u}, 0u, {false, false, false}, false, 1u};
         RecompileRequest request{{ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), code, 0u, {}}, {32u, 0u, userData, compute, std::nullopt, std::nullopt, regions}, device.Target(), {0u, 0u, 0u, 128u}};
         const auto shader = Recompile(request);
-        if (artifact.variantId == 0u) artifact = shader;
-        else Require(shader.cacheHit && shader.variantId == artifact.variantId, "bindless table changed the compiled artifact");
+        if (artifact.variantId == 0u) {
+            artifact = shader;
+            sourceOwner = shader.sourceOwner;
+        } else Require(shader.cacheHit && shader.variantId == artifact.variantId, "bindless table changed the compiled artifact");
         if (iteration == 1u) {
             auto invalid = shader;
             auto binding = std::ranges::find_if(invalid.bindings, [](const DescriptorBinding& value) { return value.role == DescriptorRole::ImageTableMap; });
             Require(binding != invalid.bindings.end(), "bindless shader has no image table map");
-            binding->guestDescriptor.at(ImageTableAbi::HeaderElementCount) += 1u;
+            auto mapWords = binding->guestDescriptor.Copy();
+            mapWords[ImageTableAbi::HeaderElementCount] += 1u;
+            binding->guestDescriptor = SharedValues<std::uint32_t>(std::move(mapWords));
             bool rejected = false;
             try {
                 device.Dispatch(invalid, 1u, 1u, 1u);

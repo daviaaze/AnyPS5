@@ -14,6 +14,7 @@
 #include "ShaderCacheDirectory.hpp"
 #include "../NarrowConstantStoreFixture.hpp"
 #include "Recompiler.hpp"
+#include "ShaderDiskCache.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "VulkanTestDevice.hpp"
 #ifdef _WIN32
@@ -37,8 +38,43 @@
 #include <random>
 #include <span>
 #include <string>
+#include <limits>
 #include <vector>
 
+
+struct TestJournalRecordHeader {
+    std::uint32_t kind;
+    std::uint32_t reserved;
+    std::uint64_t payloadBytes;
+    std::uint64_t payloadHash;
+};
+static_assert(sizeof(TestJournalRecordHeader) == 24);
+
+enum class JournalDamage { OversizedDecodedSize, TruncatedFrame, CorruptIdentity };
+
+std::vector<std::byte> DamagedJournal(std::span<const std::byte> original, JournalDamage damage) {
+    auto bytes = std::vector<std::byte>(original.begin(), original.end());
+    constexpr std::size_t headerBytes = 32;
+    AgcDriver::Graphics::Require(bytes.size() >= headerBytes + sizeof(TestJournalRecordHeader), "the journal has no record to damage");
+    TestJournalRecordHeader record{};
+    std::memcpy(&record, bytes.data() + headerBytes, sizeof(record));
+    AgcDriver::Graphics::Require(record.kind == 1 && record.payloadBytes >= 25, "the journal does not start with a compressed module record");
+    const auto payloadOffset = headerBytes + sizeof(record);
+    AgcDriver::Graphics::Require(record.payloadBytes <= bytes.size() - payloadOffset, "the journal module payload is truncated");
+    auto payload = std::span<std::byte>(bytes).subspan(payloadOffset, static_cast<std::size_t>(record.payloadBytes));
+    if (damage == JournalDamage::OversizedDecodedSize) {
+        const std::uint32_t forged = std::numeric_limits<std::uint32_t>::max();
+        std::memcpy(payload.data() + 20, &forged, sizeof(forged));
+    } else if (damage == JournalDamage::TruncatedFrame) {
+        --record.payloadBytes;
+        payload = payload.first(static_cast<std::size_t>(record.payloadBytes));
+    } else {
+        payload[0] ^= std::byte{1};
+    }
+    record.payloadHash = ShaderRecompiler::HashBytes(payload);
+    std::memcpy(bytes.data() + headerBytes, &record, sizeof(record));
+    return bytes;
+}
 namespace {
 
 using AgcDriver::Graphics::ColorTargetLayout;
@@ -283,6 +319,34 @@ Totals Snapshot() {
     return {AgcDriver::Graphics::PipelineJournalTotals(), AgcDriver::Graphics::PipelineStoreTotals()};
 }
 
+void JournalDamageTests() {
+    const auto path = AgcDriver::Graphics::PipelineJournalPath();
+    std::ifstream input(path, std::ios::binary);
+    Require(static_cast<bool>(input), "the journal could not be opened for corruption tests");
+    std::vector<char> raw((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    std::vector<std::byte> original(raw.size());
+    std::memcpy(original.data(), raw.data(), raw.size());
+    for (const auto damage : {JournalDamage::OversizedDecodedSize, JournalDamage::TruncatedFrame, JournalDamage::CorruptIdentity}) {
+        const auto bytes = DamagedJournal(original, damage);
+        {
+            std::ofstream output(path, std::ios::binary | std::ios::trunc);
+            Require(static_cast<bool>(output), "the journal could not be opened for a corruption case");
+            output.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+            Require(static_cast<bool>(output), "the damaged journal could not be written");
+        }
+        const auto device = OpenVulkanTestDevice();
+        Require(device != nullptr, "the corruption test could not open a Vulkan device");
+        device->WaitForPipelineJournalReplay();
+        Require(Snapshot().journal.droppedRecords != 0, "a malformed compressed module was not rejected");
+    }
+    {
+        std::ofstream output(path, std::ios::binary | std::ios::trunc);
+        Require(static_cast<bool>(output), "the original journal could not be restored");
+        output.write(reinterpret_cast<const char*>(original.data()), static_cast<std::streamsize>(original.size()));
+        Require(static_cast<bool>(output), "the original journal could not be restored");
+    }
+}
+
 void JournalTests() {
     using namespace NarrowConstantStoreFixture;
     Require(AgcDriver::Graphics::PipelineJournalEnabled(), "the pipeline journal is disabled although the shader cache directory is set");
@@ -362,6 +426,13 @@ void HeldModuleTests() {
         for (std::size_t index = 0; index < results.size(); ++index) device->Dispatch(results[index], 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(codes[index].data()));
         device->WaitIdle();
         AgcDriver::Graphics::FlushPipelineJournal();
+        std::uint64_t encodedBytes = 0;
+        for (const auto& result : results) {
+            std::vector<std::byte> encoded;
+            ShaderRecompiler::ShaderDiskCache::EncodeResult(result, encoded);
+            encodedBytes += encoded.size();
+        }
+        Require(std::filesystem::file_size(AgcDriver::Graphics::PipelineJournalPath()) < encodedBytes, "the journal did not compress its held modules");
     }
     SetEnvironment("APS5_PIPELINE_JOURNAL_THREADS", "1");
     const auto before = Snapshot();
@@ -676,7 +747,9 @@ void OversizedRecordKeepsTheJournal() {
         device->WaitForPipelineJournalReplay();
         const auto code = ComputeCode(2);
         auto result = CompileCompute(*device, code, words, 32);
-        result.shaderDataUserWords.assign(400000u, 0u);
+        result.shaderDataUserWords.resize(400000u);
+        std::mt19937 noise(0x9e3779b9u);
+        for (auto& word : result.shaderDataUserWords) word = noise();
         AgcDriver::Graphics::RecordComputePipeline(result, false);
         AgcDriver::Graphics::FlushPipelineJournal();
     }
@@ -721,6 +794,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         JournalTests();
+        JournalDamageTests();
         NewestEntriesTests();
         EvictionTests();
         EvictionWatermarkTests();

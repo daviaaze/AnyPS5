@@ -204,13 +204,13 @@ struct Backing {
 
 std::vector<Backing*> backings;
 
-bool Resolve(std::uintptr_t address, std::size_t bytes, int* file, std::uint64_t* offset) {
+
+bool Resolve(std::uintptr_t address, std::size_t bytes, GuestArena::SharedBackingVisitor visitor, void* context) {
+    if (visitor == nullptr || bytes == 0 || address > UINTPTR_MAX - bytes) return false;
     for (const auto* backing : backings) {
         const auto begin = reinterpret_cast<std::uintptr_t>(backing->base);
-        if (address < begin || address + bytes > begin + backing->bytes) continue;
-        *file = dup(backing->file);
-        *offset = backing->fileOffset + (address - begin);
-        return *file >= 0;
+        if (address < begin || address - begin > backing->bytes || bytes > backing->bytes - (address - begin)) continue;
+        return visitor(context, backing->file, backing->fileOffset + (address - begin), bytes);
     }
     return false;
 }

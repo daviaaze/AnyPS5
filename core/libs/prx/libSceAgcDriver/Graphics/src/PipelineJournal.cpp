@@ -16,8 +16,8 @@
 #include <fstream>
 #include <map>
 #include <mutex>
-#include <set>
-#include <system_error>
+#include <limits>
+#include <zstd.h>
 #include <thread>
 #include <type_traits>
 #ifdef _WIN32
@@ -47,7 +47,7 @@ static_assert(sizeof(ShaderRecompiler::TessellationConfiguration) == 40, "Tessel
 constexpr std::uint32_t FileMagic = 0x4c4a5041u;
 // Bumped when the recipe codec, CanonicalPipelineState or the store key change in a way the
 // layout guards above do not catch (a field renumbered or reinterpreted at the same size).
-constexpr std::uint32_t FileFormat = 10u;
+constexpr std::uint32_t FileFormat = 11u;
 constexpr std::uint32_t ModuleRecord = 1u;
 constexpr std::uint32_t GraphicsRecord = 2u;
 constexpr std::uint32_t ComputeRecord = 3u;
@@ -522,7 +522,26 @@ struct LoadedModule {
     std::uint64_t payloadOffset = 0;
     std::uint64_t payloadBytes = 0;
     std::uint64_t payloadHash = 0;
+    std::uint32_t moduleBytes = 0;
 };
+
+
+// A module's encoded cache artifact is capped by the journal's own byte budget. The size stored
+// on disk and the zstd frame's content size must both agree before allocating decoded storage.
+constexpr std::size_t ModuleHeaderBytes = 24u;
+
+bool expandModule(std::span<const std::byte> payload, std::uint64_t maxBytes, std::vector<std::byte>& module) {
+    if (payload.size() < ModuleHeaderBytes) return false;
+    std::uint32_t bytes = 0;
+    std::memcpy(&bytes, payload.data() + 20, sizeof(bytes));
+    const auto frame = payload.subspan(ModuleHeaderBytes);
+    const auto frameBytes = ZSTD_getFrameContentSize(frame.data(), frame.size());
+    if (bytes == 0 || bytes > maxBytes || frameBytes == ZSTD_CONTENTSIZE_ERROR ||
+        frameBytes == ZSTD_CONTENTSIZE_UNKNOWN || frameBytes != bytes) return false;
+    module.resize(bytes);
+    const auto expanded = ZSTD_decompress(module.data(), module.size(), frame.data(), frame.size());
+    return !ZSTD_isError(expanded) && expanded == bytes;
+}
 
 struct LoadedEntry {
     std::uint32_t kind;
@@ -665,7 +684,7 @@ bool scanSpans(const std::filesystem::path& path, std::uint64_t device, SpanScan
         span.kind = record.kind;
         span.hash = record.payloadHash;
         if (record.kind == ModuleRecord) {
-            if (record.payloadBytes < 20u) break;
+            if (record.payloadBytes < ModuleHeaderBytes) break;
             std::memcpy(&span.identity.low, prefix.data(), sizeof(span.identity.low));
             std::memcpy(&span.identity.high, prefix.data() + 8, sizeof(span.identity.high));
         } else if (record.kind == ComputeRecord) {
@@ -893,7 +912,7 @@ private:
                 RecordHeader record;
                 if (!file.ReadValue(cursor, record)) return false;
                 const auto payloadOffset = cursor + sizeof(RecordHeader);
-                if (record.payloadBytes > size - payloadOffset) break;
+                if (record.payloadBytes > maxBytes || record.payloadBytes > size - payloadOffset) break;
                 const auto end = padded(payloadOffset + record.payloadBytes);
                 if (end > size) break;
                 bytes.resize(static_cast<std::size_t>(record.payloadBytes));
@@ -901,7 +920,7 @@ private:
                 const auto payload = std::span<const std::byte>(bytes);
                 if (ShaderRecompiler::HashBytes(payload) != record.payloadHash) break;
                 if (record.kind == ModuleRecord) {
-                    if (payload.size() < 20u) break;
+                    if (payload.size() < ModuleHeaderBytes) break;
                     ShaderRecompiler::PipelineIdentity identity;
                     std::memcpy(&identity.low, payload.data(), sizeof(identity.low));
                     std::memcpy(&identity.high, payload.data() + 8, sizeof(identity.high));
@@ -910,8 +929,9 @@ private:
                     bool decoded = !decode;
                     if (decode && !loaded.indexModules.contains(identity)) {
                         ShaderRecompiler::RecompileResult result;
-                        decoded = ShaderRecompiler::ShaderDiskCache::DecodeResult(payload.subspan(20), result) && result.Identity() == identity;
-                        if (decoded) loaded.modules.emplace(identity, LoadedModule{static_cast<ShaderRecompiler::ShaderStage>(stage), payloadOffset, record.payloadBytes, record.payloadHash});
+                        std::vector<std::byte> module;
+                        decoded = expandModule(payload, maxBytes, module) && ShaderRecompiler::ShaderDiskCache::DecodeResult(module, result) && result.Identity() == identity;
+                        if (decoded) loaded.modules.emplace(identity, LoadedModule{static_cast<ShaderRecompiler::ShaderStage>(stage), payloadOffset, record.payloadBytes, record.payloadHash, static_cast<std::uint32_t>(module.size())});
                         else ++dropped;
                     }
                     if (decoded) loaded.indexModules.insert(identity);
@@ -1132,12 +1152,19 @@ private:
     }
 
     std::vector<std::byte> EncodeModule(const PendingModule& module) {
+        std::vector<std::byte> encoded;
+        ShaderRecompiler::ShaderDiskCache::EncodeResult(*module.result, encoded);
+        if (encoded.empty() || encoded.size() > std::numeric_limits<std::uint32_t>::max() || encoded.size() > maxBytes) return {};
         std::vector<std::byte> payload;
         Writer writer(payload);
         writer.U64(module.identity.low);
         writer.U64(module.identity.high);
         writer.U32(static_cast<std::uint32_t>(module.stage));
-        ShaderRecompiler::ShaderDiskCache::EncodeResult(*module.result, payload);
+        writer.U32(static_cast<std::uint32_t>(encoded.size()));
+        payload.resize(ModuleHeaderBytes + ZSTD_compressBound(encoded.size()));
+        const auto compressed = ZSTD_compress(payload.data() + ModuleHeaderBytes, payload.size() - ModuleHeaderBytes, encoded.data(), encoded.size(), 1);
+        if (ZSTD_isError(compressed)) return {};
+        payload.resize(ModuleHeaderBytes + compressed);
         return payload;
     }
 
@@ -1161,6 +1188,10 @@ private:
         for (const auto& identity : missing) {
             const auto module = std::ranges::find_if(pending.modules, [&](const PendingModule& candidate) { return candidate.identity == identity; });
             missingPayloads.push_back(EncodeModule(*module));
+            if (missingPayloads.back().empty()) {
+                counters.writeFailures.fetch_add(1, std::memory_order_relaxed);
+                return true;
+            }
         }
         std::uint64_t batchSize = recordBytes(pending.payload.size());
         for (const auto& payload : missingPayloads) batchSize += recordBytes(payload.size());
@@ -1378,10 +1409,12 @@ private:
     }
 
     std::shared_ptr<const ShaderRecompiler::RecompileResult> readModule(const ShaderRecompiler::PipelineIdentity& identity, const LoadedModule& module) const {
-        auto bytes = std::make_shared<std::vector<std::byte>>(static_cast<std::size_t>(module.payloadBytes));
-        if (loaded.file == nullptr || !loaded.file->Read(module.payloadOffset, *bytes) || ShaderRecompiler::HashBytes(*bytes) != module.payloadHash) return nullptr;
+        std::vector<std::byte> payload(static_cast<std::size_t>(module.payloadBytes));
+        if (loaded.file == nullptr || !loaded.file->Read(module.payloadOffset, payload) || ShaderRecompiler::HashBytes(payload) != module.payloadHash) return nullptr;
+        auto bytes = std::make_shared<std::vector<std::byte>>();
+        if (!expandModule(payload, module.moduleBytes, *bytes)) return nullptr;
         auto result = std::make_shared<ShaderRecompiler::RecompileResult>();
-        if (!ShaderRecompiler::ShaderDiskCache::DecodeResult(std::span<const std::byte>(*bytes).subspan(20), *result, bytes) || !(result->Identity() == identity)) return nullptr;
+        if (!ShaderRecompiler::ShaderDiskCache::DecodeResult(*bytes, *result, bytes) || !(result->Identity() == identity)) return nullptr;
         return result;
     }
 
@@ -1410,7 +1443,7 @@ private:
                 counters.rejected.fetch_add(1, std::memory_order_relaxed);
                 return;
             }
-            const Held held(module->second.payloadBytes);
+            const Held held(module->second.moduleBytes);
             const auto result = readModule(module->first, module->second);
             if (result == nullptr) {
                 counters.rejected.fetch_add(1, std::memory_order_relaxed);
@@ -1428,7 +1461,7 @@ private:
                 return;
             }
             modules.push_back(&*module);
-            bytes += module->second.payloadBytes;
+            bytes += module->second.moduleBytes;
         }
         if (modules.empty() || context.descriptorCache == nullptr) {
             counters.rejected.fetch_add(1, std::memory_order_relaxed);

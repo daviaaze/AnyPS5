@@ -2,8 +2,8 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_GUESTBUFFERMEMORY_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
-#include "BdaAbi.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "BdaAbi.hpp"
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -286,6 +286,10 @@ public:
     // memory whatever its size (see AllowDeviceStaging).
     void AddWritable(std::uint64_t address, std::size_t bytes, bool atomic = false, bool swept = false);
     void AddReadable(std::uint64_t address, std::size_t bytes);
+    // Summarizes the immediately preceding matching descriptor registration; a clipped or
+    // missing registration stays Whole. All aliases are retained before merging transfer spans.
+    void AddFootprint(std::uint64_t descriptorAddress, std::uint64_t descriptorBytes,
+        const ShaderRecompiler::BufferTransferFootprint& footprint);
     // Device-local staging of written and atomic elements inside host imports (see
     // GuestBufferMemory.cpp): allowed only for a build whose every use records its work and then
     // calls RecordCopyBacks (a dispatch), since a staged region's results reach guest memory by
@@ -312,6 +316,16 @@ public:
     VkDescriptorBufferInfo Descriptor(std::uint64_t address, std::size_t bytes, std::uint32_t& adjustment) const;
     static std::uint64_t ViewBytes(std::uint64_t bytes, std::uint32_t adjustment);
     std::vector<ShaderRecompiler::BdaAbi::Range> AddressRanges() const;
+    struct AddressPayload {
+        VkDescriptorBufferInfo source;
+        std::shared_ptr<const void> owner;
+    };
+    // Diagnostic view of an already-uploaded BDA range. `ranges` must be this upload's
+    // AddressRanges(), i.e. the same precedence/cuts used to build its shader page table.
+    // No registry lookup, import creation, guest read or device-address inversion.
+    // Imports remain protected by the draw's existing lease/recorder retirement contract.
+    std::optional<AddressPayload> ResolveAddressPayload(std::uint64_t address, std::size_t bytes,
+        std::span<const ShaderRecompiler::BdaAbi::Range> ranges) const;
     // The BDA table of the cached address space when it serves this upload alone (an address-based
     // build with no region outside it): its ranges, immutable while the space lives, and the
     // space's serial, by which BdaResources reuses the table buffer built for it without a
@@ -428,7 +442,20 @@ private:
         // The device refused the shadow (memory or allocations exhausted): the region takes the
         // path it would take without staging, in both upload stages.
         bool unstaged = false;
+        // False retains the allocation's whole-range transfer path; vectors are used only when
+        // per-registration summaries cover every byte of this coalesced region.
+        bool boundedSpans = false;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> inputSpans;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> outputSpans;
+        bool copyInRecorded = false;
         bool overlay = false;
+    };
+    struct Footprint {
+        std::uint64_t begin;
+        std::uint64_t end;
+        bool writable;
+        bool summarized;
+        ShaderRecompiler::BufferTransferFootprint value;
     };
 
     // How [begin, end) lies against the space's base regions.
@@ -500,6 +527,7 @@ private:
     // regions follow the registry's order), so AddSnapshot can search instead of scanning.
     bool regionsSorted = false;
     bool regionsOverlap = false;
+    std::vector<Footprint> footprints;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> readsOverBase;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> servedInsideBase;

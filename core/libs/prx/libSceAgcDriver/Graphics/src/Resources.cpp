@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include <algorithm>
 #include <exception>
 
@@ -10,24 +11,64 @@ namespace AgcDriver::Graphics {
 
 namespace {
 
+struct BufferCtorTiming {
+    bool enabled;
+    std::size_t size, capacity;
+    VkBufferUsageFlags usage;
+    VkMemoryPropertyFlags properties;
+    std::chrono::steady_clock::time_point totalStart{}, stageStart{};
+    double poolMs = 0, createMs = 0, requirementsMs = 0, memoryTypeMs = 0, allocationMs = 0, bindAddressMs = 0, mapMs = 0;
+    std::int64_t memoryType = -1, heap = -1;
+    VkMemoryPropertyFlags selectedProperties = 0;
+    bool hit = false, slab = false;
+
+    BufferCtorTiming(bool enabled, std::size_t size, std::size_t capacity, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties)
+        : enabled(enabled), size(size), capacity(capacity), usage(usage), properties(properties) {
+        if (enabled) totalStart = stageStart = std::chrono::steady_clock::now();
+    }
+    void lap(double& destination) {
+        if (!enabled) return;
+        const auto now = std::chrono::steady_clock::now();
+        destination += std::chrono::duration<double, std::milli>(now - stageStart).count();
+        stageStart = now;
+    }
+    void finish() {
+        if (!enabled) return;
+        const auto now = std::chrono::steady_clock::now();
+        const auto totalMs = std::chrono::duration<double, std::milli>(now - totalStart).count();
+        if ((properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0 || totalMs < 50.0) return;
+        std::uint32_t flags = memoryType >= 0 ? static_cast<std::uint32_t>(selectedProperties) : 0;
+        AgcDriver::ProfilePrint_nid_no_patch("[host-buffer] size=%zu capacity=%zu usage=0x%x properties=0x%x memoryType=%lld selectedProperties=0x%x heap=%lld hit=%d slab=%d pool_ms=%.3f create_ms=%.3f requirements_ms=%.3f memory_type_ms=%.3f allocation_ms=%.3f bind_address_ms=%.3f map_ms=%.3f total_ms=%.3f\n",
+            size, capacity, usage, properties, static_cast<long long>(memoryType), flags, static_cast<long long>(heap), hit ? 1 : 0, slab ? 1 : 0,
+            poolMs, createMs, requirementsMs, memoryTypeMs, allocationMs, bindAddressMs, mapMs, totalMs);
+    }
+};
+
+
 VkDeviceSize ClassAllocationBytes(const VkMemoryRequirements& requirements, std::size_t capacity) {
     const auto alignment = std::max<VkDeviceSize>(requirements.alignment, 1);
     return std::max<VkDeviceSize>(requirements.size, (static_cast<VkDeviceSize>(capacity) + alignment - 1) / alignment * alignment);
 }
 
-VkBuffer BindExactBuffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkDeviceMemory memory, VkDeviceSize offset, VkDeviceSize availableBytes) {
+VkBuffer BindExactBuffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkDeviceMemory memory, VkDeviceSize offset, VkDeviceSize availableBytes, BufferCtorTiming* timing = nullptr) {
     VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     info.size = size;
     info.usage = usage;
     info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     VkBuffer buffer = VK_NULL_HANDLE;
+    auto stage = timing != nullptr && timing->enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     Check(context.Function<PFN_vkCreateBuffer>("vkCreateBuffer")(context.device, &info, nullptr, &buffer), "vkCreateBuffer pooled");
+    if (timing != nullptr && timing->enabled) timing->createMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stage).count();
     try {
+        stage = timing != nullptr && timing->enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         VkMemoryRequirements requirements{};
         context.Function<PFN_vkGetBufferMemoryRequirements>("vkGetBufferMemoryRequirements")(context.device, buffer, &requirements);
+        if (timing != nullptr && timing->enabled) timing->requirementsMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stage).count();
         Require(requirements.size <= availableBytes, "pooled buffer memory is smaller than the requested buffer");
         Require(requirements.alignment == 0 || offset % requirements.alignment == 0, "pooled buffer offset breaks the requested buffer's alignment");
+        stage = timing != nullptr && timing->enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         Check(context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, buffer, memory, offset), "vkBindBufferMemory pooled");
+        if (timing != nullptr && timing->enabled) timing->bindAddressMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stage).count();
     } catch (...) {
         context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);
         throw;
@@ -38,32 +79,44 @@ VkBuffer BindExactBuffer(const Context& context, std::size_t size, VkBufferUsage
 }
 
 Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties) : context(context), size(size), capacity(BufferPool::Capacity(size, properties)), usage(BufferPool::Usage(usage, properties)), properties(properties) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    BufferCtorTiming timing(profile && (properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0, size, capacity, this->usage, properties);
+    const auto finish = [&] { timing.finish(); };
     Require(size != 0, "zero-sized GPU buffer");
     const bool addressable = (usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0;
     Require(!addressable || context.bufferDeviceAddress, "buffer device address is not enabled");
     cache = GetBufferPool(context);
-    if (const auto allocation = cache->Take(size, this->usage, properties)) {
+    const auto allocation = cache->Take(size, this->usage, properties);
+    timing.lap(timing.poolMs);
+    if (allocation) {
+        timing.hit = true;
         buffer = allocation->buffer;
         memory = allocation->memory;
         mapping = allocation->mapping;
         deviceAddress = allocation->address;
         allocationBytes = allocation->allocationBytes;
+        memoryType = allocation->memoryType;
         capacity = allocation->bytes;
+        timing.capacity = capacity;
         offset = allocation->offset;
         slab = allocation->slab;
+        timing.slab = slab;
         if (allocation->bufferBytes != size) {
             context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);
             buffer = VK_NULL_HANDLE;
             deviceAddress = 0;
+            timing.lap(timing.createMs);
             try {
-                buffer = BindExactBuffer(context, size, this->usage, memory, offset, allocationBytes);
+                buffer = BindExactBuffer(context, size, this->usage, memory, offset, allocationBytes, &timing);
                 initializeAddress(usage);
             } catch (...) {
                 release();
+                finish();
                 throw;
             }
         }
         ready = true;
+        finish();
         return;
     }
     try {
@@ -71,9 +124,13 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
         info.size = size;
         info.usage = this->usage;
         info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        auto stage = timing.enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         Check(context.Function<PFN_vkCreateBuffer>("vkCreateBuffer")(context.device, &info, nullptr, &buffer), "vkCreateBuffer");
+        if (timing.enabled) timing.createMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stage).count();
+        stage = timing.enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         VkMemoryRequirements requirements{};
         context.Function<PFN_vkGetBufferMemoryRequirements>("vkGetBufferMemoryRequirements")(context.device, buffer, &requirements);
+        if (timing.enabled) timing.requirementsMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stage).count();
         VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         const VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, nullptr, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT, 0};
         if (addressable) allocation.pNext = &flags;
@@ -81,27 +138,95 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
         allocationBytes = allocation.allocationSize;
         // The CPU reads most of these buffers back (write-back, diffs), which is very slow from
         // write-combined memory, so the default host properties prefer cached host memory.
-        const bool useSlab = (properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0 && BufferPool::SlabEligible(capacity, requirements.alignment, requirements.size, context.limits.nonCoherentAtomSize);
-        allocation.memoryTypeIndex = context.BufferMemoryType(requirements.memoryTypeBits, properties, useSlab ? BufferPool::SlabBlockBytes(capacity) : allocation.allocationSize);
-        if (useSlab) {
-            const auto slot = cache->TakeSlot(context, allocation.memoryTypeIndex, capacity, addressable);
-            memory = slot.memory;
-            offset = slot.offset;
-            slab = true;
-            allocationBytes = capacity;
-            Check(context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, buffer, memory, offset), "vkBindBufferMemory slab");
-            initializeAddress(usage);
-            mapping = slot.mapping;
-            ready = true;
-            return;
+        bool useSlab = (properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0 && BufferPool::SlabEligible(capacity, requirements.alignment, requirements.size, context.limits.nonCoherentAtomSize);
+        stage = timing.enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        try {
+            allocation.memoryTypeIndex = context.BufferMemoryType(requirements.memoryTypeBits, properties, useSlab ? BufferPool::SlabBlockBytes(capacity) : allocation.allocationSize);
+        } catch (const std::runtime_error&) {
+            if (!useSlab) throw;
+            useSlab = false;
+            allocation.memoryTypeIndex = context.BufferMemoryType(requirements.memoryTypeBits, properties, allocation.allocationSize);
         }
+        memoryType = allocation.memoryTypeIndex;
+        if (timing.enabled) {
+            timing.memoryTypeMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stage).count();
+            timing.memoryType = allocation.memoryTypeIndex;
+            const auto& type = context.memory.memoryTypes[allocation.memoryTypeIndex];
+            timing.selectedProperties = type.propertyFlags;
+            timing.heap = type.heapIndex;
+        }
+        if ((properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0 && (!useSlab || capacity >= (std::size_t{1} << 20u))) {
+            stage = timing.enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            const auto hostTransfer = cache->TakeHostTransfer(capacity, this->usage, properties, requirements.size, requirements.alignment, requirements.memoryTypeBits, allocation.memoryTypeIndex);
+            if (timing.enabled) timing.poolMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stage).count();
+            if (hostTransfer) {
+                timing.hit = true;
+                context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, hostTransfer->buffer, nullptr);
+                memory = hostTransfer->memory;
+                mapping = hostTransfer->mapping;
+                allocationBytes = hostTransfer->allocationBytes;
+                capacity = hostTransfer->bytes;
+                offset = hostTransfer->offset;
+                memoryType = hostTransfer->memoryType;
+                timing.capacity = capacity;
+                Check(context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, buffer, memory, offset), "vkBindBufferMemory");
+                stage = timing.enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                initializeAddress(usage);
+                if (timing.enabled) timing.bindAddressMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stage).count();
+                ready = true;
+                finish();
+                return;
+            }
+        }
+        if (useSlab) {
+            stage = timing.enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            const auto slot = cache->TakeSlot(context, allocation.memoryTypeIndex, capacity, addressable);
+            if (timing.enabled) timing.allocationMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stage).count();
+            if (slot.memory != VK_NULL_HANDLE) {
+                memory = slot.memory;
+                offset = slot.offset;
+                slab = true;
+                timing.slab = true;
+                allocationBytes = capacity;
+                stage = timing.enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                Check(context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, buffer, memory, offset), "vkBindBufferMemory slab");
+                initializeAddress(usage);
+                if (timing.enabled) timing.bindAddressMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stage).count();
+                mapping = slot.mapping;
+                ready = true;
+                finish();
+                return;
+            }
+        }
+        if (useSlab && memory == VK_NULL_HANDLE) {
+            stage = timing.enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            allocation.memoryTypeIndex = context.BufferMemoryType(requirements.memoryTypeBits, properties, allocation.allocationSize);
+            memoryType = allocation.memoryTypeIndex;
+            if (timing.enabled) {
+                timing.memoryTypeMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stage).count();
+                timing.memoryType = allocation.memoryTypeIndex;
+                const auto& type = context.memory.memoryTypes[allocation.memoryTypeIndex];
+                timing.selectedProperties = type.propertyFlags;
+                timing.heap = type.heapIndex;
+            }
+        }
+        stage = timing.enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         memory = cache->AllocateMemory(allocation, "vkAllocateMemory buffer");
+        if (timing.enabled) timing.allocationMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stage).count();
+        stage = timing.enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         Check(context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, buffer, memory, 0), "vkBindBufferMemory");
         initializeAddress(usage);
-        if ((properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) Check(context.Function<PFN_vkMapMemory>("vkMapMemory")(context.device, memory, 0, VK_WHOLE_SIZE, 0, &mapping), "vkMapMemory");
+        if (timing.enabled) timing.bindAddressMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stage).count();
+        if ((properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) {
+            stage = timing.enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            Check(context.Function<PFN_vkMapMemory>("vkMapMemory")(context.device, memory, 0, VK_WHOLE_SIZE, 0, &mapping), "vkMapMemory");
+            if (timing.enabled) timing.mapMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stage).count();
+        }
         ready = true;
+        finish();
     } catch (...) {
         release();
+        finish();
         throw;
     }
 }
@@ -112,7 +237,7 @@ Buffer::~Buffer() {
 
 void Buffer::release() noexcept {
     if (ready && cache) {
-        cache->Put({buffer, memory, mapping, deviceAddress, allocationBytes, capacity, usage, properties, offset, slab, size});
+        cache->Put({buffer, memory, mapping, deviceAddress, allocationBytes, capacity, usage, properties, offset, slab, size, memoryType});
         return;
     }
     if (slab) {
@@ -357,7 +482,9 @@ CommandBatch::~CommandBatch() {
 void CommandBatch::release() noexcept {
     if (pending) {
         auto result = context.Function<PFN_vkGetFenceStatus>("vkGetFenceStatus")(context.device, fence);
-        if (result == VK_NOT_READY) result = context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue);
+        if (result == VK_NOT_READY) result = OnQueue(context.queueLane, [] { return GuestMemory::GpuMutex().DepthOnThisThread(); },
+            [] { GuestMemory::GpuMutex().unlock(); }, [] { GuestMemory::GpuMutex().lock(); },
+            [&] { return context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue); });
         if (result != VK_SUCCESS && result != VK_ERROR_DEVICE_LOST) std::terminate();
     }
     if (commands) context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 1, &commands);
@@ -381,7 +508,9 @@ void CommandBatch::Submit() {
     submission.commandBufferCount = 1;
     submission.pCommandBuffers = &commands;
     timing.Mark("command_end");
-    Check(context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.queue, 1, &submission, fence), "vkQueueSubmit graphics");
+    Check(OnQueue(context.queueLane, [] { return GuestMemory::GpuMutex().DepthOnThisThread(); },
+        [] { GuestMemory::GpuMutex().unlock(); }, [] { GuestMemory::GpuMutex().lock(); },
+        [&] { return context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.queue, 1, &submission, fence); }), "vkQueueSubmit graphics");
     pending = true;
     submitted = true;
     timing.Mark("queue_submit");

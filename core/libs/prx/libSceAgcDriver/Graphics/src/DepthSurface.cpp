@@ -295,9 +295,11 @@ public:
             VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
             allocation.allocationSize = requirements.size;
             allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-            memory = AllocateImageMemory(context, allocation, requirements.memoryTypeBits, "vkAllocateMemory depth target");
+            std::uint32_t memoryType = 0;
+            VkDeviceSize memoryBytes = 0;
+            memory = AllocateImageMemory(context, allocation, requirements.memoryTypeBits, "vkAllocateMemory depth target", &memoryType, false, nullptr, &memoryBytes);
             Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, memory, 0), "vkBindImageMemory depth");
-            if (target.samples != 1u) owned = std::make_shared<OwnedImage>(this->context, image, memory);
+            if (target.samples != 1u) owned = std::make_shared<OwnedImage>(this->context, image, memory, memoryBytes, memoryType);
             VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
             viewInfo.image = image;
             viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
@@ -1162,6 +1164,23 @@ private:
     }
 };
 
+// Why DepthPlaneCopy::Refresh re-filled a layer that has no depth surface from guest memory, on a
+// [depth-plane] layers line every 4096 layers under APS5_PROFILE_DRAW: unchanged layers are kept;
+// untracked (no write stamp), first (new copy or moved layer), pending (recorded GPU work writes it)
+// and changed (written since its fill) are uploaded.
+enum class GuestLayerOutcome : std::size_t { Unchanged, Untracked, First, PendingWrite, Changed, Count };
+
+void countGuestLayer(GuestLayerOutcome outcome) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile) return;
+    static std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(GuestLayerOutcome::Count)> counts{};
+    static std::atomic<std::uint64_t> total{0};
+    counts[static_cast<std::size_t>(outcome)].fetch_add(1, std::memory_order_relaxed);
+    if (total.fetch_add(1, std::memory_order_relaxed) % 4096u != 4095u) return;
+    const auto at = [&](GuestLayerOutcome which) { return static_cast<unsigned long long>(counts[static_cast<std::size_t>(which)].load(std::memory_order_relaxed)); };
+    std::fprintf(stderr, "[depth-plane] guest layers (cumulative): unchanged %llu, uploaded: untracked %llu, first %llu, pending GPU write %llu, changed %llu\n", at(GuestLayerOutcome::Unchanged), at(GuestLayerOutcome::Untracked), at(GuestLayerOutcome::First), at(GuestLayerOutcome::PendingWrite), at(GuestLayerOutcome::Changed));
+}
+
 struct DepthPlaneSlice {
     VkImage image = VK_NULL_HANDLE;
     std::uint64_t written = 0;
@@ -1190,10 +1209,12 @@ public:
             VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
             allocation.allocationSize = requirements.size;
             allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-            memory = AllocateImageMemory(context, allocation, requirements.memoryTypeBits, "vkAllocateMemory depth plane copy");
+            std::uint32_t memoryType = 0;
+            VkDeviceSize memoryBytes = 0;
+            memory = AllocateImageMemory(context, allocation, requirements.memoryTypeBits, "vkAllocateMemory depth plane copy", &memoryType, false, nullptr, &memoryBytes);
             Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, memory, 0), "vkBindImageMemory depth plane copy");
             imageBytes = requirements.size;
-            owned = std::make_shared<OwnedImage>(context, image, memory);
+            owned = std::make_shared<OwnedImage>(context, image, memory, memoryBytes, memoryType);
         } catch (...) {
             release();
             throw;
@@ -1206,8 +1227,7 @@ public:
     std::shared_ptr<Texture> Refresh(std::span<const DepthPlaneSlice> slices, const GuestTextureResource& resource, VkComponentMapping components, VkImageViewType viewType, std::uint32_t baseLayer) {
         Require(slices.size() == layers, "depth plane copy slices do not match its layers");
         const auto geometry = DescribeSurface(resource);
-        const bool guestFill = std::any_of(slices.begin(), slices.end(), [](const auto& slice) { return slice.image == VK_NULL_HANDLE; });
-        if (guestFill && (geometry.layers != layers || geometry.sliceLinearBytes < sliceBytes() || geometry.mips.empty())) {
+        if (geometry.layers != layers || geometry.sliceLinearBytes < sliceBytes() || geometry.mips.empty()) {
             char text[320];
             std::snprintf(text, sizeof(text), "AGC graphics: depth plane copy geometry does not match its layers (copy %ux%u, %u layers, %llu bytes a slice; texture %ux%u guest format %u, dimension %d, tile mode %u, %u layers, %llu bytes a slice, %zu mips)", extent.width, extent.height, layers, static_cast<unsigned long long>(sliceBytes()), resource.width, resource.height, resource.format, static_cast<int>(resource.dimension), resource.tileMode, geometry.layers, static_cast<unsigned long long>(geometry.sliceLinearBytes), geometry.mips.size());
             throw std::runtime_error(text);
@@ -1228,10 +1248,14 @@ public:
             }
             surface = {};
             const GuestLayer current{resource.baseAddress + geometry.GuestLayerOffset(layer), geometry.layerBytes, resource.tileMode, geometry.thick, GuestMemory::CollectWrites(resource.baseAddress + geometry.GuestLayerOffset(layer), static_cast<std::size_t>(geometry.layerBytes))};
-            if (held.generation != 0 && held.address == current.address && held.bytes == current.bytes && held.tileMode == current.tileMode && held.thick == current.thick && !Recorder::SnapshotWriteOverlaps(current.address, static_cast<std::size_t>(current.bytes)) && GuestMemory::UnchangedSince(current.address, static_cast<std::size_t>(current.bytes), held.generation)) {
+            const bool sameLayer = held.generation != 0 && held.address == current.address && held.bytes == current.bytes && held.tileMode == current.tileMode && held.thick == current.thick;
+            const bool pendingWrite = sameLayer && Recorder::SnapshotWriteOverlaps(current.address, static_cast<std::size_t>(current.bytes));
+            if (sameLayer && !pendingWrite && GuestMemory::UnchangedSince(current.address, static_cast<std::size_t>(current.bytes), held.generation)) {
                 held.generation = current.generation;
+                countGuestLayer(GuestLayerOutcome::Unchanged);
                 continue;
             }
+            countGuestLayer(current.generation == 0 ? GuestLayerOutcome::Untracked : !sameLayer ? GuestLayerOutcome::First : pendingWrite ? GuestLayerOutcome::PendingWrite : GuestLayerOutcome::Changed);
             auto upload = std::make_shared<Buffer>(context, static_cast<std::size_t>(geometry.layerBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
             GuestMemory::ReadCommitted(current.address, upload->Bytes().first(static_cast<std::size_t>(geometry.layerBytes)));
             uploads.push_back(std::move(upload));
@@ -1299,8 +1323,9 @@ private:
             return copy;
         };
         for (const auto layer : copiedLayers) {
+            const auto& slice = slices[layer];
             const auto copy = region(layer, VK_IMAGE_ASPECT_DEPTH_BIT, 0);
-            context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, slices[layer].image, VK_IMAGE_LAYOUT_GENERAL, staging->Handle(), 1, &copy);
+            context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, slice.image, VK_IMAGE_LAYOUT_GENERAL, staging->Handle(), 1, &copy);
             regions.push_back(region(layer, aspect(), layer));
         }
         if (!uploads.empty()) {
@@ -1373,9 +1398,12 @@ std::uint64_t& planeCopyClock() {
 }
 
 void evictPlaneCopies(const std::tuple<VkDevice, std::uint64_t, std::uint32_t, std::uint32_t, VkFormat, std::uint32_t>& keep) {
+    // 1 GiB: a game samples several layered depth arrays a frame (Demon's Souls: an 80-layer
+    // 1024x1024 D32 array is 320 MiB alone); under a smaller budget the copies evict each other
+    // every use and each comeback re-creates the image and re-uploads every layer from guest memory.
     static const VkDeviceSize budget = [] {
         const char* text = std::getenv("APS5_DEPTH_PLANE_COPY_MIB");
-        return static_cast<VkDeviceSize>(text != nullptr ? std::strtoull(text, nullptr, 10) : 256ull) << 20u;
+        return static_cast<VkDeviceSize>(text != nullptr ? std::strtoull(text, nullptr, 10) : 1024ull) << 20u;
     }();
     if (budget == 0) return;
     auto& copies = planeCopies();
@@ -1525,16 +1553,78 @@ void takePlanes(DepthSurface& surface, bool created, VkImageAspectFlags clearAsp
     if (surface.target.stencilAddress != 0) takePlane(surface, stencilOwners(), surface.target.stencilAddress, VK_IMAGE_ASPECT_STENCIL_BIT, created, clearAspects);
 }
 
+// Why a registered surface is not the depth slice at `address` for `base`, or nullptr when it is.
+const char* depthSliceRejection(const DepthSurface& surface, VkDevice device, std::uint64_t address, const DepthTarget& base) {
+    if (!surface.active->load(std::memory_order_acquire)) return "inactive";
+    if (surface.context.device != device) return "other device";
+    if (surface.retired) return "retired";
+    if (surface.target.address != address) return "address differs from surface base";
+    if (surface.target.extent.width != base.extent.width || surface.target.extent.height != base.extent.height) return "extent mismatch";
+    if (surface.target.format != base.format) return "format mismatch";
+    return nullptr;
+}
+
 DepthSurface* depthSlice(VkDevice device, std::uint64_t address, const DepthTarget& base) {
     if (const auto found = depthOwners().find({device, address}); found != depthOwners().end()) {
         const auto& target = found->second.surface->target;
         if (found->second.surface->active->load(std::memory_order_acquire) && target.extent.width == base.extent.width && target.extent.height == base.extent.height && target.format == base.format) return found->second.surface;
     }
     const auto& list = surfaces();
-    const auto slice = std::find_if(list.rbegin(), list.rend(), [&](const auto& surface) { return surface->active->load(std::memory_order_acquire) && surface->context.device == device && !surface->retired && surface->target.address == address && surface->target.extent.width == base.extent.width && surface->target.extent.height == base.extent.height && surface->target.format == base.format; });
+    const auto slice = std::find_if(list.rbegin(), list.rend(), [&](const auto& surface) { return depthSliceRejection(*surface, device, address, base) == nullptr; });
     return slice == list.rend() ? nullptr : slice->get();
 }
 
+// Diagnostic: once per distinct layer (capped), why a depth plane copy layer falls back to a guest fill.
+// The caller holds surfacesMutex().
+void logDepthSliceMiss(VkDevice device, const DepthTarget& base, const GuestTextureResource& resource, std::uint32_t layer, std::uint32_t layers, std::uint64_t address, std::uint64_t layerBytes) {
+    static std::set<std::tuple<std::uint64_t, std::uint64_t, std::uint32_t, std::uint32_t, std::uint32_t>> seen;
+    constexpr std::size_t Cap = 64;
+    if (seen.size() >= Cap || !seen.insert({base.address, address, resource.width, resource.height, resource.format}).second) return;
+    std::string text;
+    char line[512];
+    std::snprintf(line, sizeof(line), "[depth-plane] guest-fill miss #%zu: copy base 0x%llx layer %u/%u at 0x%llx (+0x%llx bytes); base %ux%u vk %d swizzle %u slices %u-%u; texture %ux%u guest format %u dimension %d tile %u baseArray %u lastArray %u",
+                  seen.size(), static_cast<unsigned long long>(base.address), layer, layers, static_cast<unsigned long long>(address), static_cast<unsigned long long>(layerBytes), base.extent.width, base.extent.height, static_cast<int>(base.format), base.depthSwizzle, base.firstSlice, base.lastSlice,
+                  resource.width, resource.height, resource.format, static_cast<int>(resource.dimension), static_cast<unsigned>(resource.tileMode), resource.baseArray, resource.depthOrLastArray);
+    text += line;
+    bool any = false;
+    for (const auto& surface : surfaces()) {
+        if (!surface->Overlaps(address, layerBytes)) continue;
+        any = true;
+        const auto& target = surface->target;
+        const auto* reason = depthSliceRejection(*surface, device, address, base);
+        const auto offset = address >= target.address ? static_cast<long long>(address - target.address) : -static_cast<long long>(target.address - address);
+        const auto arraySize = target.lastSlice >= target.firstSlice ? target.lastSlice - target.firstSlice + 1u : 0u;
+        std::snprintf(line, sizeof(line), "; overlap surface 0x%llx (layer at %+lld) %ux%u vk %d samples %u array %u swizzle %u slices %u-%u stencil 0x%llx active %d retired %d: %s",
+                      static_cast<unsigned long long>(target.address), offset, target.extent.width, target.extent.height, static_cast<int>(target.format), target.samples, arraySize, target.depthSwizzle, target.firstSlice, target.lastSlice,
+                      static_cast<unsigned long long>(target.stencilAddress), surface->active->load(std::memory_order_acquire) ? 1 : 0, surface->retired ? 1 : 0, reason != nullptr ? reason : "accepted (owner/surface list race)");
+        text += line;
+    }
+    if (!any) text += "; no registered depth surface overlaps the layer";
+    if (seen.size() == Cap) text += "; further misses are not logged";
+    try {
+        if (const auto pending = StorageTexture::FindPendingSlice(address, layerBytes); pending != nullptr) {
+            const auto& source = pending->Descriptor();
+            const auto sourceOffset = address >= source.baseAddress ? static_cast<unsigned long long>(address - source.baseAddress) : 0ull;
+            const bool exactLayer = pending->ImageLayers() > 1 && pending->GuestBytes() % pending->ImageLayers() == 0 &&
+                                    pending->GuestBytes() / pending->ImageLayers() == layerBytes &&
+                                    sourceOffset % layerBytes == 0 && sourceOffset / layerBytes < pending->ImageLayers();
+            std::snprintf(line, sizeof(line), "; pending storage candidate base 0x%llx guest bytes 0x%llx image layers %u format %u version %llu dirty %d layer %llu exact-layer %s; ownership/currency unproven (pending lookup does not expose per-layer pending coverage)",
+                          static_cast<unsigned long long>(source.baseAddress), static_cast<unsigned long long>(pending->GuestBytes()), pending->ImageLayers(), source.format,
+                          static_cast<unsigned long long>(pending->Version()), pending->Dirty() ? 1 : 0, static_cast<unsigned long long>(exactLayer ? sourceOffset / layerBytes : 0), exactLayer ? "yes" : "no");
+            text += line;
+            std::snprintf(line, sizeof(line), "; source extent %ux%u dimension %d tile %u slices %u-%u byte offset 0x%llx",
+                          source.width, source.height, static_cast<int>(source.dimension), static_cast<unsigned>(source.tileMode), source.baseArray, source.depthOrLastArray, sourceOffset);
+            text += line;
+        } else {
+            text += "; no pending storage candidate found by exact-layer lookup";
+        }
+    } catch (const std::exception& error) {
+        text += "; pending storage lookup rejected candidate: ";
+        text += error.what();
+    }
+
+    std::fprintf(stderr, "%s\n", text.c_str());
+}
 DepthSurface* planeSurface(VkDevice device, std::uint64_t address) {
     const auto depth = depthOwners().find({device, address});
     const auto stencil = stencilOwners().find({device, address});
@@ -2396,7 +2486,10 @@ std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<c
         const auto address = base.address + geometry.GuestLayerOffset(layer);
         auto* slice = depthSlice(context.device, address, base);
         if (slice != nullptr) slice->ApplyFastClear();
-        if (slice == nullptr) slices.push_back({});
+        if (slice == nullptr) {
+            logDepthSliceMiss(context.device, base, resource, layer, layers, address, geometry.layerBytes);
+            slices.push_back({});
+        }
         else slices.push_back({slice->image, slice == drawnDepth ? 0u : slice->written});
     }
     const auto imageFormat = integer ? VK_FORMAT_R16_UINT : d16 ? VK_FORMAT_D16_UNORM : VK_FORMAT_D32_SFLOAT;

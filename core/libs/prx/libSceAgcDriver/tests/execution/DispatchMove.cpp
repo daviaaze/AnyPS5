@@ -151,10 +151,12 @@ void Run(AgcDriver::VulkanDevice& device, const ShaderRecompiler::RecompileResul
     for (auto& binding : result.bindings) {
         if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
         Require(binding.guestDescriptor.size() == static_cast<std::size_t>(binding.count) * 4u && binding.bufferWritten.size() == binding.count, "dispatch move: the program's buffer bindings have another shape");
+        auto descriptorWords = binding.guestDescriptor.Copy();
         for (std::uint32_t element = 0; element < binding.count; ++element, ++elements) {
             const auto words = binding.bufferWritten[element] ? BufferDescriptor(output, Bytes) : BufferDescriptor(input, inputBytes);
-            std::copy(words.begin(), words.end(), binding.guestDescriptor.begin() + static_cast<std::ptrdiff_t>(element) * 4);
+            std::copy(words.begin(), words.end(), descriptorWords.begin() + static_cast<std::ptrdiff_t>(element) * 4);
         }
+        binding.guestDescriptor = ShaderRecompiler::SharedValues<std::uint32_t>(std::move(descriptorWords));
     }
     Require(elements == 2, "dispatch move: the program does not bind an input and an output");
     device.Dispatch(result, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(Code.data()));

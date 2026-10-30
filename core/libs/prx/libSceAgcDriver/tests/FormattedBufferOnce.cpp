@@ -83,7 +83,8 @@ Counts Compile(std::size_t loads, bool formattedStores = false, bool gpu = false
     else request.context.compute = ShaderComputeStageInfo{{32u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
     request.context.memory = memory;
     request.useCache = false;
-    return Count(Recompile(request).spirv.Words());
+    const auto result = Recompile(request);
+    return Count(result.spirv.Words());
 }
 
 Counts CompileScalarReads(std::size_t loads) {
@@ -109,7 +110,8 @@ Counts CompileScalarReads(std::size_t loads) {
     request.shader.codeAddress = reinterpret_cast<std::uintptr_t>(words.data());
     request.shader.code = words;
     request.context.memory = memory;
-    return Count(Recompile(request).spirv.Words());
+    const auto result = Recompile(request);
+    return Count(result.spirv.Words());
 }
 
 }

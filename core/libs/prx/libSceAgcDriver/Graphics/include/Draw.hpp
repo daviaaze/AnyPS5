@@ -8,7 +8,10 @@
 #include "prx/libSceAgcDriver/Execution/include/Recipe.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include <memory>
+#include <array>
+#include <cstddef>
 #include <vector>
+#include <string_view>
 
 namespace AgcDriver::Graphics {
 
@@ -19,8 +22,15 @@ struct DrawTraceContext {
     std::uint64_t submission = 0;
     std::uint32_t queue = 0;
     std::size_t offset = 0;
+    std::uint64_t payloadOrdinal = 0;
     std::uint64_t target = 0;
+    std::size_t requestBytes = 0;
+    // APS5_DRAW_TARGET_READBACK_PIXEL_PROGRAMS: whether this selected draw may take the one-shot
+    // target readback (always when no pixel-program selector is given).
+    bool targetReadback = true;
 };
+
+std::size_t CaptureDrawRequest(const DrawTraceContext& trace, std::size_t stage, std::size_t subdraw, std::uint64_t shader, std::uint64_t variant, std::string_view serialized);
 
 // `recipe`, when given, receives the DrawRecipe a recorded, cacheable, reusable, non-indirect draw
 // built for its draw-cache entry (design_cpu_final M8; null otherwise, and always under
@@ -48,8 +58,9 @@ struct DrawInputCopy {
     std::uint64_t registryGeneration = 0;
 };
 DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use);
+DrawInputCopy CopyClampedDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::uint32_t indexSize, bool skipRestart, std::uint32_t limit, Recorder::SnapshotUse use);
 DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t validBytes, std::size_t stride = 0);
-void KeepDrawInput(Recorder* recorder, std::uint64_t address, const DrawInputCopy& copy, Recorder::SnapshotUse use, std::uint32_t derived);
+void KeepDrawInput(Recorder* recorder, std::uint64_t address, const DrawInputCopy& copy, Recorder::SnapshotUse use, std::uint32_t derived, std::uint64_t indexClamp = 0);
 const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t alignment, bool* behindGpuWrite = nullptr);
 struct InPlaceIndices {
     std::optional<std::uint32_t> highest;
@@ -131,6 +142,13 @@ const char* IndirectDrawPathName(IndirectDrawPath path);
 // Thrown (the decode or the build threw); `us` is the packet's time in the driver.
 enum class DrawSkip : std::uint8_t { Nothing, Prechecked, Thrown, Count };
 void CountDrawSkip(DrawSkip kind, double us);
+
+// Driver::commitDraw's parts on the draw committer (APS5_PROFILE_DRAW), in microseconds. `SubmitDue`
+// spans the eligibility checks and any synchronous SubmitRecorded path, including its retirement/
+// write-back work; it is not one Vulkan submit per draw.
+enum class DrawCommitPart : std::size_t { MutexWait, MutexHold, Labels, Writers, DeviceDraw, SubmitDue, Count };
+void NoteDrawCommit(const std::array<double, static_cast<std::size_t>(DrawCommitPart::Count)>& us);
+void NoteSubmitAttribution(bool deadlineDue, bool batchCapped, bool submitRecordedCalled, double checkWallUs, double submitRecordedWallUs, double submitRecordedThreadCpuUs);
 
 // Recorded draws whose written guest buffers were copied (their results reach guest memory by a CPU
 // write-back when their batch completes), listed until that write-back ran. It is the draw

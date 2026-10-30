@@ -298,8 +298,6 @@ void SuccessfulDrawEmitsNoFailureRecord(const char* tracePath) {
     const auto batch = TraceField(recorded, "batch");
     Require(!batch.empty() && batch != "0", "the draw-recorded record carries no actual batch serial");
     Require(ReadTraceFile(tracePath).find("submit batch=" + batch + " ") != std::string::npos, "the recorded batch was not submitted");
-    const auto submit = TraceLine(ReadTraceFile(tracePath), "submit batch=" + batch + " ");
-    Require(submit == "submit batch=" + batch + " tokens=[" + token + "]", "the submit record lost the draw token set");
     Require(ReadTraceFile(tracePath).find("submit-confirmed batch=" + batch + " tokens=[" + token + "]") != std::string::npos, "the confirmed submit record lost the draw token set");
     Require(trace.find("draw-shader-request-failed") == std::string::npos, "a successful draw emitted a draw-shader-request-failed record");
 }

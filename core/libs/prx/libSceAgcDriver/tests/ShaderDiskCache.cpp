@@ -129,7 +129,7 @@ void removeCacheDirectory(const std::filesystem::path& directory) {
 }
 
 bool sameBinding(const DescriptorBinding& left, const DescriptorBinding& right) {
-    return left.kind == right.kind && left.role == right.role && left.descriptorSet == right.descriptorSet && left.binding == right.binding && left.count == right.count && left.guestDescriptor == right.guestDescriptor && left.readOnly == right.readOnly && left.imageShape == right.imageShape && left.samplerDepthCompare == right.samplerDepthCompare && left.imageWritten == right.imageWritten && left.imageDepthCompare == right.imageDepthCompare && left.imageAtomic == right.imageAtomic && left.imageShapes == right.imageShapes && left.bufferAtomic == right.bufferAtomic && left.bufferWritten == right.bufferWritten && left.bufferRead == right.bufferRead && left.bufferExtent == right.bufferExtent && left.samplerUnnormalized == right.samplerUnnormalized && left.samplerIntegerBorder == right.samplerIntegerBorder && left.samplerCoordinatesIgnored == right.samplerCoordinatesIgnored && left.imageUnnormalized == right.imageUnnormalized && left.imageUnnormalizedBaseLevel == right.imageUnnormalizedBaseLevel && left.imageSamplers == right.imageSamplers;
+    return left.kind == right.kind && left.role == right.role && left.descriptorSet == right.descriptorSet && left.binding == right.binding && left.count == right.count && left.guestDescriptor == right.guestDescriptor && left.readOnly == right.readOnly && left.imageShape == right.imageShape && left.samplerDepthCompare == right.samplerDepthCompare && left.imageWritten == right.imageWritten && left.imageDepthCompare == right.imageDepthCompare && left.imageAtomic == right.imageAtomic && left.imageShapes == right.imageShapes && left.bufferAtomic == right.bufferAtomic && left.bufferWritten == right.bufferWritten && left.bufferRead == right.bufferRead && left.bufferExtent == right.bufferExtent && left.bufferFootprints == right.bufferFootprints && left.samplerUnnormalized == right.samplerUnnormalized && left.samplerIntegerBorder == right.samplerIntegerBorder && left.samplerCoordinatesIgnored == right.samplerCoordinatesIgnored && left.imageUnnormalized == right.imageUnnormalized && left.imageUnnormalizedBaseLevel == right.imageUnnormalizedBaseLevel && left.imageSamplers == right.imageSamplers;
 }
 
 bool sameBindings(const std::vector<DescriptorBinding>& left, const std::vector<DescriptorBinding>& right) {
@@ -213,7 +213,7 @@ DescriptorBinding sampleBinding(std::uint32_t seed) {
     binding.descriptorSet = 0;
     binding.binding = 29 + seed;
     binding.count = 3;
-    binding.guestDescriptor = {0x11111111u * seed, 0xdeadbeefu, 0x80000000u, 7u, 0u, 0xffffffffu, 42u, seed};
+    binding.guestDescriptor = SharedValues<std::uint32_t>(std::vector<std::uint32_t>{0x11111111u * seed, 0xdeadbeefu, 0x80000000u, 7u, 0u, 0xffffffffu, 42u, seed});
     binding.readOnly = seed % 2 == 0;
     binding.imageShape = DescriptorImageShape::Image2DArray;
     binding.samplerDepthCompare = {true, false, true};
@@ -244,6 +244,9 @@ RecompileResult sampleResult() {
     result.bindings[1].kind = DescriptorKind::StorageBuffer;
     result.bindings[1].role = DescriptorRole::GuestBuffers;
     result.bindings[1].imageShape.reset();
+    result.bindings[1].guestDescriptor = SharedValues<std::uint32_t>(std::vector<std::uint32_t>{
+        0x1000u, 0x00140002u, 4u, 0u, 0x2000u, 0x00140002u, 4u, 0u, 0x3000u, 0x00140002u, 4u, 0u});
+    result.bindings[1].bufferFootprints = SharedValues<BufferTransferFootprint>(std::vector<BufferTransferFootprint>{{true, 4u, 12u, 16u, 20u}, {false, 0u, 0u, 0u, 0u}, {true, 24u, 24u, 24u, 32u}});
     result.pushConstants = {std::byte{1}, std::byte{0xff}, std::byte{0}, std::byte{0x80}, std::byte{7}};
     result.readsDepthRemapPush = true;
     result.bdaAbiVersion = 3;
@@ -277,7 +280,8 @@ RecompileResult sampleResult() {
     result.variantId = 99;
     result.imageTablePoison = {{{1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u}, 8u, 2u, 6u}, {{9u, 0u, 0u, 0u, 0u, 0u, 0u, 0u}, 4u, 0xffffffffu, 19u}};
     result.imageTableRanges = {{0x1000u, 0x200u}, {0x5000000000ull, 48u}};
-    result.imageTableReadRanges = {{{0x1000u, 32u}, {0x1040u, 32u}}, {}, {{0x5000000000ull, 16u}}};
+    using ReadRange = std::pair<std::uint64_t, std::uint64_t>;
+    result.imageTableReadRanges = {SharedValues<ReadRange>(std::vector<ReadRange>{{0x1000u, 32u}, {0x1040u, 32u}}), SharedValues<ReadRange>{}, SharedValues<ReadRange>(std::vector<ReadRange>{{0x5000000000ull, 16u}})};
     result.imageTableShader = 0x80003aa700ull;
     result.imageTableFaults = 3u;
     result.userDataRegisterReads = (std::uint64_t{1} << 63u) | (std::uint64_t{1} << 32u) | 0x25u;
@@ -419,9 +423,21 @@ void verifyResultRoundTrip() {
     std::vector<std::byte> bytes;
     ShaderDiskCache::EncodeResult(result, bytes);
     RecompileResult decoded;
+    const std::weak_ptr<const void> oldPlan = decoded.preparedPlanOwner = std::make_shared<std::array<std::uint32_t, 1024>>();
+    const std::weak_ptr<const void> oldSource = decoded.sourceOwner = std::make_shared<std::array<std::uint32_t, 1024>>();
     require(ShaderDiskCache::DecodeResult(bytes, decoded), "an encoded result does not decode");
+    require(oldPlan.expired() && oldSource.expired(), "decoding into a reused result kept its previous runtime-owned allocations alive");
     requireSameResult(result, decoded, "result round trip");
     require(decoded.variantId == 0 && !decoded.cacheHit, "the per-process fields were stored");
+    auto malformedFootprint = result;
+    auto malformedFootprints = malformedFootprint.bindings[1].bufferFootprints.Copy();
+    malformedFootprints[0].readBegin = malformedFootprints[0].readEnd + 1u;
+    malformedFootprint.bindings[1].bufferFootprints = SharedValues<BufferTransferFootprint>(std::move(malformedFootprints));
+    bytes.clear();
+    ShaderDiskCache::EncodeResult(malformedFootprint, bytes);
+    require(!ShaderDiskCache::DecodeResult(bytes, decoded), "a result with a reversed bounded transfer footprint decodes");
+    bytes.clear();
+    ShaderDiskCache::EncodeResult(result, bytes);
     for (std::size_t size = 0; size < bytes.size(); size += size < 256 ? 1 : 97) {
         RecompileResult partial;
         require(!ShaderDiskCache::DecodeResult(std::span(bytes).first(size), partial), "a result truncated to " + std::to_string(size) + " bytes decodes");
@@ -691,7 +707,9 @@ void verifyArtifactStorageIsolation() {
     auto variant = sampleVariant();
     variant.artifact = result;
     const auto before = ShaderDiskCache::EncodeEntry(key, variant);
-    result.bindings[0].guestDescriptor[0] ^= 0x10000u;
+    auto changedDescriptor = result.bindings[0].guestDescriptor.Copy();
+    changedDescriptor[0] ^= 0x10000u;
+    result.bindings[0].guestDescriptor = SharedValues<std::uint32_t>(std::move(changedDescriptor));
     result.pushConstants[0] ^= std::byte{0xff};
     result.vertexAttributes[0].resource.fields[0] ^= 0x10000u;
     variant.artifact = result;
@@ -1225,6 +1243,7 @@ std::uint64_t diskMisses() {
 void verifyEmissionFailureMemo() {
     const auto before = ShaderDiskCache::Totals();
     ClockRequest clock;
+    const auto clockSource = ResolveSource(clock.request);
     const auto first = emissionFailure(clock.request);
     require(diskMisses() == before.misses + 1, "the first compile was not looked up");
     require(emissionFailure(clock.request) == first, "the second compile failed with another message");
@@ -1232,19 +1251,26 @@ void verifyEmissionFailureMemo() {
 
     ClockRequest layout;
     layout.request.layout = {0, 0, 16, 112};
+    const auto layoutSource = ResolveSource(layout.request);
     static_cast<void>(emissionFailure(layout.request));
     require(diskMisses() == before.misses + 2, "another binding layout reused the failure");
     ClockRequest stride(16);
+    const auto strideSource = ResolveSource(stride.request);
     static_cast<void>(emissionFailure(stride.request));
     require(diskMisses() == before.misses + 2, "a runtime buffer stride change repeated static preparation");
     ClockRequest relocated;
     relocated.request.shader.codeAddress += 0x1000u;
+    const auto relocatedSource = ResolveSource(relocated.request);
     static_cast<void>(emissionFailure(relocated.request));
     require(diskMisses() == before.misses + 3, "a relocated copy reused the failure");
     require(emissionFailure(clock.request) == first && diskMisses() == before.misses + 3, "the other requests replaced the failure");
-
+    static_cast<void>(clockSource);
+    static_cast<void>(layoutSource);
+    static_cast<void>(strideSource);
+    static_cast<void>(relocatedSource);
     ClockRequest concurrent;
     concurrent.request.layout.pushConstantSizeBytes = 64;
+    const auto concurrentSource = ResolveSource(concurrent.request);
     std::array<std::future<std::string>, 4> failures;
     for (auto& future : failures) future = std::async(std::launch::async, [&concurrent] { return emissionFailure(concurrent.request); });
     std::vector<std::string> messages;
@@ -1254,6 +1280,7 @@ void verifyEmissionFailureMemo() {
 
     ShaderDiskCache::Flush();
     require(ShaderDiskCache::Totals().writes == before.writes, "an emission failure was stored in the disk cache");
+    static_cast<void>(concurrentSource);
 }
 
 int runWithoutFailureMemo() {
@@ -1384,8 +1411,10 @@ void verifyBindingPlanSelection() {
     builder.Populate(populated, compiled, selected, 0u, snapshot, {});
     require(populated.bindings.size() == 2u && populated.pushConstants.empty(), "module selection retained an unused descriptor");
     auto expected = full.bindings[0];
-    expected.guestDescriptor[0] += 0x10000u;
-    expected.guestDescriptor[6] = 128u;
+    auto expectedDescriptor = expected.guestDescriptor.Copy();
+    expectedDescriptor[0] += 0x10000u;
+    expectedDescriptor[6] = 128u;
+    expected.guestDescriptor = SharedValues<std::uint32_t>(std::move(expectedDescriptor));
     require(sameBinding(expected, populated.bindings[0]) && sameBinding(full.bindings[3], populated.bindings[1]), "selected plan changed binding order or reused stale buffer data");
     bool rejected = false;
     try { static_cast<void>(builder.Select(plan, std::array{UINT32_MAX})); }
@@ -1894,6 +1923,14 @@ IrResourcePlan handBuiltPlan() {
     image.dimension = RdnaImageDimension::Dim2D;
     plan.info.images = {image};
     ResourceMaterializer::PrepareImageModes(plan.info);
+    BufferAccessRecord bufferAccess{};
+    bufferAccess.index = {BufferUniformSource::Kind::CapturedFlatSlot, 0u};
+    bufferAccess.offset = {BufferUniformSource::Kind::UserData, 2u};
+    bufferAccess.soffset = {BufferUniformSource::Kind::Constant, 0u};
+    bufferAccess.immediateOffset = 4u;
+    bufferAccess.byteWidth = 8u;
+    bufferAccess.access = BufferAccessClass::Atomic;
+    plan.bufferAccessPlans = {BufferAccessPlan{true, false, {bufferAccess}}};
     plan.uniformFill.fill = {UniformFillKind::Buffer, 1u, {4u, 8u, 12u}, 2u, 0x3f800000u};
     auto& fillValue = readConst(5);
     plan.uniformFill.values = {&fillValue, &fillValue, nullptr, nullptr};
@@ -1960,6 +1997,17 @@ bool samePlan(const IrResourcePlan& left, const IrResourcePlan& right) {
         const auto& a = left.controlFlow[index];
         const auto& b = right.controlFlow[index];
         if (!sameValue(a.condition, b.condition) || a.successors != b.successors || a.sources != b.sources || a.images != b.images || a.flatSlots != b.flatSlots) return false;
+    }
+    if (left.bufferAccessPlans.size() != right.bufferAccessPlans.size()) return false;
+    for (std::size_t index = 0; index < left.bufferAccessPlans.size(); ++index) {
+        const auto& a = left.bufferAccessPlans[index];
+        const auto& b = right.bufferAccessPlans[index];
+        if (a.complete != b.complete || a.failed != b.failed || a.accesses.size() != b.accesses.size()) return false;
+        for (std::size_t access = 0; access < a.accesses.size(); ++access) {
+            const auto& x = a.accesses[access];
+            const auto& y = b.accesses[access];
+            if (x.index != y.index || x.offset != y.offset || x.soffset != y.soffset || x.immediateOffset != y.immediateOffset || x.byteWidth != y.byteWidth || x.access != y.access) return false;
+        }
     }
     for (std::size_t index = 0; index < left.srtReads.size(); ++index) {
         if (!sameValue(left.srtReads[index].value, right.srtReads[index].value) || left.srtReads[index].flatOffset != right.srtReads[index].flatOffset) return false;
@@ -2116,6 +2164,11 @@ void verifyMalformedPlans() {
     rejects("an image table heap past the sources", [](IrResourcePlan& plan) { plan.descriptorSources[1].tableColumn->heapSource = 4u; });
     rejects("an image table key past the sources", [](IrResourcePlan& plan) { plan.descriptorSources[1].tableColumn->keyDomains[1].source = 4u; });
     rejects("an image table selection past the sources", [](IrResourcePlan& plan) { plan.descriptorSources[1].tableColumn->selection = 4u; });
+    rejects("a captured access slot past SRT reads", [](IrResourcePlan& plan) { plan.bufferAccessPlans[0].accesses[0].index.value = 2u; });
+    rejects("an invalid access source kind", [](IrResourcePlan& plan) { plan.bufferAccessPlans[0].accesses[0].offset.kind = static_cast<BufferUniformSource::Kind>(9u); });
+    rejects("a user-data access past the count", [](IrResourcePlan& plan) { plan.bufferAccessPlans[0].accesses[0].offset.value = plan.userDataCount; });
+    rejects("an unsupported buffer access width", [](IrResourcePlan& plan) { plan.bufferAccessPlans[0].accesses[0].byteWidth = 20u; });
+    rejects("an invalid buffer access kind", [](IrResourcePlan& plan) { plan.bufferAccessPlans[0].accesses[0].access = static_cast<BufferAccessClass>(0u); });
     auto foreign = handBuiltPlan();
     IrValue stray(IrOpcode::Void, IrType::U32, 99u);
     foreign.srtReads[0].value = &stray;

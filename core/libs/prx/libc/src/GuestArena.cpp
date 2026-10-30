@@ -658,9 +658,9 @@ bool GuestArenaWriteSharedBacking_nid_no_patch(std::uintptr_t address, const voi
     return writer != nullptr && writer(address, source, bytes);
 }
 
-bool GuestArenaSharedBacking_nid_postfix(std::uintptr_t address, std::size_t bytes, int* file, std::uint64_t* offset) {
+bool GuestArenaSharedBacking_nid_postfix(std::uintptr_t address, std::size_t bytes, SharedBackingVisitor visitor, void* context) {
     const auto resolver = sharedBackingResolver.load(std::memory_order_acquire);
-    return resolver != nullptr && resolver(address, bytes, file, offset);
+    return resolver != nullptr && visitor != nullptr && resolver(address, bytes, visitor, context);
 }
 #endif
 

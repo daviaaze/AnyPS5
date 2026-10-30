@@ -1,5 +1,8 @@
 #include "prx/libkernel/include/Api.hpp"
 #include "prx/libSceAgc/Command/include/Packet.hpp"
+#include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
+#include "prx/libSceAgcDriver/tools/ComputePipelineFixture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PipelineLinkOptimization.hpp"
 #include "Triangle_frag_spv.h"
 #include "Triangle_vert_spv.h"
@@ -82,6 +85,16 @@ namespace {
 
 using namespace AgcDriver::Graphics;
 using AgcDriver::GuestMemory::GpuMutex;
+void setDescriptor(ShaderRecompiler::DescriptorBinding& binding, std::vector<std::uint32_t> words) {
+    binding.guestDescriptor = ShaderRecompiler::SharedValues<std::uint32_t>(std::move(words));
+}
+
+template <typename TUpdate>
+void mutateDescriptor(ShaderRecompiler::DescriptorBinding& binding, TUpdate&& update) {
+    auto words = binding.guestDescriptor.Copy();
+    update(words);
+    setDescriptor(binding, std::move(words));
+}
 
 void* AllocateWatched(std::size_t bytes, std::size_t alignment) {
     if (!AgcDriver::GuestMemory::WriteWatched()) return nullptr;
@@ -602,7 +615,7 @@ void copiedDirectOrderingTests(const Device& device, Recorder& recorder) {
     binding.descriptorSet = 0;
     binding.binding = 0;
     binding.count = 1;
-    binding.guestDescriptor = {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u) & 0xffffu, 1024, 0x31000000u};
+    setDescriptor(binding, {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u) & 0xffffu, 1024, 0x31000000u});
     binding.bufferWritten = {true};
     program.bindings.push_back(binding);
     const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
@@ -670,7 +683,7 @@ void copiedDirectOrderingTests(const Device& device, Recorder& recorder) {
         std::erase(writers, copied);
     });
     auto separateProgram = program;
-    separateProgram.bindings[0].guestDescriptor[0] += 4096;
+    mutateDescriptor(separateProgram.bindings[0], [](auto& words) { words[0] += 4096; });
     const CompiledShader separateCompute{ShaderRecompiler::ShaderStage::Compute, &separateProgram, 0};
     auto separate = std::make_shared<ShaderResources>(context, separateCompute);
     Require(!writers.empty() && *block == 20, "a disjoint consumer waited for copied writes");
@@ -690,6 +703,24 @@ void copiedDirectOrderingTests(const Device& device, Recorder& recorder) {
     update(direct, 2);
     recorder.Sync();
     Require(*block == 45, "direct consumers lost GPU-ordered updates");
+    for (const bool reuse : {false, true}) {
+        const auto* imported = HostImportFor(context, address, bytes);
+        Require(imported != nullptr, "the label-ordering input lost its import");
+        const auto commands = recorder.Commands();
+        context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, imported->buffer, HostImportOffset(*imported, address), 4, 43);
+        const std::uint32_t value = 43;
+        recorder.NoteLabel(address, std::as_bytes(std::span(&value, 1)), 1001, 0);
+        auto completed = std::make_shared<bool>(false);
+        Require(recorder.AfterRecordedWork([completed] { *completed = true; }), "the unrelated completion was not queued");
+        Require(recorder.PendingLabelIn(address, 4) && !recorder.CompletionLabelIn(address, 4), "the GPU label was classified as a CPU completion store");
+        Require(!CompletePendingCpuWrites(context, address, 4), "an unrelated completion forced a CPU wait for a GPU-ordered label");
+        if (reuse) Require(direct->Revalidate(std::span(&compute, 1)), "a GPU-only label prevented direct consumer reuse");
+        else direct = std::make_shared<ShaderResources>(context, compute);
+        Require(!*completed, "the GPU-only label consumer completed unrelated host work");
+        update(direct, 2);
+        recorder.Sync();
+        Require(*completed && *block == 45, "the GPU label consumer lost its value or completion");
+    }
     {
         std::array<std::uint32_t, 1024> unregistered{};
         struct Finish {
@@ -700,7 +731,9 @@ void copiedDirectOrderingTests(const Device& device, Recorder& recorder) {
         auto mixedProgram = program;
         auto& mixedBinding = mixedProgram.bindings[0];
         mixedBinding.count = 2;
-        mixedBinding.guestDescriptor.insert(mixedBinding.guestDescriptor.end(), {static_cast<std::uint32_t>(copiedAddress), static_cast<std::uint32_t>(copiedAddress >> 32u) & 0xffffu, 1024, 0x31000000u});
+        auto mixedWords = mixedBinding.guestDescriptor.Copy();
+        mixedWords.insert(mixedWords.end(), {static_cast<std::uint32_t>(copiedAddress), static_cast<std::uint32_t>(copiedAddress >> 32u) & 0xffffu, 1024, 0x31000000u});
+        setDescriptor(mixedBinding, std::move(mixedWords));
         mixedBinding.bufferWritten = {true, true};
         const CompiledShader mixedCompute{ShaderRecompiler::ShaderStage::Compute, &mixedProgram, 0};
         for (const bool draw : {false, true}) {
@@ -744,7 +777,7 @@ void copiedDirectOrderingTests(const Device& device, Recorder& recorder) {
         imageBinding.count = 1;
         imageBinding.imageSamplers = {0};
         imageBinding.imageShape = ShaderRecompiler::DescriptorImageShape::Image2D;
-        imageBinding.guestDescriptor = {static_cast<std::uint32_t>(address >> 8), static_cast<std::uint32_t>(address >> 40) | (56u << 20) | (3u << 30), 15u | (63u << 14), 0x91b00fac, 0, 0, 0, 0};
+        setDescriptor(imageBinding, {static_cast<std::uint32_t>(address >> 8), static_cast<std::uint32_t>(address >> 40) | (56u << 20) | (3u << 30), 15u | (63u << 14), 0x91b00fac, 0, 0, 0, 0});
         imageProgram.bindings.push_back(imageBinding);
         const CompiledShader imageCompute{ShaderRecompiler::ShaderStage::Compute, &imageProgram, 0};
         auto sampled = std::make_shared<ShaderResources>(imageContext, imageCompute);
@@ -778,10 +811,9 @@ void copiedDirectOrderingTests(const Device& device, Recorder& recorder) {
         ClearCachedTextures(context.device);
         const auto keys = address + 65536;
         const auto keyBytes = DccKeyBytes(65536);
-        imageProgram.bindings[0].guestDescriptor[6] = (1u << 21) | (static_cast<std::uint32_t>((keys >> 8) & 0xffu) << 24);
-        imageProgram.bindings[0].guestDescriptor[7] = static_cast<std::uint32_t>(keys >> 16);
+        mutateDescriptor(imageProgram.bindings[0], [&](auto& words) { words[6] = (1u << 21) | (static_cast<std::uint32_t>((keys >> 8) & 0xffu) << 24); words[7] = static_cast<std::uint32_t>(keys >> 16); });
         auto keyProgram = program;
-        keyProgram.bindings[0].guestDescriptor = {static_cast<std::uint32_t>(keys), static_cast<std::uint32_t>(keys >> 32u) & 0xffffu, static_cast<std::uint32_t>(keyBytes), 0x31000000u};
+        setDescriptor(keyProgram.bindings[0], {static_cast<std::uint32_t>(keys), static_cast<std::uint32_t>(keys >> 32u) & 0xffffu, static_cast<std::uint32_t>(keyBytes), 0x31000000u});
         const CompiledShader keyCompute{ShaderRecompiler::ShaderStage::Compute, &keyProgram, 0};
         for (int reuse = 0; reuse < 2; ++reuse) {
             std::memset(reinterpret_cast<void*>(keys), 0, keyBytes);
@@ -1379,6 +1411,26 @@ void afterRecordedWorkTests(const Device& device, Recorder& recorder) {
     Require(ran == std::vector<int>{1, 2, 3} && Recorder::PendingCompletionLabels() == 0 && recorder.Idle(), "actions behind recorded work did not run once each, in order");
     Require(seen == 1, "an action ran before the completion label recorded ahead of it");
 }
+void completionWaitTests(const Device& device, Recorder& recorder) {
+    alignas(64) static std::uint32_t memory[16];
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    recorder.Sync();
+    const std::array<std::byte, 4> gpuValue{std::byte{5}, std::byte{0}, std::byte{0}, std::byte{0}};
+    auto ran = std::make_shared<bool>(false);
+    recorder.NotePendingWrite(base, sizeof(memory));
+    recorder.AfterCompletions(base, gpuValue, 7, 0, true);
+    Require(recorder.AfterRecordedWork([ran] { *ran = true; }) && Recorder::PendingCompletionLabels() != 0, "completion wait: the action behind the open batch is not pending");
+    CompletePendingCpuWrites(device.GetContext(), base, sizeof(memory));
+    Require(!*ran && !recorder.Idle(), "completion wait: a GPU-stored label forced a CPU wait");
+    recorder.Sync();
+    Require(*ran && recorder.Idle(), "completion wait: the action did not run at sync");
+    const std::array<std::byte, 4> cpuValue{std::byte{9}, std::byte{0}, std::byte{0}, std::byte{0}};
+    recorder.NotePendingWrite(base, sizeof(memory));
+    recorder.AfterCompletions(base + 4u, cpuValue, 8, 0, false);
+    CompletePendingCpuWrites(device.GetContext(), base, sizeof(memory));
+    Require(memory[1] == 9u && Recorder::PendingCompletionLabels() == 0, "completion wait: CPU completion bytes were not published");
+}
+
 
 int gpuTimingCompletionTests(const Device& device, bool incomplete) {
     const auto& context = device.GetContext();
@@ -1422,6 +1474,13 @@ void batchStampTests(Recorder& recorder) {
     Require(recorder.Idle(), "batch stamps: the recorder is busy");
     double previousEnd = 0;
     for (int round = 0; round < 3; ++round) {
+        if (Recorder::GpuTimingEnabled()) {
+            for (std::uint64_t range = 0; range < 2; ++range) {
+                const auto timing = recorder.BeginGpuTiming(0x600000 + static_cast<std::uint64_t>(round * 2) + range);
+                Require(timing != Recorder::NoTiming, "batch stamps: a full-range timing query was not allocated");
+                recorder.EndGpuTiming(timing);
+            }
+        }
         recorder.NotePendingWrite(0x60000, 0x100);
         const auto serial = recorder.Submissions() + 1;
         recorder.Submit();
@@ -1656,6 +1715,7 @@ void keyProofTests(const Device& device, Recorder& recorder) {
     // A recorded write over the keys (noted and stamped as the driver's key stores are): the scans
     // are not kept until its batch signaled.
     recorder.NotePendingWrite(address, keyCount);
+    NoteKeysFillOnGpu(address, keyCount, DccKeys::Clear0001);
     MarkWritten(address, keyCount);
     before = KeyProofCounts();
     Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001 && proof.generation == 0, "(9) a scan under a pending write was kept");
@@ -1664,10 +1724,14 @@ void keyProofTests(const Device& device, Recorder& recorder) {
     Require(after.scanned == before.scanned + 2 && after.unstable == before.unstable + 2 && after.proved == before.proved, "(9) unstable scans were miscounted");
     recorder.Submit();
     device.WaitQueue();
-    Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001 && proof.generation != 0, "(9) a signaled write kept the scan unstable");
+    Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001 && proof.generation == 0, "(9) a signaled but in-flight write stored a proof");
     recorder.Sync();
     before = KeyProofCounts();
-    Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001 && KeyProofCounts().proved == before.proved + 1, "(9) the proof did not hold after the batch finished");
+    Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001 && proof.generation != 0, "(9) a reaped write did not store a proof");
+    after = KeyProofCounts();
+    Require(after.scanned == before.scanned + 1 && after.proved == before.proved, "(9) the first post-reap scan was not kept");
+    before = KeyProofCounts();
+    Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001 && KeyProofCounts().proved == before.proved + 1, "(9) the proof did not hold after the batch was reaped");
 }
 
 void targetKeyProofTests(const Device& device, Recorder& recorder) {
@@ -3243,7 +3307,7 @@ void resourceReadTests(const Device& device, Recorder& recorder) {
     binding.descriptorSet = 0;
     binding.binding = 0;
     binding.count = 1;
-    binding.guestDescriptor = {static_cast<std::uint32_t>(element), static_cast<std::uint32_t>(element >> 32u) & 0xffffu, elementBytes, 0x31000000u};
+    setDescriptor(binding, {static_cast<std::uint32_t>(element), static_cast<std::uint32_t>(element >> 32u) & 0xffffu, elementBytes, 0x31000000u});
     binding.bufferWritten = {false};
     program.bindings.push_back(binding);
     const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
@@ -3367,10 +3431,21 @@ bool bdaStagingTests(const Device& device, Recorder& recorder) {
         memory.AllowDeviceStaging();
         memory.AcquireRegistered();
         memory.AddWritable(element, elementBytes, false, false);
+        const ShaderRecompiler::BufferTransferFootprint boundedFootprint{true, 0, 4, 256, 512};
+        memory.AddFootprint(element, elementBytes, boundedFootprint);
+        memory.AddWritable(element + 32, 16);
+        memory.AddFootprint(element + 32, 16, ShaderRecompiler::BufferTransferFootprint{});
         memory.AddReadable(element + 16, 64);
+        memory.AddFootprint(element + 16, 64, ShaderRecompiler::BufferTransferFootprint{true, 0, 64, 0, 0});
         memory.AddReadable(address + (1u << 20u), 64);
+        memory.AddReadable(element + 120, 4);
+        // A clipped registration must not summarize an earlier same-extent unknown alias.
+        memory.AddReadable(element + 512, 64);
+        memory.AddReadable(element + 512, 32);
+        memory.AddFootprint(element + 512, 64, ShaderRecompiler::BufferTransferFootprint{true, 0, 4, 0, 0});
+        memory.AddReadable(element + 640, 32);
+        memory.AddFootprint(element + 640, 32, ShaderRecompiler::BufferTransferFootprint{});
         memory.Upload(true);
-        checkTable(memory.AddressRanges(), true);
         const auto cached = memory.CachedAddressTable();
         Require(cached.has_value() && cached->ranges != nullptr && cached->ranges->size() == memory.AddressRanges().size(), "the cached BDA table of a staged build differs from its ranges");
         std::uint32_t adjustment = 0;
@@ -3380,6 +3455,21 @@ bool bdaStagingTests(const Device& device, Recorder& recorder) {
         Require(memory.Descriptor(element + 16, 64, innerAdjustment).buffer == view.buffer, "a read inside the staged element does not read its shadow");
         recorder.Sync();
         auto commands = recorder.Commands();
+        Buffer aliasReadback(context, 8, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        CopyBuffer(context, commands, view.buffer, view.offset + adjustment + 120, aliasReadback.Handle(), 0, 4);
+        CopyBuffer(context, commands, view.buffer, view.offset + adjustment + 560, aliasReadback.Handle(), 4, 4);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        recorder.Sync();
+        std::uint32_t aliasValue = 0;
+        std::memcpy(&aliasValue, aliasReadback.Bytes().data(), sizeof(aliasValue));
+        Require(aliasValue == 0x11111111u, "an unclassified contained read was not initialized from guest memory");
+        std::memcpy(&aliasValue, aliasReadback.Bytes().data() + 4, sizeof(aliasValue));
+        Require(aliasValue == 0x11111111u, "a clipped summary stole an earlier unknown alias's input");
+        // Copy-back must not restore the old input of a read-only Whole alias.
+        words[first + 656 / 4] = 0x55555555u;
+        commands = recorder.Commands();
+        fill(commands, view.buffer, view.offset + adjustment + 32u, 4, 0x33333333u);
         fill(commands, view.buffer, view.offset + adjustment + 64u * 4u, 64, 0x22222222u);
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
         memory.RecordCopyBacks(recorder);
@@ -3388,10 +3478,11 @@ bool bdaStagingTests(const Device& device, Recorder& recorder) {
         std::size_t wrong = 0;
         for (std::size_t index = 0; index < bytes / 4u; ++index) {
             const auto at = index >= first ? index - first : bytes;
-            const auto expected = at >= 64 && at < 80 ? 0x22222222u : 0x11111111u;
+            const auto expected = at == 8 ? 0x33333333u : at == 656 / 4 ? 0x55555555u :
+                (at >= 64 && at < 80 ? 0x22222222u : 0x11111111u);
             if (words[index] != expected && wrong++ < 8) std::cout << "address-based staging copy-back dword " << index << " holds 0x" << std::hex << words[index] << ", expected 0x" << expected << std::dec << "\n";
         }
-        Require(wrong == 0, "an address-based staged copy-back left the wrong guest bytes");
+        Require(wrong == 0, "overlapping unknown-alias copy-back changed untouched padding or lost a write");
         memory.WriteBack();
     }
     std::memset(block, 0x11, bytes);
@@ -3467,7 +3558,7 @@ bool readWrittenStagingTests(const Device& device, Recorder& recorder) {
         binding.descriptorSet = 0;
         binding.binding = 0;
         binding.count = 1;
-        binding.guestDescriptor = {static_cast<std::uint32_t>(element), (static_cast<std::uint32_t>(element >> 32u) & 0xffffu) | (stride << 16u), records, 0x31000000u};
+        setDescriptor(binding, {static_cast<std::uint32_t>(element), (static_cast<std::uint32_t>(element >> 32u) & 0xffffu) | (stride << 16u), records, 0x31000000u});
         binding.bufferWritten = {true};
         binding.bufferRead = {read};
         binding.bufferExtent = {extent};
@@ -3636,7 +3727,7 @@ bool sparseRunImportTests(const Device& device, bool copied) {
         binding.descriptorSet = 0;
         binding.binding = 0;
         binding.count = 1;
-        binding.guestDescriptor = {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u) & 0xffffu, static_cast<std::uint32_t>(heap), 0x31000000u};
+        setDescriptor(binding, {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u) & 0xffffu, static_cast<std::uint32_t>(heap), 0x31000000u});
         binding.bufferWritten = {false};
         program.bindings.push_back(binding);
         program.pushConstants.resize(16);
@@ -3719,7 +3810,7 @@ void misalignedRegionTests(const Device& device, Recorder& recorder) {
     binding.descriptorSet = 0;
     binding.binding = 0;
     binding.count = 1;
-    binding.guestDescriptor = {static_cast<std::uint32_t>(view), static_cast<std::uint32_t>(view >> 32u) & 0xffffu, static_cast<std::uint32_t>(elementBytes), 0x31000000u};
+    setDescriptor(binding, {static_cast<std::uint32_t>(view), static_cast<std::uint32_t>(view >> 32u) & 0xffffu, static_cast<std::uint32_t>(elementBytes), 0x31000000u});
     binding.bufferWritten = {false};
     vertex.bindings.push_back(binding);
     vertex.pushConstants.resize(16);
@@ -3808,8 +3899,10 @@ void misalignedSnapshotTests(const Device& device, Recorder& recorder) {
     binding.descriptorSet = 0;
     binding.binding = 0;
     binding.count = 2;
-    for (const auto word : words(address + outer, outerBytes)) binding.guestDescriptor.push_back(word);
-    for (const auto word : words(address + offset, elementBytes)) binding.guestDescriptor.push_back(word);
+    std::vector<std::uint32_t> descriptorWords;
+    for (const auto word : words(address + outer, outerBytes)) descriptorWords.push_back(word);
+    for (const auto word : words(address + offset, elementBytes)) descriptorWords.push_back(word);
+    setDescriptor(binding, std::move(descriptorWords));
     binding.bufferWritten = {false, false};
     program.bindings.push_back(binding);
     program.pushConstants.resize(16);
@@ -3894,7 +3987,7 @@ void drawDescriptorWriteTests(const Device& device, Recorder& recorder) {
         data.role = ShaderRecompiler::DescriptorRole::FlattenedSrt;
         data.binding = 2;
         data.count = 1;
-        data.guestDescriptor = {1, 2, 3, 4};
+        setDescriptor(data, {1, 2, 3, 4});
         program.bindings.push_back(data);
         data.binding = 7;
         program.bindings.push_back(data);
@@ -3903,7 +3996,7 @@ void drawDescriptorWriteTests(const Device& device, Recorder& recorder) {
         sampler.role = ShaderRecompiler::DescriptorRole::GuestSamplers;
         sampler.binding = static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Samplers);
         sampler.count = 2;
-        sampler.guestDescriptor.resize(8);
+        setDescriptor(sampler, std::vector<std::uint32_t>(8u));
         sampler.samplerDepthCompare = {false, false};
         program.bindings.push_back(sampler);
         const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
@@ -3912,7 +4005,7 @@ void drawDescriptorWriteTests(const Device& device, Recorder& recorder) {
         const auto original = updates.calls.front();
         Require(original.buffers.size() == 2 && original.images.size() == 2, "descriptor test lacks mixed bindings and an image array");
         for (std::size_t allocation = 0; allocation < 2; ++allocation) {
-            const std::array<std::uint32_t, 4> words{5, 6, 7, 8};
+            const ShaderRecompiler::SharedValues<std::uint32_t> words(std::vector<std::uint32_t>{5, 6, 7, 8});
             const ShaderResources::MovedBuffer moved{allocation, 0, 16, words};
             const auto draw = resources.PrepareDrawBindings(snapshots, std::span(&moved, 1));
             Require(draw != nullptr && draw->snapshots.size() == 1, "moved shader data did not create a draw snapshot");
@@ -3961,11 +4054,12 @@ void drawSnapshotTableSetTests(const Device& device, Recorder& recorder) {
         map.descriptorSet = set;
         map.binding = static_cast<std::uint32_t>(stage) * bindingCount + static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::ImageTableMap);
         map.count = 1;
-        map.guestDescriptor.assign(Abi::HeaderWords + elements, 0u);
-        map.guestDescriptor[Abi::HeaderVersion] = Abi::Version;
-        map.guestDescriptor[Abi::HeaderElementCount] = elements;
-        map.guestDescriptor[Abi::HeaderElementFaults] = Abi::HeaderWords;
-        map.guestDescriptor[Abi::HeaderSamplerFaults] = Abi::HeaderWords + elements;
+        std::vector<std::uint32_t> mapWords(Abi::HeaderWords + elements, 0u);
+        mapWords[Abi::HeaderVersion] = Abi::Version;
+        mapWords[Abi::HeaderElementCount] = elements;
+        mapWords[Abi::HeaderElementFaults] = Abi::HeaderWords;
+        mapWords[Abi::HeaderSamplerFaults] = Abi::HeaderWords + elements;
+        setDescriptor(map, std::move(mapWords));
         program.bindings.push_back(map);
         ShaderRecompiler::DescriptorBinding images{};
         images.kind = DescriptorKind::SampledImage;
@@ -3973,7 +4067,9 @@ void drawSnapshotTableSetTests(const Device& device, Recorder& recorder) {
         images.descriptorSet = set;
         images.binding = ShaderRecompiler::RuntimeAbi::ImageTableBinding;
         images.count = elements;
-        for (std::uint32_t element = 0; element < elements; ++element) images.guestDescriptor.insert(images.guestDescriptor.end(), texture.begin(), texture.end());
+        std::vector<std::uint32_t> imageWords;
+        for (std::uint32_t element = 0; element < elements; ++element) imageWords.insert(imageWords.end(), texture.begin(), texture.end());
+        setDescriptor(images, std::move(imageWords));
         images.imageShapes.assign(elements, ShaderRecompiler::DescriptorImageShape::Image2D);
         images.imageDepthCompare.assign(elements, false);
         images.imageSamplers.assign(elements, 0u);
@@ -3991,14 +4087,14 @@ void drawSnapshotTableSetTests(const Device& device, Recorder& recorder) {
         data.role = DescriptorRole::FlattenedSrt;
         data.binding = static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::FlattenedSrt);
         data.count = 1;
-        data.guestDescriptor = {1, 2, 3, 4};
+        setDescriptor(data, {1, 2, 3, 4});
         vertex.bindings.push_back(data);
         addTable(vertex, ShaderRecompiler::RuntimeAbi::Stage::Main, 0u, 1u);
         addTable(fragment, ShaderRecompiler::RuntimeAbi::Stage::Fragment, ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, 2u);
         const ColorTarget target{};
         ShaderResources resources(context, vertex, fragment, target, 0, 0);
         Require(resources.SplitSets(), "a fragment image table did not get its own descriptor set");
-        const std::array<std::uint32_t, 4> movedWords{5, 6, 7, 8};
+        const ShaderRecompiler::SharedValues<std::uint32_t> movedWords(std::vector<std::uint32_t>{5, 6, 7, 8});
         const ShaderResources::MovedBuffer moved{0, 0, 16, movedWords};
         const auto draw = resources.PrepareDrawBindings(snapshots, std::span(&moved, 1));
         Require(draw != nullptr && draw->snapshots.size() == 1, "moved shader data did not create a draw snapshot");
@@ -4043,18 +4139,19 @@ void imageTableFirstLayerRevalidateTests(const Device& device, Recorder& recorde
     map.role = DescriptorRole::ImageTableMap;
     map.binding = static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Stage::Main) * bindingCount + static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::ImageTableMap);
     map.count = 1;
-    map.guestDescriptor.assign(Abi::HeaderWords + 1u, 0u);
-    map.guestDescriptor[Abi::HeaderVersion] = Abi::Version;
-    map.guestDescriptor[Abi::HeaderElementCount] = 1u;
-    map.guestDescriptor[Abi::HeaderElementFaults] = Abi::HeaderWords;
-    map.guestDescriptor[Abi::HeaderSamplerFaults] = Abi::HeaderWords + 1u;
+    std::vector<std::uint32_t> mapWords(Abi::HeaderWords + 1u, 0u);
+    mapWords[Abi::HeaderVersion] = Abi::Version;
+    mapWords[Abi::HeaderElementCount] = 1u;
+    mapWords[Abi::HeaderElementFaults] = Abi::HeaderWords;
+    mapWords[Abi::HeaderSamplerFaults] = Abi::HeaderWords + 1u;
+    setDescriptor(map, std::move(mapWords));
     program.bindings.push_back(map);
     ShaderRecompiler::DescriptorBinding images{};
     images.kind = DescriptorKind::SampledImage;
     images.role = DescriptorRole::ImageTable;
     images.binding = ShaderRecompiler::RuntimeAbi::ImageTableBinding;
     images.count = 1;
-    images.guestDescriptor.assign(texture.begin(), texture.end());
+    setDescriptor(images, std::vector<std::uint32_t>(texture.begin(), texture.end()));
     images.imageShapes.assign(1, ShaderRecompiler::DescriptorImageShape::Image2D);
     images.imageDepthCompare.assign(1, false);
     images.imageSamplers.assign(1, 0u);
@@ -4120,7 +4217,7 @@ void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
     binding.descriptorSet = 0;
     binding.binding = 0;
     binding.count = 1;
-    binding.guestDescriptor = {static_cast<std::uint32_t>(element), static_cast<std::uint32_t>(element >> 32u) & 0xffffu, elementBytes, 0x31000000u};
+    setDescriptor(binding, {static_cast<std::uint32_t>(element), static_cast<std::uint32_t>(element >> 32u) & 0xffffu, elementBytes, 0x31000000u});
     binding.bufferWritten = {false};
     program.bindings.push_back(binding);
     const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
@@ -4215,7 +4312,7 @@ void drawSnapshotPatchTests(const Device& device) {
     binding.descriptorSet = 0;
     binding.binding = 0;
     binding.count = 1;
-    binding.guestDescriptor = {static_cast<std::uint32_t>(element), static_cast<std::uint32_t>(element >> 32u) & 0xffffu, static_cast<std::uint32_t>(elementBytes), 0x31000000u};
+    setDescriptor(binding, {static_cast<std::uint32_t>(element), static_cast<std::uint32_t>(element >> 32u) & 0xffffu, static_cast<std::uint32_t>(elementBytes), 0x31000000u});
     binding.bufferWritten = {false};
     program.bindings.push_back(binding);
     const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
@@ -4318,7 +4415,7 @@ void drawSnapshotEpochTests(const Device& device) {
     binding.descriptorSet = 0;
     binding.binding = 0;
     binding.count = 1;
-    binding.guestDescriptor = {static_cast<std::uint32_t>(element), static_cast<std::uint32_t>(element >> 32u) & 0xffffu, static_cast<std::uint32_t>(elementBytes), 0x31000000u};
+    setDescriptor(binding, {static_cast<std::uint32_t>(element), static_cast<std::uint32_t>(element >> 32u) & 0xffffu, static_cast<std::uint32_t>(elementBytes), 0x31000000u});
     binding.bufferWritten = {false};
     program.bindings.push_back(binding);
     const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
@@ -4417,7 +4514,7 @@ void drawSnapshotCapTests(const Device& device, Recorder& recorder) {
     smallBinding.descriptorSet = 0;
     smallBinding.binding = 0;
     smallBinding.count = 1;
-    smallBinding.guestDescriptor = {static_cast<std::uint32_t>(smallAddress), static_cast<std::uint32_t>(smallAddress >> 32u) & 0xffffu, static_cast<std::uint32_t>(smallBytes), 0x31000000u};
+    setDescriptor(smallBinding, {static_cast<std::uint32_t>(smallAddress), static_cast<std::uint32_t>(smallAddress >> 32u) & 0xffffu, static_cast<std::uint32_t>(smallBytes), 0x31000000u});
     smallBinding.bufferWritten = {false};
     program.bindings.push_back(smallBinding);
     ShaderRecompiler::DescriptorBinding largeBinding;
@@ -4426,7 +4523,7 @@ void drawSnapshotCapTests(const Device& device, Recorder& recorder) {
     largeBinding.descriptorSet = 0;
     largeBinding.binding = 1;
     largeBinding.count = 1;
-    largeBinding.guestDescriptor = {static_cast<std::uint32_t>(largeAddress), static_cast<std::uint32_t>(largeAddress >> 32u) & 0xffffu, static_cast<std::uint32_t>(largeBytes), 0x31000000u};
+    setDescriptor(largeBinding, {static_cast<std::uint32_t>(largeAddress), static_cast<std::uint32_t>(largeAddress >> 32u) & 0xffffu, static_cast<std::uint32_t>(largeBytes), 0x31000000u});
     largeBinding.bufferWritten = {false};
     program.bindings.push_back(largeBinding);
     const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
@@ -4479,7 +4576,7 @@ void drawSnapshotCapTests(const Device& device, Recorder& recorder) {
     firstBinding.descriptorSet = 0;
     firstBinding.binding = 0;
     firstBinding.count = 1;
-    firstBinding.guestDescriptor = {static_cast<std::uint32_t>(firstAddress), static_cast<std::uint32_t>(firstAddress >> 32u) & 0xffffu, static_cast<std::uint32_t>(firstBytes), 0x31000000u};
+    setDescriptor(firstBinding, {static_cast<std::uint32_t>(firstAddress), static_cast<std::uint32_t>(firstAddress >> 32u) & 0xffffu, static_cast<std::uint32_t>(firstBytes), 0x31000000u});
     firstBinding.bufferWritten = {false};
     cumulativeProgram.bindings.push_back(firstBinding);
     ShaderRecompiler::DescriptorBinding secondBinding;
@@ -4488,7 +4585,7 @@ void drawSnapshotCapTests(const Device& device, Recorder& recorder) {
     secondBinding.descriptorSet = 0;
     secondBinding.binding = 1;
     secondBinding.count = 1;
-    secondBinding.guestDescriptor = {static_cast<std::uint32_t>(secondAddress), static_cast<std::uint32_t>(secondAddress >> 32u) & 0xffffu, static_cast<std::uint32_t>(secondBytes), 0x31000000u};
+    setDescriptor(secondBinding, {static_cast<std::uint32_t>(secondAddress), static_cast<std::uint32_t>(secondAddress >> 32u) & 0xffffu, static_cast<std::uint32_t>(secondBytes), 0x31000000u});
     secondBinding.bufferWritten = {false};
     cumulativeProgram.bindings.push_back(secondBinding);
     const CompiledShader cumulativeCompute{ShaderRecompiler::ShaderStage::Compute, &cumulativeProgram, 0};
@@ -4656,7 +4753,7 @@ void drawSnapshotUploadTests(const Device& device, Recorder& recorder) {
         binding.descriptorSet = 0;
         binding.binding = index;
         binding.count = 1;
-        binding.guestDescriptor = {static_cast<std::uint32_t>(elements[index]), static_cast<std::uint32_t>(elements[index] >> 32u) & 0xffffu, static_cast<std::uint32_t>(sizes[index]), 0x31000000u};
+        setDescriptor(binding, {static_cast<std::uint32_t>(elements[index]), static_cast<std::uint32_t>(elements[index] >> 32u) & 0xffffu, static_cast<std::uint32_t>(sizes[index]), 0x31000000u});
         binding.bufferWritten = {false};
         program.bindings.push_back(binding);
     }
@@ -4697,14 +4794,14 @@ void drawSnapshotUploadTests(const Device& device, Recorder& recorder) {
     recorder.Activate();
 }
 
-void drawInputReuseTests(const Device& device, Recorder& recorder) {
+bool drawInputReuseTests(const Device& device, Recorder& recorder) {
     using namespace AgcDriver::GuestMemory;
     using Use = Recorder::SnapshotUse;
     constexpr std::size_t bytes = 65536;
     void* block = WriteWatched() ? AllocateWatched(bytes, 65536) : nullptr;
     if (block == nullptr) {
         std::cout << "write watching unavailable: draw input reuse not tested\n";
-        return;
+        return false;
     }
     struct Release {
         void* block;
@@ -4740,6 +4837,64 @@ void drawInputReuseTests(const Device& device, Recorder& recorder) {
     Require(!marked.reused && equalsGuest(marked), "a draw input outlived a stamped GPU store");
     KeepDrawInput(&recorder, address, marked, Use::Index32, 1);
     Require(CopyDrawInput(context, &recorder, address, size, 4, Use::Index32).reused, "the copy after the GPU store was not kept");
+    const auto clampUse = Use::Index32;
+    auto clamped = CopyClampedDrawInput(context, &recorder, address, size, 4, false, 9, clampUse);
+    const auto clampedIndices = std::span<const std::uint32_t>(reinterpret_cast<const std::uint32_t*>(clamped.buffer->Bytes().data()), size / sizeof(std::uint32_t));
+    Require(!clamped.reused && clamped.derived == 9 && clampedIndices[0] == 0 && clampedIndices[1] == 3 && clampedIndices[4] == 9 &&
+            std::all_of(clampedIndices.begin(), clampedIndices.end(), [](std::uint32_t index) { return index <= 9; }),
+            "the initial clamped draw input has incorrect indices, bounds, or derived maximum");
+    const auto clampedAgain = CopyClampedDrawInput(context, &recorder, address, size, 4, false, 9, clampUse);
+    Require(clampedAgain.reused && clampedAgain.buffer == clamped.buffer && clampedAgain.derived == clamped.derived &&
+            std::equal(clampedIndices.begin(), clampedIndices.end(), reinterpret_cast<const std::uint32_t*>(clampedAgain.buffer->Bytes().data())),
+            "an unchanged clamp did not reuse identical derived indices");
+    const auto changedLimit = CopyClampedDrawInput(context, &recorder, address, size, 4, false, 8, clampUse);
+    Require(!changedLimit.reused && changedLimit.derived == 8 &&
+            std::all_of(reinterpret_cast<const std::uint32_t*>(changedLimit.buffer->Bytes().data()),
+                        reinterpret_cast<const std::uint32_t*>(changedLimit.buffer->Bytes().data()) + size / sizeof(std::uint32_t),
+                        [](std::uint32_t index) { return index <= 8; }),
+            "a changed clamp limit reused the wrong result or exceeded its bound");
+    words[4] = 1000;
+    const auto afterClampCpuWrite = CopyClampedDrawInput(context, &recorder, address, size, 4, false, 9, clampUse);
+    Require(!afterClampCpuWrite.reused && reinterpret_cast<const std::uint32_t*>(afterClampCpuWrite.buffer->Bytes().data())[4] == 9,
+            "a clamped snapshot outlived a CPU write");
+    MarkWritten(address + 4, 4);
+    const auto afterClampGpuWrite = CopyClampedDrawInput(context, &recorder, address, size, 4, false, 9, clampUse);
+    Require(!afterClampGpuWrite.reused, "a clamped snapshot outlived a stamped GPU write");
+
+    words[0] = 0xffffffffu;
+    words[1] = 0x12345u;
+    const auto restartUse = Use::Index32Restart;
+    const auto restartClamp = CopyClampedDrawInput(context, &recorder, address, size, 4, true, 9, restartUse);
+    const auto* restartIndices = reinterpret_cast<const std::uint32_t*>(restartClamp.buffer->Bytes().data());
+    Require(restartIndices[0] == 0xffffffffu && restartIndices[1] == 9 && restartClamp.derived == 10,
+            "clamping changed a restart marker or failed to clamp a normal index");
+    const auto restartAgain = CopyClampedDrawInput(context, &recorder, address, size, 4, true, 9, restartUse);
+    Require(restartAgain.reused && restartAgain.buffer == restartClamp.buffer && restartAgain.derived == restartClamp.derived,
+            "an unchanged restart-aware clamp was not reused");
+    auto* halfWords = static_cast<std::uint16_t*>(block);
+    halfWords[0] = 0xffffu;
+    halfWords[1] = 100u;
+    const auto restart16Use = Use::Index16Restart;
+    const auto restart16Clamp = CopyClampedDrawInput(context, &recorder, address, size, 2, true, 9, restart16Use);
+    const auto* restart16Indices = reinterpret_cast<const std::uint16_t*>(restart16Clamp.buffer->Bytes().data());
+    const auto restart16Again = CopyClampedDrawInput(context, &recorder, address, size, 2, true, 9, restart16Use);
+    Require(restart16Indices[0] == 0xffffu && restart16Indices[1] == 9 && restart16Clamp.derived == 10 &&
+            restart16Again.reused && restart16Again.buffer == restart16Clamp.buffer,
+            "16-bit restart-aware clamp changed its marker or failed reuse");
+    std::fill_n(words, size / sizeof(std::uint32_t), 0xffffffffu);
+    const auto emptyClamp = CopyClampedDrawInput(context, &recorder, address, size, 4, true, 9, restartUse);
+    const auto emptyAgain = CopyClampedDrawInput(context, &recorder, address, size, 4, true, 9, restartUse);
+    Require(emptyClamp.derived == 0 && emptyAgain.reused && emptyAgain.derived == 0,
+            "an all-restart empty draw did not preserve its empty derived result");
+    words[0] = 0;
+    words[1] = 3;
+    KeepDrawInput(&recorder, address, CopyDrawInput(context, &recorder, address, size, 4, Use::Index32), Use::Index32, 3);
+    Require(!CopyClampedDrawInput(context, &recorder, address, size, 2, false, 9, Use::Index16).reused,
+            "a clamp reused a snapshot with a different index size");
+    Require(!CopyClampedDrawInput(context, &recorder, address, size, 4, true, 9, Use::Index32Restart).reused,
+            "a clamp reused a snapshot with a different restart policy");
+    Require(!CopyClampedDrawInput(context, nullptr, address, size, 4, false, 9, clampUse).reused,
+            "a clamped input was reused without a recorder");
     alignas(64) static std::byte other[64];
     {
         GuestAllocations::Mutation mutation;
@@ -4770,7 +4925,7 @@ void drawInputReuseTests(const Device& device, Recorder& recorder) {
     KeepDrawInput(&recorder, pool, after, Use::Vertex, 0);
     const auto small = CopyDrawInput(context, &recorder, pool, 4096, 1, Use::Vertex);
     Require(small.reused && small.buffer == after.buffer, "the new vertex snapshot does not serve shorter reads");
-    recorder.Sync();
+    return true;
 }
 
 void drawInputInPlaceTests(const Device& device, Recorder& recorder, bool copied = false) {
@@ -6067,6 +6222,173 @@ void staleGenerationTests(const Device& device, Recorder& recorder) {
     recorder.Sync();
 #endif
 }
+
+class StorageReadyProbe {
+public:
+    explicit StorageReadyProbe(Context& context) : context(context), resolver(context.deviceProc) {
+        Require(active == nullptr && context.functions == nullptr, "storage ready probe requires uncached device functions");
+        active = this;
+        context.deviceProc = resolve;
+    }
+    ~StorageReadyProbe() {
+        context.deviceProc = resolver;
+        active = nullptr;
+    }
+    void Begin(VkBuffer source, VkBuffer destination) {
+        this->source = source;
+        this->destination = destination;
+        recording = true;
+    }
+    void End() { recording = false; }
+    std::uint32_t Copies() const { return copies; }
+    std::uint32_t Dispatches() const { return dispatches; }
+    std::uint32_t ReadyBarriers() const { return readyBarriers; }
+    std::uint32_t UnorderedDispatches() const { return unorderedDispatches; }
+
+private:
+    template<typename TFunction>
+    TFunction function(const char* name) const { return reinterpret_cast<TFunction>(resolver(context.device, name)); }
+    static VKAPI_ATTR void VKAPI_CALL copyBuffer(VkCommandBuffer commands, VkBuffer source, VkBuffer destination, std::uint32_t count, const VkBufferCopy* regions) {
+        if (active->recording && source == active->source && destination == active->destination) {
+            for (std::uint32_t i = 0; i < count; ++i) {
+                if (regions[i].size != 0) {
+                    ++active->copies;
+                    active->pending = true;
+                }
+            }
+        }
+        active->function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, source, destination, count, regions);
+    }
+    static VKAPI_ATTR void VKAPI_CALL barrier(VkCommandBuffer commands, VkPipelineStageFlags sourceStage, VkPipelineStageFlags destinationStage, VkDependencyFlags flags, std::uint32_t memoryCount, const VkMemoryBarrier* memory, std::uint32_t bufferCount, const VkBufferMemoryBarrier* buffers, std::uint32_t imageCount, const VkImageMemoryBarrier* images) {
+        const bool fromTransfer = (sourceStage & (VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT)) != 0;
+        const bool toCompute = (destinationStage & (VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT)) != 0;
+        if (active->recording && active->pending && fromTransfer && toCompute) {
+            for (std::uint32_t i = 0; i < memoryCount; ++i) {
+                if ((memory[i].srcAccessMask & VK_ACCESS_TRANSFER_WRITE_BIT) != 0 && (memory[i].dstAccessMask & VK_ACCESS_SHADER_READ_BIT) != 0) {
+                    active->pending = false;
+                    ++active->readyBarriers;
+                    break;
+                }
+            }
+        }
+        active->function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, sourceStage, destinationStage, flags, memoryCount, memory, bufferCount, buffers, imageCount, images);
+    }
+    static VKAPI_ATTR void VKAPI_CALL dispatch(VkCommandBuffer commands, std::uint32_t x, std::uint32_t y, std::uint32_t z) {
+        if (active->recording && active->copies != 0) {
+            ++active->dispatches;
+            if (active->pending) ++active->unorderedDispatches;
+        }
+        active->function<PFN_vkCmdDispatch>("vkCmdDispatch")(commands, x, y, z);
+    }
+    static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL resolve(VkDevice device, const char* name) {
+        if (std::strcmp(name, "vkCmdCopyBuffer") == 0) return reinterpret_cast<PFN_vkVoidFunction>(copyBuffer);
+        if (std::strcmp(name, "vkCmdPipelineBarrier") == 0) return reinterpret_cast<PFN_vkVoidFunction>(barrier);
+        if (std::strcmp(name, "vkCmdDispatch") == 0) return reinterpret_cast<PFN_vkVoidFunction>(dispatch);
+        return active->resolver(device, name);
+    }
+    Context& context;
+    PFN_vkGetDeviceProcAddr resolver;
+    VkBuffer source = VK_NULL_HANDLE;
+    VkBuffer destination = VK_NULL_HANDLE;
+    bool recording = false;
+    bool pending = false;
+    std::uint32_t copies = 0;
+    std::uint32_t dispatches = 0;
+    std::uint32_t readyBarriers = 0;
+    std::uint32_t unorderedDispatches = 0;
+    static inline StorageReadyProbe* active = nullptr;
+};
+
+bool storageHoleCopyBarrierTests(const Device& device, Recorder& previous) {
+    const auto& base = device.GetContext();
+    Require(Recorder::BarrierBatch() && Recorder::MergeBarriers(), "storage hole-copy barrier test requires default barrier batching");
+    GuestTextureResource resource{};
+    resource.width = 1000;
+    resource.height = 700;
+    resource.mipCount = 1;
+    resource.tileMode = TextureTileMode::kR64KBX;
+    resource.dimension = TextureDimension::k2D;
+    resource.format = 56;
+    resource.dstSelX = 4;
+    resource.dstSelY = 5;
+    resource.dstSelZ = 6;
+    resource.dstSelW = 7;
+    const auto geometry = DescribeSurface(resource);
+    const auto surfaceBytes = static_cast<std::size_t>(geometry.guestBytes);
+    const auto bytes = (surfaceBytes + 65535) / 65536 * 65536 + 65536;
+    struct Release {
+        const Context& context;
+        void* block = nullptr;
+        std::uint64_t address = 0;
+        std::size_t bytes;
+        std::int64_t physical = -1;
+        ~Release() {
+#ifdef __linux__
+            if (block != nullptr) sceKernelMunmap(reinterpret_cast<std::uint64_t>(block), bytes);
+            if (physical >= 0) sceKernelReleaseDirectMemory(physical, bytes);
+#else
+            if (block == nullptr) return;
+            GuestAllocations::Mutation().Remove(block);
+            HostImportFor(context, address, bytes);
+            ReleaseWatched(block, bytes);
+#endif
+        }
+    } release{base, nullptr, 0, bytes};
+#ifdef __linux__
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, bytes, 65536, 0, &release.physical) == 0, "cannot allocate hole-copy direct memory");
+    Require(sceKernelMapDirectMemory(&release.block, bytes, 0x33, 0, release.physical, 65536) == 0, "cannot map hole-copy direct memory for the GPU");
+#else
+    release.block = AllocateWatched(bytes, 65536);
+    if (release.block == nullptr) return false;
+    GuestAllocations::Mutation().Add(release.block, bytes, true, true, true);
+#endif
+    void* block = release.block;
+    auto* memory = static_cast<std::uint8_t*>(block);
+    for (std::size_t i = 0; i < bytes; ++i) memory[i] = static_cast<std::uint8_t>(i * 131u + 7u);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    release.address = address;
+    const auto* import = HostImportFor(base, address, bytes);
+    if (import == nullptr || !AgcDriver::GuestMemory::Watched(address, bytes)) return false;
+    auto destination = ShadowDestinationFor(base, *import, address, address + surfaceBytes);
+    Require(destination.has_value() && destination->seedUnits.empty() && SlabBoundary(*import, address) >= address + surfaceBytes, "storage hole-copy test did not allocate an unseeded slab");
+    auto context = base;
+    StorageReadyProbe probe(context);
+    TextureDetiler detiler(context);
+    context.detiler = &detiler;
+    resource.baseAddress = address;
+    bool retiled = false;
+    std::weak_ptr<StorageTexture> lifetime;
+    {
+        Recorder recorder(context);
+        recorder.Activate();
+        auto image = StorageTexture::Create(context, detiler, resource, 0);
+        lifetime = image;
+        const auto commands = recorder.Commands();
+        recorder.Keep(image);
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, resource.mipCount, 0, 1};
+        const VkClearColorValue value{{1.0f, 0.0f, 0.0f, 1.0f}};
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image->Image(), VK_IMAGE_LAYOUT_GENERAL, &value, 1, &range);
+        image->MarkDirty();
+        constexpr VkAccessFlags covered = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, covered | VK_ACCESS_HOST_WRITE_BIT, covered);
+        recorder.MarkCovered(covered);
+        const auto before = StorageTexture::SlabRetiles();
+        probe.Begin(import->buffer, destination->buffer);
+        image->WriteBack();
+        probe.End();
+        recorder.Sync();
+        retiled = StorageTexture::SlabRetiles() > before;
+    }
+    previous.Activate();
+    Require(lifetime.expired(), "storage hole-copy test image outlived its recorder");
+    Require(retiled, "storage hole-copy test did not retile into a slab");
+    Require(probe.Copies() != 0 && probe.Dispatches() != 0, "storage hole-copy test did not record import-to-slab hole copies followed by a retile dispatch");
+    std::cout << "storage hole-copy barrier: " << probe.Copies() << " hole copies, " << probe.Dispatches() << " retile dispatches, " << probe.ReadyBarriers() << " ready barriers, " << probe.UnorderedDispatches() << " unordered dispatches" << std::endl;
+    Require(probe.ReadyBarriers() != 0 && probe.UnorderedDispatches() == 0, "storage retile reads slab hole copies without a following ready barrier");
+    return true;
+}
+
 
 // A write-back stores the texels of an image and leaves every other byte of the surface's memory
 // as it was: the padding of the tile blocks the surface covers only partly (its last block column
@@ -8347,7 +8669,7 @@ void imageMemoTests(const Device& device, Recorder& recorder) {
     std::vector<std::shared_ptr<Texture>> kept;
     const auto sample = [&](const std::uint8_t* surface) {
         const auto words = linearTextureWords(reinterpret_cast<std::uint64_t>(surface), width, height, 56);
-        program.bindings[0].guestDescriptor.assign(words.begin(), words.end());
+        setDescriptor(program.bindings[0], {words.begin(), words.end()});
         ShaderResources resources(context, compiled);
         Require(resources.SampledTextures().size() == 1, "the build has no sampled texture");
         kept.push_back(resources.SampledTextures().front());
@@ -8367,8 +8689,9 @@ void imageMemoTests(const Device& device, Recorder& recorder) {
     const auto secondWords = linearTextureWords(reinterpret_cast<std::uint64_t>(second), width, height, 56);
     const auto bindElements = [&](std::initializer_list<std::array<std::uint32_t, 8>> elements, std::vector<bool> depthCompare) {
         program.bindings[0].count = static_cast<std::uint32_t>(elements.size());
-        program.bindings[0].guestDescriptor.clear();
-        for (const auto& words : elements) program.bindings[0].guestDescriptor.insert(program.bindings[0].guestDescriptor.end(), words.begin(), words.end());
+        std::vector<std::uint32_t> descriptorWords;
+        for (const auto& words : elements) descriptorWords.insert(descriptorWords.end(), words.begin(), words.end());
+        setDescriptor(program.bindings[0], std::move(descriptorWords));
         program.bindings[0].imageDepthCompare = std::move(depthCompare);
         program.bindings[0].imageSamplers.assign(elements.size(), 0u);
         ShaderResources resources(context, compiled);
@@ -8406,10 +8729,10 @@ void dataRefreshTests(const Device& device, Recorder& recorder) {
     binding.descriptorSet = 0;
     binding.binding = 0;
     binding.count = 1;
-    binding.guestDescriptor = {1, 2, 3, 4};
+    setDescriptor(binding, {1, 2, 3, 4});
     program.bindings.push_back(binding);
     auto patched = program;
-    patched.bindings[0].guestDescriptor[2] = 0x33;
+    mutateDescriptor(patched.bindings[0], [](auto& words) { words[2] = 0x33; });
     const CompiledShader original{ShaderRecompiler::ShaderStage::Compute, &program, 0};
     const CompiledShader live{ShaderRecompiler::ShaderStage::Compute, &patched, 0};
     ShaderResources resources(context, original);
@@ -8551,16 +8874,13 @@ void multisampleGuestAccessTests(const Device& device, Recorder& recorder) {
     binding.count = 1;
     binding.imageShape = ShaderRecompiler::DescriptorImageShape::Image2D;
     binding.imageSamplers = {0};
-    binding.guestDescriptor = {
+    setDescriptor(binding, {
         static_cast<std::uint32_t>(address >> 8u),
         static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (56u << 20u) | (((side - 1u) & 3u) << 30u),
         ((side - 1u) >> 2u) | ((side - 1u) << 14u),
         0xfacu | (9u << 28u),
-        0u,
-        0u,
-        0u,
-        0u,
-    };
+        0u, 0u, 0u, 0u,
+    });
     program.bindings.push_back(binding);
     const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
     refused([&] {
@@ -8585,7 +8905,7 @@ void multisampleGuestAccessTests(const Device& device, Recorder& recorder) {
         element.kind = kind;
         if (kind == ShaderRecompiler::DescriptorKind::StorageImage) element.binding = ShaderRecompiler::RuntimeAbi::FirstStorageImageBinding;
         element.imageShape = shape;
-        element.guestDescriptor = std::move(words);
+        setDescriptor(element, std::move(words));
         result.bindings.push_back(std::move(element));
         return result;
     };
@@ -8816,16 +9136,13 @@ void oneFragmentFmaskGuardTests(const Device& device) {
     binding.count = 1;
     binding.imageShape = ShaderRecompiler::DescriptorImageShape::Image2D;
     binding.imageSamplers = {0};
-    binding.guestDescriptor = {
+    setDescriptor(binding, {
         static_cast<std::uint32_t>(address >> 8u),
         static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (56u << 20u) | (((side - 1u) & 3u) << 30u),
         ((side - 1u) >> 2u) | ((side - 1u) << 14u),
         0xfacu | (9u << 28u),
-        0u,
-        0u,
-        0u,
-        0u,
-    };
+        0u, 0u, 0u, 0u,
+    });
     program.bindings.push_back(binding);
     const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
     for (const char* what : {"a texture read", "a repeated texture read"}) {
@@ -9095,16 +9412,13 @@ void depthSurfaceProofTests(const Device& device, Recorder& recorder) {
     binding.count = 1;
     binding.imageShape = ShaderRecompiler::DescriptorImageShape::Image2D;
     binding.imageSamplers = {0};
-    binding.guestDescriptor = {
+    setDescriptor(binding, {
         static_cast<std::uint32_t>(address >> 8u),
         static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (22u << 20u) | (((side - 1u) & 3u) << 30u),
         ((side - 1u) >> 2u) | ((side - 1u) << 14u),
         0xfacu | (9u << 28u),
-        0u,
-        0u,
-        0u,
-        0u,
-    };
+        0u, 0u, 0u, 0u,
+    });
     program.bindings.push_back(binding);
     const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
     bool reusable = false;
@@ -9124,9 +9438,9 @@ void depthSurfaceProofTests(const Device& device, Recorder& recorder) {
         Require(proved[use], "a set sampling an unchanged depth surface failed its proof on use " + name);
         Require(reports[use].path == ShaderResources::ProofPath::Fast, "a set sampling an unchanged depth surface left the fast proof for the full walk on use " + name);
     }
-    const auto resource = DecodeTextureResource(binding.guestDescriptor);
+    const auto resource = DecodeTextureResource(binding.guestDescriptor.Span());
     const VkComponentMapping identity{VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
-    const auto texture = DepthSurfaceTexture(context, binding.guestDescriptor, resource, identity);
+    const auto texture = DepthSurfaceTexture(context, binding.guestDescriptor.Span(), resource, identity);
     Require(texture != nullptr && DepthSurfaceHolds(context, resource, texture.get()), "a 2D depth lookup is not fast-provable");
     auto arrayed = resource;
     arrayed.dimension = TextureDimension::k2DArray;
@@ -9237,10 +9551,227 @@ private:
     VkSampler sampler = VK_NULL_HANDLE;
     VkDescriptorPool pool = VK_NULL_HANDLE;
 };
+#ifndef _WIN32
+void committedReadHoleTests() {
+    constexpr std::size_t page = 0x4000;
+    constexpr std::size_t bytes = page * 5;
+    auto* area = static_cast<std::byte*>(AllocateWatched(bytes, page));
+    Require(area != nullptr, "cannot map committed-read hole fixture");
+    for (const auto offset : {std::size_t{0}, page * 2, page * 4}) {
+        GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(area + offset, page);
+        Require(mprotect(area + offset, page, PROT_NONE) == 0, "cannot create committed-read holes");
+    }
+    std::memset(area + page, 0x11, page);
+    std::memset(area + page * 3, 0x22, page);
+    GuestAllocations::Mutation().Add(area, bytes, true, true, true);
+    const auto check = [&](bool synced) {
+        constexpr std::size_t requestBytes = bytes - 2;
+        std::array<std::byte, requestBytes> output;
+        output.fill(std::byte{0xa5});
+        const auto address = reinterpret_cast<std::uint64_t>(area + 1);
+        if (synced) AgcDriver::GuestMemory::ReadCommitted(address, output);
+        else AgcDriver::GuestMemory::ReadCommittedUnsynced(address, output);
+        Require(std::all_of(output.begin(), output.begin() + page - 1, [](std::byte value) { return value == std::byte{0}; }), "unaligned leading committed-read hole was not zeroed");
+        Require(std::all_of(output.begin() + page - 1, output.begin() + page * 2 - 1, [](std::byte value) { return value == std::byte{0x11}; }), "first committed island was not copied");
+        Require(std::all_of(output.begin() + page * 2 - 1, output.begin() + page * 3 - 1, [](std::byte value) { return value == std::byte{0}; }), "interior committed-read hole was not zeroed");
+        Require(std::all_of(output.begin() + page * 3 - 1, output.begin() + page * 4 - 1, [](std::byte value) { return value == std::byte{0x22}; }), "second committed island was not copied");
+        Require(std::all_of(output.begin() + page * 4 - 1, output.end(), [](std::byte value) { return value == std::byte{0}; }), "unaligned trailing committed-read hole was not zeroed");
+        std::array<std::byte, page> allHoles;
+        allHoles.fill(std::byte{0x9c});
+        if (synced) AgcDriver::GuestMemory::ReadCommitted(reinterpret_cast<std::uint64_t>(area), allHoles);
+        else AgcDriver::GuestMemory::ReadCommittedUnsynced(reinterpret_cast<std::uint64_t>(area), allHoles);
+        Require(std::all_of(allHoles.begin(), allHoles.end(), [](std::byte value) { return value == std::byte{0}; }), "fully inaccessible committed read retained destination bytes");
+    };
+    check(true);
+    check(false);
+    GuestAllocations::Mutation().Remove(area);
+    ReleaseWatched(area, bytes);
+}
+#endif
 
 void expectRed(float got, float want, const char* what) {
     if (std::abs(got - want) > 1.5f / 255.0f) throw std::runtime_error(std::string(what) + ": read " + std::to_string(got) + ", expected " + std::to_string(want));
 }
+bool snapshotReadIntoStagingTests(const Device& device, Recorder& recorder) {
+    if (!AgcDriver::GuestMemory::WriteWatched()) {
+        std::cout << "skipped, guest memory has no write watch\n";
+        return false;
+    }
+    const auto& context = device.GetContext();
+    TextureDetiler detiler(context);
+    SampleProgram program(context, recorder);
+    auto cacheContext = context;
+    cacheContext.detiler = &detiler;
+    constexpr std::size_t unit = 65536;
+    constexpr std::size_t compareBytes = 256u << 10u;
+    struct Surface {
+        std::uint8_t* data = nullptr;
+        std::size_t bytes = 0;
+        Surface(const Surface&) = delete;
+        Surface& operator=(const Surface&) = delete;
+        explicit Surface(std::size_t size, std::size_t holeBegin = 0, std::size_t holeEnd = 0) : bytes((size + unit - 1) / unit * unit) {
+#ifdef _WIN32
+            data = static_cast<std::uint8_t*>(holeBegin < holeEnd ? GuestArena::GuestArenaAllocate_nid_postfix(bytes, unit) : AllocateWatched(bytes, unit));
+#else
+            data = static_cast<std::uint8_t*>(AllocateWatched(bytes, unit));
+#endif
+            Require(data != nullptr, "cannot allocate a watched surface for the staging snapshot test");
+            if (holeBegin < holeEnd) {
+#ifdef _WIN32
+                GuestArena::GuestArenaCommit_nid_postfix(data, holeBegin, PAGE_READWRITE, holeBegin);
+                GuestArena::GuestArenaCommit_nid_postfix(data + holeEnd, bytes - holeEnd, PAGE_READWRITE, bytes - holeEnd);
+#else
+                GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(data + holeBegin, holeEnd - holeBegin);
+                Require(mmap(data + holeBegin, holeEnd - holeBegin, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0) != MAP_FAILED, "cannot leave the centre of the staging snapshot surface uncommitted");
+#endif
+                Require(!AgcDriver::GuestMemory::Accessible(data + holeBegin, holeEnd - holeBegin) && AgcDriver::GuestMemory::Watched(Address(), holeBegin) && AgcDriver::GuestMemory::Watched(Address() + holeEnd, bytes - holeEnd), "the staging snapshot surface is not watched around its uncommitted centre");
+            }
+            GuestAllocations::Mutation().Add(data, bytes, true, true, true);
+        }
+        ~Surface() {
+            GuestAllocations::Mutation().Remove(data);
+            ReleaseWatched(data, bytes);
+        }
+        std::uint64_t Address() const { return reinterpret_cast<std::uint64_t>(data); }
+    };
+    std::vector<std::unique_ptr<Surface>> surfaces;
+    struct Clear {
+        const Context& context;
+        Recorder& recorder;
+        ~Clear() {
+            recorder.Sync();
+            ClearCachedTextures(context.device);
+        }
+    } clear{context, recorder};
+    const auto allocate = [&](std::size_t bytes, std::size_t holeBegin = 0, std::size_t holeEnd = 0) -> Surface& {
+        surfaces.push_back(std::make_unique<Surface>(bytes, holeBegin, holeEnd));
+        return *surfaces.back();
+    };
+    const auto lookup = [&](const std::array<std::uint32_t, 8>& words, const std::string& what) {
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        auto texture = CachedSampledTexture(cacheContext, words);
+        Require(texture != nullptr && !texture->ViewsStorageImage(), "the " + what + " surface was not sampled through a snapshot");
+        return texture;
+    };
+    const auto spare = [](std::size_t entries, std::uint64_t bytes) {
+        const auto use = TextureCacheUsage();
+        return use.spareEntries == entries && use.spareBytes == bytes;
+    };
+    const auto mark = [](std::uint8_t* data, const auto& mip, std::uint8_t value) {
+        for (std::uint32_t row = mip.height / 2 - 1; row <= mip.height / 2; ++row) std::fill_n(data + static_cast<std::size_t>(row) * mip.pitchBytes + (mip.width / 2 - 1) * 4u, 8, value);
+    };
+    const auto dropped = [&](const std::string& what, const std::array<std::uint32_t, 8>& words, const std::vector<std::uint8_t>& levels) {
+        const auto bytes = static_cast<std::size_t>(DescribeSurface(DecodeTextureResource(words)).guestBytes);
+        Require(bytes > compareBytes, "the " + what + " surface is too small for its snapshot to be dropped");
+        const void* poisoned = nullptr;
+        {
+            Buffer stale(context, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+            std::fill(stale.Bytes().begin(), stale.Bytes().end(), std::byte{0xee});
+            poisoned = stale.Bytes().data();
+        }
+        const auto texture = lookup(words, what);
+        Require(spare(0, 0), "the dropped snapshot of the " + what + " surface parked a vector in the spare pool");
+        {
+            Buffer probe(context, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+            Require(probe.Bytes().data() != poisoned, "the dropped snapshot of the " + what + " surface was not uploaded from the reused pooled staging buffer");
+        }
+        for (std::size_t level = 0; level < levels.size(); ++level) expectRed(program.Red(texture->View(), texture->Layout(), static_cast<float>(level)), levels[level] / 255.0f, ("the dropped snapshot of the " + what + " surface read into a reused pooled staging buffer sampled the wrong bytes in level " + std::to_string(level)).c_str());
+        AgcDriver::GuestMemory::MarkWritten(DecodeTextureResource(words).baseAddress + 0x200, 4);
+        Require(lookup(words, what) != texture, "the snapshot of the " + what + " surface kept its bytes to compare after a driver store of the bytes already there");
+        std::cout << "dropped snapshot read into its staging buffer, " << what << ": passed\n";
+    };
+    ClearCachedTextures(context.device);
+    Require(spare(0, 0), "clearing the texture caches left spare snapshot vectors");
+    {
+        auto& surface = allocate(std::size_t{512} * 512 * 4);
+        const auto words = linearTextureWords(surface.Address(), 512, 512, 56);
+        const auto geometry = DescribeSurface(DecodeTextureResource(words));
+        std::memset(surface.data, 0x10, static_cast<std::size_t>(geometry.guestBytes));
+        mark(surface.data, geometry.mips[0], 0x40);
+        dropped("linear", words, {0x40});
+    }
+    {
+        auto& surface = allocate(std::size_t{512} * 512 * 4);
+        auto words = linearTextureWords(surface.Address(), 512, 512, 56);
+        words[3] |= 0x1bu << 20u;
+        const auto resource = DecodeTextureResource(words);
+        Require(resource.tileMode == TextureTileMode::kR64KBX, "the tiled staging snapshot surface is not 64KB_R_X");
+        std::memset(surface.data, 0x90, static_cast<std::size_t>(DescribeSurface(resource).guestBytes));
+        dropped("tiled", words, {0x90});
+    }
+    {
+        const auto padded = DescribeSurface(DecodeTextureResource(linearTextureWords(0x100000, 600, 300, 56)));
+        auto& surface = allocate(static_cast<std::size_t>(padded.guestBytes));
+        const auto words = linearTextureWords(surface.Address(), 600, 300, 56);
+        const auto geometry = DescribeSurface(DecodeTextureResource(words));
+        Require(geometry.mips[0].pitchBytes != geometry.mips[0].width * 4u, "the padded staging snapshot surface has no row padding");
+        std::memset(surface.data, 0x10, static_cast<std::size_t>(geometry.guestBytes));
+        mark(surface.data, geometry.mips[0], 0x70);
+        dropped("padded linear", words, {0x70});
+    }
+    {
+        const auto threeLevels = [](std::uint64_t address) {
+            auto words = linearTextureWords(address, 512, 512, 56);
+            words[3] |= 2u << 16u;
+            words[5] |= 2u << 4u;
+            return words;
+        };
+        const auto geometry = DescribeSurface(DecodeTextureResource(threeLevels(0x100000)));
+        const auto& mip = geometry.mips[1];
+        const auto holeBegin = (static_cast<std::size_t>(mip.tiledOffset) + static_cast<std::size_t>(mip.height / 2 - 1) * mip.pitchBytes) / unit * unit;
+        const auto holeEnd = (static_cast<std::size_t>(mip.tiledOffset) + static_cast<std::size_t>(mip.height / 2 + 1) * mip.pitchBytes + unit - 1) / unit * unit;
+        const auto bytes = static_cast<std::size_t>(geometry.guestBytes);
+        Require(geometry.mips.size() == 3 && geometry.mips[2].tiledOffset + geometry.mips[2].tiledSize <= holeBegin && geometry.mips[0].tiledOffset >= holeEnd, "the partially committed staging snapshot surface has no committed level before and after its uncommitted centre");
+        auto& surface = allocate(bytes, holeBegin, holeEnd);
+        std::memset(surface.data, 0x10, holeBegin);
+        std::memset(surface.data + holeEnd, 0x10, bytes - holeEnd);
+        mark(surface.data + geometry.mips[0].tiledOffset, geometry.mips[0], 0x40);
+        dropped("partially committed", threeLevels(surface.Address()), {0x40, 0x00, 0x10});
+    }
+    constexpr std::size_t bigBytes = std::size_t{512} * 512 * 4;
+    const auto fastCleared = [&](const std::string& what) {
+        auto& keyed = allocate(bigBytes + unit);
+        std::memset(keyed.data, 0x10, bigBytes);
+        std::memset(keyed.data + bigBytes, 0, unit);
+        auto keyedWords = linearTextureWords(keyed.Address(), 512, 512, 56);
+        const auto keys = keyed.Address() + bigBytes;
+        keyedWords[6] = (1u << 21u) | (static_cast<std::uint32_t>((keys >> 8u) & 0xffu) << 24u);
+        keyedWords[7] = static_cast<std::uint32_t>(keys >> 16u);
+        Require(DecodeTextureResource(keyedWords).dccAddress == keys, "the " + what + " staging snapshot surface does not name its keys");
+        const auto cleared = lookup(keyedWords, what);
+        Require(spare(1, bigBytes), "the dropped snapshot of the " + what + " surface did not park its vector in the spare pool");
+        expectRed(program.Red(cleared->View(), cleared->Layout(), 0.0f), 0.0f, ("the snapshot of the " + what + " surface did not read its clear").c_str());
+    };
+    fastCleared("fast-cleared");
+    for (std::uint64_t present = 0; present < SpareSnapshotPresents; ++present) Recorder::CountPresent();
+    auto& later = allocate(bigBytes);
+    std::memset(later.data, 0x50, bigBytes);
+    const auto uncompressed = lookup(linearTextureWords(later.Address(), 512, 512, 56), "uncompressed");
+    Require(spare(1, bigBytes), "the dropped snapshot of an uncompressed surface parked a vector beside the spare of its size");
+    expectRed(program.Red(uncompressed->View(), uncompressed->Layout(), 0.0f), 0x50 / 255.0f, "the dropped snapshot of an uncompressed surface sampled the wrong bytes");
+    Recorder::CountPresent();
+    auto& small = allocate(compareBytes);
+    std::memset(small.data, 0x30, compareBytes);
+    static_cast<void>(lookup(linearTextureWords(small.Address(), 256, 256, 56), "small"));
+    Require(spare(0, 0), "the dropped snapshot of an uncompressed surface took the spare of its size and parked it again, so it outlived " + std::to_string(SpareSnapshotPresents) + " presents without a use");
+    std::cout << "dropped snapshot leaves the spare snapshot pool alone: passed\n";
+    fastCleared("second fast-cleared");
+    const auto droppedHalf = [&](const std::string& what) {
+        auto& surface = allocate(bigBytes / 2);
+        std::memset(surface.data, 0x60, bigBytes / 2);
+        static_cast<void>(lookup(linearTextureWords(surface.Address(), 512, 256, 56), what));
+    };
+    for (std::uint64_t present = 0; present < SpareSnapshotPresents; ++present) Recorder::CountPresent();
+    droppedHalf("half-size");
+    Require(spare(1, bigBytes), "a dropped snapshot made " + std::to_string(SpareSnapshotPresents) + " presents after a spare was parked freed it");
+    Recorder::CountPresent();
+    droppedHalf("second half-size");
+    Require(spare(0, 0), "a dropped snapshot made " + std::to_string(SpareSnapshotPresents + 1) + " presents after a spare was parked did not free it");
+    std::cout << "dropped snapshot expires idle spare snapshots: passed\n";
+    return true;
+}
+
+
 
 void minLodTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
@@ -10918,8 +11449,81 @@ void Run(Context context) {
 }
 #endif
 
+namespace {
+void rawCaptureWindowTests() {
+    using AgcDriver::PerformanceTrace;
+    struct TraceFixture {
+        const std::array<const char*, 7> names{
+            "APS5_TRACE_FRAMES", "APS5_TRACE_SECONDS", "APS5_TRACE_SUMMARY_EVERY",
+            "APS5_TRACE_BENCH", "APS5_TRACE_EVENTS", "APS5_TRACE_DIR", "APS5_TRACE"};
+        std::array<std::optional<std::string>, 7> saved;
+        std::filesystem::path directory;
+        bool outputStarted = false;
+
+        TraceFixture() {
+            for (std::size_t i = 0; i < names.size(); ++i)
+                if (const auto* value = std::getenv(names[i])) saved[i] = value;
+        }
+        static void Set(const char* name, const char* value) {
+#ifdef _WIN32
+            Require(_putenv_s(name, value != nullptr ? value : "") == 0, "cannot configure trace fixture environment");
+#else
+            Require((value != nullptr ? setenv(name, value, 1) : unsetenv(name)) == 0, "cannot configure trace fixture environment");
+#endif
+        }
+        ~TraceFixture() {
+            if (outputStarted) {
+                try { PerformanceTrace::StopOutput(); }
+                catch (const std::exception& error) { std::cerr << "trace fixture stop failed: " << error.what() << '\n'; }
+            }
+            for (std::size_t i = 0; i < names.size(); ++i) {
+#ifdef _WIN32
+                _putenv_s(names[i], saved[i] ? saved[i]->c_str() : "");
+#else
+                if (saved[i]) setenv(names[i], saved[i]->c_str(), 1);
+                else unsetenv(names[i]);
+#endif
+            }
+            if (!directory.empty()) {
+                std::error_code error;
+                std::filesystem::remove_all(directory, error);
+            }
+        }
+    } fixture;
+    for (unsigned attempt = 0; attempt < 100; ++attempt) {
+        const auto candidate = std::filesystem::temp_directory_path()
+            / ("aps5-raw-capture-window-test-" + std::to_string(std::random_device{}()));
+        if (std::filesystem::create_directory(candidate)) {
+            fixture.directory = candidate;
+            break;
+        }
+    }
+    Require(!fixture.directory.empty(), "cannot create an owned trace fixture directory");
+    for (const auto* name : fixture.names) TraceFixture::Set(name, nullptr);
+    TraceFixture::Set("APS5_TRACE_FRAMES", "2:1");
+    TraceFixture::Set("APS5_TRACE_SUMMARY_EVERY", "1");
+    TraceFixture::Set("APS5_TRACE_DIR", fixture.directory.string().c_str());
+    Require(!PerformanceTrace::Recording(), "trace records before the first present");
+    Require(!PerformanceTrace::CapturingRawWindow(), "raw capture starts before the first present");
+    fixture.outputStarted = true;
+    for (unsigned present = 0; present < 4; ++present) {
+        PerformanceTrace::Present(1, 1, nullptr);
+        Require(PerformanceTrace::Recording(), "summary recording stopped at a present boundary");
+        Require(PerformanceTrace::CapturingRawWindow() == (present == 2),
+            "raw capture did not follow the native present window");
+    }
+    PerformanceTrace::StopOutput();
+    fixture.outputStarted = false;
+}
+}
+
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--raw-capture-window-only") {
+            rawCaptureWindowTests();
+            std::cout << "native raw capture window tests passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--collect-mapping-history-only") {
             if (!collectMappingHistoryTests()) return 77;
             std::cout << "collect mapping history tests passed\n";
@@ -10928,6 +11532,34 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--hint-mapping-history-only") {
             if (!hintMappingHistoryTests()) return 77;
             std::cout << "hint mapping history tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--compute-pipeline-teardown-only") {
+            auto fixture = AgcDriver::ComputePipelineFixture();
+            ShaderRecompiler::RecompileResult shader;
+            shader.spirv = std::move(fixture.spirv);
+            shader.specialization.reserve(fixture.specialization.size());
+            for (const auto& constant : fixture.specialization) shader.specialization.push_back({constant.id, constant.value});
+            if (shader.Identity().Empty()) throw std::runtime_error("compute pipeline fixture has no stable pipeline identity");
+            std::optional<AgcDriver::VulkanDevice> compileOnly;
+            try {
+                compileOnly.emplace(AgcDriver::VulkanDevice::CompileOnly{});
+            } catch (const std::exception& error) {
+                const std::string_view message(error.what());
+                const bool absent = (message.starts_with("Vulkan loader: ") && message != "Vulkan loader: vkGetInstanceProcAddr missing") || message == "Vulkan: no Vulkan 1.1 graphics and compute queue" || message == "vkCreateInstance: Vulkan result -9";
+                if (std::getenv("ANYPS5_REQUIRE_VULKAN") != nullptr || !absent) throw;
+                std::cout << "skipped, no usable Vulkan device: " << error.what() << '\n';
+                return 77;
+            }
+            const std::span<const AgcDriver::Graphics::GuestMemorySnapshot> snapshots;
+            auto warm = compileOnly->PrepareDispatch(shader, snapshots);
+            Require(warm != nullptr && compileOnly->ComputePipelinesCreated() == 1, "compute pipeline teardown fixture did not create exactly one pipeline");
+            auto cached = compileOnly->PrepareDispatch(shader, snapshots);
+            Require(cached != nullptr && compileOnly->ComputePipelinesCreated() == 1, "cached compute pipeline was not reused");
+            cached.reset();
+            warm.reset();
+            compileOnly.reset();
+            std::cout << "compile-only compute pipeline teardown passed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--partial-watch-restoration-only") {
@@ -11072,6 +11704,11 @@ int main(int argc, char** argv) {
             copiedDirectOrderingTests(device, recorder);
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--completion-wait-only") {
+            completionWaitTests(device, recorder);
+            std::cout << "Completion wait tests passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--pending-write-snapshot-only") {
             pendingWriteSnapshotTests(device, recorder);
             return 0;
@@ -11147,6 +11784,14 @@ int main(int argc, char** argv) {
             std::cout << "read and written staging tests passed\n";
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--snapshot-read-into-staging-only") {
+#ifndef _WIN32
+            committedReadHoleTests();
+#endif
+            if (!snapshotReadIntoStagingTests(device, recorder)) return 77;
+            std::cout << "Snapshot read into staging tests passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--written-buffer-order-only") {
             if (!writtenBufferOrderTests(device, recorder)) return 77;
             std::cout << "written buffer order tests passed\n";
@@ -11211,6 +11856,13 @@ int main(int argc, char** argv) {
                 return 77;
             }
             splitWriteBackTests(device, recorder);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--storage-hole-copy-barrier-only") {
+            if (!UnitShadowEnabled() || device.GetContext().hostImportAlignment == 0 || !storageHoleCopyBarrierTests(device, recorder)) {
+                std::cout << "skipped, the device imports no watched host memory for storage hole copies\n";
+                return 77;
+            }
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--storage-write-back-only") {
@@ -11286,6 +11938,9 @@ int main(int argc, char** argv) {
             std::cout << "DCC keys under unit shadows tests passed\n";
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--draw-input-reuse-only") {
+            return drawInputReuseTests(device, recorder) ? 0 : 77;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--draw-inputs-in-place-only") {
             drawInputInPlaceTests(device, recorder);
             std::cout << "In-place draw input tests passed\n";
@@ -11337,6 +11992,9 @@ int main(int argc, char** argv) {
             secondMappingImportTests(device);
             return 0;
         }
+#endif
+#ifndef _WIN32
+        committedReadHoleTests();
 #endif
         readTrackingTests(device, recorder);
         readListTests(device, recorder);

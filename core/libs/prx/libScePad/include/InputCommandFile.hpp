@@ -27,13 +27,23 @@ public:
         bool operator==(const Input&) const = default;
     };
 
-    explicit InputCommandFile(const std::filesystem::path& path) : path(path) {
+    explicit InputCommandFile(const std::filesystem::path& path,
+                              const std::filesystem::path& ackPath = {})
+        : path(path), ackPath(ackPath) {
         if (!this->path.empty()) lastSequence = read().sequence;
     }
 
     Input Poll(std::uint64_t now) {
         if (path.empty()) return {};
-        if (now >= nextPoll) {
+        if (ackPending && now >= started
+                && (events.empty() || now - started >= events.back().end)) {
+            const auto releasedSequence = ackSequence;
+            events.clear();
+            ackPending = false;
+            writeAck(releasedSequence, "released");
+            return {};
+        }
+        if (!ackPending && now >= nextPoll) {
             nextPoll = now > std::numeric_limits<std::uint64_t>::max() - 100000
                 ? std::numeric_limits<std::uint64_t>::max() : now + 100000;
             auto command = read();
@@ -41,6 +51,11 @@ public:
                 lastSequence = command.sequence;
                 events = std::move(command.events);
                 started = now;
+                if (!ackPath.empty() && !events.empty()) {
+                    ackSequence = lastSequence;
+                    ackPending = true;
+                    writeAck(ackSequence, "accepted");
+                }
             }
         }
         if (events.empty() || now < started) return {};
@@ -133,11 +148,19 @@ private:
         command.events.push_back({0, values[2] * 1000, input});
         return command;
     }
+    void writeAck(std::uint64_t sequence, const char* state) const {
+        if (ackPath.empty()) return;
+        std::ofstream file(ackPath, std::ios::trunc);
+        if (file) file << sequence << ' ' << state << '\n';
+    }
 
     static constexpr std::uint64_t TouchLeftBit = 0x200000;
     static constexpr std::uint64_t TouchRightBit = 0x400000;
 
     std::filesystem::path path;
+    std::filesystem::path ackPath;
+    std::uint64_t ackSequence = 0;
+    bool ackPending = false;
     std::uint64_t lastSequence = 0;
     std::uint64_t nextPoll = 0;
     std::uint64_t started = 0;

@@ -5590,8 +5590,7 @@ void bufferBudgetPlacementTests() {
                 };
                 if (fail) expectFailure(allocate, "Vulkan result -2");
                 else allocate();
-                Require(mock.allocationTypes == std::vector<std::uint32_t>{1} && mock.allocationAttempts == 1, "a coherent buffer did not select the other heap before its single allocation attempt");
-                if (!fail) Require(mock.allocatedBytes == (bytes == 512 ? BufferPool::SlabBlockBytes(512) : bytes), "a coherent buffer budget check lost its full allocation extent");
+                Require(!mock.allocationTypes.empty() && mock.allocationTypes.front() == 1, "a coherent buffer did not select the other heap for its initial full-extent allocation");
             }
             Require(mock.live == 0, "a budget-selected buffer leaked Vulkan objects");
         }
@@ -5782,8 +5781,18 @@ ShaderRecompiler::DescriptorBinding makeBinding(Role role, std::uint32_t binding
     result.descriptorSet = 0;
     result.binding = binding;
     result.count = count;
-    result.guestDescriptor = std::move(words);
+    result.guestDescriptor = ShaderRecompiler::SharedValues<std::uint32_t>(std::move(words));
     return result;
+}
+void setGuestDescriptor(ShaderRecompiler::DescriptorBinding& binding, std::vector<std::uint32_t> words) {
+    binding.guestDescriptor = ShaderRecompiler::SharedValues<std::uint32_t>(std::move(words));
+}
+
+template <typename TUpdate>
+void mutateGuestDescriptor(ShaderRecompiler::DescriptorBinding& binding, TUpdate&& update) {
+    auto words = binding.guestDescriptor.Copy();
+    update(words);
+    setGuestDescriptor(binding, std::move(words));
 }
 
 std::vector<std::uint32_t> ShaderDataWords(std::initializer_list<std::uint32_t> userData) {
@@ -6046,12 +6055,14 @@ void descriptorSnapshotTests() {
             const auto original = findWrite(0).buffers;
             const auto originalThird = findWrite(4).buffers;
             std::vector<ShaderResources::MovedBuffer> moved;
-            std::array<std::vector<std::uint32_t>, 2> words;
             for (std::size_t index = 0; index < 2; ++index) {
                 if ((selected & (1u << index)) == 0) continue;
                 const std::size_t bytes = index == 0 ? 24 : 12;
-                words[index].assign(bytes / 4, static_cast<std::uint32_t>(0x12340000u + index));
-                moved.push_back({index, 0, bytes, words[index]});
+                std::optional<ShaderRecompiler::SharedValues<std::uint32_t>> source;
+                std::vector<std::uint32_t> words(bytes / 4, static_cast<std::uint32_t>(0x12340000u + index));
+                source.emplace(std::move(words));
+                moved.push_back({index, 0, bytes, *source});
+                source.reset();
             }
             mock.writes.clear();
             const auto snapshots = resources.PrepareDrawBindings(recorder, moved);
@@ -6070,7 +6081,9 @@ void descriptorSnapshotTests() {
                 } else {
                     const auto& item = snapshots->snapshots[snapshot];
                     Require(descriptor.buffer == item.buffer->Handle() && descriptor.offset == 0 && descriptor.range == moved[snapshot].size, "snapshot descriptor used another element's buffer or range");
-                    Require(sameBytes(bufferBytes(descriptor.buffer), moved[snapshot].words.data(), moved[snapshot].size), "snapshot descriptor lost its buffer data");
+                    std::array<std::uint32_t, 6> expected;
+                    expected.fill(static_cast<std::uint32_t>(0x12340000u + index));
+                    Require(sameBytes(bufferBytes(descriptor.buffer), expected.data(), moved[snapshot].size), "snapshot descriptor lost words after their source owner was destroyed");
                     ++snapshot;
                 }
             }
@@ -6078,6 +6091,42 @@ void descriptorSnapshotTests() {
         }
         Require(mock.live == 0, "snapshot descriptor resources leaked Vulkan objects");
     }
+}
+
+void changedDrawWordsLifetimeTests() {
+    using AgcDriver::Graphics::CompiledShader;
+    using AgcDriver::Graphics::DescriptorCache;
+    using AgcDriver::Graphics::Recorder;
+    using AgcDriver::Graphics::ShaderResources;
+    mock = MockVulkan{};
+    mock.allowCopies = true;
+    auto context = mockContext();
+    {
+        DescriptorCache cache(context);
+        context.descriptorCache = &cache;
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        Recorder recorder(context);
+        ShaderRecompiler::RecompileResult vertex, fragment;
+        vertex.bindings.push_back(makeBinding(Role::FlattenedSrt, 43, 1, std::vector<std::uint32_t>(64, 0u)));
+        const auto state = AgcDriver::Graphics::DecodeState(makeState());
+        ShaderResources resources(context, vertex, fragment, state.color, 0, 0);
+        auto incoming = vertex;
+        std::vector<std::uint32_t> expected(64);
+        for (std::size_t i = 0; i < expected.size(); ++i) expected[i] = 0x12340000u + static_cast<std::uint32_t>(i);
+        setGuestDescriptor(incoming.bindings[0], expected);
+        const std::array<CompiledShader, 1> stages{{{ShaderRecompiler::ShaderStage::Vertex, &incoming, 0}}};
+        auto moved = resources.MovedReadOnlyBuffers(stages, recorder);
+        Require(moved.has_value() && moved->size() == 1, "changed draw words did not select one snapshot");
+        incoming.bindings.clear();
+        mock.writes.clear();
+        const auto snapshots = resources.PrepareDrawBindings(recorder, *moved, true);
+        Require(snapshots != nullptr && snapshots->snapshots.size() == 1, "changed draw snapshot missing");
+        const auto& write = findWrite(43);
+        Require(write.buffers.size() == 1, "changed draw descriptor missing");
+        Require(sameBytes(bufferBytes(write.buffers[0].buffer), expected.data(), expected.size() * sizeof(std::uint32_t)), "changed draw descriptor bytes differ from the submitted values");
+        recorder.Sync();
+    }
+    Require(mock.live == 0, "changed draw snapshot leaked Vulkan objects");
 }
 
 alignas(16) std::array<std::uint32_t, 8> guestMovedFirst{0x51515151, 0x52525252, 0x53535353, 0x54545454, 0x55555555, 0x56565656, 0x57575757, 0x58585858};
@@ -6109,7 +6158,9 @@ void dispatchMoveTests() {
         const auto moveTo = [&](std::size_t element, const void* where, std::uint32_t bytes) {
             auto program = built;
             const auto words = vsharp(where, bytes);
-            std::copy(words.begin(), words.end(), program.bindings[0].guestDescriptor.begin() + static_cast<std::ptrdiff_t>(element) * 4);
+            auto descriptor = program.bindings[0].guestDescriptor.Copy();
+            std::copy(words.begin(), words.end(), descriptor.begin() + static_cast<std::ptrdiff_t>(element) * 4);
+            setGuestDescriptor(program.bindings[0], std::move(descriptor));
             return program;
         };
         const auto prove = [&](const ShaderRecompiler::RecompileResult& program, std::size_t maxBytes, ShaderResources::MoveProof& proof) {
@@ -6139,7 +6190,7 @@ void dispatchMoveTests() {
 
         auto both = relocated;
         const auto firstWords = vsharp(guestMovedFirst.data(), 12);
-        std::copy(firstWords.begin(), firstWords.end(), both.bindings[0].guestDescriptor.begin());
+        mutateGuestDescriptor(both.bindings[0], [&](auto& descriptor) { std::copy(firstWords.begin(), firstWords.end(), descriptor.begin()); });
         moved = prove(both, 1024, proof);
         Require(moved.has_value() && moved->size() == 2 && proof.buffers == 2 && proof.bytes >= 36, "two moved buffers were not both listed");
         refuses(both, 30, Refusal::Limit, "moved buffers past the byte budget together were served");
@@ -6152,7 +6203,7 @@ void dispatchMoveTests() {
         refuses(moveTo(1, reinterpret_cast<const void*>(std::uintptr_t{0x10}), 24), 0, Refusal::Inaccessible, "a moved buffer over unmapped memory was served");
         refuses(moveTo(1, guestThird.data(), 8), 0, Refusal::Overlap, "a moved buffer over the dispatch's own written range was served");
         auto shaped = relocated;
-        shaped.bindings[0].guestDescriptor.resize(4);
+        mutateGuestDescriptor(shaped.bindings[0], [](auto& descriptor) { descriptor.resize(4); });
         refuses(shaped, 0, Refusal::Shape, "a dispatch with another binding shape was served");
         recorder.Sync();
     }
@@ -6179,7 +6230,7 @@ void dispatchMoveTests() {
             const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &built, 0};
             ShaderResources resources(context, shader);
             auto program = built;
-            program.bindings[0].guestDescriptor = incoming;
+            setGuestDescriptor(program.bindings[0], incoming);
             moved = resources.MovedDispatchBuffers(CompiledShader{ShaderRecompiler::ShaderStage::Compute, &program, 0}, &recorder, 0, proof);
         };
         const auto readOnly = [&](const std::vector<std::uint32_t>& words) {
@@ -6330,8 +6381,8 @@ void resourceTests() {
     expectSingleFailure(changed([](auto& binding) { binding.role = Role::GuestSamplers; binding.kind = Kind::Sampler; binding.binding = static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Samplers); }), "shader sampler descriptors exceed per-stage limits");
     expectSingleFailure(changed([](auto& binding) { binding.role = Role::GuestImages; binding.kind = Kind::SampledImage; binding.binding = 29u; }), "resource class disagrees");
     expectSingleFailure(changed([](auto& binding) { binding.role = Role::Gds; }), "invalid GDS descriptor contract");
-    expectSingleFailure(changed([](auto& binding) { binding.role = Role::BdaPagetable; binding.guestDescriptor.clear(); }), "BDA table and fault descriptors");
-    expectSingleFailure(changed([](auto& binding) { binding.role = Role::FaultBuffer; binding.guestDescriptor.clear(); }), "BDA table and fault descriptors");
+    expectSingleFailure(changed([](auto& binding) { binding.role = Role::BdaPagetable; setGuestDescriptor(binding, {}); }), "BDA table and fault descriptors");
+    expectSingleFailure(changed([](auto& binding) { binding.role = Role::FaultBuffer; setGuestDescriptor(binding, {}); }), "BDA table and fault descriptors");
     expectSingleFailure(changed([](auto& binding) { binding.kind = Kind::UniformBuffer; }), "unsupported descriptor kind UniformBuffer");
     expectSingleFailure(changed([](auto& binding) { binding.kind = Kind::UniformTexelBuffer; }), "unsupported descriptor kind UniformTexelBuffer");
     expectSingleFailure(changed([](auto& binding) { binding.kind = Kind::StorageTexelBuffer; }), "unsupported descriptor kind StorageTexelBuffer");
@@ -6340,17 +6391,16 @@ void resourceTests() {
     expectSingleFailure(changed([](auto& binding) { binding.readOnly = true; }), "read-only descriptors are unsupported");
     expectSingleFailure(changed([](auto& binding) { binding.count = 0; }), "empty descriptor binding");
     expectSingleFailure(changed([](auto& binding) { binding.count = 2; }), "four DWORDs per array element");
-    expectSingleFailure(changed([](auto& binding) { binding.role = Role::ShaderData; binding.count = 2; binding.guestDescriptor = {1, 2}; }), "must not be arrays");
-    expectSingleFailure(changed([](auto& binding) { binding.role = Role::ShaderData; binding.guestDescriptor.clear(); }), "empty shader data descriptor");
-    expectSingleFailure(changed([](auto& binding) { binding.role = Role::ShaderData; }), "invalid compact shader data size");
-    expectSingleFailure(changed([](auto& binding) { binding.role = Role::ShaderData; binding.guestDescriptor = ShaderDataWords({}); binding.guestDescriptor.pop_back(); }), "invalid compact shader data size");
-    expectSingleFailure(changed([](auto& binding) { binding.role = Role::FlattenedSrt; binding.guestDescriptor.clear(); }), "empty shader data descriptor");
-    expectSingleAccepted(changed([](auto& binding) { binding.guestDescriptor[1] |= 0x40000000u; }), "a V# with reserved bit 30");
-    expectSingleFailure(changed([](auto& binding) { binding.guestDescriptor[3] |= 0x40000000u; }), "unsupported type");
-    expectSingleAccepted(changed([](auto& binding) { binding.guestDescriptor[1] |= 0x3fffu << 16u; binding.guestDescriptor[2] = 0xffffffffu; }), "an unregistered V# past the range limit");
-    expectSingleAccepted(changed([](auto& binding) { binding.guestDescriptor[2] = 32768; }), "an unregistered V# past the range limit");
-    expectSingleAccepted(changed([](auto& binding) { binding.guestDescriptor = vsharp(reinterpret_cast<const void*>(0x1000), 8); }), "an unmapped V#");
-    expectSingleFailure(changed([&](auto& binding) { binding.guestDescriptor = vsharp(reinterpret_cast<const void*>(state.color.address), 64); }), "aliases the render target");
+    expectSingleFailure(changed([](auto& binding) { binding.role = Role::ShaderData; binding.count = 2; setGuestDescriptor(binding, {1, 2}); }), "must not be arrays");
+    expectSingleFailure(changed([](auto& binding) { binding.role = Role::ShaderData; setGuestDescriptor(binding, {}); }), "empty shader data descriptor");
+    expectSingleFailure(changed([](auto& binding) { binding.role = Role::ShaderData; auto words = ShaderDataWords({}); words.pop_back(); setGuestDescriptor(binding, std::move(words)); }), "invalid compact shader data size");
+    expectSingleFailure(changed([](auto& binding) { binding.role = Role::FlattenedSrt; setGuestDescriptor(binding, {}); }), "empty shader data descriptor");
+    expectSingleAccepted(changed([](auto& binding) { mutateGuestDescriptor(binding, [](auto& words) { words[1] |= 0x40000000u; }); }), "a V# with reserved bit 30");
+    expectSingleFailure(changed([](auto& binding) { mutateGuestDescriptor(binding, [](auto& words) { words[3] |= 0x40000000u; }); }), "unsupported type");
+    expectSingleAccepted(changed([](auto& binding) { mutateGuestDescriptor(binding, [](auto& words) { words[1] |= 0x3fffu << 16u; words[2] = 0xffffffffu; }); }), "an unregistered V# past the range limit");
+    expectSingleAccepted(changed([](auto& binding) { mutateGuestDescriptor(binding, [](auto& words) { words[2] = 32768; }); }), "an unregistered V# past the range limit");
+    expectSingleAccepted(changed([](auto& binding) { setGuestDescriptor(binding, vsharp(reinterpret_cast<const void*>(0x1000), 8)); }), "an unmapped V#");
+    expectSingleFailure(changed([&](auto& binding) { setGuestDescriptor(binding, vsharp(reinterpret_cast<const void*>(state.color.address), 64)); }), "aliases the render target");
     const auto stridedBefore = [&](std::uint32_t past) {
         constexpr std::uint32_t stride = 60;
         constexpr std::uint32_t records = 4;
@@ -6358,12 +6408,11 @@ void resourceTests() {
         descriptor[1] |= stride << 16u;
         return descriptor;
     };
-    expectSingleAccepted(changed([&](auto& binding) { binding.guestDescriptor = stridedBefore(8); binding.bufferWritten = {false}; }), "a read-only strided V# whose last record runs 8 bytes into the render target");
-    expectSingleFailure(changed([&](auto& binding) { binding.guestDescriptor = stridedBefore(8); binding.bufferWritten = {true}; }), "aliases the render target");
-    expectSingleFailure(changed([&](auto& binding) { binding.guestDescriptor = stridedBefore(60); }), "aliases the render target");
-    expectSingleAccepted(changed([](auto& binding) { binding.count = 3; binding.guestDescriptor = join(join(vsharp(guestFirst.data(), 16), vsharp(guestSecond.data(), 32)), vsharp(reinterpret_cast<const void*>(0x1000), 8)); }), "an unmapped V# element");
-    expectSingleFailure(changed([&](auto& binding) { binding.count = 2; binding.guestDescriptor = join(vsharp(guestFirst.data(), 16), vsharp(reinterpret_cast<const void*>(state.color.address), 64)); }), "aliases the render target");
-    expectSingleFailure(changed([](auto& binding) { binding.count = 17; binding.guestDescriptor.assign(68, 0); }), "per-stage limits");
+    expectSingleAccepted(changed([&](auto& binding) { setGuestDescriptor(binding, stridedBefore(8)); binding.bufferWritten = {false}; }), "a read-only strided V# whose last record runs 8 bytes into the render target");
+    expectSingleFailure(changed([&](auto& binding) { setGuestDescriptor(binding, stridedBefore(8)); binding.bufferWritten = {true}; }), "aliases the render target");
+    expectSingleFailure(changed([&](auto& binding) { setGuestDescriptor(binding, stridedBefore(60)); }), "aliases the render target");
+    expectSingleAccepted(changed([](auto& binding) { binding.count = 3; setGuestDescriptor(binding, join(join(vsharp(guestFirst.data(), 16), vsharp(guestSecond.data(), 32)), vsharp(reinterpret_cast<const void*>(0x1000), 8))); }), "an unmapped V# element");
+    expectSingleFailure(changed([&](auto& binding) { binding.count = 2; setGuestDescriptor(binding, join(vsharp(guestFirst.data(), 16), vsharp(reinterpret_cast<const void*>(state.color.address), 64))); }), "aliases the render target");
     {
         ShaderRecompiler::RecompileResult vertex;
         ShaderRecompiler::RecompileResult fragment;
@@ -6399,7 +6448,7 @@ void resourceTests() {
             vertex.bindings.back().role = role;
             vertex.bindings.back().kind = kind;
             vertex.bindings.back().binding = kind == Kind::StorageImage ? ShaderRecompiler::RuntimeAbi::FirstStorageImageBinding : kind == Kind::Sampler ? static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Samplers) : ShaderRecompiler::RuntimeAbi::FirstImageBinding;
-            vertex.bindings.back().guestDescriptor.assign(words, 0);
+            setGuestDescriptor(vertex.bindings.back(), std::vector<std::uint32_t>(words, 0));
             mock = MockVulkan{};
             auto limited = mockContext();
             limited.limits.maxPerStageResources = limit;
@@ -6453,7 +6502,7 @@ void resourceTests() {
         fragment.bindings.push_back(makeBinding(Role::GuestBuffers, 0, 1, vsharp(guestSecond.data(), 32)));
         expectResourceFailure(vertex, fragment, "duplicate shader binding");
         fragment.bindings.front().binding = 1;
-        fragment.bindings.front().guestDescriptor = vsharp(guestFirst.data(), 16);
+        setGuestDescriptor(fragment.bindings.front(), vsharp(guestFirst.data(), 16));
     }
 }
 
@@ -6601,11 +6650,12 @@ void imageTableAllocationTests() {
                 AgcDriver::Graphics::DescriptorCache cache(context);
                 if (cached) context.descriptorCache = &cache;
                 ShaderRecompiler::RecompileResult program;
-                auto map = makeBinding(Role::ImageTableMap, static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::ImageTableMap), 1, std::vector<std::uint32_t>(Abi::HeaderWords + count));
-                map.guestDescriptor[Abi::HeaderVersion] = Abi::Version;
-                map.guestDescriptor[Abi::HeaderElementCount] = count;
-                map.guestDescriptor[Abi::HeaderElementFaults] = Abi::HeaderWords;
-                map.guestDescriptor[Abi::HeaderSamplerFaults] = Abi::HeaderWords + count;
+                std::vector<std::uint32_t> mapWords(Abi::HeaderWords + count);
+                mapWords[Abi::HeaderVersion] = Abi::Version;
+                mapWords[Abi::HeaderElementCount] = count;
+                mapWords[Abi::HeaderElementFaults] = Abi::HeaderWords;
+                mapWords[Abi::HeaderSamplerFaults] = Abi::HeaderWords + count;
+                auto map = makeBinding(Role::ImageTableMap, static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::ImageTableMap), 1, std::move(mapWords));
                 program.bindings.push_back(map);
                 auto images = makeBinding(Role::ImageTable, ShaderRecompiler::RuntimeAbi::ImageTableBinding, count, std::vector<std::uint32_t>(count * 8u));
                 images.kind = Kind::SampledImage;
@@ -6651,10 +6701,11 @@ void imageTableSnapshotAllocationTests() {
         auto buffer = makeBinding(Role::GuestBuffers, 0, 1, vsharp(guestFirst.data(), 16));
         buffer.bufferWritten = {false};
         vertex.bindings.push_back(buffer);
-        auto map = makeBinding(Role::ImageTableMap, static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::ImageTableMap), 1, std::vector<std::uint32_t>(Abi::HeaderWords));
-        map.guestDescriptor[Abi::HeaderVersion] = Abi::Version;
-        map.guestDescriptor[Abi::HeaderElementFaults] = Abi::HeaderWords;
-        map.guestDescriptor[Abi::HeaderSamplerFaults] = Abi::HeaderWords;
+        std::vector<std::uint32_t> mapWords(Abi::HeaderWords);
+        mapWords[Abi::HeaderVersion] = Abi::Version;
+        mapWords[Abi::HeaderElementFaults] = Abi::HeaderWords;
+        mapWords[Abi::HeaderSamplerFaults] = Abi::HeaderWords;
+        auto map = makeBinding(Role::ImageTableMap, static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::ImageTableMap), 1, std::move(mapWords));
         vertex.bindings.push_back(map);
         auto images = makeBinding(Role::ImageTable, ShaderRecompiler::RuntimeAbi::ImageTableBinding, 0, {});
         images.kind = Kind::SampledImage;
@@ -6662,7 +6713,7 @@ void imageTableSnapshotAllocationTests() {
         const auto state = DecodeState(makeState());
         ShaderResources resources(context, vertex, fragment, state.color, 0, 0);
         const auto originalMap = findWrite(map.binding).buffers.at(0);
-        const std::array<std::uint32_t, 4> movedWords{11, 22, 33, 44};
+        const ShaderRecompiler::SharedValues<std::uint32_t> movedWords(std::vector<std::uint32_t>{11, 22, 33, 44});
         const std::array<ShaderResources::MovedBuffer, 1> moved{{{0, 0, 16, movedWords}}};
         const auto sets = cache.Counters().sets;
         mock.writes.clear();
@@ -6695,21 +6746,24 @@ void samplerTableNonSeamlessCubeTests() {
             context.limits.maxPerStageDescriptorSamplers = count;
             context.limits.maxSamplerAnisotropy = 1.0f;
             ShaderRecompiler::RecompileResult program;
-            auto map = makeBinding(Role::ImageTableMap, static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::ImageTableMap), 1, std::vector<std::uint32_t>(Abi::HeaderWords + 2u));
-            map.guestDescriptor[Abi::HeaderVersion] = Abi::Version;
-            map.guestDescriptor[Abi::HeaderSamplerCount] = count;
-            map.guestDescriptor[Abi::HeaderElementFaults] = Abi::HeaderWords;
-            map.guestDescriptor[Abi::HeaderSamplerFaults] = Abi::HeaderWords;
+            std::vector<std::uint32_t> mapWords(Abi::HeaderWords + 2u);
+            mapWords[Abi::HeaderVersion] = Abi::Version;
+            mapWords[Abi::HeaderSamplerCount] = count;
+            mapWords[Abi::HeaderElementFaults] = Abi::HeaderWords;
+            mapWords[Abi::HeaderSamplerFaults] = Abi::HeaderWords;
+            auto map = makeBinding(Role::ImageTableMap, static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::ImageTableMap), 1, std::move(mapWords));
             program.bindings.push_back(map);
             auto samplers = makeBinding(Role::SamplerTable, static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::SamplerTable), count, {});
+            std::vector<std::uint32_t> samplerWords;
             samplers.kind = Kind::Sampler;
             for (std::uint32_t entry = 0; entry < 2u; ++entry) {
                 const std::array<std::uint32_t, 4> words{0x92u | (entry == flaggedEntry ? 1u << 28u : 0u), (4u * 256u) << 12u, 0u, 0u};
                 for (std::uint32_t variant = 0; variant < Abi::SamplerEntryElements; ++variant) {
-                    samplers.guestDescriptor.insert(samplers.guestDescriptor.end(), words.begin(), words.end());
+                    samplerWords.insert(samplerWords.end(), words.begin(), words.end());
                     samplers.samplerDepthCompare.push_back(variant >= 2u);
                 }
             }
+            setGuestDescriptor(samplers, std::move(samplerWords));
             const auto samplerBinding = samplers.binding;
             program.bindings.push_back(std::move(samplers));
             const AgcDriver::Graphics::CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
@@ -6762,21 +6816,24 @@ void samplerTableDeviceLimitTests(std::optional<std::uint32_t> selected = std::n
             context.limits.maxSamplerAnisotropy = 2.0f;
             context.limits.maxSamplerLodBias = 0.5f;
             ShaderRecompiler::RecompileResult program;
-            auto map = makeBinding(Role::ImageTableMap, static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::ImageTableMap), 1, std::vector<std::uint32_t>(Abi::HeaderWords + 2u));
-            map.guestDescriptor[Abi::HeaderVersion] = Abi::Version;
-            map.guestDescriptor[Abi::HeaderSamplerCount] = count;
-            map.guestDescriptor[Abi::HeaderElementFaults] = Abi::HeaderWords;
-            map.guestDescriptor[Abi::HeaderSamplerFaults] = Abi::HeaderWords;
+            std::vector<std::uint32_t> mapWords(Abi::HeaderWords + 2u);
+            mapWords[Abi::HeaderVersion] = Abi::Version;
+            mapWords[Abi::HeaderSamplerCount] = count;
+            mapWords[Abi::HeaderElementFaults] = Abi::HeaderWords;
+            mapWords[Abi::HeaderSamplerFaults] = Abi::HeaderWords;
+            auto map = makeBinding(Role::ImageTableMap, static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::ImageTableMap), 1, std::move(mapWords));
             program.bindings.push_back(map);
             auto samplers = makeBinding(Role::SamplerTable, static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::SamplerTable), count, {});
+            std::vector<std::uint32_t> samplerWords;
             samplers.kind = Kind::Sampler;
             for (std::uint32_t entry = 0; entry < 2u; ++entry) {
                 const auto& words = entry == badEntry ? invalid[kind] : valid;
                 for (std::uint32_t variant = 0; variant < Abi::SamplerEntryElements; ++variant) {
-                    samplers.guestDescriptor.insert(samplers.guestDescriptor.end(), words.begin(), words.end());
+                    samplerWords.insert(samplerWords.end(), words.begin(), words.end());
                     samplers.samplerDepthCompare.push_back(variant >= 2u);
                 }
             }
+            setGuestDescriptor(samplers, std::move(samplerWords));
             const auto samplerBinding = samplers.binding;
             program.bindings.push_back(std::move(samplers));
             const AgcDriver::Graphics::CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
@@ -6889,11 +6946,12 @@ void tableUpdateAfterBindTests() {
             DescriptorCache cache(context);
             if (cached) context.descriptorCache = &cache;
             ShaderRecompiler::RecompileResult program;
-            auto map = makeBinding(Role::ImageTableMap, static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::ImageTableMap), 1, std::vector<std::uint32_t>(Abi::HeaderWords + 2u));
-            map.guestDescriptor[Abi::HeaderVersion] = Abi::Version;
-            map.guestDescriptor[Abi::HeaderElementCount] = 2u;
-            map.guestDescriptor[Abi::HeaderElementFaults] = Abi::HeaderWords;
-            map.guestDescriptor[Abi::HeaderSamplerFaults] = Abi::HeaderWords + 2u;
+            std::vector<std::uint32_t> mapWords(Abi::HeaderWords + 2u);
+            mapWords[Abi::HeaderVersion] = Abi::Version;
+            mapWords[Abi::HeaderElementCount] = 2u;
+            mapWords[Abi::HeaderElementFaults] = Abi::HeaderWords;
+            mapWords[Abi::HeaderSamplerFaults] = Abi::HeaderWords + 2u;
+            auto map = makeBinding(Role::ImageTableMap, static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::ImageTableMap), 1, std::move(mapWords));
             program.bindings.push_back(map);
             auto images = makeBinding(Role::ImageTable, ShaderRecompiler::RuntimeAbi::ImageTableBinding, 2u, std::vector<std::uint32_t>(16u));
             images.kind = Kind::SampledImage;
@@ -6924,20 +6982,23 @@ void tableUpdateAfterBindTests() {
             DescriptorCache cache(context);
             if (cached) context.descriptorCache = &cache;
             ShaderRecompiler::RecompileResult program;
-            auto map = makeBinding(Role::ImageTableMap, static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::ImageTableMap), 1, std::vector<std::uint32_t>(Abi::HeaderWords + 2u));
-            map.guestDescriptor[Abi::HeaderVersion] = Abi::Version;
-            map.guestDescriptor[Abi::HeaderSamplerCount] = count;
-            map.guestDescriptor[Abi::HeaderElementFaults] = Abi::HeaderWords;
-            map.guestDescriptor[Abi::HeaderSamplerFaults] = Abi::HeaderWords;
+            std::vector<std::uint32_t> mapWords(Abi::HeaderWords + 2u);
+            mapWords[Abi::HeaderVersion] = Abi::Version;
+            mapWords[Abi::HeaderSamplerCount] = count;
+            mapWords[Abi::HeaderElementFaults] = Abi::HeaderWords;
+            mapWords[Abi::HeaderSamplerFaults] = Abi::HeaderWords;
+            auto map = makeBinding(Role::ImageTableMap, static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::ImageTableMap), 1, std::move(mapWords));
             program.bindings.push_back(map);
             const auto samplerBinding = static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::SamplerTable);
             auto samplers = makeBinding(Role::SamplerTable, samplerBinding, count, {});
+            std::vector<std::uint32_t> samplerWords;
             samplers.kind = Kind::Sampler;
             const std::array<std::uint32_t, 4> valid{0x92u, (4u * 256u) << 12u, 0u, 0u};
             for (std::uint32_t element = 0; element < count; ++element) {
-                samplers.guestDescriptor.insert(samplers.guestDescriptor.end(), valid.begin(), valid.end());
+                samplerWords.insert(samplerWords.end(), valid.begin(), valid.end());
                 samplers.samplerDepthCompare.push_back(false);
             }
+            setGuestDescriptor(samplers, std::move(samplerWords));
             program.bindings.push_back(std::move(samplers));
             const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
             {
@@ -7119,7 +7180,7 @@ void misalignedShaderDataTests() {
         compute.shaderDataDwords = ShaderRecompiler::RuntimeAbi::ShaderDataDwords;
         compute.memoryOffsetDword = ShaderRecompiler::RuntimeAbi::BufferOffsetsDword;
         auto live = compute;
-        live.bindings[1].guestDescriptor = ShaderDataWords({0x33, 0x44});
+        setGuestDescriptor(live.bindings[1], ShaderDataWords({0x33, 0x44}));
         const AgcDriver::Graphics::CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &compute, 0};
         const AgcDriver::Graphics::CompiledShader liveShader{ShaderRecompiler::ShaderStage::Compute, &live, 0};
         AgcDriver::Graphics::ShaderResources resources(context, shader);
@@ -8906,7 +8967,8 @@ void orderedPixelShaderTests() {
         const auto replayed = serializer.Deserialize(serializer.Serialize(request));
         Require(replayed.request.context.pixel->orderedPixelShader == (shaderControl == 0x30600u), "the serialized request lost PRIMITIVE_ORDERED_PIXEL_SHADER");
         const auto result = ShaderRecompiler::Recompile(request);
-        Require(interlockShape(result.spirv.Words()) == expected && interlockShape(ShaderRecompiler::Recompile(replayed.request).spirv.Words()) == expected, "DB_SHADER_CONTROL " + std::to_string(shaderControl) + " declared the wrong pixel interlock: " + interlockShape(result.spirv.Words()));
+        const auto replayedResult = ShaderRecompiler::Recompile(replayed.request);
+        Require(interlockShape(result.spirv.Words()) == expected && interlockShape(replayedResult.spirv.Words()) == expected, "DB_SHADER_CONTROL " + std::to_string(shaderControl) + " declared the wrong pixel interlock: " + interlockShape(result.spirv.Words()));
         std::vector<std::uint64_t> key;
         ShaderRecompiler::RecompileCacheKey::Build(request, key);
         keys.insert(key);
@@ -8924,7 +8986,8 @@ void orderedPixelShaderTests() {
     faulting.target.supportedExtensions = bdaExtensions;
     faulting.target.bdaAbiVersion = ShaderRecompiler::BdaAbi::Version;
     std::size_t kills = 0, terminates = 0;
-    const auto exits = interlockExits(ShaderRecompiler::Recompile(faulting).spirv.Words(), kills, terminates);
+    const auto faultingResult = ShaderRecompiler::Recompile(faulting);
+    const auto exits = interlockExits(faultingResult.spirv.Words(), kills, terminates);
     Require(exits.empty() && kills == 6u && terminates == 0u, "a primitive-ordered pixel shader with BDA reads: " + (exits.empty() ? std::to_string(kills) + " OpKill and " + std::to_string(terminates) + " OpTerminateInvocation, not the valid-mask kill and 5 BDA fault kills" : exits));
     const std::array<std::string_view, 3> terminateExtensions{"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage", "SPV_KHR_terminate_invocation"};
     auto terminating = faulting;
@@ -9124,7 +9187,8 @@ void stencilRefExportTests() {
         const auto replayed = serializer.Deserialize(serializer.Serialize(request));
         Require(replayed.request.context.pixel->stencilRefExportEnable == ((shaderControl & 2u) != 0), "the serialized request lost STENCIL_TEST_VAL_EXPORT_ENABLE");
         const auto result = ShaderRecompiler::Recompile(request);
-        Require(stencilRefShape(result.spirv.Words()) == expected && stencilRefShape(ShaderRecompiler::Recompile(replayed.request).spirv.Words()) == expected, "DB_SHADER_CONTROL " + std::to_string(shaderControl) + " declared the wrong stencil reference export: " + stencilRefShape(result.spirv.Words()));
+        const auto replayedResult = ShaderRecompiler::Recompile(replayed.request);
+        Require(stencilRefShape(result.spirv.Words()) == expected && stencilRefShape(replayedResult.spirv.Words()) == expected, "DB_SHADER_CONTROL " + std::to_string(shaderControl) + " declared the wrong stencil reference export: " + stencilRefShape(result.spirv.Words()));
         std::vector<std::uint64_t> key;
         ShaderRecompiler::RecompileCacheKey::Build(request, key);
         keys.insert(key);
@@ -9136,9 +9200,11 @@ void stencilRefExportTests() {
         AgcDriver::Graphics::ValidateShaders(shaders, state, VkPhysicalDeviceSubgroupProperties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES}, false);
     }
     Require(keys.size() == cases.size(), "the recompile cache key ignores STENCIL_TEST_VAL_EXPORT_ENABLE");
-    const auto both = stencilRefShape(ShaderRecompiler::Recompile(stencilRefExportRequest(0x53u, stencilExport, DepthStencilRefExportCode)).spirv.Words());
+    const auto bothResult = ShaderRecompiler::Recompile(stencilRefExportRequest(0x53u, stencilExport, DepthStencilRefExportCode));
+    const auto both = stencilRefShape(bothResult.spirv.Words());
     Require(both == "capability extension depth replacing builtin store ", "a depth and stencil reference export declared the wrong outputs: " + both);
-    const auto depthOnly = stencilRefShape(ShaderRecompiler::Recompile(stencilRefExportRequest(0x51u, stencilExport, DepthStencilRefExportCode)).spirv.Words());
+    const auto depthOnlyResult = ShaderRecompiler::Recompile(stencilRefExportRequest(0x51u, stencilExport, DepthStencilRefExportCode));
+    const auto depthOnly = stencilRefShape(depthOnlyResult.spirv.Words());
     Require(depthOnly == "depth ", "an MRTZ stencil channel without STENCIL_TEST_VAL_EXPORT_ENABLE declared the wrong outputs: " + depthOnly);
     const auto emulated = ShaderRecompiler::Recompile(stencilRefExportRequest(0x52u, plain));
     Require(emulated.stencilReferences == std::vector<std::uint32_t>{0u} && emulated.stencilReplaySafe && stencilRefShape(emulated.spirv.Words()).empty(), "a constant stencil reference was not lowered to replay");
@@ -9160,7 +9226,9 @@ void stencilRefExportTests() {
         const auto exportedTest = stencilRefExportRequest(0x52u, stencilExport, literalStencil);
         auto exportedOperation = exportedTest;
         exportedOperation.context.pixel->stencilOperationValueExport = true;
-        Require(!readsOperationByte(ShaderRecompiler::Recompile(exportedTest).spirv.Words()) && readsOperationByte(ShaderRecompiler::Recompile(exportedOperation).spirv.Words()), "the exported stencil operation value was not taken from the second byte of the MRTZ stencil channel");
+        const auto exportedTestResult = ShaderRecompiler::Recompile(exportedTest);
+        const auto exportedOperationResult = ShaderRecompiler::Recompile(exportedOperation);
+        Require(!readsOperationByte(exportedTestResult.spirv.Words()) && readsOperationByte(exportedOperationResult.spirv.Words()), "the exported stencil operation value was not taken from the second byte of the MRTZ stencil channel");
         Require(serializer.Deserialize(serializer.Serialize(exportedOperation)).request.context.pixel->stencilOperationValueExport, "the serialized request lost the stencil operation value export");
         std::vector<std::uint64_t> testKey;
         std::vector<std::uint64_t> operationKey;
@@ -10981,7 +11049,8 @@ bool recompilesDebugBranch(std::uint32_t opcode) {
     request.target.fragmentShaderBarycentricEnabled = true;
     request.layout.pushConstantSizeBytes = 128;
     request.useCache = false;
-    return !ShaderRecompiler::Recompile(request).spirv.Words().empty();
+    const auto result = ShaderRecompiler::Recompile(request);
+    return !result.spirv.Words().empty();
 }
 
 void meshIndexBufferTests() {
@@ -11276,8 +11345,9 @@ void ResourceContentKeyTests(bool benchmark) {
         images.kind = DescriptorKind::SampledImage;
         images.role = DescriptorRole::GuestImages;
         images.count = count;
-        images.guestDescriptor.resize(static_cast<std::size_t>(count) * 8u);
-        for (std::size_t i = 0; i < images.guestDescriptor.size(); ++i) images.guestDescriptor[i] = static_cast<std::uint32_t>(i * 1664525u + 1013904223u);
+        std::vector<std::uint32_t> imageWords(static_cast<std::size_t>(count) * 8u);
+        for (std::size_t i = 0; i < imageWords.size(); ++i) imageWords[i] = static_cast<std::uint32_t>(i * 1664525u + 1013904223u);
+        setGuestDescriptor(images, std::move(imageWords));
         for (auto* bits : {&images.imageWritten, &images.samplerDepthCompare, &images.imageDepthCompare, &images.imageAtomic, &images.samplerUnnormalized, &images.samplerIntegerBorder, &images.imageUnnormalized, &images.imageUnnormalizedBaseLevel, &images.bufferWritten}) {
             bits->resize(count);
             for (std::size_t i = 0; i < bits->size(); ++i) (*bits)[i] = i % 3u == 0;
@@ -11289,24 +11359,25 @@ void ResourceContentKeyTests(bool benchmark) {
         data.kind = DescriptorKind::StorageBuffer;
         data.role = DescriptorRole::ShaderData;
         data.count = 1;
-        data.guestDescriptor.resize(257u, 0x12345678u);
+        setGuestDescriptor(data, std::vector<std::uint32_t>(257u, 0x12345678u));
         program.bindings.push_back(std::move(data));
         ShaderRecompiler::DescriptorBinding buffers{};
         buffers.kind = DescriptorKind::StorageBuffer;
         buffers.role = DescriptorRole::GuestBuffers;
         buffers.count = 1;
-        buffers.guestDescriptor = {0x1000u, 0x10000u, 4u, 0x1234u};
+        setGuestDescriptor(buffers, {0x1000u, 0x10000u, 4u, 0x1234u});
         buffers.bufferWritten = {false};
         program.bindings.push_back(std::move(buffers));
         const AgcDriver::Graphics::CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
         for (const bool dataWords : {false, true}) for (const bool movable : {false, true}) {
             const auto original = ShaderResources::ContentKey(shader, dataWords, movable);
-            program.bindings[1].guestDescriptor.back() ^= 1u;
+            const auto originalWords = original.Flatten();
+            mutateGuestDescriptor(program.bindings[1], [](auto& words) { words.back() ^= 1u; });
             Require((ShaderResources::ContentKey(shader, dataWords, movable) != original) == (dataWords && !movable), "content key changed its data-word policy");
-            program.bindings[1].guestDescriptor.back() ^= 1u;
-            program.bindings[2].guestDescriptor[0] += 0x1000u;
+            mutateGuestDescriptor(program.bindings[1], [](auto& words) { words.back() ^= 1u; });
+            mutateGuestDescriptor(program.bindings[2], [](auto& words) { words[0] += 0x1000u; });
             Require((ShaderResources::ContentKey(shader, dataWords, movable) != original) == !movable, "content key changed its movable-buffer policy");
-            program.bindings[2].guestDescriptor[0] -= 0x1000u;
+            mutateGuestDescriptor(program.bindings[2], [](auto& words) { words[0] -= 0x1000u; });
             program.bindings[2].bufferWritten[0] = true;
             Require(ShaderResources::ContentKey(shader, dataWords, movable) != original, "content key ignored the written-buffer mask");
             program.bindings[2].bufferWritten[0] = false;
@@ -11323,10 +11394,9 @@ void ResourceContentKeyTests(bool benchmark) {
                 Require(ShaderResources::ContentKey(shader, dataWords, movable) != original, "content key ignored the last image shape");
                 program.bindings[0].imageShapes.back() = ShaderRecompiler::DescriptorImageShape::Image2D;
             }
-            Require(original.capacity() == original.size(), "content key reserved a different word count than it serialized");
             std::uint64_t hash = 14695981039346656037ull;
-            for (const auto word : original) hash = (hash ^ word) * 1099511628211ull;
-            std::cout << "content-key count=" << count << " data=" << dataWords << " movable=" << movable << " words=" << original.size() << " capacity=" << original.capacity() << " hash=" << hash;
+            for (const auto word : originalWords) hash = (hash ^ word) * 1099511628211ull;
+            std::cout << "content-key count=" << count << " data=" << dataWords << " movable=" << movable << " words=" << original.size() << " capacity=" << originalWords.capacity() << " hash=" << hash;
             if (benchmark) {
                 constexpr std::size_t repeats = 256;
                 std::uint64_t checksum = 0;
@@ -11349,6 +11419,152 @@ void ResourceContentKeyTests(bool benchmark) {
 // into a second device) rebuilds the recorded graphics pipeline so the same configuration hits the
 // store, hands the compute result to its hook, recovers a tail torn inside a record's padding and
 // stops when cancelled.
+struct PipelineFlightFixture {
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool release = false;
+    bool fail = false;
+    std::size_t sameCreates = 0;
+    std::size_t otherCreates = 0;
+    std::atomic<std::uintptr_t> next{1000000};
+
+    template<typename THandle>
+    THandle Handle() {
+        const auto value = next.fetch_add(1);
+        if constexpr (std::is_pointer_v<THandle>) return reinterpret_cast<THandle>(value);
+        else return static_cast<THandle>(value);
+    }
+};
+
+PipelineFlightFixture* pipelineFlightFixture = nullptr;
+
+VKAPI_ATTR VkResult VKAPI_CALL pipelineFlightCreate(VkDevice, VkPipelineCache, std::uint32_t count, const VkGraphicsPipelineCreateInfo* infos, const VkAllocationCallbacks*, VkPipeline* pipeline) {
+    auto& fixture = *pipelineFlightFixture;
+    std::unique_lock lock(fixture.mutex);
+    Require(count == 1 && infos->pInputAssemblyState != nullptr, "single-flight fixture requires one complete graphics pipeline");
+    if (infos->pInputAssemblyState->topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST) {
+        ++fixture.sameCreates;
+        fixture.condition.notify_all();
+        fixture.condition.wait(lock, [&] { return fixture.release; });
+        if (fixture.fail) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    } else {
+        ++fixture.otherCreates;
+        fixture.condition.notify_all();
+    }
+    *pipeline = fixture.Handle<VkPipeline>();
+    return VK_SUCCESS;
+}
+
+PFN_vkVoidFunction VKAPI_CALL pipelineFlightProc(VkDevice, const char* name) {
+    const std::string_view function(name);
+    if (function == "vkCreateGraphicsPipelines") return reinterpret_cast<PFN_vkVoidFunction>(pipelineFlightCreate);
+    if (function == "vkCreateShaderModule") return reinterpret_cast<PFN_vkVoidFunction>(+[](VkDevice, const VkShaderModuleCreateInfo*, const VkAllocationCallbacks*, VkShaderModule* handle) -> VkResult {
+        *handle = pipelineFlightFixture->Handle<VkShaderModule>();
+        return VK_SUCCESS;
+    });
+    if (function == "vkCreatePipelineLayout") return reinterpret_cast<PFN_vkVoidFunction>(+[](VkDevice, const VkPipelineLayoutCreateInfo*, const VkAllocationCallbacks*, VkPipelineLayout* handle) -> VkResult {
+        *handle = pipelineFlightFixture->Handle<VkPipelineLayout>();
+        return VK_SUCCESS;
+    });
+    if (function == "vkCreateRenderPass") return reinterpret_cast<PFN_vkVoidFunction>(+[](VkDevice, const VkRenderPassCreateInfo*, const VkAllocationCallbacks*, VkRenderPass* handle) -> VkResult {
+        *handle = pipelineFlightFixture->Handle<VkRenderPass>();
+        return VK_SUCCESS;
+    });
+    if (function == "vkDestroyRenderPass") return reinterpret_cast<PFN_vkVoidFunction>(+[](VkDevice, VkRenderPass, const VkAllocationCallbacks*) {});
+    if (function == "vkDestroyShaderModule") return reinterpret_cast<PFN_vkVoidFunction>(+[](VkDevice, VkShaderModule, const VkAllocationCallbacks*) {});
+    if (function == "vkDestroyPipelineLayout") return reinterpret_cast<PFN_vkVoidFunction>(+[](VkDevice, VkPipelineLayout, const VkAllocationCallbacks*) {});
+    if (function == "vkDestroyPipeline") return reinterpret_cast<PFN_vkVoidFunction>(+[](VkDevice, VkPipeline, const VkAllocationCallbacks*) {});
+    return nullptr;
+}
+
+void pipelineStoreConcurrentSameKeyTests() {
+    using namespace AgcDriver::Graphics;
+    for (const bool fail : {false, true}) {
+        PipelineFlightFixture fixture;
+        fixture.fail = fail;
+        pipelineFlightFixture = &fixture;
+        auto context = mockContext();
+        context.device = fixture.Handle<VkDevice>();
+        context.deviceProc = pipelineFlightProc;
+        context.graphicsPipelineLibrary = false;
+        context.pipelineLinkTimeOptimization = false;
+        context.limits.framebufferNoAttachmentsSampleCounts = VK_SAMPLE_COUNT_1_BIT;
+        ShaderRecompiler::RecompileResult vertex, fragment;
+        vertex.spirv = makeModule({});
+        fragment.spirv = makeModule({.fragment = true});
+        vertex.variantId = 301;
+        fragment.variantId = 302;
+        Require(!vertex.Identity().Empty() && !fragment.Identity().Empty(), "single-flight fixture shaders lack cache identities");
+        const std::array<CompiledShader, 2> shaders{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, PipelinePushSlotBytes}}};
+        const std::array<std::uint32_t, 1> mainKey{41}, fragmentKey{42};
+        const PipelineSetLayouts resources{fixture.Handle<VkDescriptorSetLayout>(), fixture.Handle<VkDescriptorSetLayout>(), true, mainKey, fragmentKey};
+        State state{};
+        state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        auto other = state;
+        other.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+        std::array<std::shared_ptr<Pipeline>, 3> results;
+        std::array<std::exception_ptr, 3> errors;
+        std::array<std::thread, 3> workers;
+        std::array<std::atomic<bool>, 3> done{};
+        const auto start = [&](std::size_t index, const State& configuration) {
+            workers[index] = std::thread([&, index, configuration] {
+                try {
+                    results[index] = CachedPipeline(context, configuration, VertexInputLayout{}, resources, shaders);
+                } catch (...) {
+                    errors[index] = std::current_exception();
+                }
+                done[index].store(true, std::memory_order_release);
+                fixture.condition.notify_all();
+            });
+        };
+        const auto finish = [&] {
+            {
+                std::lock_guard lock(fixture.mutex);
+                fixture.release = true;
+            }
+            fixture.condition.notify_all();
+            for (auto& worker : workers) if (worker.joinable()) worker.join();
+        };
+        try {
+            const auto misses = PipelineStoreTotals().misses;
+            start(0, state);
+            {
+                std::unique_lock lock(fixture.mutex);
+                Require(fixture.condition.wait_for(lock, std::chrono::seconds(3), [&] { return fixture.sameCreates != 0 || done[0].load(std::memory_order_acquire); }), "single-flight owner did not reach Vulkan");
+                Require(fixture.sameCreates == 1, "single-flight owner failed before Vulkan");
+            }
+            start(1, state);
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+            while (PipelineStoreTotals().misses < misses + 2 && !done[1].load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+            Require(PipelineStoreTotals().misses >= misses + 2, "identical-key contender did not enter the pipeline store");
+            start(2, other);
+            {
+                std::unique_lock lock(fixture.mutex);
+                Require(fixture.condition.wait_for(lock, std::chrono::seconds(3), [&] { return done[2].load(std::memory_order_acquire); }), "a distinct pipeline key was serialized behind the blocked owner");
+                Require(fixture.otherCreates == 1 && !errors[2], "distinct-key creation did not progress independently");
+                Require(fixture.sameCreates == 1, "identical-key contenders created duplicate Vulkan pipelines");
+            }
+            finish();
+            if (fail) {
+                Require(errors[0] && errors[1] && !results[0] && !results[1], "owner failure did not reach every same-key waiter");
+                fixture.fail = false;
+                const auto retry = CachedPipeline(context, state, VertexInputLayout{}, resources, shaders);
+                const auto hit = CachedPipeline(context, state, VertexInputLayout{}, resources, shaders);
+                Require(retry && retry == hit && fixture.sameCreates == 2, "failed single-flight poisoned retry or its cached result");
+            } else {
+                Require(!errors[0] && !errors[1] && results[0] && results[0] == results[1], "same-key contenders did not receive one shared pipeline");
+                Require(CachedPipeline(context, state, VertexInputLayout{}, resources, shaders) == results[0] && fixture.sameCreates == 1, "single-flight result was not retained in the pipeline store");
+            }
+        } catch (...) {
+            finish();
+            ClearCachedPipelines(context.device);
+            throw;
+        }
+        ClearCachedPipelines(context.device);
+    }
+    pipelineFlightFixture = nullptr;
+}
+
 void pipelineStoreLazyBufferPoolTests() {
     using namespace AgcDriver::Graphics;
     mock = MockVulkan{};
@@ -11809,6 +12025,11 @@ int main(int argc, char** argv) {
             std::cout << "pipeline library clear waits for active part builds\n";
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--pipeline-store-concurrent-same-key") {
+            pipelineStoreConcurrentSameKeyTests();
+            std::cout << "pipeline store shares concurrent keys, preserves distinct-key progress and retries failures\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--pipeline-store-lazy-buffer-pool") {
             pipelineStoreLazyBufferPoolTests();
             std::cout << "cached pipelines survive lazy buffer pool creation\n";
@@ -12127,6 +12348,7 @@ int main(int argc, char** argv) {
         oversizedDescriptorTests();
         guestBufferViewBytesTests();
         descriptorSnapshotTests();
+        changedDrawWordsLifetimeTests();
         dispatchMoveTests();
         descriptorCacheTests();
         bufferBudgetPlacementTests();

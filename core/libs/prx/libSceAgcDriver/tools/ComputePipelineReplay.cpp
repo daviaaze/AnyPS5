@@ -120,16 +120,55 @@ std::string Report(const Options& options, const AgcDriver::ComputePipelineCaptu
     return output.str();
 }
 
+// Compiles every capture into the runtime's persistent Vulkan pipeline cache under DIRECTORY
+// (ANYPS5_SHADER_CACHE_DIR/<source version>/vk-pipelines-<vendor>-<device>-<driver>-<uuid>.bin),
+// the file the game loads at device creation and passes to every vkCreateComputePipelines.
+int Precompile(int argc, char** argv) {
+    if (argc < 4 || *argv[2] == '\0') throw std::runtime_error("usage: --precompile-pipelines CACHE_DIRECTORY CAPTURE|--fixture...");
+    const std::filesystem::path directory = argv[2];
+    if (!std::filesystem::is_directory(directory)) throw std::runtime_error("cache directory does not exist: " + directory.string());
+    const auto* statistics = std::getenv("APS5_PIPELINE_STATS");
+    if (statistics != nullptr && std::string_view(statistics) != "0" && *statistics != '\0') throw std::runtime_error("unset APS5_PIPELINE_STATS before precompiling");
+#ifdef _WIN32
+    if (_putenv_s("ANYPS5_SHADER_CACHE_DIR", std::filesystem::absolute(directory).string().c_str()) != 0) throw std::runtime_error("cannot set ANYPS5_SHADER_CACHE_DIR");
+#else
+    if (setenv("ANYPS5_SHADER_CACHE_DIR", std::filesystem::absolute(directory).c_str(), 1) != 0) throw std::runtime_error("cannot set ANYPS5_SHADER_CACHE_DIR");
+#endif
+    AgcDriver::VulkanDevice device(AgcDriver::VulkanDevice::CompileOnly{});
+    std::size_t compiled = 0, failed = 0;
+    double milliseconds = 0;
+    for (int index = 3; index < argc; ++index) {
+        const std::string_view source(argv[index]);
+        try {
+            const auto capture = source == "--fixture" ? AgcDriver::ComputePipelineFixture() : AgcDriver::ComputePipelineCapture::Read(std::filesystem::path(source));
+            if ((capture.flags & VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR) != 0) throw std::runtime_error("capture requests pipeline statistics");
+            const auto result = device.PrecompileComputePipeline(capture);
+            ++compiled;
+            milliseconds += result.pipelineMilliseconds;
+            std::cout << "{\"source\":" << Quote(source) << ",\"capture_identity\":" << Quote(capture.Identity()) << ",\"spirv_words\":" << capture.spirv.size() << ",\"pipeline_create_ms\":" << result.pipelineMilliseconds << "}\n";
+        } catch (const std::exception& error) {
+            ++failed;
+            std::cerr << "compute pipeline precompile: " << source << ": " << error.what() << '\n';
+        }
+    }
+    device.SavePipelineCache();
+    std::cout << "{\"compiled\":" << compiled << ",\"failed\":" << failed << ",\"pipeline_create_ms\":" << milliseconds << "}\n";
+    return failed == 0 ? 0 : 1;
+}
+
 }
 
 int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "--help") {
         std::cout << "agc_compute_pipeline_replay CAPTURE|--fixture [--cache-in FILE] [--cache-out FILE] [--output FILE]\n"
                      "agc_compute_pipeline_replay --write-fixture DIRECTORY\n"
+                     "agc_compute_pipeline_replay --precompile-pipelines CACHE_DIRECTORY CAPTURE|--fixture...\n"
+                     "  compiles captures into the runtime vk-pipelines file under CACHE_DIRECTORY (ANYPS5_SHADER_CACHE_DIR)\n"
                      "Compiles one compute pipeline without dispatch. Fresh application cache does not clear driver caches.\n";
         return 0;
     }
     try {
+        if (argc >= 2 && std::string_view(argv[1]) == "--precompile-pipelines") return Precompile(argc, argv);
         const auto options = Parse(argc, argv);
         if (!options.fixtureDirectory.empty()) {
             std::cout << AgcDriver::ComputePipelineFixture().Write(options.fixtureDirectory).string() << '\n';

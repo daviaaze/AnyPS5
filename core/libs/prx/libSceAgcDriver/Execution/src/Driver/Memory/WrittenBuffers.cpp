@@ -23,11 +23,11 @@ void visitWrittenBuffers(const ShaderRecompiler::RecompileResult& compiled, TVis
         for (std::uint32_t element = 0; element < binding.count; ++element) {
             const bool written = element >= binding.bufferWritten.size() || binding.bufferWritten[element];
             if (!written || binding.guestDescriptor.size() < (static_cast<std::size_t>(element) + 1) * 4) continue;
-            const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 4, 4);
+            const auto words = binding.guestDescriptor.Span().subspan(static_cast<std::size_t>(element) * 4, 4);
             const ShaderRecompiler::ShaderBufferResource descriptor{{words[0], words[1], words[2], words[3]}};
             const auto base = descriptor.Base48();
             const auto size = descriptor.GetSize();
-            if (base == 0 || size == 0) continue;
+            if (base == 0 || size == 0 || size > std::numeric_limits<std::uint64_t>::max() - base) continue;
             visit(element, base, base + size, element < binding.bufferAtomic.size() && binding.bufferAtomic[element]);
         }
     }
@@ -67,7 +67,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> DispatchWriteRanges(const S
                 bounded = false;
                 continue;
             }
-            const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 8, 8);
+            const auto words = binding.guestDescriptor.Span().subspan(static_cast<std::size_t>(element) * 8, 8);
             if (Graphics::IsNullTextureResource(words)) continue;
             const auto resource = Graphics::DecodeTextureResource(words);
             const auto surfaceBytes = Graphics::DescribeSurface(resource).guestBytes;
@@ -75,7 +75,34 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> DispatchWriteRanges(const S
             if (resource.dccAddress != 0) ranges.emplace_back(resource.dccAddress, resource.dccAddress + (surfaceBytes != 0 ? surfaceBytes / 256 + 1 : UnknownImageBytes));
         }
     }
-    visitWrittenBuffers(compiled, [&](std::uint32_t, std::uint64_t begin, std::uint64_t end, bool) { ranges.emplace_back(begin, end); });
+    for (const auto& binding : compiled.bindings) {
+        if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
+        for (std::uint32_t element = 0; element < binding.count; ++element) {
+            const bool written = element >= binding.bufferWritten.size() || binding.bufferWritten[element];
+            if (!written || binding.guestDescriptor.size() < (static_cast<std::size_t>(element) + 1) * 4) continue;
+            const auto words = binding.guestDescriptor.Span().subspan(static_cast<std::size_t>(element) * 4, 4);
+            const ShaderRecompiler::ShaderBufferResource descriptor{{words[0], words[1], words[2], words[3]}};
+            const auto base = descriptor.Base48();
+            const auto size = descriptor.GetSize();
+            if (base == 0 || size == 0 || size > std::numeric_limits<std::uint64_t>::max() - base) continue;
+            const auto& footprint = element < binding.bufferFootprints.size()
+                ? binding.bufferFootprints[element] : ShaderRecompiler::BufferTransferFootprint{};
+            if (!footprint.bounded || footprint.writeBegin > footprint.writeEnd || footprint.writeEnd > size) {
+                ranges.emplace_back(base, base + size);
+            } else if (footprint.writeBegin != footprint.writeEnd) {
+                ranges.emplace_back(base + footprint.writeBegin, base + footprint.writeEnd);
+            }
+        }
+    }
+    std::sort(ranges.begin(), ranges.end());
+    std::size_t count = 0;
+    for (const auto& range : ranges) {
+        if (count != 0 && range.first <= ranges[count - 1].second)
+            ranges[count - 1].second = std::max(ranges[count - 1].second, range.second);
+        else
+            ranges[count++] = range;
+    }
+    ranges.resize(count);
     return ranges;
 }
 
@@ -112,7 +139,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> DrawWriteRanges(const Graph
             for (std::uint32_t element = 0; element < binding.count; ++element) {
                 const bool written = element >= binding.imageWritten.size() || binding.imageWritten[element];
                 if (!written || binding.guestDescriptor.size() < (static_cast<std::size_t>(element) + 1) * 8) continue;
-                const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 8, 8);
+                const auto words = binding.guestDescriptor.Span().subspan(static_cast<std::size_t>(element) * 8, 8);
                 if (words[0] == 0u && (words[1] & 0xffu) == 0u) continue;
                 const auto resource = Graphics::DecodeTextureResource(words);
                 if (resource.baseAddress == 0) continue;

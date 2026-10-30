@@ -35,8 +35,8 @@ struct ResourceCapture {
     ResourceSnapshot snapshot;
     // The cache entry the plan belongs to; null when the request bypasses the cache.
     std::shared_ptr<SourceEntry> source;
-    // The walk's read addresses when the plan has pure flat slots (the leaf of each pure slot,
-    // and every other read sorted and deduplicated); empty otherwise.
+    // The walk's read addresses when the plan has pure flat slots or buffer-footprint captured slots
+    // (the leaf of each traced slot and every other read sorted and deduplicated); empty otherwise.
     SrtReadTrace readTrace;
     SrtUserDataUse userDataUse;
     // APS5_PROFILE_DRAW: what CaptureResources spent resolving the source (the stage inputs, the
@@ -63,6 +63,7 @@ public:
     static std::optional<PreparedShaderInvocation> TryCreate(const RecompileRequest& request, const std::shared_ptr<const SourceHandle>& handle);
     static std::optional<PreparedShaderInvocation> TryCreate(const RecompileRequest& request, const std::shared_ptr<const SourceHandle>& handle, std::span<const std::uint64_t> key);
     const RecompileRequest& Request() const { return request; }
+    const std::shared_ptr<const SourceHandle>& Handle() const { return handle; }
     std::shared_ptr<const ResourceCapture> Capture(const SrtRuntime& runtime) const;
     std::shared_ptr<const RecompileResult> Materialize(const ResourceCapture& capture) const;
 

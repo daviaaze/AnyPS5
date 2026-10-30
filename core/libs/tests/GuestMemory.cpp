@@ -35,6 +35,8 @@
 #include <string>
 #include <sys/mman.h>
 #include <time.h>
+#include <sys/syscall.h>
+#include <sys/uio.h>
 #include <unistd.h>
 #endif
 #ifdef _WIN32
@@ -268,6 +270,115 @@ static void CheckStrictMemoryProtectionBits() {
     Require(sceKernelMunmap(reinterpret_cast<std::uint64_t>(mapping), length) == 0);
     Require(sceKernelReleaseDirectMemory(physical, length) == 0);
 }
+#if defined(__linux__)
+static std::string MappingPermissions(const void* pointer);
+static void CheckAnonymousSharedBacking() {
+    constexpr std::size_t page = 0x4000;
+    constexpr int anonymous = 0x1002;
+    constexpr int fixed = 0x1012;
+    struct Segment { int file; std::uint64_t offset; std::size_t bytes; };
+    struct Collection { std::vector<Segment> segments; };
+    const auto collect = +[](void* context, int file, std::uint64_t offset, std::size_t bytes) {
+        auto& output = *static_cast<Collection*>(context);
+        const int duplicate = fcntl(file, F_DUPFD_CLOEXEC, 0);
+        if (duplicate < 0) return false;
+        output.segments.push_back({duplicate, offset, bytes});
+        return true;
+    };
+    const auto resolve = [&](std::uintptr_t address, std::size_t bytes, Collection& output) {
+        return GuestArena::GuestArenaSharedBacking_nid_postfix(address, bytes, collect, &output);
+    };
+    const auto closeSegments = [](Collection& output) {
+        for (const auto& segment : output.segments) close(segment.file);
+        output.segments.clear();
+    };
+    void* mapped = mmap_nid_postfix(nullptr, page * 3, 3, anonymous, -1, 0);
+    Require(mapped != reinterpret_cast<void*>(static_cast<std::uintptr_t>(-1)) && mapped != nullptr);
+    auto* memory = static_cast<unsigned char*>(mapped);
+    const auto address = reinterpret_cast<std::uintptr_t>(mapped);
+    Require(std::all_of(memory, memory + page * 3, [](unsigned char value) { return value == 0; }));
+    Collection backing;
+    Require(resolve(address, page * 3, backing) && backing.segments.size() == 1);
+    Require(backing.segments[0].bytes == page * 3);
+    memory[7] = 0x5a;
+    unsigned char byte = 0;
+    Require(pread(backing.segments[0].file, &byte, 1,
+        static_cast<off_t>(backing.segments[0].offset + 7)) == 1 && byte == 0x5a);
+    byte = 0xa7;
+    Require(pwrite(backing.segments[0].file, &byte, 1,
+        static_cast<off_t>(backing.segments[0].offset + page * 2 + 9)) == 1);
+    Require(memory[page * 2 + 9] == 0xa7);
+    const int seals = fcntl(backing.segments[0].file, F_GET_SEALS);
+    Require(seals >= 0 && (seals & F_SEAL_SHRINK) != 0 && (seals & F_SEAL_GROW) != 0);
+    const int descriptorFlags = fcntl(backing.segments[0].file, F_GETFD);
+    Require(descriptorFlags >= 0 && (descriptorFlags & FD_CLOEXEC) != 0);
+
+    std::array<unsigned char, 4> source{1, 2, 3, 4};
+    Require(GuestArena::GuestArenaWriteSharedBacking_nid_no_patch(address, source.data(), source.size()));
+    Require(std::memcmp(memory, source.data(), source.size()) == 0);
+    Require(sceKernelMprotect(mapped, page, 1) == 0);
+    Require(MappingPermissions(mapped).starts_with("r--"));
+    byte = 0x6c;
+    Require(pwrite(backing.segments[0].file, &byte, 1,
+        static_cast<off_t>(backing.segments[0].offset + 12)) == 1 && memory[12] == 0x6c);
+    Require(GuestArena::GuestArenaWriteSharedBacking_nid_no_patch(address, source.data(), source.size()));
+    Require(std::memcmp(memory, source.data(), source.size()) == 0);
+    Require(sceKernelMprotect(mapped, page, 3) == 0);
+    Require(MappingPermissions(mapped).starts_with("rw-"));
+    Require(GuestArena::GuestArenaWriteSharedBacking_nid_no_patch(address, source.data(), source.size()));
+    Require(std::memcmp(memory, source.data(), source.size()) == 0);
+
+    std::array<unsigned char, 4> savedPrefix{};
+    std::memcpy(savedPrefix.data(), memory, savedPrefix.size());
+    Require(sceKernelMunmap(reinterpret_cast<std::uint64_t>(mapped) + page, page) == 0);
+    Collection gap;
+    Require(!resolve(address, page * 3, gap) && gap.segments.empty());
+    std::vector<unsigned char> rejectedPayload(page * 2, 0xbd);
+    Require(!GuestArena::GuestArenaWriteSharedBacking_nid_no_patch(address, rejectedPayload.data(), rejectedPayload.size()));
+    Require(std::memcmp(memory, savedPrefix.data(), savedPrefix.size()) == 0);
+
+    void* priorAnonymous = mapped;
+    const int retiredAnonymous = backing.segments[0].file;
+    mapped = mmap_nid_postfix(priorAnonymous, page, 3, fixed, -1, 0);
+    Require(mapped == priorAnonymous);
+    Require(std::all_of(memory, memory + page, [](unsigned char value) { return value == 0; }));
+    Require(resolve(address, page, gap) && gap.segments.size() == 1 && gap.segments[0].bytes == page);
+    Require(pread(gap.segments[0].file, &byte, 1, static_cast<off_t>(gap.segments[0].offset + 7)) == 1 && byte == 0);
+    byte = 0x82;
+    Require(pwrite(retiredAnonymous, &byte, 1, static_cast<off_t>(backing.segments[0].offset + 7)) == 1);
+    Require(pread(gap.segments[0].file, &byte, 1, static_cast<off_t>(gap.segments[0].offset + 7)) == 1 && byte == 0);
+    closeSegments(gap);
+    Require(sceKernelMunmap(reinterpret_cast<std::uint64_t>(mapped) + page * 2, page) == 0);
+    std::int64_t physical = 0;
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, page, 0, 0, &physical) == 0);
+    auto* direct = static_cast<unsigned char*>(mapped);
+    direct[0] = 0x91;
+    void* replacement = mapped;
+    Require(sceKernelMapDirectMemory(&replacement, page, 3, 0x10, physical, 0) == 0 && replacement == mapped);
+    Require(std::all_of(direct, direct + page, [](unsigned char value) { return value == 0; }));
+    Collection directBacking;
+    Require(resolve(address, page, directBacking) && directBacking.segments.size() == 1);
+    Require(pwrite(directBacking.segments[0].file, &byte, 1,
+        static_cast<off_t>(directBacking.segments[0].offset + 3)) == 1 && direct[3] == byte);
+    const int retiredDirect = directBacking.segments[0].file;
+    byte = 0x82;
+    replacement = mmap_nid_postfix(mapped, page, 3, fixed, -1, 0);
+    Require(replacement == mapped);
+    Require(std::all_of(direct, direct + page, [](unsigned char value) { return value == 0; }));
+    Require(resolve(address, page, gap) && gap.segments.size() == 1 && gap.segments[0].bytes == page);
+    Require(pread(gap.segments[0].file, &byte, 1, static_cast<off_t>(gap.segments[0].offset + 3)) == 1 && byte == 0);
+    byte = 0x93;
+    Require(pwrite(retiredDirect, &byte, 1, static_cast<off_t>(directBacking.segments[0].offset + 3)) == 1);
+    Require(pread(gap.segments[0].file, &byte, 1, static_cast<off_t>(gap.segments[0].offset + 3)) == 1 && byte == 0);
+    closeSegments(gap);
+    Require(pread(retiredDirect, &byte, 1, static_cast<off_t>(directBacking.segments[0].offset + 3)) == 1 && byte == 0x93);
+    closeSegments(directBacking);
+    Require(sceKernelMunmap(reinterpret_cast<std::uint64_t>(mapped), page) == 0);
+
+    Require(sceKernelReleaseDirectMemory(physical, page) == 0);
+    closeSegments(backing);
+}
+#endif
 
 static void CheckPosixMprotectIgnoresUndefinedBits() {
     constexpr std::size_t length = 0x4000;
@@ -2671,69 +2782,85 @@ static void CheckDirectMemoryBackingNeedsNoFilesystem() {
 
 static void CheckDirectMemorySharedBacking() {
     constexpr std::size_t page = 0x4000;
+    struct Segment { int file; std::uint64_t offset; std::size_t bytes; };
+    struct Collection { std::vector<Segment> segments; bool reject = false; };
+    const auto collect = +[](void* context, int file, std::uint64_t offset, std::size_t bytes) {
+        auto& output = *static_cast<Collection*>(context);
+        if (output.reject) return false;
+        const int duplicate = fcntl(file, F_DUPFD_CLOEXEC, 0);
+        if (duplicate < 0) return false;
+        output.segments.push_back({duplicate, offset, bytes});
+        return true;
+    };
+    const auto resolve = [&](std::uintptr_t address, std::size_t bytes, Collection& output) {
+        return GuestArena::GuestArenaSharedBacking_nid_postfix(address, bytes, collect, &output);
+    };
+    const auto closeSegments = [](Collection& output) {
+        for (const auto& segment : output.segments) close(segment.file);
+        output.segments.clear();
+    };
     std::int64_t phys = 0;
     Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, page * 3, 0, 0, &phys) == 0);
     void* first = nullptr;
     Require(sceKernelMapDirectMemory(&first, page * 2, 3, 0, phys + page, 0) == 0);
     const auto address = reinterpret_cast<std::uintptr_t>(first);
     static_cast<volatile unsigned char*>(first)[page + 5] = 0x5a;
-    int file = -1;
-    std::uint64_t offset = 0;
     const auto base = static_cast<std::uint64_t>(phys);
-    Require(GuestArena::GuestArenaSharedBacking_nid_postfix(address + page, page, &file, &offset));
-    Require(offset == base + page * 2);
+    Collection result;
+    Require(resolve(address + page, page, result) && result.segments.size() == 1);
+    Require(result.segments[0].offset == base + page * 2 && result.segments[0].bytes == page);
     unsigned char byte = 0;
-    Require(pread(file, &byte, 1, static_cast<off_t>(offset + 5)) == 1 && byte == 0x5a);
-    const int seals = fcntl(file, F_GET_SEALS);
+    Require(pread(result.segments[0].file, &byte, 1, static_cast<off_t>(result.segments[0].offset + 5)) == 1 && byte == 0x5a);
+    const int seals = fcntl(result.segments[0].file, F_GET_SEALS);
     Require(seals >= 0 && (seals & F_SEAL_SHRINK) != 0 && (seals & F_SEAL_GROW) != 0);
-    Require((fcntl(file, F_GETFD) & FD_CLOEXEC) != 0);
-    close(file);
-    Require(GuestArena::GuestArenaSharedBacking_nid_postfix(address, page * 2, &file, &offset) && offset == base + page);
-    close(file);
-    Require(GuestArena::GuestArenaSharedBacking_nid_postfix(address + page + 0x1000, 0x1000, &file, &offset) && offset == page * 2 + 0x1000);
-    close(file);
-    Require(!GuestArena::GuestArenaSharedBacking_nid_postfix(address, page * 3, &file, &offset));
-    Require(!GuestArena::GuestArenaSharedBacking_nid_postfix(address, 0, &file, &offset));
+    Require((fcntl(result.segments[0].file, F_GETFD) & FD_CLOEXEC) != 0);
+    closeSegments(result);
+    Require(resolve(address, page * 2, result) && result.segments.size() == 1 && result.segments[0].offset == base + page);
+    closeSegments(result);
+    Require(resolve(address + page + 0x1000, 0x1000, result) && result.segments.size() == 1 && result.segments[0].offset == page * 2 + 0x1000);
+    closeSegments(result);
+    Require(!resolve(address, page * 3, result) && result.segments.empty());
+    Require(!resolve(std::numeric_limits<std::uintptr_t>::max() - 3, 8, result));
     void* flexible = nullptr;
     Require(sceKernelMapFlexibleMemory(&flexible, page * 2, 3, 0) == 0);
     const auto flexibleAddress = reinterpret_cast<std::uintptr_t>(flexible);
-    Require(!GuestArena::GuestArenaSharedBacking_nid_postfix(flexibleAddress, page, &file, &offset));
     void* low = flexible;
     Require(sceKernelMapDirectMemory(&low, page, 3, 0x10, phys, 0) == 0);
     void* high = static_cast<unsigned char*>(flexible) + page;
     Require(sceKernelMapDirectMemory(&high, page, 3, 0x10, phys + page, 0) == 0);
-    Require(GuestArena::GuestArenaSharedBacking_nid_postfix(flexibleAddress, page * 2, &file, &offset) && offset == base);
-    close(file);
+    Require(resolve(flexibleAddress, page * 2, result) && result.segments.size() == 1 && result.segments[0].offset == base);
+    closeSegments(result);
     Require(sceKernelMapDirectMemory(&high, page, 3, 0x10, phys + page * 2, 0) == 0);
-    Require(!GuestArena::GuestArenaSharedBacking_nid_postfix(flexibleAddress, page * 2, &file, &offset));
-    Require(GuestArena::GuestArenaSharedBacking_nid_postfix(flexibleAddress + page, page, &file, &offset) && offset == base + page * 2);
-    close(file);
+    Require(resolve(flexibleAddress, page * 2, result) && result.segments.size() == 2);
+    Require(result.segments[0].offset == base && result.segments[0].bytes == page &&
+        result.segments[1].offset == base + page * 2 && result.segments[1].bytes == page);
+    closeSegments(result);
+    result.reject = true;
+    Require(!resolve(flexibleAddress, page * 2, result) && result.segments.empty());
+    result.reject = false;
+    Require(resolve(flexibleAddress + page, page, result) && result.segments.size() == 1 && result.segments[0].offset == base + page * 2);
+    closeSegments(result);
     Require(sceKernelMunmap(reinterpret_cast<std::uint64_t>(high), page) == 0);
-    Require(!GuestArena::GuestArenaSharedBacking_nid_postfix(flexibleAddress + page, page, &file, &offset));
+    Require(!resolve(flexibleAddress + page, page, result));
     Require(sceKernelMunmap(reinterpret_cast<std::uint64_t>(flexible), page) == 0);
     Require(sceKernelMunmap(reinterpret_cast<std::uint64_t>(first), page * 2) == 0);
-    Require(!GuestArena::GuestArenaSharedBacking_nid_postfix(address, page, &file, &offset));
+    Require(!resolve(address, page, result));
     Require(sceKernelReleaseDirectMemory(phys, page * 3) == 0);
 
-    std::int64_t left = 0;
-    std::int64_t right = 0;
+    std::int64_t left = 0, right = 0;
     Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, page, 0, 0, &left) == 0);
     Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, page, 0, 0, &right) == 0);
     void* leftView = nullptr;
     void* rightView = nullptr;
     Require(sceKernelMapDirectMemory(&leftView, page, 3, 0, left, 0) == 0);
     Require(sceKernelMapDirectMemory(&rightView, page, 3, 0, right, 0) == 0);
-    int leftFile = -1;
-    int rightFile = -1;
-    std::uint64_t leftOffset = 0;
-    std::uint64_t rightOffset = 0;
-    Require(GuestArena::GuestArenaSharedBacking_nid_postfix(reinterpret_cast<std::uintptr_t>(leftView), page, &leftFile, &leftOffset) && leftOffset == static_cast<std::uint64_t>(left));
-    Require(GuestArena::GuestArenaSharedBacking_nid_postfix(reinterpret_cast<std::uintptr_t>(rightView), page, &rightFile, &rightOffset) && rightOffset == static_cast<std::uint64_t>(right));
-    struct stat leftInfo {};
-    struct stat rightInfo {};
-    Require(fstat(leftFile, &leftInfo) == 0 && fstat(rightFile, &rightInfo) == 0 && leftInfo.st_ino == rightInfo.st_ino && leftInfo.st_dev == rightInfo.st_dev);
-    close(leftFile);
-    close(rightFile);
+    Collection leftResult, rightResult;
+    Require(resolve(reinterpret_cast<std::uintptr_t>(leftView), page, leftResult) && leftResult.segments.size() == 1 && leftResult.segments[0].offset == static_cast<std::uint64_t>(left));
+    Require(resolve(reinterpret_cast<std::uintptr_t>(rightView), page, rightResult) && rightResult.segments.size() == 1 && rightResult.segments[0].offset == static_cast<std::uint64_t>(right));
+    struct stat leftInfo {}, rightInfo {};
+    Require(fstat(leftResult.segments[0].file, &leftInfo) == 0 && fstat(rightResult.segments[0].file, &rightInfo) == 0 && leftInfo.st_ino == rightInfo.st_ino && leftInfo.st_dev == rightInfo.st_dev);
+    closeSegments(leftResult);
+    closeSegments(rightResult);
     std::memset(leftView, 0x77, page);
     Require(sceKernelMunmap(reinterpret_cast<std::uint64_t>(leftView), page) == 0);
     Require(sceKernelReleaseDirectMemory(left, page) == 0);
@@ -2747,6 +2874,146 @@ static void CheckDirectMemorySharedBacking() {
     Require(sceKernelReleaseDirectMemory(again, page) == 0);
     Require(sceKernelReleaseDirectMemory(right, page) == 0);
 }
+#if defined(__linux__)
+struct DirectReleaseMapProbe {
+    GuestAllocations::Lease lease;
+    std::uintptr_t expectedAddress = 0;
+    std::int64_t physical = -1;
+    void* alias = nullptr;
+    void* remapTarget = nullptr;
+    int result = -1;
+    bool fixedRemap = false;
+    bool called = false;
+};
+
+static DirectReleaseMapProbe* activeDirectReleaseProbe = nullptr;
+
+static bool MapDuringDirectReleaseWait(std::uintptr_t address, std::size_t) {
+    auto* probe = activeDirectReleaseProbe;
+    if (probe == nullptr || probe->called || address != probe->expectedAddress) return false;
+    probe->called = true;
+    probe->lease.clear();
+    if (probe->fixedRemap) {
+        probe->result = sceKernelMapDirectMemory(&probe->remapTarget, 0x4000, 3, 0x10, probe->physical, 0x4000);
+    } else {
+        probe->result = sceKernelMapDirectMemory(&probe->alias, 0x4000, 3, 0, probe->physical, 0x4000);
+    }
+    return true;
+}
+
+static void CheckDirectMemoryReleaseAdmissionAndReclaim() {
+    constexpr std::size_t page = 0x4000;
+    Require(sceKernelEnableDmemAliasing() == 0);
+
+    std::int64_t physical = -1;
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, page, page, 0, &physical) == 0);
+    void* original = nullptr;
+    Require(sceKernelMapDirectMemory(&original, page, 3, 0, physical, page) == 0);
+    *static_cast<volatile unsigned char*>(original) = 0x6d;
+    DirectReleaseMapProbe probe;
+    probe.expectedAddress = reinterpret_cast<std::uintptr_t>(original);
+    probe.physical = physical;
+    probe.lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+    Require(std::any_of(probe.lease.begin(), probe.lease.end(), [&](const auto& range) {
+        return range->address == probe.expectedAddress;
+    }));
+    activeDirectReleaseProbe = &probe;
+    GuestAllocations::GuestAllocationsSetPinWaiter_nid_postfix(&MapDuringDirectReleaseWait);
+    Require(sceKernelReleaseDirectMemory(physical, page) == 0);
+    GuestAllocations::GuestAllocationsSetPinWaiter_nid_postfix(nullptr);
+    activeDirectReleaseProbe = nullptr;
+    bool lateAliasReadable = false;
+    if (probe.result == 0) {
+        unsigned char byte = 0;
+        iovec local{&byte, sizeof(byte)};
+        iovec remote{probe.alias, sizeof(byte)};
+        lateAliasReadable = syscall(SYS_process_vm_readv, getpid(), &local, 1, &remote, 1, 0) == 1 && byte == 0x6d;
+        Require(sceKernelMunmap(reinterpret_cast<std::uint64_t>(probe.alias), page) == 0);
+    }
+    Require(probe.called && probe.result != 0 && probe.alias == nullptr && !lateAliasReadable);
+    std::int64_t reused = -1;
+    Require(sceKernelAllocateDirectMemory(physical, physical + page, page, page, 0, &reused) == 0 && reused == physical);
+    void* reusedView = nullptr;
+    Require(sceKernelMapDirectMemory(&reusedView, page, 3, 0, reused, page) == 0);
+    for (std::size_t offset = 0; offset < page; ++offset)
+        Require(static_cast<const unsigned char*>(reusedView)[offset] == 0);
+    Require(sceKernelMunmap(reinterpret_cast<std::uint64_t>(reusedView), page) == 0);
+    Require(sceKernelReleaseDirectMemory(reused, page) == 0);
+
+    std::int64_t sourcePhysical = -1, targetPhysical = -1;
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, page, page, 0, &sourcePhysical) == 0);
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, page, page, 0, &targetPhysical) == 0);
+    void *source = nullptr, *target = nullptr;
+    Require(sceKernelMapDirectMemory(&source, page, 3, 0, sourcePhysical, page) == 0);
+    Require(sceKernelMapDirectMemory(&target, page, 3, 0, targetPhysical, page) == 0);
+    *static_cast<volatile unsigned char*>(source) = 0x19;
+    *static_cast<volatile unsigned char*>(target) = 0x52;
+    DirectReleaseMapProbe fixedProbe;
+    fixedProbe.expectedAddress = reinterpret_cast<std::uintptr_t>(source);
+    fixedProbe.physical = sourcePhysical;
+    fixedProbe.remapTarget = target;
+    fixedProbe.fixedRemap = true;
+    fixedProbe.lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+    activeDirectReleaseProbe = &fixedProbe;
+    GuestAllocations::GuestAllocationsSetPinWaiter_nid_postfix(&MapDuringDirectReleaseWait);
+    Require(sceKernelReleaseDirectMemory(sourcePhysical, page) == 0);
+    GuestAllocations::GuestAllocationsSetPinWaiter_nid_postfix(nullptr);
+    activeDirectReleaseProbe = nullptr;
+    Require(fixedProbe.called && fixedProbe.result != 0);
+    Require(fixedProbe.remapTarget == target && *static_cast<volatile unsigned char*>(target) == 0x52);
+    VirtualQueryInfo targetInfo{};
+    Require(sceKernelVirtualQuery(target, 0, &targetInfo, sizeof(targetInfo)) == 0);
+    Require(targetInfo.is_direct && targetInfo.offset == static_cast<std::uint64_t>(targetPhysical));
+    Require(sceKernelMunmap(reinterpret_cast<std::uint64_t>(target), page) == 0);
+    Require(sceKernelReleaseDirectMemory(targetPhysical, page) == 0);
+
+    std::int64_t triplePhysical = -1;
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, page * 3, page, 0, &triplePhysical) == 0);
+    void* triple = nullptr;
+    Require(sceKernelMapDirectMemory(&triple, page * 3, 3, 0, triplePhysical, page) == 0);
+    auto* bytes = static_cast<unsigned char*>(triple);
+    std::memset(bytes, 0x31, page);
+    std::memset(bytes + page, 0x42, page);
+    std::memset(bytes + page * 2, 0x53, page);
+    struct Backing { int file = -1; std::uint64_t offset = 0; std::size_t bytes = 0; } backing;
+    const auto collect = +[](void* context, int file, std::uint64_t offset, std::size_t length) {
+        auto& out = *static_cast<Backing*>(context);
+        out.file = fcntl(file, F_DUPFD_CLOEXEC, 0);
+        out.offset = offset;
+        out.bytes = length;
+        return out.file >= 0;
+    };
+    Require(GuestArena::GuestArenaSharedBacking_nid_postfix(
+        reinterpret_cast<std::uintptr_t>(bytes + page), page, collect, &backing));
+    Require(backing.file >= 0 && backing.offset == static_cast<std::uint64_t>(triplePhysical + page) && backing.bytes == page);
+    struct stat before{}, after{};
+    Require(fstat(backing.file, &before) == 0 && before.st_blocks > 0);
+    Require(sceKernelReleaseDirectMemory(triplePhysical + static_cast<std::int64_t>(page), page) == 0);
+    Require(fstat(backing.file, &after) == 0 && after.st_blocks < before.st_blocks);
+    std::array<unsigned char, page> readback{};
+    Require(pread(backing.file, readback.data(), readback.size(), static_cast<off_t>(backing.offset)) == static_cast<ssize_t>(readback.size()));
+    Require(std::all_of(readback.begin(), readback.end(), [](unsigned char byte) { return byte == 0; }));
+    Require(bytes[0] == 0x31 && bytes[page * 2] == 0x53);
+    Require(pread(backing.file, readback.data(), readback.size(), static_cast<off_t>(triplePhysical)) == static_cast<ssize_t>(readback.size()));
+    Require(std::all_of(readback.begin(), readback.end(), [](unsigned char byte) { return byte == 0x31; }));
+    Require(pread(backing.file, readback.data(), readback.size(), static_cast<off_t>(triplePhysical + page * 2)) == static_cast<ssize_t>(readback.size()));
+    Require(std::all_of(readback.begin(), readback.end(), [](unsigned char byte) { return byte == 0x53; }));
+    close(backing.file);
+    Require(sceKernelMunmap(reinterpret_cast<std::uint64_t>(bytes), page) == 0);
+    Require(sceKernelMunmap(reinterpret_cast<std::uint64_t>(bytes + page * 2), page) == 0);
+    std::int64_t middleAgain = -1;
+    Require(sceKernelAllocateDirectMemory(triplePhysical + static_cast<std::int64_t>(page),
+        triplePhysical + static_cast<std::int64_t>(page * 2), page, page, 0, &middleAgain) == 0 && middleAgain == triplePhysical + static_cast<std::int64_t>(page));
+    void* cleanMiddle = nullptr;
+    Require(sceKernelMapDirectMemory(&cleanMiddle, page, 3, 0, middleAgain, page) == 0);
+    for (std::size_t offset = 0; offset < page; ++offset)
+        Require(static_cast<const unsigned char*>(cleanMiddle)[offset] == 0);
+    Require(sceKernelMunmap(reinterpret_cast<std::uint64_t>(cleanMiddle), page) == 0);
+    Require(sceKernelReleaseDirectMemory(middleAgain, page) == 0);
+    Require(sceKernelReleaseDirectMemory(triplePhysical, page) == 0);
+    Require(sceKernelReleaseDirectMemory(triplePhysical + static_cast<std::int64_t>(page * 2), page) == 0);
+}
+#endif
 
 static void CheckDirectMemoryWriteWatch() {
     if (!GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix()) {
@@ -3320,6 +3587,9 @@ int main(int argc, char** argv) {
         return 0;
     }
     Require(argc == 1);
+#if defined(__linux__)
+    CheckAnonymousSharedBacking();
+#endif
     CheckAvailableDirectMemoryIsLargestFreeBlock();
     CheckVirtualQuerySplitFlexibleRanges();
     CheckVirtualQueryForNonReadableGuestRange();
@@ -3412,6 +3682,7 @@ int main(int argc, char** argv) {
     CheckMappingCostFollowsTheMappingCount();
     CheckDirectMemoryBackingNeedsNoFilesystem();
     CheckDirectMemorySharedBacking();
+    CheckDirectMemoryReleaseAdmissionAndReclaim();
     CheckVirtualQueryFindsNeighbours();
     CheckReleaseFindsEveryDirectMapping();
 #endif

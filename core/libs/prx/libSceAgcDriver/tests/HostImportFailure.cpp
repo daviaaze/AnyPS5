@@ -5,6 +5,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #endif
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -171,6 +172,45 @@ void AgcDriver::Tests::RunHostImportFailureTests(const Graphics::Context& origin
             std::printf("host import step=%u result=%d injected=%u rejected=%u threw=%u invalid releases=%u failure cleaned=%u retry cleaned=%u readbacks=%u\n", static_cast<unsigned>(step), static_cast<int>(result), probe.injected, rejected, threw, invalid, released, clean, native ? 1u : 0u);
             if (!rejected || !released || !clean || invalid != 0 || probe.invalid != invalid) ++failures;
         }
+    }
+    {
+        std::array<Heap, 4> heaps;
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        ClearHostImports(original.device);
+        probe = {};
+        probe.backend = original.deviceProc;
+        auto context = original;
+        context.deviceProc = DeviceProc;
+        SetImportWatch(context, ImportWatch::Unwatch);
+        for (std::size_t index = 0; index < 3; ++index) {
+            probe.fail = Step::Allocate;
+            probe.result = VK_ERROR_INVALID_EXTERNAL_HANDLE;
+            Require(HostImportFor(context, heaps[index].Address(), Bytes) == nullptr, "an invalid external handle unexpectedly imported");
+            if (index == 0) Require(HostImportFor(context, heaps[index].Address(), Bytes) == nullptr && probe.injected == 1, "an invalid external handle range was retried instead of remembered");
+        }
+        Require(probe.injected == 3, "three invalid external handle imports were not attempted");
+        probe.fail = Step::None;
+        const auto* recovered = HostImportFor(context, heaps[3].Address(), Bytes);
+        Require(recovered != nullptr, "invalid external handle failures lowered the budget and blocked another range");
+        ClearHostImports(context.device);
+    }
+    {
+        std::array<Heap, 4> heaps;
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        ClearHostImports(original.device);
+        probe = {};
+        probe.backend = original.deviceProc;
+        auto context = original;
+        context.deviceProc = DeviceProc;
+        SetImportWatch(context, ImportWatch::Unwatch);
+        for (std::size_t index = 0; index < 3; ++index) {
+            probe.fail = Step::Allocate;
+            probe.result = VK_ERROR_OUT_OF_HOST_MEMORY;
+            Require(HostImportFor(context, heaps[index].Address(), Bytes) == nullptr, "an injected host-memory failure unexpectedly imported");
+        }
+        probe.fail = Step::None;
+        Require(HostImportFor(context, heaps[3].Address(), Bytes) == nullptr, "three host-memory failures did not lower the import ceiling");
+        ClearHostImports(context.device);
     }
     Require(failures == 0, "failed host import creation released an undefined handle or leaked a resource");
 }

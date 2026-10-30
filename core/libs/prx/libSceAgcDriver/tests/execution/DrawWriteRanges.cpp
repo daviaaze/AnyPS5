@@ -54,15 +54,17 @@ int main() {
         images.kind = ShaderRecompiler::DescriptorKind::StorageImage;
         images.role = ShaderRecompiler::DescriptorRole::GuestImages;
         images.count = 2;
+        std::vector<std::uint32_t> descriptorWords;
         for (const auto base : {written, readOnly}) {
             const auto words = ImageWords(base, 256, 128);
-            images.guestDescriptor.insert(images.guestDescriptor.end(), words.begin(), words.end());
+            descriptorWords.insert(descriptorWords.end(), words.begin(), words.end());
         }
+        images.guestDescriptor = ShaderRecompiler::SharedValues<std::uint32_t>(std::move(descriptorWords));
         images.imageWritten = {true, false};
         program.bindings.push_back(images);
         const std::array<AgcDriver::Graphics::CompiledShader, 1> stages{{{ShaderRecompiler::ShaderStage::Fragment, &program, 0}}};
         AgcDriver::Graphics::State state{};
-        const auto resource = AgcDriver::Graphics::DecodeTextureResource(std::span<const std::uint32_t>(images.guestDescriptor).subspan(0, 8));
+        const auto resource = AgcDriver::Graphics::DecodeTextureResource(images.guestDescriptor.Span().subspan(0, 8));
         const auto surfaceBytes = AgcDriver::Graphics::DescribeSurface(resource).guestBytes;
         Require(resource.baseAddress == written && surfaceBytes >= 256u * 128u * 4u, "the test T# does not decode as meant");
         for (const bool exact : {false, true}) {
@@ -75,7 +77,9 @@ int main() {
         auto nullImage = ImageWords(0, 256, 128);
         nullImage[0] = 0;
         nullImage[1] &= ~0xffu;
-        std::copy(nullImage.begin(), nullImage.end(), program.bindings[0].guestDescriptor.begin() + 8);
+        auto nullDescriptorWords = program.bindings[0].guestDescriptor.Copy();
+        std::copy(nullImage.begin(), nullImage.end(), nullDescriptorWords.begin() + 8);
+        program.bindings[0].guestDescriptor = ShaderRecompiler::SharedValues<std::uint32_t>(std::move(nullDescriptorWords));
         program.bindings[0].imageWritten = {true, true};
         for (const bool exact : {false, true}) {
             const auto ranges = DrawWriteRanges(state, stages, exact);

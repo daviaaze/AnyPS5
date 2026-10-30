@@ -141,7 +141,7 @@ RecompileResult Compile(std::span<const std::uint32_t> modes, bool integer, bool
     result.spirv = module.Finalize();
     const auto base = reinterpret_cast<std::uintptr_t>(Data.data());
     result.bindings.push_back({DescriptorKind::StorageBuffer, DescriptorRole::GuestBuffers, 0u, 0u, 1u,
-        {static_cast<std::uint32_t>(base), static_cast<std::uint32_t>((base >> 32u) & 0xffffu), static_cast<std::uint32_t>(sizeof(Data)), 0x31016facu}, false});
+        ShaderRecompiler::SharedValues<std::uint32_t>(std::vector<std::uint32_t>{static_cast<std::uint32_t>(base), static_cast<std::uint32_t>((base >> 32u) & 0xffffu), static_cast<std::uint32_t>(sizeof(Data)), 0x31016facu}), false});
     return result;
 }
 

@@ -519,7 +519,8 @@ void verifyLayoutPair() {
     auto color = LayoutPairRequest(colorCode, std::span(buffer).first(1u), true, defaultLimit);
     color.shader.codeAddress = relocated.shader.codeAddress;
     color.layout.pushConstantSizeBytes = 0u;
-    require(ResolveSource(color) != nullptr, "layout pair: the other source was not resolved");
+    const auto otherSource = ResolveSource(color);
+    require(otherSource != nullptr, "layout pair: the other source was not resolved");
     const auto colored = PrepareShader(color, &preparation);
     require(colored->source != first->source && preparation.ResourcePrograms() == 2u, "layout pair: another source at the same code address reused the retained program");
     verifyLayoutPairIsolation(color, *colored, defaultLimit + 1u);
@@ -1642,13 +1643,14 @@ const ShaderRecompiler::DescriptorBinding* TableBinding(const ShaderRecompiler::
     return found == result.bindings.end() ? nullptr : &*found;
 }
 
-const std::vector<std::uint32_t>& TableMap(const ShaderRecompiler::RecompileResult& result) {
+const ShaderRecompiler::SharedValues<std::uint32_t>& TableMap(const ShaderRecompiler::RecompileResult& result) {
     const auto* binding = TableBinding(result, ShaderRecompiler::DescriptorRole::ImageTableMap);
     require(binding != nullptr && binding->guestDescriptor.size() >= ShaderRecompiler::ImageTableAbi::HeaderWords, "image table: the result has no map");
     return binding->guestDescriptor;
 }
 
-std::vector<std::uint32_t> TableCodes(const std::vector<std::uint32_t>& map, std::uint32_t table) {
+template <typename TMap>
+std::vector<std::uint32_t> TableCodes(const TMap& map, std::uint32_t table) {
     namespace Abi = ShaderRecompiler::ImageTableAbi;
     const auto header = Abi::TableHeader(table);
     const auto start = map.at(header + Abi::TableMapStart);
@@ -1656,6 +1658,7 @@ std::vector<std::uint32_t> TableCodes(const std::vector<std::uint32_t>& map, std
     require(static_cast<std::size_t>(start) + keys <= map.size(), "image table: the map is truncated");
     return std::vector<std::uint32_t>(map.begin() + start, map.begin() + start + keys);
 }
+
 
 struct TableSpirvScan {
     bool runtimeArray = false;
@@ -2342,11 +2345,11 @@ void verifyTableSnapshotReuse() {
     require(otherBuffer.result != compiled.result && otherBuffer.result->variantId == compiled.result->variantId && resolvedShared.resolutionsShared - resolvedBefore.resolutionsShared == 1u && resolvedShared.resolutions == resolvedBefore.resolutions && TableMap(*otherBuffer.result) == map && TableBinding(*otherBuffer.result, DescriptorRole::ImageTable)->guestDescriptor == images->guestDescriptor, "table snapshot reuse: a result for another buffer did not reuse the unchanged table's resolution");
     const auto storedWord = heap[5u * 8u];
     heap[5u * 8u] = heap[6u * 8u];
-    const auto restoredMap = map;
+    const auto restoredMap = map.Copy();
     const auto storedTable = CompileTable(request);
     heap[5u * 8u] = storedWord;
     const auto resolvedStored = ResourceMaterializer::TableReuse();
-    require(resolvedStored.resolutionsShared == resolvedShared.resolutionsShared && resolvedStored.resolutions - resolvedShared.resolutions == 1u && TableMap(*storedTable.result) != restoredMap, "table snapshot reuse: a table changed by a CPU store took the resolution of its old words");
+    require(resolvedStored.resolutionsShared == resolvedShared.resolutionsShared && resolvedStored.resolutions - resolvedShared.resolutions == 1u && !(TableMap(*storedTable.result) == restoredMap), "table snapshot reuse: a table changed by a CPU store took the resolution of its old words");
     const auto& storedMap = TableMap(*storedTable.result);
     const auto storedCodes = TableCodes(storedMap, 0);
     const auto* storedImages = TableBinding(*storedTable.result, DescriptorRole::ImageTable);
@@ -2406,7 +2409,7 @@ void verifyTableSnapshotReuse() {
     GuestAllocations::GuestAllocationsInvalidate_nid_postfix(reinterpret_cast<std::uintptr_t>(paged), PagedBytes);
     const auto pagedRemapped = capture(pagedRequest, paged, PagedBytes, nullptr);
     require(pagedRemapped.reuse.unwritten == 0u && pagedRemapped.reuse.shared == 0u && pagedRemapped.reuse.columns == 1u && !sharesColumn(pagedRemapped, pagedFresh) && heldRecords(pagedRemapped, paged, PagedRecords), "table snapshot reuse: a table mapped again with new contents was not read again");
-    std::cout << "table snapshot reuse " << (watched ? "with" : "without") << " write watching passed\n";
+    require(TableMap(*compiled.result) == restoredMap, "table snapshot reuse: a later CPU store or cache eviction changed a retained map result");
 }
 
 std::atomic<int> tableRacePhase{0};
@@ -2788,6 +2791,7 @@ void verifyImageTableScratchReuse() {
         ResolvedImageTables tables;
         std::uint64_t allocations = 0;
     };
+    const auto source = ResolveSource(request);
     const auto resolve = [&] {
         CountingMemory memory;
         SrtRuntime runtime;
@@ -2800,7 +2804,7 @@ void verifyImageTableScratchReuse() {
         runtime.readWords = &CountingReadWords;
         Resolved out;
         const auto before = allocationCount;
-        const auto capture = CaptureResources(request, runtime);
+        const auto capture = CaptureResources(request, runtime, *source);
         auto tables = ResourceMaterializer::ResolveImageTables(info, capture->snapshot);
         out.allocations = allocationCount - before;
         out.snapshot = capture->snapshot.tables;
@@ -3510,7 +3514,7 @@ void verifyPointerImageTable() {
     const auto unaligned = CompileTable(loaded);
     const auto& unalignedCodes = unaligned.capture->snapshot.tables.tables.at(0).codes;
     require(unalignedCodes.size() == Entries && std::all_of(unalignedCodes.begin(), unalignedCodes.end(), [](std::uint32_t code) { return code == Abi::PoisonCode(static_cast<std::uint32_t>(Abi::PoisonReason::Unmapped)); }), "pointer image table: a pointer that is not dword-aligned was read");
-    require(unaligned.result->imageTableReadRanges == std::vector<std::vector<std::pair<std::uint64_t, std::uint64_t>>>{{}}, "pointer image table: an unaligned pointer recorded consumed ranges");
+    require(unaligned.result->imageTableReadRanges.size() == 1u && unaligned.result->imageTableReadRanges[0].empty(), "pointer image table: an unaligned pointer recorded consumed ranges");
     root[12] = static_cast<std::uint32_t>(pointer);
 
     const std::vector<std::uint32_t> directCode{0xf4080700u, 0xfa000010u, 0xf4080800u, 0xfa000020u, 0xf4000440u, 0xfa000038u, 0x8f128511u, 0xf40c0900u,
@@ -6551,6 +6555,168 @@ void verifySpecializedBufferAtomicBindings(bool finalAbiOnly = false) {
     expectFailure([&] { static_cast<void>(compile(shaderOnly)); }, "buffer atomic fault addresses require shaderInt64", "specialized buffer atomic: the program compiled without shaderInt64");
 }
 
+void verifyPreparedGuestBufferFootprintsArePerCapture() {
+    using namespace ShaderRecompiler;
+    constexpr std::uint32_t stride = 20u;
+    constexpr std::uint32_t records = 15000u;
+    alignas(256) static std::array<std::uint32_t, records * stride / sizeof(std::uint32_t)> buffer{};
+    const auto address = reinterpret_cast<std::uintptr_t>(buffer.data());
+    const std::array<std::uint32_t, 4> descriptor{
+        static_cast<std::uint32_t>(address),
+        static_cast<std::uint32_t>((address >> 32u) & 0xffffu) | (stride << 16u),
+        records,
+        0x00005204u};
+    alignas(256) std::array<std::uint32_t, 8> root{};
+    alignas(256) std::array<std::uint32_t, 1> indexWord{0u};
+    std::copy(descriptor.begin(), descriptor.end(), root.begin());
+    const auto indexAddress = reinterpret_cast<std::uintptr_t>(indexWord.data());
+    root[4] = static_cast<std::uint32_t>(indexAddress);
+    root[5] = static_cast<std::uint32_t>(indexAddress >> 32u);
+    const auto rootAddress = reinterpret_cast<std::uintptr_t>(root.data());
+    const std::array<std::uint32_t, 2> userData{static_cast<std::uint32_t>(rootAddress), static_cast<std::uint32_t>(rootAddress >> 32u)};
+    const std::array<std::uint32_t, 23> code{
+        0xf40c0100u, 0xfa000000u, 0xbf8cc07fu,
+        0xf4000504u, 0xfa000000u, 0xbf8cc07fu,
+        0x7e000214u, 0x7e020287u, 0xe0c86000u, 0x80010100u, 0xbf8c3f70u,
+        0x7e040214u, 0x7e0602ffu, 0x55667788u, 0x7e0802ffu, 0x11223344u, 0x7e0a02ffu, 0xa1b2c3d4u,
+        0xe0742004u, 0x80010302u, 0xe0702010u, 0x80010502u, 0xbf810000u};
+    auto request = FrontendRequest(code, userData);
+    request.useCache = true;
+    const std::array<MemoryRegion, 3> regions{{
+        {reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(std::span(code))},
+        {rootAddress, std::as_bytes(std::span(root))},
+        {indexAddress, std::as_bytes(std::span(indexWord))}}};
+    request.context.memory = regions;
+    AgcDriver::ShaderMemory firstMemory(regions);
+    const auto firstCapture = firstMemory.Capture(request);
+    const auto firstRegions = firstMemory.Regions();
+    request.context.memory = firstRegions;
+    const auto firstResult = Recompile(request, *firstCapture);
+    indexWord[0] = records - 1u;
+    AgcDriver::ShaderMemory secondMemory(regions);
+    const auto secondCapture = secondMemory.Capture(request);
+    const auto secondRegions = secondMemory.Regions();
+    request.context.memory = secondRegions;
+    const auto secondResult = Recompile(request, *secondCapture);
+    const auto flatBinding = std::ranges::find_if(firstResult->bindings, [](const DescriptorBinding& value) {
+        return value.role == DescriptorRole::FlattenedSrt;
+    });
+    require(flatBinding != firstResult->bindings.end(), "prepared buffer footprint: missing flattened bindings");
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> runs{{{indexAddress, indexAddress + sizeof(std::uint32_t)}}};
+    const std::array<std::uint32_t, 1> firstWords{0u};
+    std::vector<std::uint32_t> positions, slots;
+    static_cast<void>(AgcDriver::DataWordPositions(runs, firstCapture->readTrace.leaves, firstCapture->readTrace.otherReads,
+                                                 firstWords, flatBinding->guestDescriptor.Span(), positions, slots));
+    require(positions.empty(), "prepared buffer footprint: changing the transfer index was accepted as data-only");
+    const auto footprint = [](const RecompileResult& result) -> BufferTransferFootprint {
+        const auto binding = std::ranges::find_if(result.bindings, [](const DescriptorBinding& value) { return value.role == DescriptorRole::GuestBuffers; });
+        require(binding != result.bindings.end() && !binding->bufferFootprints.empty(), "prepared buffer footprint: result omitted its guest-buffer footprint");
+        return binding->bufferFootprints[0];
+    };
+    const BufferTransferFootprint expectedFirst{true, 0u, 4u, 0u, 20u};
+    const BufferTransferFootprint expectedSecond{true, 299980u, 299984u, 299980u, 300000u};
+    require(footprint(*firstResult) == expectedFirst && footprint(*secondResult) == expectedSecond,
+            "prepared buffer footprint: reusing the compiled pipeline reused the previous capture's transfer hull");
+    require(firstResult->variantId == secondResult->variantId && firstResult->spirv == secondResult->spirv,
+            "prepared buffer footprint: the dynamic index changed pipeline identity");
+    require(footprint(*firstResult) == expectedFirst, "prepared buffer footprint: a later capture mutated an earlier result");
+    // With indexStride zero the swizzle still groups eight indices. At index
+    // one, offsets 0/4/8/16 address bytes 4/36/68/132, not 20/24/28/36.
+    indexWord[0] = 1u;
+    for (const bool swizzled : {false, true}) {
+        root[1] = descriptor[1] | (swizzled ? (1u << 31u) : 0u);
+        AgcDriver::ShaderMemory memory(regions);
+        const auto capture = memory.Capture(request);
+        const auto capturedRegions = memory.Regions();
+        request.context.memory = capturedRegions;
+        const auto result = Recompile(request, *capture);
+        const auto hull = footprint(*result);
+        const std::uint64_t atomicByte = swizzled ? 4u : stride;
+        require(!hull.bounded || (hull.readBegin <= atomicByte && hull.readEnd >= atomicByte + 4u),
+                "prepared buffer footprint: index-one atomic read address falls outside the transfer hull");
+        for (const std::uint64_t offset : {0u, 4u, 8u, 16u}) {
+            const auto byte = swizzled ? 4u + offset * 8u : stride + offset;
+            require(!hull.bounded || (hull.writeBegin <= byte && hull.writeEnd >= byte + 4u),
+                    "prepared buffer footprint: index-one write address falls outside the transfer hull");
+        }
+    }
+}
+void verifyPreparedFragmentBufferReadFootprintsArePerCapture() {
+    using namespace ShaderRecompiler;
+    constexpr std::uint32_t stride = 20u;
+    constexpr std::uint32_t records = 15000u;
+    alignas(256) static std::array<std::uint32_t, records * stride / sizeof(std::uint32_t)> buffer{};
+    const auto address = reinterpret_cast<std::uintptr_t>(buffer.data());
+    const std::array<std::uint32_t, 4> descriptor{
+        static_cast<std::uint32_t>(address),
+        static_cast<std::uint32_t>((address >> 32u) & 0xffffu) | (stride << 16u),
+        records,
+        0x00005204u};
+    alignas(256) std::array<std::uint32_t, 8> root{};
+    alignas(256) std::array<std::uint32_t, 1> indexWord{0u};
+    std::copy(descriptor.begin(), descriptor.end(), root.begin());
+    const auto indexAddress = reinterpret_cast<std::uintptr_t>(indexWord.data());
+    root[4] = static_cast<std::uint32_t>(indexAddress);
+    root[5] = static_cast<std::uint32_t>(indexAddress >> 32u);
+    const auto rootAddress = reinterpret_cast<std::uintptr_t>(root.data());
+    const std::array<std::uint32_t, 2> userData{static_cast<std::uint32_t>(rootAddress), static_cast<std::uint32_t>(rootAddress >> 32u)};
+    const std::array<std::uint32_t, 15> code{
+        0xf40c0100u, 0xfa000000u, 0xbf8cc07fu,
+        0xf4000504u, 0xfa000000u, 0xbf8cc07fu,
+        0x7e000214u, 0x7e020287u,
+        0xe0302000u, 0x80010100u, 0xbf8c3f70u,
+        0x7e0e0301u, 0xf800180fu, 0x07070707u, 0xbf810000u};
+    auto request = FrontendRequest(code, userData);
+    request.shader.stage = ShaderStage::Fragment;
+    request.context.compute.reset();
+    request.context.pixel = ShaderPixelStageInfo{};
+    request.context.pixel->wave32 = true;
+    request.context.pixel->inputAddr = PixelInputBit(PixelInput::PositionX) | PixelInputBit(PixelInput::PositionY);
+    request.context.pixel->posX = true;
+    request.context.pixel->posY = true;
+    request.context.pixel->targetOutputMode[0] = 9u;
+    request.context.pixel->targetExportMapping.fill(0xe4u);
+    request.context.waveSize = 32u;
+    request.useCache = true;
+    const std::array<MemoryRegion, 3> regions{{
+        {reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(std::span(code))},
+        {rootAddress, std::as_bytes(std::span(root))},
+        {indexAddress, std::as_bytes(std::span(indexWord))}}};
+    request.context.memory = regions;
+    AgcDriver::ShaderMemory firstMemory(regions);
+    const auto firstCapture = firstMemory.Capture(request);
+    const auto firstRegions = firstMemory.Regions();
+    request.context.memory = firstRegions;
+    const auto firstResult = Recompile(request, *firstCapture);
+    indexWord[0] = records - 1u;
+    AgcDriver::ShaderMemory secondMemory(regions);
+    const auto secondCapture = secondMemory.Capture(request);
+    const auto secondRegions = secondMemory.Regions();
+    request.context.memory = secondRegions;
+    const auto secondResult = Recompile(request, *secondCapture);
+    indexWord[0] = 0u;
+    AgcDriver::ShaderMemory thirdMemory(regions);
+    const auto thirdCapture = thirdMemory.Capture(request);
+    const auto thirdRegions = thirdMemory.Regions();
+    request.context.memory = thirdRegions;
+    const auto thirdResult = Recompile(request, *thirdCapture);
+    const auto footprint = [](const RecompileResult& result) -> BufferTransferFootprint {
+        const auto binding = std::ranges::find_if(result.bindings, [](const DescriptorBinding& value) { return value.role == DescriptorRole::GuestBuffers; });
+        require(binding != result.bindings.end() && !binding->bufferFootprints.empty(), "prepared fragment buffer read footprint: result omitted its guest-buffer footprint");
+        return binding->bufferFootprints[0];
+    };
+    const BufferTransferFootprint expectedFirst{true, 0u, 4u, 0u, 0u};
+    const BufferTransferFootprint expectedSecond{true, 299980u, 299984u, 0u, 0u};
+    require(footprint(*firstResult) == expectedFirst, "prepared fragment buffer read footprint: read at index zero was not bounded to four bytes");
+    require(footprint(*secondResult) == expectedSecond, "prepared fragment buffer read footprint: read at the last index had the wrong transfer hull");
+    require(footprint(*thirdResult) == expectedFirst, "prepared fragment buffer read footprint: returning to index zero did not refresh the transfer hull");
+    require(firstResult->variantId == secondResult->variantId && secondResult->variantId == thirdResult->variantId &&
+            firstResult->spirv == secondResult->spirv && secondResult->spirv == thirdResult->spirv,
+            "prepared fragment buffer read footprint: dynamic index changed pipeline identity or SPIR-V");
+    require(footprint(*firstResult) == expectedFirst, "prepared fragment buffer read footprint: a later capture mutated the retained first snapshot");
+}
+
+
 void verifyCoherentGds() {
     using namespace ShaderRecompiler;
     const std::array<std::string_view, 2> extensions{"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
@@ -8276,6 +8442,90 @@ void verifyVolumeBiasTableRejection() {
     }
 }
 
+void verifyDecodeMemoAddressCanonicalization() {
+    using namespace ShaderRecompiler;
+    namespace Abi = ImageTableAbi;
+    ImageResource image{};
+    image.resourceClass = ImageResourceClass::Sampled;
+    image.dimension = RdnaImageDimension::Dim2D;
+    image.table = 0u;
+    image.tableOperation = TableOperation::Supported;
+    image.singleMipPlaneBiasCompatible = true;
+    const auto modes = ResourceMaterializer::RuntimeImageModes(image);
+    ShaderInfo info{};
+    info.images.push_back(image);
+    info.runtimeImageModes.push_back(modes);
+    ResourceSnapshot snapshot{};
+    snapshot.tables.tables.resize(1u);
+    auto& column = snapshot.tables.tables.front();
+    const auto descriptor = [](std::uint32_t address, std::uint32_t format = TableFormat8888UNorm, std::uint32_t type = TableType2D) {
+        return DescriptorValue{{address, format << 20u, 0u, (type << 28u) | 0xfacu, 0u, 0u, 0u, 0u}, 8u, 0xffu};
+    };
+    const auto resolve = [&](std::vector<DescriptorValue> words, std::uint64_t key) {
+        column.records = static_cast<std::uint32_t>(words.size());
+        column.keys = static_cast<std::uint32_t>(words.size());
+        std::vector<std::uint32_t> codes(words.size());
+        for (std::uint32_t index = 0; index < codes.size(); ++index) codes[index] = index;
+        column.codes = SharedValues<std::uint32_t>(std::move(codes));
+        column.words = SharedValues<DescriptorValue>(std::move(words));
+        return ResourceMaterializer::ResolveImageTables(info, snapshot, key);
+    };
+    const auto recordFlags = [](const ResolvedImageTables& result, std::uint32_t key) {
+        const auto start = result.map.at(Abi::TableHeader(0u) + Abi::TableMapStart);
+        const auto record = result.map.at(start + key);
+        return record == Abi::NullCode ? Abi::NullCode : result.map.at(record + Abi::ImageRecordFlags);
+    };
+
+    const auto first = descriptor(0x1000u);
+    const auto second = descriptor(0x2000u);
+    const auto highAddress = descriptor(0x80000000u);
+    const auto firstResult = resolve({first}, 0xdec0deu);
+    const auto secondResult = resolve({second}, 0xdec0deu);
+    const auto highResult = resolve({highAddress}, 0xdec0deu);
+    const auto expected2d = ResourceMaterializer::RuntimeImageMode(image, first, modes);
+    require(modes.at(expected2d).dimension == RdnaImageDimension::Dim2D && modes.at(expected2d).numericClass == IrTextureNumericClass::Float,
+            "memoized image mode: baseline 2D UNORM descriptor did not resolve to sampled float 2D");
+    for (const auto* result : {&firstResult, &secondResult, &highResult}) {
+        const auto flags = recordFlags(*result, 0u);
+        require((flags & Abi::PoisonFlag) == 0u && (flags >> Abi::ModeShift) == expected2d, "memoized image mode: differing address selected a different 2D mode or poison");
+    }
+    require(firstResult.elements.size() == 1u && secondResult.elements.size() == 1u && highResult.elements.size() == 1u &&
+            firstResult.elements[0].words == first.dwords && secondResult.elements[0].words == second.dwords && highResult.elements[0].words == highAddress.dwords,
+            "memoized image mode: address canonicalization changed emitted descriptor words");
+
+    auto nullLow = descriptor(0u);
+    nullLow.dwords[1] |= 1u;
+    const auto nulls = resolve({descriptor(0u), nullLow}, 0xdec0deu);
+    require(recordFlags(nulls, 0u) == Abi::NullCode, "memoized image mode: exact raw-null descriptor did not remain null");
+    require((recordFlags(nulls, 1u) & Abi::PoisonFlag) == 0u && nulls.elements.size() == 1u &&
+            nulls.elements[0].words == nullLow.dwords,
+            "memoized image mode: zero address with nonzero low address bits aliased the raw-null descriptor");
+
+    const auto otherFormat = descriptor(0x3000u, TableFormat32UInt);
+    const auto volume = descriptor(0x4000u, TableFormat8888UNorm, TableType3D);
+    auto mipVariant = first;
+    mipVariant.dwords[3] |= 1u << 12u;
+    auto swizzleVariant = first;
+    swizzleVariant.dwords[3] = (swizzleVariant.dwords[3] & ~0xfffu) | 0x1ffu;
+    auto invalidVolume = volume;
+    invalidVolume.dwords[3] |= 1u << 12u;
+    const auto variants = resolve({first, otherFormat, volume, mipVariant, swizzleVariant, invalidVolume}, 0xdec0deu);
+    for (const auto index : {0u, 1u, 2u, 3u, 4u}) {
+        const auto flags = recordFlags(variants, index);
+        require((flags & Abi::PoisonFlag) == 0u, "memoized image mode: a supported descriptor variant was poisoned");
+        const auto& mode = modes.at(flags >> Abi::ModeShift);
+        const auto numeric = index == 1u ? IrTextureNumericClass::Uint : IrTextureNumericClass::Float;
+        const auto dimension = index == 2u ? RdnaImageDimension::Dim3D : RdnaImageDimension::Dim2D;
+        require(mode.dimension == dimension && mode.numericClass == numeric, "memoized image mode: format, type, mip, or swizzle variant selected the wrong runtime mode");
+    }
+    const auto invalidFlags = recordFlags(variants, 5u);
+    require((invalidFlags & Abi::PoisonFlag) != 0u, "memoized image mode: an invalid volume mip range reused a valid mode");
+    const auto& fault = variants.poison.at(invalidFlags & ~Abi::PoisonFlag);
+    require(fault.reason == Abi::PoisonReason::Dimension && fault.words == invalidVolume.dwords, "memoized image mode: an invalid volume lost its Dimension poison or descriptor");
+
+
+}
+
 void verifySamplerTableDeduplication() {
     using namespace ShaderRecompiler;
     namespace Abi = ImageTableAbi;
@@ -8526,6 +8776,7 @@ int main(int argc, char** argv) {
         verifyGuardedDescriptorSources();
         verifyLaneMaskGuardedDescriptorSources();
         verifyExecGuardedDescriptorSources();
+        verifyPreparedGuestBufferFootprintsArePerCapture();
         verifySrtTape();
         verifyTargetFeatureKey();
         verifyImageTableKeys();
@@ -8537,6 +8788,7 @@ int main(int argc, char** argv) {
         verifyChainedTableOffset();
         verifyPointerChainImageTable();
         verifyWaterfallImageTable();
+        verifyPreparedFragmentBufferReadFootprintsArePerCapture();
         verifySplitWaterfallImageTable();
         verifyDescriptorPhis();
         verifyUniformTableImage();
@@ -8581,6 +8833,7 @@ int main(int argc, char** argv) {
         verifyVolumeArrayLoadMode();
         verifyArrayVolumeStoreMode();
         verifyMultisamplePlaneReadMode();
+        verifyDecodeMemoAddressCanonicalization();
         verifyVolumeBiasTableRejection();
         verifySamplerTableDeduplication();
         verifyDynamicStorageMipChain();

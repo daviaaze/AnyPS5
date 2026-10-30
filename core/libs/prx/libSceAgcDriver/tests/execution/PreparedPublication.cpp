@@ -378,25 +378,44 @@ void CommittedLinks() {
     Require(front.prepared->fragments.size() == 1 && front.prepared->fragments.front().lock() == pixel, "a resolved link was not published");
     ShaderSnapshot unrelated{};
     auto other = std::make_shared<ShaderSnapshot>();
-    std::optional<ShaderPreparationTransaction> open(std::in_place);
-    static_cast<void>(open->Read(unrelated));
-    auto repeated = std::async(std::launch::async, [&] { ResolvePreparedGraphics(front, pixel, 0, {}); });
-    const bool unblocked = repeated.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
-    auto linking = std::async(std::launch::async, [&] { ResolvePreparedGraphics(front, other, 0, {}); });
-    const bool excluded = linking.wait_for(std::chrono::milliseconds(200)) == std::future_status::timeout;
-    open->Commit();
-    open.reset();
+    std::future<void> repeated;
+    std::future<void> linking;
+    bool unblocked = false;
+    bool excluded = false;
+    {
+        ShaderPreparationTransaction open;
+        static_cast<void>(open.Read(unrelated));
+        std::promise<void> repeating;
+        auto repeatedStarted = repeating.get_future();
+        repeated = std::async(std::launch::async, [&] {
+            repeating.set_value();
+            ResolvePreparedGraphics(front, pixel, 0, {});
+        });
+        repeatedStarted.get();
+        unblocked = repeated.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+        std::promise<void> adding;
+        auto linkingStarted = adding.get_future();
+        linking = std::async(std::launch::async, [&] {
+            adding.set_value();
+            ResolvePreparedGraphics(front, other, 0, {});
+        });
+        linkingStarted.get();
+        excluded = linking.wait_for(std::chrono::milliseconds(200)) == std::future_status::timeout;
+        open.Commit();
+    }
+    repeated.wait();
+    linking.wait();
     repeated.get();
     linking.get();
-    Require(unblocked, "resolving a link the shader already had waited for another thread's transaction");
-    Require(excluded && front.prepared->fragments.size() == 2, "a new link was published beside a transaction that had read prepared state");
+    Require(unblocked, "resolving a committed link waited for an unrelated transaction");
+    Require(excluded && front.prepared->fragments.size() == 2, "a new link was not excluded until transaction commit");
     {
         ShaderPreparationTransaction transaction;
         transaction.Edit(front).fragments.clear();
         ResolvePreparedGraphics(front, pixel, 0, {});
         transaction.Commit();
     }
-    Require(front.prepared->fragments.size() == 1 && front.prepared->fragments.front().lock() == pixel, "a link resolved in a transaction that had changed the shader was checked against the published links");
+    Require(front.prepared->fragments.size() == 1 && front.prepared->fragments.front().lock() == pixel, "committed links bypassed transaction-local edits");
 }
 
 void PreparationPriority(bool beforeSubmit) {

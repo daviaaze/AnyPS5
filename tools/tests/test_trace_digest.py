@@ -47,6 +47,22 @@ STACKS = "# samples=5 depth=64 truncated=1\n# module a.prx 0x1000 0x1\nntdll.dll
 
 
 class TraceDigestTests(unittest.TestCase):
+    def test_cli_uses_closing_witness_instead_of_rounded_up_summary_end(self):
+        closing_us = 39999.843
+        events = EVENTS + [{"name": "present", "ph": "i", "ts": closing_us,
+                            "args": {"present": 603}}]
+        summary = dict(SUMMARY, presents=3, window=dict(SUMMARY["window"], ms=40.0))
+        (self.trace.parent / "aps5-summary.jsonl").write_text(json.dumps(summary) + "\n", encoding="utf-8")
+        with gzip.open(self.trace, "wt", encoding="utf-8") as handle:
+            json.dump({"traceEvents": events}, handle)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(trace_digest.main([str(self.trace), "--json"]), 0)
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["frames"], SUMMARY["presents"])
+        self.assertAlmostEqual(result["window_ms"], closing_us / 1000.0)
+        self.assertEqual({frame["present"] for frame in result["slowest_frames"]}, {600, 601, 602})
+
     def test_cli_rejects_invalid_event_container_shapes_without_partial_output(self):
         cases = [(value, "trace must be an event array or object") for value in (None, True, 7, "trace")]
         cases += [({"traceEvents": value}, "traceEvents must be an array")

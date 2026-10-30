@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "Recompiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <limits>
@@ -40,8 +41,10 @@ std::uint64_t StorageTextureCacheBudget(const Context& context);
 inline constexpr std::uint64_t SpareSnapshotPresents = 16;
 struct TextureCacheUse {
     std::size_t sampledEntries = 0;
+    std::size_t overflowEntries = 0;
     std::size_t spareEntries = 0;
     std::uint64_t sampledBytes = 0;
+    std::uint64_t overflowBytes = 0;
     std::uint64_t spareBytes = 0;
     std::uint64_t storageBytes = 0;
 };
@@ -154,6 +157,11 @@ struct ImageTableReuseCounts {
 };
 ImageTableReuseCounts ImageTableReuses();
 std::uint64_t SampledLookupKeyScans();
+struct PreparedSnapshotStagingCounts {
+    std::uint64_t prepared = 0;
+    std::uint64_t used = 0;
+};
+PreparedSnapshotStagingCounts PreparedSnapshotStagings();
 
 struct PresyncSurface {
     std::uint64_t address;
@@ -194,6 +202,7 @@ public:
             std::shared_ptr<Buffer> buffer;
             VkDeviceSize offset = 0;
             std::size_t bytes = 0;
+            std::size_t allocation = std::numeric_limits<std::size_t>::max();
             std::span<std::byte> Bytes() const { return buffer->Bytes().subspan(static_cast<std::size_t>(offset), bytes); }
         };
         DescriptorCache* cache = nullptr;
@@ -208,9 +217,11 @@ public:
         std::size_t allocation;
         std::uint64_t address;
         std::size_t size;
-        std::span<const std::uint32_t> words;
+        ShaderRecompiler::SharedValues<std::uint32_t> words;
     };
     std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, bool movedOnly = false) const;
+    // Record before the render pass, after PrepareDrawBindings. Sources remain owned by the draw.
+    std::size_t CaptureDrawPayload(Recorder& recorder, VkCommandBuffer commands, std::span<const CompiledShader> shaders, const std::shared_ptr<DrawBindings>& drawBindings, std::uint64_t ordinal, std::size_t maxBytes) const;
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const;
     enum class MoveRefusal : std::size_t { None, Shape, NotGuest, Written, Limit, Inaccessible, Overlap, Bindings, Count };
     struct MoveProof {
@@ -269,8 +280,8 @@ public:
     // Without `dataWords` the ShaderData and FlattenedSrt descriptor words stay out of the key
     // (their count and size remain): a compute template then serves dispatches whose constants
     // differ, and the hit refreshes its data buffers with the dispatch's words (RefreshData).
-    static std::vector<std::uint32_t> ContentKey(const CompiledShader& shader, bool dataWords = true, bool movableBuffers = false);
-    static void AppendContentKey(const CompiledShader& shader, bool dataWords, bool movableBuffers, std::vector<std::uint32_t>& key);
+    static ShaderRecompiler::ResourceKey ContentKey(const CompiledShader& shader, bool dataWords = true, bool movableBuffers = false);
+    static void AppendContentKey(const CompiledShader& shader, bool dataWords, bool movableBuffers, ShaderRecompiler::ResourceKey& key);
     static bool DiffContentKeys(std::span<const std::uint32_t> previous, std::span<const std::uint32_t> key, bool draw, ContentKeyDiff& diff);
     // Records the shader's ShaderData and FlattenedSrt words into this object's data buffers
     // (vkCmdUpdateBuffer, a transfer write the caller's pre-dispatch barrier makes visible; a
@@ -397,7 +408,8 @@ private:
         const ShaderRecompiler::RecompileResult* program = nullptr;
         const ShaderRecompiler::DescriptorBinding* images = nullptr;
         std::size_t mapAllocation = std::numeric_limits<std::size_t>::max();
-        std::vector<std::uint32_t> map;
+        ShaderRecompiler::SharedValues<std::uint32_t> map;
+        std::vector<std::pair<std::size_t, std::uint32_t>> mapUpdates;
         std::vector<ShaderRecompiler::ImageTableEntryPoison> poison;
         std::vector<std::string> messages;
         std::uint32_t elementBase = 0;
@@ -408,6 +420,21 @@ private:
         bool storage = false;
         std::vector<std::size_t> elementTextures;
         std::vector<std::pair<std::uint32_t, std::uint32_t>> samplerRejections;
+        [[nodiscard]] std::uint32_t MapValue(std::size_t index) const {
+            const auto update = std::lower_bound(mapUpdates.begin(), mapUpdates.end(), index,
+                [](const auto& entry, std::size_t value) { return entry.first < value; });
+            return update != mapUpdates.end() && update->first == index ? update->second : map[index];
+        }
+        void SetMapValue(std::size_t index, std::uint32_t value) {
+            if (mapUpdates.empty() || mapUpdates.back().first < index) {
+                mapUpdates.emplace_back(index, value);
+                return;
+            }
+            const auto update = std::lower_bound(mapUpdates.begin(), mapUpdates.end(), index,
+                [](const auto& entry, std::size_t key) { return entry.first < key; });
+            if (update != mapUpdates.end() && update->first == index) update->second = value;
+            else mapUpdates.insert(update, {index, value});
+        }
     };
     std::vector<TableStage> tableStages;
     std::array<std::size_t, 2> tableBindings{std::numeric_limits<std::size_t>::max(), std::numeric_limits<std::size_t>::max()};
@@ -475,6 +502,12 @@ private:
         std::shared_ptr<StorageTexture> source;
         DccKeys entryKeys = DccKeys::Uncompressed;
         std::uint64_t entryGeneration = 0;
+        // A sampled element stage A predicts will miss into a large uncompressed snapshot: its
+        // exact-size TRANSFER_SRC staging Buffer, made here outside the device lock. Stage B hands it
+        // to cachedTexture, which uses it only when the lookup still misses into a staged snapshot of
+        // the same size; otherwise it is released (back to the pool). APS5_NO_PREPARED_SNAPSHOT_STAGING
+        // disables it.
+        std::shared_ptr<Buffer> preparedStaging;
     };
     std::vector<ImageRecord> imageRecords;
     struct PreviousSampled {
@@ -597,7 +630,7 @@ private:
     std::vector<VkWriteDescriptorSet> descriptorWrites;
     struct MovedWordBuffer {
         std::size_t allocation;
-        std::vector<std::uint32_t> words;
+        ShaderRecompiler::SharedValues<std::uint32_t> words;
         std::size_t size;
         std::shared_ptr<Buffer> buffer;
     };
@@ -660,7 +693,7 @@ private:
     std::vector<Binding> bindings;
     std::vector<VkDescriptorBindingFlags> layoutBindingFlags;
     std::vector<VkDescriptorBindingFlags> fragmentBindingFlags;
-    std::vector<std::uint32_t> refreshResourceKey;
+    ShaderRecompiler::ResourceKey refreshResourceKey;
     struct DeferredImages {
         const ShaderRecompiler::DescriptorBinding* binding;
         std::size_t index;
@@ -701,7 +734,7 @@ private:
 // teardown before its descriptor caches go.
 class ResourceCache {
 public:
-    using Key = std::vector<std::uint32_t>;
+    using Key = ShaderRecompiler::ResourceKey;
     std::shared_ptr<ShaderResources> Find(const Key& key);
     // `evicted`, when given, receives the objects the insert displaces (the entry replaced under the
     // key, the ones over the bound) instead of their being destroyed here: a caller under the GPU
@@ -736,28 +769,7 @@ private:
     void noteUse(const Key& key);
     void removeImage(const StorageTexture* image, std::vector<std::shared_ptr<ShaderResources>>* evicted);
     struct KeyHash {
-        std::size_t operator()(const Key& key) const noexcept {
-            constexpr std::uint64_t Prime = 0x9e3779b97f4a7c15ull;
-            std::uint64_t lanes[4] = {0x243f6a8885a308d3ull, 0x13198a2e03707344ull, 0xa4093822299f31d0ull, 0x082efa98ec4e6c89ull};
-            const auto* words = key.data();
-            const auto count = key.size();
-            std::size_t at = 0;
-            for (; at + 8u <= count; at += 8u) {
-                for (std::size_t lane = 0; lane < 4u; ++lane) {
-                    const auto value = static_cast<std::uint64_t>(words[at + lane * 2u]) | static_cast<std::uint64_t>(words[at + lane * 2u + 1u]) << 32u;
-                    lanes[lane] = (lanes[lane] ^ value) * Prime;
-                    lanes[lane] ^= lanes[lane] >> 29u;
-                }
-            }
-            std::uint64_t hash = lanes[0] ^ (lanes[1] << 17u | lanes[1] >> 47u) ^ (lanes[2] << 31u | lanes[2] >> 33u) ^ (lanes[3] << 47u | lanes[3] >> 17u) ^ count;
-            for (; at < count; ++at) hash = (hash ^ words[at]) * Prime;
-            hash ^= hash >> 33u;
-            hash *= 0xff51afd7ed558ccdull;
-            hash ^= hash >> 33u;
-            hash *= 0xc4ceb9fe1a85ec53ull;
-            hash ^= hash >> 33u;
-            return static_cast<std::size_t>(hash);
-        }
+        std::size_t operator()(const Key& key) const noexcept { return key.Hash(); }
     };
     mutable AgcDriver::Mutex mutex;
     std::list<std::pair<Key, std::shared_ptr<ShaderResources>>> entries;

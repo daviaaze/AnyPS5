@@ -35,6 +35,7 @@ void Driver::verifyDataHit(const ShaderSnapshot& snapshot, std::size_t codeOffse
         const auto& fresh = result->bindings[b];
         const auto& reused = patched.bindings[b];
         if (fresh.kind != reused.kind || fresh.role != reused.role || fresh.binding != reused.binding || fresh.count != reused.count || fresh.guestDescriptor != reused.guestDescriptor) fail("the bindings", b, 0);
+        if (fresh.bufferFootprints != reused.bufferFootprints) fail("the buffer transfer footprints", b, 0);
     }
     std::lock_guard cacheLock(dispatchCacheMutex);
     ++entryCounters.dataVerified;

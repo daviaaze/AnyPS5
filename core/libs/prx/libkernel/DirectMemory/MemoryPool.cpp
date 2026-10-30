@@ -87,6 +87,14 @@ struct PhysicalMemoryPool {
     bool Free(uint64_t start, size_t len) { return _release(start, len, false); }
 
     bool CheckedFree(uint64_t start, size_t len) { return _release(start, len, true); }
+    std::unique_lock<std::mutex> MapLock(uint64_t start, size_t len) {
+        uint64_t lo, hi;
+        if (!PageSpan(start, len, lo, hi)) return {};
+        std::unique_lock<std::mutex> lock(_mutex);
+        if (_claimed(lo, hi)) return {};
+        return lock;
+    }
+
 
     bool ClaimRelease(uint64_t start, size_t len, bool requireAllocated) {
         uint64_t lo, hi;
@@ -328,6 +336,10 @@ void DirectMemoryFree(int64_t start, size_t len) {
 bool DirectMemoryCheckedFree(int64_t start, size_t len) {
     return PhysicalMemoryPool::Instance().CheckedFree(static_cast<uint64_t>(start), len);
 }
+std::unique_lock<std::mutex> DirectMemoryMapLock(int64_t start, size_t len) {
+    return PhysicalMemoryPool::Instance().MapLock(static_cast<uint64_t>(start), len);
+}
+
 
 bool DirectMemoryClaimRelease(int64_t start, size_t len, bool requireAllocated) {
     return PhysicalMemoryPool::Instance().ClaimRelease(static_cast<uint64_t>(start), len, requireAllocated);

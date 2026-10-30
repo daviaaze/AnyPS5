@@ -63,7 +63,39 @@ also builds `libs` through the `patched_libraries_tests` dependency. Titles load
 files from `build/core/libs/libs`; running a title after a library change without rebuilding `libs`
 therefore tests the previous binaries and can show no effect at all.
 
+For committed texture reads, build `agc_driver_recorder_tests` and run
+`build/tests/agc_driver_recorder_tests --snapshot-read-into-staging-only`.
+The native GPU smoke checks linear, tiled, padded and partially committed texture
+uploads. On Linux it also checks both committed-read APIs across unaligned
+leading/trailing holes and multiple readable islands, starting with nonzero
+destination bytes. Readable spans are copied once; only inaccessible gaps are
+zero-filled. The synced API still flushes GPU writers before reading.
+
 [Relinker usage and runtime layout](../user/USAGE.md).
+
+## Offline shader-cache precompilation
+
+Build `agc_shader_replay` from the same configured build tree as the runtime PRX, then pass the runtime shader-cache root and one or more request files/directories:
+
+```sh
+cmake --build build --target agc_shader_replay
+ANYPS5_SHADER_CACHE_DIR=/path/to/runtime/shader_cache \
+  build/core/libs/prx/libSceAgcDriver/agc_shader_replay \
+  --precompile /path/to/runtime/shader_cache --threads 8 /path/to/request-snapshots
+```
+
+`--precompile` writes the same source-version directory and shader/resource-plan entries used by runtime compilation. It processes requests concurrently (default: half of reported hardware threads, minimum one); use `--threads` to bound concurrency. Existing valid entries are loaded instead of recompiled, so rerunning after interruption resumes naturally. The cache writer is flushed before exit. Do not run the game concurrently against this cache while precompiling.
+
+The request directory should contain captured `shader_*.req` files. Captures provide the request's compiler target, code, layout, and captured resource inputs; exact request keys are required. The tool warms compiled shader variants and resource plans only. It does not create Vulkan pipelines: `.req` lacks the runtime-created Vulkan device objects and full pipeline recipes (graphics render state/attachments and layouts, and compute specialization/layout state). The opaque `vk-pipelines-*.bin` is driver-owned and can only be populated by pipeline creation on the actual runtime device; `pipelines.journal` records/replays recipes captured by the game. Consequently precompilation can prevent shader translation/resource-analysis misses but cannot guarantee driver pipeline-cache hits on the next run. Check the tool's reported source version and cache path, then verify runtime `[shader-disk-cache]` hit totals in `systemd-client.stderr`; pipeline creation may still occur on first use.
+
+For the captured gameplay snapshot on the AnyPS5 workbench, with a build at `/home/daviaaze/Games/anyps5-workbench/build` and the runtime cache at `/home/daviaaze/Games/anyps5-workbench/DemonSouls-candidate/shader_cache`, run:
+
+```sh
+ANYPS5_SHADER_CACHE_DIR=/home/daviaaze/Games/anyps5-workbench/DemonSouls-candidate/shader_cache \
+  /home/daviaaze/Games/anyps5-workbench/build/core/libs/prx/libSceAgcDriver/agc_shader_replay \
+  --precompile /home/daviaaze/Games/anyps5-workbench/DemonSouls-candidate/shader_cache --threads 8 \
+  /home/daviaaze/Games/anyps5-workbench/evidence/t1-gameplay-20261023/request-snapshots/native-game-d677f4637daa
+```
 
 ## Windows setup and troubleshooting
 
@@ -167,6 +199,7 @@ On Windows MinGW frees `thread_local` objects before their destructors run, so t
 Build `agc_compute_pipeline_replay` in the full build with `-DANYPS5_ENABLE_SPIRV_TOOLS=ON`; replay validates the captured module before calling Vulkan. Set `APS5_DUMP_COMPUTE_PIPELINES` to a dedicated empty directory before starting a title to save each uncached compute pipeline's final SPIR-V, descriptor layouts, push constant ranges, specialization values, subgroup size and creation flags before compilation. Files are named `compute-<identity>/capture.aps5cp`; identical records are deduplicated. The pipelines of the start-up f32 denormal flush probe are not captured. Capture stops with an error at 128 records, 256 MiB total or 36 MiB per record (at most 8,388,608 SPIR-V words, or 32 MiB of shader code). Capture files contain shader code and device metadata, but no guest buffers or textures; review them before sharing.
 
 Set `APS5_DUMP_COMPUTE_MIN_WORDS` to capture only modules at or above that SPIR-V word count, for example `100000` when investigating large NVIDIA compilations. The default is `0` (all modules); values outside `0` through `8388608` fail. The filter applies only when capture is enabled.
+When compute capture is enabled, `APS5_DUMP_COMPUTE_SLOW_MS` also saves a full `.aps5cp` identity after `vkCreateComputePipelines` if the driver call reaches the threshold, regardless of SPIR-V word count. It uses `vk_ms` (excluding pipeline-cache wait); the bounded launcher sets 1000 ms. Use `0` only for fixtures that need to force the slow-capture path.
 
 ```sh
 cmake --build build --target agc_compute_pipeline_replay
@@ -176,9 +209,24 @@ build/core/libs/prx/libSceAgcDriver/agc_compute_pipeline_replay capture.aps5cp -
 
 On Windows use `agc_compute_pipeline_replay.exe` and prepend `build/core/libs/libs/unpatched` to the process `PATH`. `ANYPS5_GPU` selects a device by name as for the driver. The tool uses the driver's compute pipeline creation path, without recording commands, dispatching work or importing guest memory. Compile-only devices also enable supported partially-bound, variable-count and runtime-array descriptor features to replay captured layouts; ordinary runtime devices are unchanged. Binding flags are preserved independently of update-after-bind. Replay accepts the unconditional Vulkan 1.0 capabilities listed in the pinned [Vulkan registry](https://github.com/KhronosGroup/Vulkan-Headers/blob/2fa203425eb4af9dfc6b03f97ef72b0b5bcb8350/registry/vk.xml); other capabilities must be enabled by the device target. Non-Vulkan capabilities such as Kernel and unknown capabilities fail before pipeline creation. Unsupported features, non-highest variable bindings and counts exceeding layout support fail explicitly. Unsupported inputs and mismatched cache vendor, device or UUID fail explicitly. Output files must not already exist.
 
-Each invocation creates one pipeline. With no `--cache-in`, its application pipeline cache starts empty; `--cache-in` imports a raw cache previously written by `--cache-out` (at most 64 MiB), and `--cache-out` exports the resulting cache. The title's wrapped `vk-pipelines-*.bin` format is not accepted. It does not load or save the title's usual pipeline cache. NVIDIA and other driver caches remain uncontrolled: a fresh application cache is not a cold driver cache. JSON reports the capture identity, GPU/driver identifiers, word count, cache policy and separate wall times for shader module, layouts, pipeline creation and cache work. Device initialization is outside these timings. Pipeline statistics captures and `APS5_PIPELINE_STATS` are refused because they change compilation cost.
+Each invocation creates one pipeline. With no `--cache-in`, its application pipeline cache starts empty; `--cache-in` imports a raw cache previously written by `--cache-out` (at most 64 MiB), and `--cache-out` exports the resulting cache. The title's wrapped `vk-pipelines-*.bin` format is not accepted. It does not load or save the title's usual pipeline cache; use `--precompile-pipelines` for that. NVIDIA and other driver caches remain uncontrolled: a fresh application cache is not a cold driver cache. JSON reports the capture identity, GPU/driver identifiers, word count, cache policy and separate wall times for shader module, layouts, pipeline creation and cache work. Device initialization is outside these timings. Pipeline statistics captures and `APS5_PIPELINE_STATS` are refused because they change compilation cost.
 
-`--fixture` compiles a tiny synthetic compute shader with specialization, sparse descriptor binding and push constant metadata; `--write-fixture DIRECTORY` saves it without opening Vulkan. It performs no GPU work and does not reproduce a title's compile workload. With `BUILD_TESTING=ON`, `agc_compute_pipeline_capture` checks serialization and rejected inputs. With SPIRV-Tools also enabled, `agc_compute_pipeline_replay` compiles the fixture with fresh and imported application caches, verifies cache rejection, and checks required subgroup support. `agc_compute_pipeline_capture_run` verifies the existing branch-past-endpgm compute fixture's output with capture disabled and enabled, then replays the captured pipelines and checks their identities and metadata. Each test has a 30-second timeout. Runtime tests skip when Vulkan is absent; set `ANYPS5_REQUIRE_VULKAN=1` to require execution. There is no performance pass threshold.
+### Precompiling captured compute pipelines into the runtime cache
+
+```sh
+build/core/libs/prx/libSceAgcDriver/agc_compute_pipeline_replay \
+  --precompile-pipelines /path/to/runtime/shader_cache compute-*/capture.aps5cp
+```
+
+`--precompile-pipelines CACHE_DIRECTORY CAPTURE...` sets `ANYPS5_SHADER_CACHE_DIR` to `CACHE_DIRECTORY`, opens a compile-only device (which loads the title's `CACHE_DIRECTORY/<source version>/vk-pipelines-<vendor>-<device>-<driver>-<pipelineCacheUUID>.bin` exactly as the runtime device does), creates every capture's pipeline with that device's `VkPipelineCache` and saves it back through the runtime's merge-and-replace writer. `--fixture` may be given in place of a capture. Each pipeline prints one JSON line; a final line reports `compiled`, `failed` and summed `pipeline_create_ms`. Captures that fail validation are reported and skipped, and the exit status is 1 when any failed. Do not run the title against the same cache directory concurrently.
+
+The file name and payload checks come from the same `Graphics::PipelineCache` class as the runtime, so the vendor ID, device ID, driver version and pipeline cache UUID of the GPU running the tool, and the source version compiled into the tool, must match the title's: build the tool from the same commit as the installed `libSceAgcDriver` and run it on the same GPU/driver. A capture records the exact final SPIR-V, layouts, specialization, subgroup size and flags the runtime passed to `vkCreateComputePipelines`, so the driver's cache key matches as long as the recompiler output is unchanged; captures made by another source version may compile without producing hits. Driver disk caches (for example Mesa's `~/.cache/mesa_shader_cache`) are also populated as a side effect when enabled for the user running the tool.
+
+Coverage is limited to captured pipelines: captures taken with `APS5_DUMP_COMPUTE_MIN_WORDS=200000` include only the largest modules. Smaller compute pipelines are not precompiled; the title records every compute pipeline it creates in `pipelines.journal`, whose startup replay (`[pipeline-journal] loaded N pipelines`) rebuilds them on later runs from journaled recompiler results. The journal cannot be fed from captures because its compute records reference guest shader identities and recompiled modules, not raw SPIR-V.
+
+To observe the effect, the title prints `[pipeline-cache] loaded <KiB> KiB from <file>` at device creation; the size should include the precompiled pipelines. With `APS5_PROFILE_DRAW=1` (or capture enabled), `[dispatch] created a pipeline for N SPIR-V words in T ms` and `[compute-create-timing] ... vk_ms=` lines for the captured programs should drop from seconds to a few milliseconds on first use.
+
+`--fixture` compiles a tiny synthetic compute shader with specialization, sparse descriptor binding and push constant metadata; `--write-fixture DIRECTORY` saves it without opening Vulkan. It performs no GPU work and does not reproduce a title's compile workload. With `BUILD_TESTING=ON`, `agc_compute_pipeline_capture` checks serialization and rejected inputs. With SPIRV-Tools also enabled, `agc_compute_pipeline_replay` compiles the fixture with fresh and imported application caches, verifies cache rejection, precompiles it into a temporary runtime `vk-pipelines-*.bin`, and checks required subgroup support. `agc_compute_pipeline_capture_run` verifies the existing branch-past-endpgm compute fixture's output with capture disabled and enabled, then replays the captured pipelines and checks their identities and metadata. Each test has a 30-second timeout. Runtime tests skip when Vulkan is absent; set `ANYPS5_REQUIRE_VULKAN=1` to require execution. There is no performance pass threshold.
 
 ## PM4 submission replay
 
@@ -301,6 +349,9 @@ With `APS5_PROFILE_DRAW` set (any value), the driver prints a profile line on st
 | `[flip]` | from the start |
 | `[fill-sync]` | from the start |
 | `[buffers] descriptor elements bound` | from the start |
+
+
+The cumulative `[texture]` line is printed every 200 newly created sampled textures. Its `vkCreateImage` and `actual vkAllocateMemory` totals time only those Vulkan API calls; `image pool+allocate` includes image-memory-pool lookup, reuse, fallback/reclaim and any Vulkan allocations. A pool hit makes zero `vkAllocateMemory` calls; the reported pool-hit and API-call counts make that distinction explicit. `requirements+type` includes `vkGetImageMemoryRequirements` and memory-type selection. These are CPU-side wall durations, not GPU execution time.
 
 `[gputime]` is described above and needs `APS5_PROFILE_GPU`. Other profile lines state their window in their text or are not listed here because their counters were not checked.
 

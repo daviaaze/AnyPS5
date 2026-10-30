@@ -646,7 +646,7 @@ void CheckDrawFeedback() {
     image.descriptorSet = ShaderRecompiler::RuntimeAbi::DescriptorSet;
     image.binding = binding;
     image.count = 1u;
-    image.guestDescriptor.assign(words.begin(), words.end());
+    image.guestDescriptor = ShaderRecompiler::SharedValues<std::uint32_t>(std::vector<std::uint32_t>(words.begin(), words.end()));
     image.imageShape = ShaderRecompiler::DescriptorImageShape::Image2DMultisample;
     image.imageSamplers = {0u};
     reader.bindings.push_back(std::move(image));

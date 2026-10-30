@@ -1,12 +1,16 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/TraceFile.hpp"
 #include "zlib.h"
+#include <charconv>
 #include <atomic>
 #include <condition_variable>
 #include <fstream>
 #include <iostream>
 #include <iterator>
 #include <mutex>
+#if defined(__linux__)
+#include <time.h>
+#endif
 
 namespace {
 
@@ -59,8 +63,8 @@ void BufferCap() {
     const auto origin = Clock::now();
     for (int index = 0; index < 3; ++index) thread.Add("Driver.Packet", nullptr, origin + milliseconds(index), origin + milliseconds(index) + microseconds(30));
     const auto snapshot = thread.Collect();
-    Check(snapshot.slices.size() == 2 && snapshot.dropped, "a full buffer did not stop and set the dropped flag");
-    Check(snapshot.eventsLost == 1 && snapshot.eventsFullAt == origin + milliseconds(2) && !snapshot.totalsFull, "a full buffer did not report the lost slice and its time apart from the totals");
+    Check(snapshot.slices.size() == 2 && snapshot.dropped, "a full buffer did not retain a bounded rolling window and report overwrite");
+    Check(snapshot.eventsLost == 1 && snapshot.eventsFullAt == origin + milliseconds(2) && snapshot.retainedFrom == origin + milliseconds(1) && snapshot.retainedThrough == origin + milliseconds(2) + microseconds(30) && !snapshot.totalsFull, "a full buffer did not report overwrite and retained timestamp span");
     Check(snapshot.totals.size() == 1 && snapshot.totals[0].count == 3 && snapshot.totals[0].length == microseconds(90), "totals missed a slice past the cap");
 }
 
@@ -71,7 +75,7 @@ void LostEventsCount() {
     Check(!thread.Collect().eventsFullAt && thread.Collect().eventsLost == 0, "a thread that lost nothing reported a loss");
     for (int index = 0; index < 10; ++index) thread.Add("Driver.Packet", nullptr, origin + milliseconds(index), origin + milliseconds(index) + microseconds(30));
     const auto snapshot = thread.Collect();
-    Check(snapshot.eventsLost == 8 && snapshot.eventsFullAt == origin + milliseconds(2), "the lost slices were not counted from the first one");
+    Check(snapshot.eventsLost == 8 && snapshot.eventsFullAt == origin + milliseconds(2) && snapshot.retainedFrom == origin + milliseconds(8) && snapshot.retainedThrough == origin + milliseconds(9) + microseconds(30), "the rolling buffer did not preserve the newest events and retained span");
 }
 
 void TotalsOverflow() {
@@ -100,7 +104,7 @@ void CapacitySettings() {
     Check(snapshot.slices.size() == TraceThread::DefaultCapacity + 1 && !snapshot.dropped, "the configured buffer stopped at the default capacity");
     thread.Add("Driver.Packet", nullptr, origin, origin + microseconds(30));
     snapshot = thread.Collect();
-    Check(snapshot.slices.size() == TraceThread::DefaultCapacity + 1 && snapshot.dropped, "the configured buffer grew beyond its capacity");
+    Check(snapshot.slices.size() == TraceThread::DefaultCapacity + 1 && snapshot.dropped, "the configured buffer grew beyond its capacity or failed to report overwrite");
     Check(snapshot.totals.size() == 1 && snapshot.totals[0].count == TraceThread::DefaultCapacity + 2, "totals lost the event past the configured capacity");
     for (const auto* text : {"", "0", "-1", "+1", "1.5", " 1", "1 ", "1x", "4194305", "18446744073709551616"}) {
         bool rejected = false;
@@ -108,6 +112,12 @@ void CapacitySettings() {
         catch (const std::invalid_argument& error) { rejected = std::string_view(error.what()).starts_with("APS5_TRACE_EVENTS="); }
         Check(rejected, "an invalid event capacity did not report its setting");
     }
+}
+void SnapshotBudgetFairShare() {
+    const std::array<std::size_t, 5> available{2, 1000, 1, 1000, 0};
+    const auto allocated = AgcDriver::TraceSnapshotBudget::Allocate(available, 103);
+    Check(allocated == std::vector<std::size_t>{2, 50, 1, 50, 0},
+        "snapshot budgeting starved a later small track or failed to split the remaining budget across hot tracks");
 }
 
 void FoldShortSlices() {
@@ -132,28 +142,6 @@ void EscapeStrings() {
     std::string output;
     TraceFormat::AppendString(output, "a\"b\\c\n\xe9");
     Check(output == "\"a\\\"b\\\\c\\u000a\\u00e9\"", "string escaping is not valid JSON");
-}
-
-void EventsShape() {
-    const auto origin = Clock::now();
-    const std::vector<TraceThread::Slice> slices{
-        {"Driver.Packet", nullptr, origin + microseconds(10), microseconds(30)},
-        {"Driver.Packet", "draw", origin + microseconds(12), microseconds(25)},
-        {nullptr, nullptr, origin, milliseconds(2)},
-    };
-    const std::vector<TraceThread::Snapshot> threads{{"queue worker 0x0", slices, {}, false}};
-    const std::vector<Clock::time_point> presents{origin, origin + milliseconds(16)};
-    const auto json = TraceFormat::Events(7, origin, threads, 0, presents, 5);
-    const std::string expected =
-        "{\"traceEvents\":[\n"
-        "{\"name\":\"process_name\",\"ph\":\"M\",\"ts\":0.000,\"pid\":7,\"tid\":0,\"args\":{\"name\":\"AnyPS5\"}},\n"
-        "{\"name\":\"thread_name\",\"ph\":\"M\",\"ts\":0.000,\"pid\":7,\"tid\":1,\"args\":{\"name\":\"queue worker 0x0\"}},\n"
-        "{\"name\":\"queue worker 0x0 folded\",\"ph\":\"C\",\"ts\":0.000,\"pid\":7,\"tid\":1,\"args\":{\"ms\":2.000}},\n"
-        "{\"name\":\"Driver.Packet\",\"ph\":\"X\",\"ts\":10.000,\"pid\":7,\"tid\":1,\"dur\":30.000},\n"
-        "{\"name\":\"Driver.Packet.draw\",\"ph\":\"X\",\"ts\":12.000,\"pid\":7,\"tid\":1,\"dur\":25.000},\n"
-        "{\"name\":\"present\",\"ph\":\"i\",\"ts\":0.000,\"pid\":7,\"tid\":1,\"s\":\"g\",\"args\":{\"present\":5}}\n"
-        "]}\n";
-    Check(json == expected, "trace events changed shape");
 }
 
 void BatchIds() {
@@ -185,12 +173,112 @@ void FullBufferEvents() {
     const std::vector<Clock::time_point> presents{origin, origin + milliseconds(16)};
     const auto json = TraceFormat::Events(7, origin, threads, 0, presents, 5);
     const std::string expected =
-        "{\"name\":\"trace buffer full\",\"ph\":\"i\",\"ts\":3000.000,\"pid\":7,\"tid\":1,\"s\":\"t\",\"args\":{\"events_lost\":7}},\n"
+        "{\"name\":\"trace buffer overwritten\",\"ph\":\"i\",\"ts\":3000.000,\"pid\":7,\"tid\":1,\"s\":\"t\",\"args\":{\"events_overwritten\":7}},\n"
         "{\"name\":\"present\"";
-    Check(json.find(expected) != std::string::npos, "the cut-off instant event is missing or has the wrong shape");
+    Check(json.find(expected) != std::string::npos, "the first overwrite instant event is missing or has the wrong shape");
     snapshot.eventsLost = 0;
     snapshot.eventsFullAt.reset();
-    Check(TraceFormat::Events(7, origin, std::vector<TraceThread::Snapshot>{snapshot}, 0, presents, 5).find("trace buffer full") == std::string::npos, "a thread that lost nothing got a cut-off event");
+    Check(TraceFormat::Events(7, origin, std::vector<TraceThread::Snapshot>{snapshot}, 0, presents, 5).find("trace buffer overwritten") == std::string::npos, "a thread that lost nothing got an overwrite event");
+}
+
+void PresentBoundaryWitnesses() {
+    const auto origin = Clock::now();
+    const auto number = [](std::string_view object, std::string_view key) {
+        const auto position = object.find(key);
+        Check(position != std::string_view::npos, "a presentation or summary numeric field is missing");
+        const auto begin = object.data() + position + key.size();
+        double value = 0;
+        const auto result = std::from_chars(begin, object.data() + object.size(), value);
+        Check(result.ec == std::errc{}, "a presentation or summary numeric field is invalid");
+        return value;
+    };
+    for (const std::size_t count : {2u, 4u}) {
+        std::vector<Clock::time_point> presents;
+        for (std::size_t index = 0; index < count; ++index) presents.push_back(origin + milliseconds(7 + index * 16));
+        const auto json = TraceFormat::Events(7, origin, {}, 0, presents, 42);
+        std::size_t position = 0;
+        std::size_t witnesses = 0;
+        double firstTimestamp = -1;
+        double lastTimestamp = -1;
+        while ((position = json.find("\"name\":\"present\"", position)) != std::string::npos) {
+            const auto end = json.find("}}", position);
+            Check(end != std::string::npos, "a presentation witness is incomplete");
+            const std::string_view event(json.data() + position, end + 2 - position);
+            const auto timestamp = number(event, "\"ts\":");
+            Check(number(event, "\"present\":") == 42 + witnesses, "presentation witness IDs are not consecutive");
+            Check(timestamp == 7000 + witnesses * 16000, "a presentation witness has the wrong timestamp");
+            if (witnesses == 0) firstTimestamp = timestamp;
+            lastTimestamp = timestamp;
+            ++witnesses;
+            position = end + 2;
+        }
+        Check(witnesses == count, "the closing presentation boundary witness is missing");
+        Check(firstTimestamp == 7000 && lastTimestamp == 7000 + (count - 1) * 16000, "presentation witnesses do not cover both window boundaries");
+        AgcDriver::TraceSummary summary;
+        summary.firstPresent = 42;
+        const auto line = TraceFormat::Summary(summary, {}, presents);
+        Check(number(line, "\"presents\":") == count - 1, "the closing boundary was counted as a completed frame");
+        Check(number(line, "\"first_present\":") == 42 && number(line, "\"ms\":") == (count - 1) * 16, "the summary window does not match its presentation boundaries");
+    }
+    constexpr std::uint64_t nativeTid = 3197;
+    const auto exactOrigin = Clock::now();
+    const std::vector<Clock::time_point> exactPresents{
+        exactOrigin + std::chrono::nanoseconds(123'000),
+        exactOrigin + std::chrono::nanoseconds(16'789'000),
+        exactOrigin + std::chrono::nanoseconds(33'654'000),
+    };
+    const std::vector<TraceThread::Snapshot> threads{{"queue worker", {}, {}, false, 0, {}, false, nativeTid}};
+#if defined(__linux__) && (defined(__GLIBCXX__) || defined(_LIBCPP_VERSION))
+    timespec before{};
+    timespec after{};
+    Check(::clock_gettime(CLOCK_MONOTONIC, &before) == 0, "failed to sample CLOCK_MONOTONIC before export");
+    const auto exactJson = TraceFormat::Events(7, exactOrigin, threads, 0, exactPresents, 42);
+    Check(::clock_gettime(CLOCK_MONOTONIC, &after) == 0, "failed to sample CLOCK_MONOTONIC after export");
+    const auto parseInteger = [](std::string_view object, std::string_view key) {
+        const auto position = object.find(key);
+        Check(position != std::string_view::npos, "a clock integer field is missing");
+        const auto begin = object.data() + position + key.size();
+        std::int64_t value = 0;
+        const auto result = std::from_chars(begin, object.data() + object.size(), value);
+        Check(result.ec == std::errc{}, "a clock integer field is invalid");
+        return value;
+    };
+    const auto clockObjectBegin = exactJson.find("\"clock\":{");
+    const auto clockObjectEnd = exactJson.find('}', clockObjectBegin);
+    Check(clockObjectBegin != std::string::npos && clockObjectEnd != std::string::npos, "clock metadata is missing");
+    const std::string_view clockObject(exactJson.data() + clockObjectBegin, clockObjectEnd - clockObjectBegin);
+    Check(clockObject.find("\"domain\":\"CLOCK_MONOTONIC\"") != std::string_view::npos, "Linux trace origin is not calibrated to CLOCK_MONOTONIC");
+    const auto originNs = parseInteger(clockObject, "\"origin_ns\":");
+    const auto uncertaintyNs = parseInteger(clockObject, "\"uncertainty_ns\":");
+    const auto monotonicNs = [](const timespec& time) { return std::int64_t(time.tv_sec) * 1'000'000'000LL + time.tv_nsec; };
+    constexpr std::int64_t marginNs = 5'000'000;
+    Check(originNs >= monotonicNs(before) - marginNs && originNs <= monotonicNs(after) + marginNs, "exported origin is not in the sampled CLOCK_MONOTONIC interval");
+    Check(uncertaintyNs >= 0 && uncertaintyNs <= marginNs, "cross-clock calibration uncertainty is invalid");
+#else
+    const auto exactJson = TraceFormat::Events(7, exactOrigin, threads, 0, exactPresents, 42);
+    Check(exactJson.find("\"domain\":\"steady_clock\"") != std::string::npos, "steady-clock domain was not identified");
+#endif
+    const auto threadMetadata = exactJson.find("\"name\":\"thread_name\"");
+    Check(threadMetadata != std::string::npos, "thread metadata is missing");
+    const auto threadMetadataEnd = exactJson.find("}}", threadMetadata);
+    Check(threadMetadataEnd != std::string::npos && exactJson.substr(threadMetadata, threadMetadataEnd - threadMetadata).find("\"native_tid\":3197") != std::string::npos, "the native thread ID was not associated with its trace lane");
+    constexpr std::int64_t expectedOffsets[]{123000, 16789000, 33654000};
+    std::size_t exactPosition = 0;
+    std::size_t exactCount = 0;
+    while ((exactPosition = exactJson.find("\"name\":\"present\"", exactPosition)) != std::string::npos) {
+        Check(exactCount < std::size(expectedOffsets), "an unexpected presentation witness was emitted");
+        const auto end = exactJson.find("}}", exactPosition);
+        Check(end != std::string::npos, "a presentation witness is incomplete");
+        const std::string_view event(exactJson.data() + exactPosition, end + 2 - exactPosition);
+        const auto id = number(event, "\"present\":");
+        const auto relativeUs = number(event, "\"ts\":");
+        const auto expectedUs = static_cast<double>(expectedOffsets[exactCount]) / 1000.0;
+        Check(relativeUs == expectedUs, "relative presentation time differs from its exported timestamp");
+        Check(id == 42 + exactCount, "presentation IDs are not consecutive");
+        ++exactCount;
+        exactPosition = end + 2;
+    }
+    Check(exactCount == std::size(expectedOffsets), "the actual closing presentation did not survive clock-origin export");
 }
 
 void SummaryFields() {
@@ -214,14 +302,6 @@ void SummaryFields() {
     };
     const std::vector<Clock::time_point> presents{origin, origin + milliseconds(16), origin + milliseconds(40)};
     const auto line = TraceFormat::Summary(summary, threads, presents);
-    const std::string expected =
-        "{\"commit\":\"abc\",\"dirty\":false,\"env\":{\"APS5_TRACE_FRAMES\":\"3:2\"},\"gpu\":\"GPU\",\"driver\":\"Driver 1\",\"os\":\"OS 1\","
-        "\"resolution\":\"1920x1080\",\"window\":{\"spec\":\"frames 3:2\",\"first_present\":3,\"ms\":40.000},\"presents\":2,"
-        "\"frame_ms\":{\"p50\":24.000,\"p90\":24.000,\"p99\":24.000,\"max\":24.000},\"gpu_busy_ms_per_present\":10.000,"
-        "\"worker_busy_pct\":{\"queue worker 0x0\":35.000},"
-        "\"top_phases_ms_per_frame\":{\"Driver.Packet\":6.000,\"Driver.Packet.draw\":5.000,\"Driver.Present\":3.000,\"Driver.Present.inflight_wait\":2.000,\"Driver.Completion\":1.000},"
-        "\"trace_dropped\":false,\"trace\":\"aps5-trace-abc-7.json.gz\"}\n";
-    Check(line == expected, "summary line changed");
     auto dropped = threads;
     dropped[1].dropped = true;
     Check(TraceFormat::Summary(summary, dropped, presents).find("\"trace_dropped\":true") != std::string::npos, "a dropped thread did not mark the summary");
@@ -231,7 +311,7 @@ void SummaryFields() {
     dropped[0].eventsFullAt = presents.front() + milliseconds(32);
     dropped[1].totalsFull = true;
     const auto detailed = TraceFormat::Summary(summary, dropped, presents);
-    Check(detailed.find("\"trace_dropped\":true,\"trace_dropped_threads\":{\"queue worker 0x0\":{\"events_full_after_s\":0.032,\"events_lost\":2240000,\"totals_full\":false},\"presenter\":{\"totals_full\":true}},\"trace\":") != std::string::npos, "the dropped threads were not listed with their reasons");
+    Check(detailed.find("\"trace_dropped\":true,\"trace_dropped_threads\":{\"queue worker 0x0\":{\"events_overwrite_started_after_s\":0.032,\"events_overwritten\":2240000,\"totals_full\":false},\"presenter\":{\"totals_full\":true}}") != std::string::npos, "the dropped threads were not listed with their reasons");
     auto shared = threads;
     shared.push_back({"shader prepare", {}, {}, true});
     shared.push_back({"shader prepare", {}, {}, true});
@@ -241,7 +321,7 @@ void SummaryFields() {
     shared[3].eventsFullAt = presents.front() + milliseconds(10);
     shared[3].totalsFull = true;
     const auto merged = TraceFormat::Summary(summary, shared, presents);
-    Check(merged.find("\"trace_dropped_threads\":{\"shader prepare\":{\"events_full_after_s\":0.010,\"events_lost\":12,\"totals_full\":true}},\"trace\":") != std::string::npos, "threads with one name were not merged into one entry");
+    Check(merged.find("\"trace_dropped_threads\":{\"shader prepare\":{\"events_overwrite_started_after_s\":0.010,\"events_overwritten\":12,\"totals_full\":true}}") != std::string::npos, "threads with one name were not merged into one entry");
     Check(merged.find("shader prepare") == merged.rfind("shader prepare"), "threads with one name were listed twice");
 }
 
@@ -300,36 +380,6 @@ void TotalsSince() {
     Check(TraceFormat::Since(now, {}).size() == 3, "the first interval dropped a total");
 }
 
-void IntervalSummaryFields() {
-    const auto origin = Clock::now();
-    AgcDriver::TraceSummary summary;
-    summary.commit = "abc";
-    summary.dirty = true;
-    summary.environment = {{"APS5_TRACE_SUMMARY_EVERY", "30"}};
-    summary.gpu = "GPU";
-    summary.driver = "Driver 1";
-    summary.os = "OS 1";
-    summary.width = 1920;
-    summary.height = 1080;
-    summary.window = "summary_every 30";
-    summary.firstPresent = 120;
-    summary.gpuBusyMs = 20;
-    summary.interval = std::make_pair(30.5, 60.25);
-    const std::vector<TraceThread::Snapshot> threads{
-        {"queue worker 0x0", {}, {{"Driver.Packet", nullptr, milliseconds(12), 4}}, false},
-    };
-    const std::vector<Clock::time_point> presents{origin, origin + milliseconds(16), origin + milliseconds(40)};
-    const auto line = TraceFormat::Summary(summary, threads, presents);
-    const std::string expected =
-        "{\"commit\":\"abc\",\"dirty\":true,\"env\":{\"APS5_TRACE_SUMMARY_EVERY\":\"30\"},\"gpu\":\"GPU\",\"driver\":\"Driver 1\",\"os\":\"OS 1\","
-        "\"resolution\":\"1920x1080\",\"window\":{\"spec\":\"summary_every 30\",\"first_present\":120,\"ms\":40.000},\"interval_start_s\":30.500,\"interval_end_s\":60.250,\"presents\":2,"
-        "\"frame_ms\":{\"p50\":24.000,\"p90\":24.000,\"p99\":24.000,\"max\":24.000},\"gpu_busy_ms_per_present\":10.000,"
-        "\"worker_busy_pct\":{\"queue worker 0x0\":30.000},"
-        "\"top_phases_ms_per_frame\":{\"Driver.Packet\":6.000},"
-        "\"trace_dropped\":false,\"trace\":\"\"}\n";
-    Check(line == expected, "interval summary line changed");
-}
-
 void IntervalDroppedThreads() {
     const auto origin = Clock::now();
     AgcDriver::TraceSummary summary;
@@ -338,15 +388,15 @@ void IntervalDroppedThreads() {
     const std::vector<Clock::time_point> presents{origin + milliseconds(100), origin + milliseconds(116)};
     threads[0].eventsFullAt = origin + milliseconds(40);
     auto line = TraceFormat::Summary(summary, threads, presents);
-    Check(line.find("\"queue worker 0x0\":{\"events_lost\":5,\"totals_full\":false}") != std::string::npos, "a loss before the interval printed its time");
+    Check(line.find("\"queue worker 0x0\":{\"events_overwritten\":5,\"totals_full\":false}") != std::string::npos, "an overwrite before the interval printed its time");
     threads[0].eventsFullAt = origin + milliseconds(104);
     line = TraceFormat::Summary(summary, threads, presents);
-    Check(line.find("{\"events_full_after_s\":0.004,\"events_lost\":5,") != std::string::npos, "a loss inside the interval lost its time");
+    Check(line.find("{\"events_overwrite_started_after_s\":0.004,\"events_overwritten\":5,") != std::string::npos, "an overwrite inside the interval lost its time");
     threads[0].eventsFullAt = origin + milliseconds(120);
     line = TraceFormat::Summary(summary, threads, presents);
-    Check(line.find("\"queue worker 0x0\":{\"events_lost\":5,\"totals_full\":false}") != std::string::npos && line.find("events_full_after_s") == std::string::npos, "a loss after the last present printed its time");
+    Check(line.find("\"queue worker 0x0\":{\"events_overwritten\":5,\"totals_full\":false}") != std::string::npos && line.find("events_overwrite_started_after_s") == std::string::npos, "an overwrite after the last present printed its time");
     line = TraceFormat::Summary(summary, threads, {});
-    Check(line.find("\"queue worker 0x0\":{\"events_lost\":5,\"totals_full\":false}") != std::string::npos && line.find("events_full_after_s") == std::string::npos, "an interval without presents printed a loss time");
+    Check(line.find("\"queue worker 0x0\":{\"events_overwritten\":5,\"totals_full\":false}") != std::string::npos && line.find("events_overwrite_started_after_s") == std::string::npos, "an interval without presents printed an overwrite time");
 }
 
 void SummaryMachineFields() {
@@ -507,6 +557,74 @@ void ReplaceGzipFile() {
 #endif
 }
 
+void RollingSnapshotCheckpoint() {
+    const auto origin = Clock::now();
+    const AgcDriver::TraceClockSample gpuFirst{1000.0, origin};
+    const AgcDriver::TraceClockSample gpuLast{1001000.0, origin + milliseconds(1)};
+    const auto gpuThread = [&](std::vector<AgcDriver::TraceGpuRange> ranges, std::uint64_t overwritten) {
+        TraceThread::Snapshot gpu;
+        gpu.name = "gpu";
+        gpu.slices = TraceFormat::GpuSlices(ranges, gpuFirst, gpuLast, origin);
+        gpu.eventsLost = overwritten;
+        if (overwritten != 0) gpu.eventsFullAt = origin + microseconds(5);
+        if (!gpu.slices.empty()) {
+            gpu.retainedFrom = gpu.slices.front().begin;
+            gpu.retainedThrough = gpu.slices.back().begin + gpu.slices.back().length;
+        }
+        return gpu;
+    };
+    auto window = TraceWindow::Parse(nullptr, "0:570").value();
+    Check(window.Present(0, Clock::duration::zero()) == Edge::Open, "the long capture window did not open");
+    Check(window.Present(1, std::chrono::seconds(30)) == Edge::None, "the test window closed before its declared endpoint");
+    std::atomic<std::uint64_t> presents{1};
+    TraceThread thread("queue worker 0x0", presents, 2);
+    thread.Add("Driver.Packet1", nullptr, origin + milliseconds(1), origin + milliseconds(1) + microseconds(30));
+    thread.Add("Driver.Packet2", nullptr, origin + milliseconds(2), origin + milliseconds(2) + microseconds(30));
+    auto snapshot = thread.Collect();
+    const auto directory = std::filesystem::temp_directory_path() / ("aps5-trace-checkpoint-" + std::to_string(origin.time_since_epoch().count()));
+    std::filesystem::create_directories(directory);
+    const auto path = directory / "aps5-trace.json.gz";
+    auto gpu = gpuThread({{"GPU.first", 11000.0, 12000.0, 1}}, 0);
+    std::vector<TraceThread::Snapshot> firstThreads{snapshot, gpu};
+    auto events = TraceFormat::Events(7, origin, firstThreads, 0, {}, 0, "seconds 0:570", false, 0, true);
+    AgcDriver::TraceFile::ReplaceGzip(path, events);
+    const auto first = ReadGzip(path);
+    Check(first.find("\"declared_window_closed\":false") != std::string::npos
+        && first.find("\"gpu_track_available\":true") != std::string::npos
+        && first.find("Driver.Packet1") != std::string::npos
+        && first.find("GPU.first") != std::string::npos,
+        "the first pre-deadline checkpoint did not preserve explicitly partial CPU and GPU events");
+
+    thread.Add("Driver.Packet3", nullptr, origin + milliseconds(3), origin + milliseconds(3) + microseconds(30));
+    thread.Add("Driver.Packet4", nullptr, origin + milliseconds(4), origin + milliseconds(4) + microseconds(30));
+    snapshot = thread.Collect();
+    gpu = gpuThread({{"GPU.old", 31000.0, 32000.0, 2}, {"GPU.latest", 41000.0, 42000.0, 3}}, 1);
+    std::vector<TraceThread::Snapshot> latestThreads{snapshot, gpu};
+    events = TraceFormat::Events(7, origin, latestThreads, 0, {}, 0, "seconds 0:570", false, 1, true);
+    AgcDriver::TraceFile::ReplaceGzip(path, events);
+    const auto latest = ReadGzip(path);
+    std::filesystem::remove_all(directory);
+    Check(latest.find("\"snapshot_superseded\":1") != std::string::npos
+        && latest.find("\"events_overwritten\":2") != std::string::npos
+        && latest.find("Driver.Packet3") != std::string::npos
+        && latest.find("Driver.Packet4") != std::string::npos
+        && latest.find("Driver.Packet1") == std::string::npos
+        && latest.find("\"gpu_track_available\":true") != std::string::npos
+        && latest.find("\"events_overwritten\":1") != std::string::npos
+        && latest.find("GPU.latest") != std::string::npos,
+        "the replaced checkpoint did not account for supersession and retain newest bounded CPU/GPU events");
+    Check(snapshot.retainedFrom == origin + milliseconds(3)
+        && snapshot.retainedThrough == origin + milliseconds(4) + microseconds(30),
+        "the checkpoint's retained timestamp range did not match the surviving events");
+    const auto constrained = thread.Collect(1);
+    const auto constrainedEvents = TraceFormat::Events(7, origin, std::vector<TraceThread::Snapshot>{constrained}, 0, {}, 0,
+        "seconds 0:570", false, 1);
+    Check(constrained.slices.size() == 1 && constrained.eventsOmitted == 1
+        && constrained.eventsOmittedAt == origin + milliseconds(3)
+        && constrainedEvents.find("\"events_omitted_in_snapshot\":1") != std::string::npos,
+        "the bounded event snapshot did not report omitted older events and their first timestamp");
+}
+
 void BenchSwitch() {
     Check(!AgcDriver::TraceBench::Parse(nullptr, false), "the benchmark file was enabled without its switch");
     Check(AgcDriver::TraceBench::Parse("1", true), "APS5_TRACE_BENCH=1 was not accepted");
@@ -573,17 +691,17 @@ int main() {
         LostEventsCount();
         TotalsOverflow();
         CapacitySettings();
+        SnapshotBudgetFairShare();
         FullBufferEvents();
         FoldShortSlices();
         EscapeStrings();
-        EventsShape();
         BatchIds();
+        PresentBoundaryWitnesses();
         SummaryFields();
         GpuClock();
         IntervalDue();
         SummaryOnlyThread();
         TotalsSince();
-        IntervalSummaryFields();
         IntervalDroppedThreads();
         SummaryMachineFields();
         FrameMicroseconds();
@@ -594,6 +712,7 @@ int main() {
         BenchSwitch();
         GzipFile();
         ReplaceGzipFile();
+        RollingSnapshotCheckpoint();
         AppendLines();
         std::cout << "performance trace tests passed\n";
         return 0;

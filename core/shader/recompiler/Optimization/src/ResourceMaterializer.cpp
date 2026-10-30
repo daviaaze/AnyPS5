@@ -1316,13 +1316,117 @@ void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, 
         throw std::runtime_error("materialization sources are missing buffer descriptors");
     }
     snapshot.buffers.assign(values.begin(), values.begin() + plan.info.buffers.size());
+    cursor += plan.info.buffers.size();
     if (GcnGuestShaders()) {
         for (auto& buffer : snapshot.buffers) {
             buffer.dwords[1] &= GcnBufferWord1Mask;
             buffer.dwords[3] = GcnBufferWord3(buffer.dwords[1], buffer.dwords[3]);
         }
     }
-    cursor += plan.info.buffers.size();
+    const auto capturedReadSafe = [&](std::uint32_t slot) {
+        if (runtime.readTrace == nullptr || slot >= plan.srtReads.size()) return false;
+        const auto flatOffset = plan.srtReads[slot].flatOffset;
+        bool leafSeen = false;
+        const auto overlapsWrite = [&](std::uint64_t address) {
+            if (address > UINT64_MAX - sizeof(std::uint32_t)) return true;
+            const std::uint64_t readEnd = address + sizeof(std::uint32_t);
+            for (std::uint32_t index = 0; index < plan.info.buffers.size(); ++index) {
+                const auto& buffer = plan.info.buffers[index];
+                if (!buffer.written && !buffer.atomic) continue;
+                const auto& descriptor = snapshot.buffers[index];
+                if (descriptor.dwordCount != 4u) return true;
+                const auto stride = static_cast<std::uint64_t>((descriptor.dwords[1] >> 16u) & 0x3fffu);
+                const auto bytes = stride == 0u ? static_cast<std::uint64_t>(descriptor.dwords[2]) : stride * descriptor.dwords[2];
+                const auto base = static_cast<std::uint64_t>(descriptor.dwords[0]) | (static_cast<std::uint64_t>(descriptor.dwords[1] & 0xffffu) << 32u);
+                if (bytes > UINT32_MAX || base > UINT64_MAX - bytes) return true;
+                if (address < base + bytes && base < readEnd) return true;
+            }
+            return false;
+        };
+        for (const auto& [readSlot, address] : runtime.readTrace->leaves) {
+            if (readSlot != flatOffset) continue;
+            leafSeen = true;
+            if (overlapsWrite(address)) return false;
+        }
+        if (!leafSeen) return false;
+        for (const auto address : runtime.readTrace->otherReads) {
+            if (overlapsWrite(address)) return false;
+        }
+        return true;
+    };
+    snapshot.bufferFootprints.resize(plan.info.buffers.size());
+    const auto resolveSource = [&](const BufferUniformSource& source, std::uint32_t& value) {
+        switch (source.kind) {
+        case BufferUniformSource::Kind::Constant:
+            value = source.value;
+            return true;
+        case BufferUniformSource::Kind::UserData:
+            if (source.value >= snapshot.userData.size()) return false;
+            value = snapshot.userData[source.value];
+            return true;
+        case BufferUniformSource::Kind::CapturedFlatSlot: {
+            if (source.value >= plan.srtReads.size() || snapshot.nullRootReads != 0u || !capturedReadSafe(source.value)) return false;
+            const auto flatOffset = plan.srtReads[source.value].flatOffset;
+            if (std::ranges::any_of(snapshot.srtPoison, [&](const SrtReadPoison& poison) { return poison.slot == flatOffset; })) return false;
+            if (flatOffset >= snapshot.flattenedSrt.size()) return false;
+            value = snapshot.flattenedSrt[flatOffset];
+            return true;
+        }
+        }
+        return false;
+    };
+    for (std::uint32_t resource = 0; resource < plan.info.buffers.size(); ++resource) {
+        if (resource >= plan.bufferAccessPlans.size()) continue;
+        const auto& accessPlan = plan.bufferAccessPlans[resource];
+        if (!accessPlan.complete || accessPlan.failed || accessPlan.accesses.empty()) continue;
+        const auto& descriptor = snapshot.buffers[resource];
+        // Linear hulls cannot cover swizzled addressing, even with indexStride zero.
+        if (descriptor.dwordCount != 4u || (descriptor.dwords[1] & (1u << 31u)) != 0u) continue;
+        const std::uint32_t stride = (descriptor.dwords[1] >> 16u) & 0x3fffu;
+        const std::uint32_t records = descriptor.dwords[2];
+        const std::uint32_t word3 = descriptor.dwords[3];
+        if (stride == 0u || records == 0u || (word3 & (1u << 23u)) != 0u ||
+            (word3 & (3u << 28u)) != 0u || (word3 & (3u << 21u)) != 0u) continue;
+        const std::uint64_t extent = static_cast<std::uint64_t>(stride) * records;
+        if (extent > UINT32_MAX) continue;
+        BufferTransferFootprint footprint;
+        footprint.bounded = true;
+        bool hasRead = false;
+        bool hasWrite = false;
+        for (const auto& access : accessPlan.accesses) {
+            std::uint32_t index = 0, offset = 0, soffset = 0;
+            if (!resolveSource(access.index, index) || !resolveSource(access.offset, offset) ||
+                !resolveSource(access.soffset, soffset) || index >= records || access.byteWidth == 0u ||
+                access.byteWidth > 16u || (access.byteWidth & 3u) != 0u) {
+                footprint.bounded = false;
+                break;
+            }
+            const std::uint64_t indexBase = static_cast<std::uint64_t>(index) * stride;
+            const std::uint64_t local = static_cast<std::uint64_t>(offset) + access.immediateOffset + soffset;
+            if (indexBase > UINT32_MAX || local > UINT32_MAX || indexBase + local > UINT32_MAX ||
+                local + access.byteWidth > stride || indexBase + local + access.byteWidth > extent) {
+                footprint.bounded = false;
+                break;
+            }
+            const std::uint64_t begin = indexBase + local;
+            const std::uint64_t end = begin + access.byteWidth;
+            if ((begin & 3u) != 0u || (end & 3u) != 0u) {
+                footprint.bounded = false;
+                break;
+            }
+            const bool read = access.access == BufferAccessClass::Read || access.access == BufferAccessClass::Atomic;
+            const bool write = access.access == BufferAccessClass::Write || access.access == BufferAccessClass::Atomic;
+            if (read) {
+                if (!hasRead) { footprint.readBegin = begin; footprint.readEnd = end; hasRead = true; }
+                else { footprint.readBegin = std::min(footprint.readBegin, begin); footprint.readEnd = std::max(footprint.readEnd, end); }
+            }
+            if (write) {
+                if (!hasWrite) { footprint.writeBegin = begin; footprint.writeEnd = end; hasWrite = true; }
+                else { footprint.writeBegin = std::min(footprint.writeBegin, begin); footprint.writeEnd = std::max(footprint.writeEnd, end); }
+            }
+        }
+        if (footprint.bounded) snapshot.bufferFootprints[resource] = footprint;
+    }
 
     snapshot.images.resize(plan.info.images.size());
     for (std::uint32_t i = 0; i < plan.info.images.size(); i++) {
@@ -1541,6 +1645,7 @@ void materializeSrtGuards(const IrResourcePlan& plan, ResourceSnapshot& snapshot
 struct DecodeMemoKey {
     std::uint64_t artifact = 0;
     std::uint32_t resource = 0;
+    std::uint32_t dwordCount = 0;
     std::array<std::uint32_t, 8> words{};
 
     bool operator==(const DecodeMemoKey& other) const = default;
@@ -1555,10 +1660,81 @@ struct DecodeMemoHash {
         };
         mix(key.artifact);
         mix(key.resource);
+        mix(key.dwordCount);
         for (const auto word : key.words) mix(word);
         return static_cast<std::size_t>(hash);
     }
 };
+
+// Keep repeated descriptor shapes off the shared hash table and its mutex.
+// Entries retain the complete normalized key, including the mode-source identity.
+struct HotDecodeMemo {
+    static constexpr std::size_t SetCount = 128;
+    static constexpr std::size_t Ways = 4;
+    struct Entry {
+        DecodeMemoKey key{};
+        std::uint32_t value = 0;
+        bool valid = false;
+    };
+    struct Set {
+        std::array<Entry, Ways> entries{};
+        std::size_t next = 0;
+    };
+    std::array<Set, SetCount> sets{};
+    std::uint32_t consecutiveMisses = 0;
+    std::uint32_t bypassRemaining = 0;
+
+    bool StartLookup() {
+        if (bypassRemaining == 0u) return true;
+        --bypassRemaining;
+        return false;
+    }
+
+    void RecordHit() {
+        consecutiveMisses = 0;
+    }
+
+    void RecordMiss() {
+        if (++consecutiveMisses == 64u) {
+            consecutiveMisses = 0;
+            bypassRemaining = 4096u;
+        }
+    }
+
+    bool Bypassing() const {
+        return bypassRemaining != 0u;
+    }
+
+    static std::size_t SetIndex(std::size_t hash) {
+        // Fold high hash bits down before selecting among the 128 sets.
+        auto mixed = static_cast<std::uint64_t>(hash);
+        mixed ^= mixed >> 33u;
+        mixed *= 0xff51afd7ed558ccdull;
+        mixed ^= mixed >> 33u;
+        return static_cast<std::size_t>(mixed) & (SetCount - 1u);
+    }
+
+    std::optional<std::uint32_t> Find(const DecodeMemoKey& key, std::size_t hash) const {
+        for (const auto& entry : sets[SetIndex(hash)].entries) {
+            if (entry.valid && entry.key == key) return entry.value;
+        }
+        return std::nullopt;
+    }
+
+    void Insert(const DecodeMemoKey& key, std::size_t hash, std::uint32_t value) {
+        auto& set = sets[SetIndex(hash)];
+        auto& entry = set.entries[set.next];
+        entry = {key, value, true};
+        set.next = (set.next + 1u) % Ways;
+    }
+};
+
+static_assert(sizeof(HotDecodeMemo) <= 64u * 1024u);
+
+HotDecodeMemo& hotDecodeMemo() {
+    struct Storage {};
+    return HostThreadLocal<HotDecodeMemo, Storage>();
+}
 
 struct DecodeMemo {
     std::mutex mutex;
@@ -1574,11 +1750,30 @@ constexpr std::uint32_t DecodeMemoEntries = 1u << 20u;
 constexpr std::uint32_t DecodeFailed = 0x80000000u;
 
 std::uint32_t decodeTableEntry(const ImageResource& image, std::span<const ImageResource> modes, const DescriptorValue& words, std::uint64_t memoKey, std::uint32_t resource) {
-    DecodeMemoKey key{memoKey, resource, words.dwords};
+    DecodeMemoKey key{memoKey, resource, words.dwordCount, words.dwords};
+    // Runtime mode selection observes the address only through raw nullness.
+    key.words[0] = nullImageDescriptor(words) ? 0u : 1u;
+    key.words[1] &= ~0xffu;
+    HotDecodeMemo* hot = nullptr;
+    std::size_t hash = 0;
+    bool probeHot = false;
     if (memoKey != 0u) {
+        hot = &hotDecodeMemo();
+        probeHot = hot->StartLookup();
+        if (probeHot) {
+            hash = DecodeMemoHash{}(key);
+            if (const auto value = hot->Find(key, hash)) {
+                hot->RecordHit();
+                return *value;
+            }
+            hot->RecordMiss();
+        }
         auto& memo = decodeMemo();
         std::lock_guard lock(memo.mutex);
-        if (const auto found = memo.entries.find(key); found != memo.entries.end()) return found->second;
+        if (const auto found = memo.entries.find(key); found != memo.entries.end()) {
+            if (probeHot && !hot->Bypassing()) hot->Insert(key, hash, found->second);
+            return found->second;
+        }
     }
     const auto match = ResourceMaterializer::TryRuntimeImageMode(image, words, modes);
     const auto value = match.mode.has_value() ? *match.mode : DecodeFailed | static_cast<std::uint32_t>(match.reason);
@@ -1587,6 +1782,7 @@ std::uint32_t decodeTableEntry(const ImageResource& image, std::span<const Image
         std::lock_guard lock(memo.mutex);
         if (memo.entries.size() >= DecodeMemoEntries) memo.entries.clear();
         memo.entries.emplace(key, value);
+        if (probeHot && !hot->Bypassing()) hot->Insert(key, hash, value);
     }
     return value;
 }
@@ -1660,8 +1856,8 @@ ResolvedImageTables ResourceMaterializer::ResolveImageTables(const ShaderInfo& i
     const auto& tables = snapshot.tables;
     if (tables.tables.size() != count) throw std::runtime_error("image table snapshot disagrees with the static tables");
     if (info.runtimeImageModes.size() != info.images.size()) throw std::runtime_error("prepared runtime image modes are missing");
-    out.map.assign(Abi::HeaderWords + Abi::TableWords * count, 0u);
-    out.map[Abi::HeaderVersion] = Abi::Version;
+    std::vector<std::uint32_t> map(Abi::HeaderWords + Abi::TableWords * count, 0u);
+    map[Abi::HeaderVersion] = Abi::Version;
     out.poison.push_back({{}, 0u, NoTable, PoisonReason::OutsideSnapshot});
     out.poison.push_back({{}, 0u, NoTable, PoisonReason::OutsideDomain});
     HashScratchIndex poisonIndex{threadScratch<HashSlot, PoisonIndexTag>()};
@@ -1699,8 +1895,8 @@ ResolvedImageTables ResourceMaterializer::ResolveImageTables(const ShaderInfo& i
         std::array<std::uint32_t, Abi::ImageRecordWords> record{0u, words.dwords[3], 0u};
         if ((words.availableDwordMask & (1u << 3u)) == 0u) {
             record[Abi::ImageRecordFlags] = poison(resource, PoisonReason::OutsideSnapshot, &words);
-            const auto offset = static_cast<std::uint32_t>(out.map.size());
-            out.map.insert(out.map.end(), record.begin(), record.end());
+            const auto offset = static_cast<std::uint32_t>(map.size());
+            map.insert(map.end(), record.begin(), record.end());
             return offset;
         }
         const auto decoded = decodeTableEntry(image, modes, words, memoKey, resource);
@@ -1735,8 +1931,8 @@ ResolvedImageTables ResourceMaterializer::ResolveImageTables(const ShaderInfo& i
                 }
             }
         }
-        const auto offset = static_cast<std::uint32_t>(out.map.size());
-        out.map.insert(out.map.end(), record.begin(), record.end());
+        const auto offset = static_cast<std::uint32_t>(map.size());
+        map.insert(map.end(), record.begin(), record.end());
         return offset;
     };
     const auto samplerRecord = [&](std::uint32_t resource, const DescriptorValue& words) {
@@ -1770,8 +1966,8 @@ ResolvedImageTables ResourceMaterializer::ResolveImageTables(const ShaderInfo& i
                 record[Abi::SamplerRecordElement] = *index;
             }
         }
-        const auto offset = static_cast<std::uint32_t>(out.map.size());
-        out.map.insert(out.map.end(), record.begin(), record.end());
+        const auto offset = static_cast<std::uint32_t>(map.size());
+        map.insert(map.end(), record.begin(), record.end());
         return offset;
     };
     std::vector<bool> outside(count, false);
@@ -1781,21 +1977,21 @@ ResolvedImageTables ResourceMaterializer::ResolveImageTables(const ShaderInfo& i
     const auto fill = [&](std::uint32_t resource, std::uint32_t table, bool sampler) {
         const auto& column = tables.tables.at(table);
         const auto header = Abi::TableHeader(table);
-        out.map[header + Abi::TableKeyCount] = column.keys;
-        out.map[header + Abi::TableSizeLow] = static_cast<std::uint32_t>(column.size);
-        out.map[header + Abi::TableSizeHigh] = static_cast<std::uint32_t>(column.size >> 32u);
-        out.map[header + Abi::TableBaseLow] = static_cast<std::uint32_t>(column.base);
-        out.map[header + Abi::TableBaseHigh] = static_cast<std::uint32_t>(column.base >> 32u);
+        map[header + Abi::TableKeyCount] = column.keys;
+        map[header + Abi::TableSizeLow] = static_cast<std::uint32_t>(column.size);
+        map[header + Abi::TableSizeHigh] = static_cast<std::uint32_t>(column.size >> 32u);
+        map[header + Abi::TableBaseLow] = static_cast<std::uint32_t>(column.base);
+        map[header + Abi::TableBaseHigh] = static_cast<std::uint32_t>(column.base >> 32u);
         if (column.codes.size() != column.keys) throw std::runtime_error("image table snapshot has a truncated map");
         if (column.fault != 0u) {
-            out.map[header + Abi::TableFault] = poison(resource, static_cast<PoisonReason>(column.fault & ~Abi::PoisonFlag), nullptr);
+            map[header + Abi::TableFault] = poison(resource, static_cast<PoisonReason>(column.fault & ~Abi::PoisonFlag), nullptr);
         } else if (!sampler && (info.images[resource].tableOperation == TableOperation::Unsupported || info.runtimeImageModes[resource].empty())) {
-            out.map[header + Abi::TableFault] = poison(resource, PoisonReason::UnsupportedOperation, nullptr);
+            map[header + Abi::TableFault] = poison(resource, PoisonReason::UnsupportedOperation, nullptr);
         }
         outside[table] = column.outside;
-        const auto mapStart = static_cast<std::uint32_t>(out.map.size());
-        out.map[header + Abi::TableMapStart] = mapStart;
-        out.map.resize(out.map.size() + column.keys, 0u);
+        const auto mapStart = static_cast<std::uint32_t>(map.size());
+        map[header + Abi::TableMapStart] = mapStart;
+        map.resize(map.size() + column.keys, 0u);
         records.Clear();
         for (std::uint32_t key = 0; key < column.keys; key++) {
             const auto code = column.codes[key];
@@ -1803,7 +1999,7 @@ ResolvedImageTables ResourceMaterializer::ResolveImageTables(const ShaderInfo& i
             if ((code & Abi::PoisonFlag) != 0u) {
                 const auto reason = static_cast<PoisonReason>(code & ~Abi::PoisonFlag);
                 mapped = reason == PoisonReason::OutsideDomain ? Abi::PoisonCode(Abi::OutsideDomainPoison) : poison(resource, reason, nullptr);
-            } else if (out.map[header + Abi::TableFault] == 0u) {
+            } else if (map[header + Abi::TableFault] == 0u) {
                 if (const auto known = records.Find(code)) {
                     mapped = *known;
                 } else {
@@ -1812,12 +2008,12 @@ ResolvedImageTables ResourceMaterializer::ResolveImageTables(const ShaderInfo& i
                     records.Set(code, mapped);
                 }
             }
-            out.map[mapStart + key] = mapped;
+            map[mapStart + key] = mapped;
         }
-        if (sampler && out.map[header + Abi::TableFault] == 0u) {
+        if (sampler && map[header + Abi::TableFault] == 0u) {
             DescriptorValue zero;
             zero.dwordCount = 4u;
-            out.map[header + Abi::TableOutsideCode] = samplerRecord(resource, zero);
+            map[header + Abi::TableOutsideCode] = samplerRecord(resource, zero);
         }
     };
     for (std::uint32_t resource = 0; resource < info.images.size(); resource++) {
@@ -1826,15 +2022,16 @@ ResolvedImageTables ResourceMaterializer::ResolveImageTables(const ShaderInfo& i
     for (std::uint32_t resource = 0; resource < info.samplers.size(); resource++) {
         if (info.samplers[resource].table != NoTable) fill(resource, info.samplers[resource].table, true);
     }
-    out.map[Abi::HeaderElementCount] = static_cast<std::uint32_t>(out.elements.size());
-    out.map[Abi::HeaderSamplerCount] = static_cast<std::uint32_t>(out.samplers.size());
-    out.map[Abi::HeaderPoisonCount] = static_cast<std::uint32_t>(out.poison.size());
-    out.map[Abi::HeaderTableCount] = count;
-    out.map[Abi::HeaderElementFaults] = static_cast<std::uint32_t>(out.map.size());
-    out.map.resize(out.map.size() + out.elements.size(), 0u);
-    out.map[Abi::HeaderSamplerFaults] = static_cast<std::uint32_t>(out.map.size());
-    out.map.resize(out.map.size() + out.samplers.size() / Abi::SamplerEntryElements, 0u);
+    map[Abi::HeaderElementCount] = static_cast<std::uint32_t>(out.elements.size());
+    map[Abi::HeaderSamplerCount] = static_cast<std::uint32_t>(out.samplers.size());
+    map[Abi::HeaderPoisonCount] = static_cast<std::uint32_t>(out.poison.size());
+    map[Abi::HeaderTableCount] = count;
+    map[Abi::HeaderElementFaults] = static_cast<std::uint32_t>(map.size());
+    map.resize(map.size() + out.elements.size(), 0u);
+    map[Abi::HeaderSamplerFaults] = static_cast<std::uint32_t>(map.size());
+    map.resize(map.size() + out.samplers.size() / Abi::SamplerEntryElements, 0u);
     out.faults = static_cast<std::uint32_t>(expectedCount + static_cast<std::size_t>(std::count(outside.begin(), outside.end(), true)));
+    out.map = SharedValues<std::uint32_t>(std::move(map));
     return out;
 }
 
@@ -2442,6 +2639,7 @@ IrResourcePlan ResourceMaterializer::ExtractPlan(const IrProgram& program) const
         }
         plan.materializationSources.push_back(index);
     };
+    plan.bufferAccessPlans = source.bufferAccessPlans;
     for (const auto& buffer : plan.info.buffers) addSource(buffer.source);
     for (const auto& image : plan.info.images) {
         if (image.source >= plan.descriptorSources.size()) {
@@ -2461,6 +2659,16 @@ IrResourcePlan ResourceMaterializer::ExtractPlan(const IrProgram& program) const
         }
     }
     plan.pureFlatSlots = Detail::ComputePureFlatSlots(plan);
+    for (const auto& accessPlan : plan.bufferAccessPlans) {
+        for (const auto& access : accessPlan.accesses) {
+            for (const auto* sourceValue : {&access.index, &access.offset, &access.soffset}) {
+                if (sourceValue->kind == BufferUniformSource::Kind::CapturedFlatSlot && sourceValue->value < plan.srtReads.size()) {
+                    const auto flatOffset = plan.srtReads[sourceValue->value].flatOffset;
+                    if (flatOffset < plan.pureFlatSlots.size()) plan.pureFlatSlots[flatOffset] = 0u;
+                }
+            }
+        }
+    }
     plan.guardedSrtSlots = Detail::ComputeGuardedFlatSlots(plan);
     ownPlanValues(plan);
     buildCompactPlan(plan);

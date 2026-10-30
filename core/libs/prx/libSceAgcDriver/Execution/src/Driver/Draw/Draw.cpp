@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawProgramTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
@@ -14,6 +15,7 @@
 #include "Optimization/ResourceProgram.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <atomic>
+#include <charconv>
 #include <array>
 #include <algorithm>
 #include <bit>
@@ -56,6 +58,123 @@ std::string ExceptionReason(const std::exception_ptr& failure) {
     } catch (...) {
     }
     return "unknown exception";
+}
+struct ProgramSelector {
+    std::array<std::uint64_t, 64> addresses{};
+    std::size_t count = 0;
+    bool specified = false;
+    bool valid = true;
+};
+
+ProgramSelector ParseProgramSelector(const char* variable) {
+    ProgramSelector selector;
+    const char* text = std::getenv(variable);
+    if (text == nullptr) return selector;
+    selector.specified = true;
+    auto remaining = std::string_view(text);
+    for (;;) {
+        const auto comma = remaining.find(',');
+        auto item = remaining.substr(0, comma);
+        if (item.starts_with("0x") || item.starts_with("0X")) item.remove_prefix(2);
+        std::uint64_t address = 0;
+        const auto parsed = std::from_chars(item.data(), item.data() + item.size(), address, 16);
+        if (item.empty() || parsed.ec != std::errc{} || parsed.ptr != item.data() + item.size()
+                || address == 0 || selector.count == selector.addresses.size()) {
+            selector.valid = false;
+            return selector;
+        }
+        selector.addresses[selector.count++] = address;
+        if (comma == std::string_view::npos) return selector;
+        remaining.remove_prefix(comma + 1);
+    }
+}
+
+// Unspecified selects every draw; an invalid selector selects none.
+bool ProgramStageSelected(const ProgramSelector& selector, std::span<const DrawProgram> programs, ShaderRecompiler::ShaderStage stage) {
+    if (!selector.valid) return false;
+    return !selector.specified || std::any_of(programs.begin(), programs.end(), [&](const DrawProgram& program) {
+        return program.binary.stage == stage
+                && std::find(selector.addresses.begin(), selector.addresses.begin() + selector.count, program.binary.codeAddress)
+                        != selector.addresses.begin() + selector.count;
+    });
+}
+
+bool DrawPayloadProgramsSelected(std::span<const DrawProgram> programs) {
+    static const auto vertexPrograms = ParseProgramSelector("APS5_DRAW_STATE_VERTEX_PROGRAMS");
+    return ProgramStageSelected(vertexPrograms, programs, ShaderRecompiler::ShaderStage::Vertex);
+}
+
+bool DrawTargetReadbackSelected(std::span<const DrawProgram> programs) {
+    static const auto pixelPrograms = ParseProgramSelector("APS5_DRAW_TARGET_READBACK_PIXEL_PROGRAMS");
+    return ProgramStageSelected(pixelPrograms, programs, ShaderRecompiler::ShaderStage::Fragment);
+}
+
+bool DrawPayloadTargetEligible(const Graphics::State& state, std::span<const DrawProgram> programs) {
+    return state.hasColorTarget && !state.depthTest && !state.depthWrite && DrawPayloadProgramsSelected(programs);
+}
+
+std::uint64_t LogDrawStateDiagnostic(const QueueState& queue, const Graphics::State& state,
+        std::span<const DrawProgram> programs, std::span<const ShaderRecompiler::ProgramRole> roles) {
+    static const bool enabled = std::getenv("APS5_DRAW_STATE_DIAGNOSTIC") != nullptr;
+    if (!enabled) return 0;
+    static const std::uint64_t skip = [] {
+        const char* text = std::getenv("APS5_DRAW_STATE_SKIP");
+        return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+    }();
+    static const std::uint64_t limit = [] {
+        const char* text = std::getenv("APS5_DRAW_STATE_COUNT");
+        const auto parsed = text != nullptr ? std::strtoull(text, nullptr, 10) : 64ull;
+        return std::min<std::uint64_t>(parsed, 4096);
+    }();
+    static const bool timedTrace = std::getenv("APS5_TRACE_SECONDS") != nullptr;
+    static std::atomic<std::uint64_t> ordinal{0}, emitted{0};
+    const auto draw = ordinal.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (draw <= skip || limit == 0 || (timedTrace && !PerformanceTrace::CapturingRawWindow())) return 0;
+    // Screen-space color candidates, not a claim that every selected draw is UI.
+    // Keep the global ordinal/skip semantics, but never spend slots on shadows.
+    if (!DrawPayloadTargetEligible(state, programs)) return 0;
+    auto count = emitted.load(std::memory_order_relaxed);
+    while (count < limit && !emitted.compare_exchange_weak(count, count + 1, std::memory_order_relaxed)) {}
+    if (count >= limit) return 0;
+    const auto& cx = queue.context;
+    const auto reg = [&cx](std::uint32_t offset) { const auto it = cx.find(offset); return it == cx.end() ? 0u : it->second; };
+    std::fprintf(stderr,
+            "[draw-state] ordinal=%llu target=%ux%u color_address=0x%llx color_extent=%ux%u blend_enable=%u color_write_mask=0x%x blend_color=%u,%u,%u blend_alpha=%u,%u,%u blend_constants=%a,%a,%a,%a color_rop=0x%x dual_source=%u reversed_blend=0x%x depth_test=%u depth_write=%u vte=0x%08x viewport_raw=%08x,%08x,%08x,%08x,%08x,%08x clip=0x%08x scissor_raw=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x decoded_viewport=%g,%g,%g,%g,%g,%g decoded_scissor=%d,%d,%u,%u shaders=",
+            static_cast<unsigned long long>(draw), state.renderExtent.width, state.renderExtent.height,
+            static_cast<unsigned long long>(state.color.address), state.color.extent.width, state.color.extent.height,
+            static_cast<unsigned>(state.blend.blendEnable), static_cast<unsigned>(state.blend.colorWriteMask),
+            static_cast<unsigned>(state.blend.srcColorBlendFactor), static_cast<unsigned>(state.blend.dstColorBlendFactor), static_cast<unsigned>(state.blend.colorBlendOp),
+            static_cast<unsigned>(state.blend.srcAlphaBlendFactor), static_cast<unsigned>(state.blend.dstAlphaBlendFactor), static_cast<unsigned>(state.blend.alphaBlendOp),
+            state.blendConstants[0], state.blendConstants[1], state.blendConstants[2], state.blendConstants[3],
+            static_cast<unsigned>(state.colorRop), static_cast<unsigned>(state.dualSourceBlend), state.reversedBlend,
+            static_cast<unsigned>(state.depthTest), static_cast<unsigned>(state.depthWrite),
+            reg(0x206), reg(0x10f), reg(0x110), reg(0x111), reg(0x112), reg(0x113), reg(0x114),
+            reg(0x204), reg(0x0c), reg(0x0d), reg(0x81), reg(0x82), reg(0x90), reg(0x91), reg(0x94), reg(0x95),
+            state.viewport.x, state.viewport.y, state.viewport.width, state.viewport.height, state.viewport.minDepth, state.viewport.maxDepth,
+            state.scissor.offset.x, state.scissor.offset.y, state.scissor.extent.width, state.scissor.extent.height);
+    for (std::size_t i = 0; i < programs.size(); ++i) {
+        const auto& program = programs[i];
+        std::fprintf(stderr, "%s%u/%u@0x%llx", i == 0 ? "" : ",",
+                static_cast<unsigned>(program.binary.stage), static_cast<unsigned>(roles[i]),
+                static_cast<unsigned long long>(program.binary.codeAddress));
+    }
+    std::fputc('\n', stderr);
+    for (std::size_t index = 0; index < std::min<std::size_t>(state.colors.size(), 8); ++index) {
+        const auto& color = state.colors[index];
+        if (color.exportIndex >= state.blends.size()) {
+            std::fprintf(stderr, "[draw-state] ordinal=%llu color_index=%zu export_index=%u status=missing-blend\n",
+                    static_cast<unsigned long long>(draw), index, color.exportIndex);
+            continue;
+        }
+        const auto& blend = state.blends[color.exportIndex];
+        std::fprintf(stderr, "[draw-state] ordinal=%llu color_index=%zu export_index=%u color_address=0x%llx color_format=%u blend_enable=%u color_write_mask=0x%x blend_color=%u,%u,%u blend_alpha=%u,%u,%u\n",
+                static_cast<unsigned long long>(draw), index, color.exportIndex,
+                static_cast<unsigned long long>(color.address), static_cast<unsigned>(color.format),
+                static_cast<unsigned>(blend.blendEnable), static_cast<unsigned>(blend.colorWriteMask),
+                static_cast<unsigned>(blend.srcColorBlendFactor), static_cast<unsigned>(blend.dstColorBlendFactor), static_cast<unsigned>(blend.colorBlendOp),
+                static_cast<unsigned>(blend.srcAlphaBlendFactor), static_cast<unsigned>(blend.dstAlphaBlendFactor), static_cast<unsigned>(blend.alphaBlendOp));
+    }
+    return draw;
 }
 
 const char* ExceptionType(const std::exception_ptr& failure) {
@@ -126,6 +245,7 @@ struct DrawTail {
     bool profile = false;
     std::array<double, DrawDriverPhaseCount> phaseMs{};
     std::uint64_t captures = 0;
+    std::uint64_t spatialDiagnosticOrdinal = 0;
     std::chrono::steady_clock::time_point phaseLap{};
     DrawPhaseTiming phaseTiming{false, phaseMs, phaseLap};
     Pm4::DrawParameters drawParameters{};
@@ -329,7 +449,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         pending.tailAt = phaseLap;
         return DrawVerdict::Drawn;
     };
-    const std::uint64_t traceToken = TraceShaderCorrelation() ? NextDrawTraceToken().fetch_add(1, std::memory_order_relaxed) + 1 : 0;
+    static const bool drawPayloadEnabled = std::getenv("APS5_DRAW_PAYLOAD_DIAGNOSTIC") != nullptr;
+    std::uint64_t traceToken = TraceShaderCorrelation() ? NextDrawTraceToken().fetch_add(1, std::memory_order_relaxed) + 1 : 0;
     if (traceToken != 0) {
         AgcDriver::CaptureTrace::LogBestEffort("draw-attempt token=%llu submission=%llu queue=%x offset=%zu",
                 static_cast<unsigned long long>(traceToken), static_cast<unsigned long long>(submission.serial), submission.queue, packetOffset);
@@ -518,6 +639,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     for (const auto& patch : userPatches) writablePrograms[patch.program].userData[patch.index] = patch.value;
     tail.programs = writesPrograms ? &writablePrograms : &decode->programs;
     const auto& programs = *tail.programs;
+    tail.spatialDiagnosticOrdinal = LogDrawStateDiagnostic(queue, graphics, programs, decode->roles);
+    if (drawPayloadEnabled && tail.spatialDiagnosticOrdinal != 0 && traceToken == 0) traceToken = NextDrawTraceToken().fetch_add(1, std::memory_order_relaxed) + 1;
     if (const auto skipped = SkippedShader(); skipped != 0 && std::any_of(programs.begin(), programs.end(), [skipped](const DrawProgram& program) { return program.binary.codeAddress == skipped; })) return drawn();
     const bool emptyIndirectSkip = EmptyIndirectSkip();
     auto& cpuIndirectPrograms = CpuIndirectPrograms();
@@ -625,6 +748,11 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
 
     auto& stageCaptures = tail.stageCaptures;
     stageCaptures.resize(programs.size());
+    // A stage variant first seen in a non-screen-space pass may be reused by
+    // a later eligible draw; keep its selected source without spending a slot.
+    if (drawPayloadEnabled && DrawPayloadProgramsSelected(programs)) {
+        for (auto& stage : stageCaptures) stage.captureSelectedRequest = true;
+    }
     auto& matched = tail.matched;
     matched.resize(programs.size());
     auto& matchedRegions = tail.matchedRegions;
@@ -682,7 +810,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     tail.relocatedDecode = relocatedDecode;
     std::uint64_t stageDataVerified = 0;
     const auto target = graphics.hasColorTarget ? graphics.color.address : 0;
-    const VulkanDevice::DrawTraceContext trace{traceToken, submission.serial, submission.queue, packetOffset, target};
+    VulkanDevice::DrawTraceContext trace{traceToken, submission.serial, submission.queue, packetOffset, drawPayloadEnabled ? tail.spatialDiagnosticOrdinal : 0, target};
+    trace.targetReadback = trace.payloadOrdinal != 0 && DrawTargetReadbackSelected(programs);
     const auto* tracePtr = trace.token != 0 ? &trace : nullptr;
     tail.traceToken = traceToken;
     tail.trace = trace;
@@ -941,6 +1070,91 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             else if (dataEntry != nullptr) ++dataStagesCompiled;
         }
         const auto& result = *programResults[i];
+        // Inspect only already-materialized state: never read guest vertex/constant
+        // pointers here, wait for producers, or change resource ownership.
+        // DecodeGraphicsPrograms emits at most Local/Hull/Domain/Fragment;
+        // reserve one extra slot without allowing future stage growth to flood logs.
+        if (tail.spatialDiagnosticOrdinal != 0 && i < 5) {
+            const auto ordinal = static_cast<unsigned long long>(tail.spatialDiagnosticOrdinal);
+            const auto shader = static_cast<unsigned long long>(program.binary.codeAddress);
+            const auto stamp = std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+            const auto role = static_cast<unsigned>(decode->roles[i]);
+            const auto userCount = std::min<std::size_t>(program.userData.size(), 32);
+            const auto pushCount = std::min<std::size_t>(result.pushConstants.size() / 4, 32);
+            const auto attributeCount = std::min<std::size_t>(result.vertexAttributes.size(), 16);
+            std::fprintf(stderr, "[draw-state] ordinal=%llu spatial_shader=0x%llx stage_index=%zu stage=%u role=%u stages_total=%zu stages_emitted=%zu monotonic_us=%lld attributes=%zu attributes_emitted=%zu user_words=%zu user_words_emitted=%zu push_bytes=%zu push_words_emitted=%zu\n",
+                    ordinal, shader, i, static_cast<unsigned>(program.binary.stage), role,
+                    programs.size(), std::min<std::size_t>(programs.size(), 5),
+                    static_cast<long long>(stamp), result.vertexAttributes.size(), attributeCount,
+                    program.userData.size(), userCount, result.pushConstants.size(), pushCount);
+            // Cache hits need not retain a complete invocation's captured memory.
+            // Dump immutable decoded code instead of advertising a partial .req.
+            // This selection and formatting allocate nothing and never read guest memory.
+            if (program.binary.stage != ShaderRecompiler::ShaderStage::Fragment && !program.binary.code.empty()) {
+                static std::mutex codeMutex;
+                static std::array<std::uint64_t, 32> codeAddresses{};
+                static std::size_t codeAddressCount = 0;
+                std::lock_guard codeLock(codeMutex);
+                const auto end = codeAddresses.begin() + codeAddressCount;
+                if (codeAddressCount < codeAddresses.size() &&
+                        std::find(codeAddresses.begin(), end, program.binary.codeAddress) == end) {
+                    const auto codeId = codeAddressCount;
+                    codeAddresses[codeAddressCount++] = program.binary.codeAddress;
+                    const auto wordCount = std::min<std::size_t>(program.binary.code.size(), 4096);
+                    // One complete record prevents individual words interleaving
+                    // with candidate/user/push lines from other drawing threads.
+                    static std::array<char, 4096 * 9 + 1> words;
+                    constexpr char hex[] = "0123456789abcdef";
+                    for (std::size_t word = 0; word < wordCount; ++word) {
+                        const auto bits = program.binary.code[word];
+                        for (unsigned digit = 0; digit < 8; ++digit)
+                            words[word * 9 + digit] = hex[(bits >> (28u - digit * 4u)) & 0xfu];
+                        words[word * 9 + 8] = word + 1 == wordCount ? '\0' : ',';
+                    }
+                    std::fprintf(stderr, "[draw-state] ordinal=%llu spatial_shader=0x%llx stage_index=%zu role=%u source=immutable_vertex_code code_id=%zu code_address=0x%llx words_total=%zu words_emitted=%zu truncated=%u encoding=u32_hex words=%s\n",
+                            ordinal, shader, i, role, codeId, shader, program.binary.code.size(), wordCount,
+                            static_cast<unsigned>(wordCount != program.binary.code.size()), words.data());
+                }
+            }
+            // Candidates are not asserted positions/matrices. A complete bounded
+            // line per source avoids interleaving individual words between draws.
+            const auto logWords = [&](const char* source, std::size_t count, bool push) {
+                std::array<char, 2048> line{};
+                std::size_t used = 0, written = 0;
+                for (std::size_t word = 0; word < count; ++word) {
+                    std::uint32_t bits;
+                    if (push) std::memcpy(&bits, result.pushConstants.data() + word * 4, sizeof(bits));
+                    else bits = program.userData[word];
+                    const auto position = push ? word * 4 : program.firstUserSgpr + word;
+                    const auto size = std::snprintf(line.data() + used, line.size() - used,
+                            "%s%zu:%08x/%g", word == 0 ? "" : ",", position, bits, std::bit_cast<float>(bits));
+                    if (size < 0 || static_cast<std::size_t>(size) >= line.size() - used) {
+                        line[used] = '\0';
+                        break;
+                    }
+                    used += static_cast<std::size_t>(size);
+                    ++written;
+                }
+                std::fprintf(stderr, "[draw-state] ordinal=%llu spatial_shader=0x%llx stage_index=%zu role=%u source=%s words_emitted=%zu words_selected=%zu encoding=position:raw/float_candidate words=%s\n",
+                        ordinal, shader, i, role, source, written, count, line.data());
+            };
+            logWords("user_sgpr", userCount, false);
+            logWords("push_byte", pushCount, true);
+            for (std::size_t attributeIndex = 0; attributeIndex < attributeCount; ++attributeIndex) {
+                const auto& attribute = result.vertexAttributes[attributeIndex];
+                const auto& fields = attribute.resource.fields;
+                const auto address = fields[0] | (static_cast<std::uint64_t>(fields[1] & 0xffffu) << 32u);
+                const auto format = Graphics::DecodeVertexFormat(attribute);
+                std::fprintf(stderr, "[draw-state] ordinal=%llu spatial_shader=0x%llx stage_index=%zu role=%u attribute=%zu location=%u components=%u format_components=%u fetch_index=%u descriptor=%08x,%08x,%08x,%08x address=0x%llx stride=%u records=%u vk_format=%u fetch_bytes=%u alignment=%u null=%u out_of_range=%u\n",
+                        ordinal, shader, i, role, attributeIndex, attribute.location, attribute.components,
+                        attribute.formatComponents, attribute.fetchIndex, fields[0], fields[1], fields[2], fields[3],
+                        static_cast<unsigned long long>(address), (fields[1] >> 16u) & 0x3fffu, fields[2],
+                        static_cast<unsigned>(format.format), format.bytes, format.alignment,
+                        static_cast<unsigned>(Graphics::NullVertexDescriptor(attribute)),
+                        static_cast<unsigned>(Graphics::VertexFetchOutOfRange(attribute)));
+            }
+        }
         if (i == 0 && drawParameters.indirect) {
             indirectCpu = ClassifyIndirectDraw(result, graphics, programs.front(), localDevice, drawParameters, traceIndirect);
             if (EmptyIndirectSkip()) CpuIndirectPrograms()[programs.front().binary.codeAddress] = indirectCpu.has_value();
@@ -1065,6 +1279,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         for (const auto& region : memory) snapshots.push_back({region.guestAddress, region.bytes});
     };
     snapshot();
+    if (tail.trace.payloadOrdinal != 0 && !drawParameters.indirect) CaptureSelectedDrawRequests(programs, stageCaptures, matched, memory, linked, tail.trace, 0);
     timing.Mark("post_compile_prepare");
     const auto lockForDraw = [&] {
         require(tail.queue != nullptr, "the draw finisher reached a draw it cannot commit through the pipeline");
@@ -1161,6 +1376,10 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             fold(*programResults[0], direct);
             if (graphics.rectList && patched.contains(0)) buildRectList();
             snapshot();
+            if (tail.trace.payloadOrdinal != 0) {
+                tail.trace.requestBytes = 0;
+                CaptureSelectedDrawRequests(programs, stageCaptures, matched, memory, linked, tail.trace, record + 1);
+            }
             if (auto known = localDevice->KnownDrawRejection(graphics, stages)) {
                 rejected = std::move(*known);
                 return DrawVerdict::Rejected;
@@ -1171,10 +1390,10 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                 const auto commitQueue = submission.queue;
                 const auto commitPacket = tail.packetOpcode;
                 const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
-                auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), direct, stages = std::move(stages), snapshots = std::move(snapshots), commitQueue, commitPacket, epoch, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData)] {
+                auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), direct, stages = std::move(stages), snapshots = std::move(snapshots), commitQueue, commitPacket, epoch, trace = trace, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData)] {
                     DrawPipeline::FollowEpoch(epoch);
                     GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
-                    commitDraw(localDevice, commitQueue, decode->state, direct, stages, snapshots, nullptr, {}, 0);
+                    commitDraw(localDevice, commitQueue, decode->state, direct, stages, snapshots, nullptr, {}, 0, trace);
                 };
                 auto held = std::make_shared<decltype(commit)>(std::move(commit));
                 DrawPipeline::Queue0().Enqueue([held] { (*held)(); }, std::move(writes));
@@ -1251,18 +1470,51 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
 
 void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, VulkanDevice::DrawTraceContext trace) {
     const auto* tracePtr = trace.token != 0 ? &trace : nullptr;
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    using Clock = std::chrono::steady_clock;
+    using CommitTimes = std::array<double, static_cast<std::size_t>(Graphics::DrawCommitPart::Count)>;
+    const auto part = [](Graphics::DrawCommitPart value) { return static_cast<std::size_t>(value); };
+    const auto micros = [](Clock::time_point from, Clock::time_point to) { return std::chrono::duration<double, std::micro>(to - from).count(); };
+    CommitTimes us{};
+    Clock::time_point lap{};
+    Clock::time_point locked{};
+    if (profile) lap = Clock::now();
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
-    std::lock_guard gpuLock(GuestMemory::GpuMutex());
-    if (auto current = device.Load(); current != nullptr && current != localDevice) localDevice = std::move(current);
+    std::unique_lock gpuLock(GuestMemory::GpuMutex());
+    if (profile) {
+        locked = Clock::now();
+        us[part(Graphics::DrawCommitPart::MutexWait)] = micros(lap, locked);
+        lap = locked;
+    }
+    // Runs submitDueAfterCommit under the lock on every normal exit; when profiling it also
+    // closes the timing record, then releases the lock before handing the totals over.
     struct SubmitDue {
         Driver& driver;
         const std::shared_ptr<VulkanDevice>& device;
+        std::unique_lock<std::remove_reference_t<decltype(GuestMemory::GpuMutex())>>& held;
+        bool profile;
+        CommitTimes& us;
+        Clock::time_point& lap;
+        Clock::time_point locked;
         ~SubmitDue() noexcept(false) {
+            const auto before = profile ? Clock::now() : Clock::time_point{};
+            if (profile) us[static_cast<std::size_t>(Graphics::DrawCommitPart::DeviceDraw)] += std::chrono::duration<double, std::micro>(before - lap).count();
             if (std::uncaught_exceptions() == 0) driver.submitDueAfterCommit(device.get());
+            if (profile) {
+                const auto after = Clock::now();
+                us[static_cast<std::size_t>(Graphics::DrawCommitPart::SubmitDue)] += std::chrono::duration<double, std::micro>(after - before).count();
+                us[static_cast<std::size_t>(Graphics::DrawCommitPart::MutexHold)] = std::chrono::duration<double, std::micro>(after - locked).count();
+                held.unlock();
+                Graphics::NoteDrawCommit(us);
+            }
         }
-    } submitDue{*this, localDevice};
+    } submitDue{*this, localDevice, gpuLock, profile, us, lap, locked};
+    if (auto current = device.Load(); current != nullptr && current != localDevice) localDevice = std::move(current);
+    if (profile) lap = Clock::now();
     recordLabelsForPacket(localDevice.get(), queue);
+    if (profile) { const auto now = Clock::now(); us[static_cast<std::size_t>(Graphics::DrawCommitPart::Labels)] += std::chrono::duration<double, std::micro>(now - lap).count(); lap = now; }
     noteDrawWriters(stages, queue);
+    if (profile) { const auto now = Clock::now(); us[static_cast<std::size_t>(Graphics::DrawCommitPart::Writers)] += std::chrono::duration<double, std::micro>(now - lap).count(); lap = now; }
     if (recipe != nullptr) {
         if (localDevice->DrawFromRecipe(graphics, drawParameters, stages, snapshots, recipe, tracePtr) == RecipeOutcome::Recorded) return;
         VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);

@@ -1,6 +1,9 @@
 #ifndef CORE_SHADER_RECOMPILIER_INCLUDE_SHADER_RECOMPILIER_RECOMPILER_HPP
 #define CORE_SHADER_RECOMPILIER_INCLUDE_SHADER_RECOMPILIER_RECOMPILER_HPP
 
+#include "BufferTransferFootprint.hpp"
+#include "IntermediateRepresentation/include/IntermediateRepresentation/ResourceKey.hpp"
+#include "IntermediateRepresentation/include/IntermediateRepresentation/SharedValues.hpp"
 #include "RuntimeAbi.hpp"
 #include "PipelineSpecialization.hpp"
 #include "prx/libc/include/general/AtomicSharedPtr.hpp"
@@ -494,7 +497,7 @@ struct DescriptorBinding {
     std::uint32_t descriptorSet;
     std::uint32_t binding;
     std::uint32_t count;
-    std::vector<std::uint32_t> guestDescriptor;
+    SharedValues<std::uint32_t> guestDescriptor;
     bool readOnly = false;
     std::optional<DescriptorImageShape> imageShape;
     std::vector<bool> samplerDepthCompare;
@@ -522,6 +525,7 @@ struct DescriptorBinding {
     std::vector<std::uint32_t> imageSamplers;
     std::vector<bool> bufferRead;
     std::vector<std::uint32_t> bufferExtent;
+    SharedValues<BufferTransferFootprint> bufferFootprints;
 };
 
 struct ImageTableEntryPoison {
@@ -639,7 +643,7 @@ public:
     std::vector<std::uint32_t>::iterator insert(std::vector<std::uint32_t>::const_iterator where, std::initializer_list<std::uint32_t> values) { return Mutable().insert(where, values); }
     friend bool operator==(const SharedSpirv& left, const SharedSpirv& right) { return std::ranges::equal(left.Words(), right.Words()); }
 
-private:
+    friend SharedSpirv InternSpirv(std::vector<std::uint32_t> words);
     struct Holder {
         Holder(std::vector<std::uint32_t> words, std::shared_ptr<const void> owner, std::span<const std::uint32_t> view) : words(std::move(words)), owner(std::move(owner)), view(view) {}
         [[nodiscard]] std::span<const std::uint32_t> Words() const { return owner ? view : std::span<const std::uint32_t>(words); }
@@ -649,21 +653,32 @@ private:
         mutable std::atomic<std::uint64_t> hashLow{0};
         mutable std::atomic<std::uint64_t> hashHigh{0};
         mutable std::atomic<bool> hashed{false};
+        bool interned = false;
     };
-
+    [[nodiscard]] static SharedSpirv FromInternedHolder(std::shared_ptr<Holder> value) {
+        SharedSpirv result;
+        result.holder = std::move(value);
+        return result;
+    }
     std::vector<std::uint32_t>& Mutable() {
-        if (holder == nullptr || holder.use_count() != 1 || holder->owner != nullptr) {
+        if (holder == nullptr || holder->interned || holder.use_count() != 1 || holder->owner != nullptr) {
             holder = std::make_shared<Holder>(Copy(), nullptr, std::span<const std::uint32_t>{});
         } else {
             holder->hashed.store(false, std::memory_order_relaxed);
         }
         return holder->words;
     }
-
     std::shared_ptr<Holder> holder;
 };
 
 [[nodiscard]] SharedSpirv InternSpirv(std::vector<std::uint32_t> words);
+
+struct SpecializedModuleBindings {
+    std::vector<std::uint32_t> bindings;
+    bool pushData = false;
+};
+
+[[nodiscard]] SpecializedModuleBindings ScanSpecializedModuleBindings(std::span<const std::uint32_t> words);
 
 struct VertexInput {
     std::uint32_t location;
@@ -715,6 +730,15 @@ struct CompiledShaderArtifact {
     std::uint64_t variantId = 0;
 };
 
+struct SpecializedModuleCacheData {
+    SharedSpirv spirv;
+    std::vector<std::uint32_t> bindings;
+    bool pushData = false;
+    std::uint64_t specializationId = 0;
+};
+
+[[nodiscard]] SpecializedModuleCacheData BuildSpecializedModuleForCache(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target);
+
 struct ShaderInvocation {
     std::vector<PipelineSpecializationConstant> specialization;
     std::uint64_t specializationId = 0;
@@ -726,7 +750,7 @@ struct ShaderInvocation {
     std::uint32_t poisonedSrtReads = 0;
     std::vector<ImageTableEntryPoison> imageTablePoison;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> imageTableRanges;
-    std::vector<std::vector<std::pair<std::uint64_t, std::uint64_t>>> imageTableReadRanges;
+    std::vector<SharedValues<std::pair<std::uint64_t, std::uint64_t>>> imageTableReadRanges;
     std::uint64_t imageTableShader = 0;
     std::uint32_t imageTableFaults = 0;
 };
@@ -746,11 +770,11 @@ struct PipelineIdentity {
 };
 
 struct ResultKeyMemo {
-    mutable AtomicSharedPtr<const std::vector<std::uint32_t>> words;
+    mutable AtomicSharedPtr<const ResourceKey> key;
     ResultKeyMemo() = default;
     ResultKeyMemo(const ResultKeyMemo&) {}
     ResultKeyMemo& operator=(const ResultKeyMemo&) {
-        words.store(nullptr, std::memory_order_relaxed);
+        key.store(nullptr, std::memory_order_relaxed);
         return *this;
     }
 };
@@ -760,6 +784,9 @@ struct RecompileResult : CompiledShaderArtifact, ShaderInvocation {
     bool cacheHit = false;
     std::uint32_t workgroupMemoryDwords = 0;
     std::vector<std::uint32_t> shaderDataUserWords;
+    // Results retain prepared plans; only legacy by-value results retain their source cache entry.
+    std::shared_ptr<const void> preparedPlanOwner;
+    std::shared_ptr<const void> sourceOwner;
     [[nodiscard]] std::uint64_t PipelineVariantId() const { return specializationId != 0 ? specializationId : variantId; }
     [[nodiscard]] PipelineIdentity Identity() const {
         const auto hash = spirv.ContentHash();

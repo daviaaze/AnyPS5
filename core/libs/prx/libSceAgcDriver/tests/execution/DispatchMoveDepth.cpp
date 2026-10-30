@@ -209,12 +209,14 @@ void RunRow(AgcDriver::VulkanDevice& device, const ShaderRecompiler::RecompileRe
     for (auto& binding : result.bindings) {
         if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
         Require(binding.guestDescriptor.size() == static_cast<std::size_t>(binding.count) * 4u, "dispatch move depth: the program's buffer bindings have another shape");
+        auto descriptorWords = binding.guestDescriptor.Copy();
         for (std::uint32_t element = 0; element < binding.count; ++element, ++elements) {
-            auto* current = binding.guestDescriptor.data() + static_cast<std::size_t>(element) * 4u;
+            auto* current = descriptorWords.data() + static_cast<std::size_t>(element) * 4u;
             const auto built = static_cast<std::uint64_t>(current[0]) | (static_cast<std::uint64_t>(current[1] & 0xffffu) << 32u);
             const auto words = built == static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(output)) ? BufferDescriptor(output, Bytes) : BufferDescriptor(input, Bytes);
             std::copy(words.begin(), words.end(), current);
         }
+        binding.guestDescriptor = ShaderRecompiler::SharedValues<std::uint32_t>(std::move(descriptorWords));
     }
     Require(elements == 2, "dispatch move depth: the program does not bind an input and an output");
     device.Dispatch(result, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(RowCode.data()));

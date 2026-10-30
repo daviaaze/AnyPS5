@@ -175,14 +175,16 @@ void Driver::stop() {
     StopWorkerSampler();
     CloseRegistrationPreparation();
     Graphics::StopPipelineLibraryWorker();
-    std::lock_guard gpuLock(GuestMemory::GpuMutex());
-    Graphics::ReportHostImports();
-    device.Reset();
-    replacedDevices.clear();
-    Graphics::FlushPipelineJournal();
-    Graphics::ShutdownGuestBufferWorkers();
-    Graphics::StopCompareHelpers();
-    ShaderRecompiler::ShaderDiskCache::Shutdown();
+    {
+        std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        Graphics::ReportHostImports();
+        device.Reset();
+        replacedDevices.clear();
+        Graphics::FlushPipelineJournal();
+        Graphics::ShutdownGuestBufferWorkers();
+        Graphics::StopCompareHelpers();
+        ShaderRecompiler::ShaderDiskCache::Shutdown();
+    }
     PerformanceTrace::StopOutput();
     FlushAsyncLogAtEnd_nid_no_patch();
     StopProfileOutput_nid_no_patch();

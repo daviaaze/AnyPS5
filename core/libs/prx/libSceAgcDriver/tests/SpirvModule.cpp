@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <exception>
 #include <map>
+#include <memory>
 #include <set>
 #include <string>
 #include <spirv/unified1/spirv.hpp>
@@ -460,6 +461,31 @@ void testInternedSpirvSharesEqualWords() {
     check(edited[6] == spv::CapabilityFloat64 && first[6] == spv::CapabilityShader && again.data() == first.data(), "a write to one holder of interned SPIR-V changed the others");
 }
 
+void testInternedSpirvReleasesUnusedWords() {
+    const std::vector<std::uint32_t> words{spv::MagicNumber, 0x00010400u, 0u, 7u, 0u, (2u << 16u) | spv::OpCapability, spv::CapabilityShader};
+    std::weak_ptr<SharedSpirv::Holder> observer;
+    {
+        const auto first = InternSpirv(words);
+        observer = first.holder;
+        {
+            const auto alias = InternSpirv(words);
+            check(alias.data() == first.data(), "live interned words were not shared");
+        }
+        check(!observer.expired(), "interned words were released while a consumer still owned them");
+    }
+    check(observer.expired(), "the interner retained words after the last consumer released them");
+}
+
+void testSoleInternedOwnerDetachesBeforeMutation() {
+    const std::vector<std::uint32_t> words{spv::MagicNumber, 0x00010400u, 0u, 7u, 0u, (2u << 16u) | spv::OpCapability, spv::CapabilityShader};
+    auto edited = InternSpirv(words);
+    const std::weak_ptr<SharedSpirv::Holder> original = edited.holder;
+    edited[6] = spv::CapabilityFloat64;
+    check(original.expired(), "mutation reused backing that was published in the interner");
+    const auto again = InternSpirv(words);
+    check(std::ranges::equal(again.Words(), words) && edited[6] == spv::CapabilityFloat64, "sole-owner mutation corrupted a later interned module");
+}
+
 int main() {
     testFoldingLeavesNoDeadBlocksOrConstants();
     testIdsBeyondTheBoundAreRejected();
@@ -477,6 +503,8 @@ int main() {
     testEmittedWordsAreStable();
     testBlockBallotsOfOnePredicateShareOneBallot();
     testInternedSpirvSharesEqualWords();
+    testInternedSpirvReleasesUnusedWords();
+    testSoleInternedOwnerDetachesBeforeMutation();
     if (failures != 0) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);
         return 1;

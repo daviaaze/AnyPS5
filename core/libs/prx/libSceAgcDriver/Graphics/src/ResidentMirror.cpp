@@ -234,6 +234,46 @@ std::vector<Mapping> mappings(std::uint64_t begin, std::uint64_t end) {
     return found;
 }
 
+struct SharedSegment {
+    int file = -1;
+    std::uint64_t offset = 0;
+    std::size_t bytes = 0;
+};
+
+struct SharedBacking {
+    std::vector<SharedSegment> segments;
+    std::uint64_t covered = 0;
+    std::uint64_t expected = 0;
+    ~SharedBacking() { for (const auto& segment : segments) if (segment.file >= 0) close(segment.file); }
+    static bool record(void* context, int file, std::uint64_t offset, std::size_t bytes) {
+        auto& backing = *static_cast<SharedBacking*>(context);
+        if (file < 0 || bytes == 0 || offset > UINT64_MAX - bytes ||
+            backing.covered > backing.expected || bytes > backing.expected - backing.covered) return false;
+        const int owned = fcntl(file, F_DUPFD_CLOEXEC, 0);
+        if (owned < 0) return false;
+        try { backing.segments.push_back({owned, offset, bytes}); }
+        catch (...) { close(owned); throw; }
+        backing.covered += bytes;
+        return true;
+    }
+};
+
+void fileData(std::vector<Candidate>& maybe, const Mapping& mapping, int file, std::uint64_t offset);
+void sharedFileData(std::vector<Candidate>& maybe, const Mapping& mapping, const SharedBacking& backing) {
+    std::uint64_t virtualOffset = mapping.begin;
+    for (const auto& segment : backing.segments) {
+        const auto segmentEnd = virtualOffset + segment.bytes;
+        const Mapping part{virtualOffset, segmentEnd, mapping.readable, mapping.privateAnonymous};
+        fileData(maybe, part, segment.file, segment.offset);
+        virtualOffset = segmentEnd;
+    }
+}
+
+bool sharedBacking(const Mapping& mapping, SharedBacking& backing) {
+    backing.expected = mapping.end - mapping.begin;
+    return GuestArena::GuestArenaSharedBacking_nid_postfix(static_cast<std::uintptr_t>(mapping.begin),
+        static_cast<std::size_t>(backing.expected), &SharedBacking::record, &backing) && backing.covered == backing.expected;
+}
 void fileData(std::vector<Candidate>& maybe, const Mapping& mapping, int file, std::uint64_t offset) {
     const auto end = offset + (mapping.end - mapping.begin);
     auto at = static_cast<off_t>(offset);
@@ -289,16 +329,9 @@ std::vector<Candidate> possiblyNonzero(std::uint64_t begin, std::uint64_t end) {
     maybe.push_back({begin, end, true});
 #else
     for (const auto& mapping : mappings(begin, end)) {
-        int file = -1;
-        std::uint64_t offset = 0;
-        if (GuestArena::GuestArenaSharedBacking_nid_postfix(static_cast<std::uintptr_t>(mapping.begin), static_cast<std::size_t>(mapping.end - mapping.begin), &file, &offset)) {
-            try {
-                fileData(maybe, mapping, file, offset);
-            } catch (...) {
-                close(file);
-                throw;
-            }
-            close(file);
+        SharedBacking backing;
+        if (sharedBacking(mapping, backing)) {
+            sharedFileData(maybe, mapping, backing);
         } else if (mapping.privateAnonymous) {
             populatedPages(maybe, mapping);
         } else {

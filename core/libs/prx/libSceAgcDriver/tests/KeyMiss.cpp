@@ -37,7 +37,6 @@ std::vector<std::uint32_t> shaderKey(bool dataWords, bool movable, const std::ve
     }
     return key;
 }
-
 std::vector<std::uint32_t> drawKey(std::uint32_t device, const std::vector<std::uint32_t>& stage, std::uint32_t target) {
     std::vector<std::uint32_t> key{0xffffffffu, device, 0u, 1u, static_cast<std::uint32_t>(stage.size())};
     key.insert(key.end(), stage.begin(), stage.end());

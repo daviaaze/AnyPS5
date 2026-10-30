@@ -66,9 +66,15 @@ See [Build](BUILD.md#performance-trace) for the trace format, summary fields and
 | `APS5_TRACE_FRAMES=<start>:<count>` | Records a window of presents by zero-based frame number. |
 | `APS5_TRACE_SECONDS=<start>:<length>` | Records a window of presents by elapsed seconds after the first present. Cannot be set with `APS5_TRACE_FRAMES`. |
 | `APS5_TRACE_SUMMARY_EVERY=<seconds>` | Writes periodic summary lines without recording trace events. Can be combined with either window switch. |
-| `APS5_TRACE_EVENTS=<count>` | Sets the per-thread event-buffer capacity for a frame or seconds window (1–4,194,304; default 262,144). |
+| `APS5_TRACE_EVENTS=<count>` | Sets each thread's event-buffer capacity and the GPU-range capacity for a frame or seconds window (1–4,194,304; default 262,144). |
 | `APS5_TRACE_DIR=<path>` | Writes performance capture and summary files to this directory instead of the working directory. |
 | `APS5_VIDEOOUT_TELEMETRY_DIR=<path>` | Writes the presents and the pad changes of a run to `<path>/videoout.jsonl`; see [Usage](../user/USAGE.md#video-out-and-pad-telemetry). |
+
+A window of N complete frame intervals emits N+1 `present` boundary witnesses with consecutive IDs and timestamps spanning both ends of the capture. The final witness records the closing boundary; it is not an additional completed frame. The summary's `presents` count remains N.
+
+The digest uses the actual timestamp of the closing witness whose ID equals `window.first_present + presents`, rather than the rounded summary duration. Rounding that duration upward must not create a tiny extra frame interval. Historical captures without that witness retain the summary endpoint for digest reporting; strict presentation-window checks still require recorded endpoint coverage.
+
+The event JSON has a top-level `clock` object. On Linux using libstdc++ or libc++, `origin_ns` is the integer nanosecond estimate of the exact `steady_clock` origin in `CLOCK_MONOTONIC`: export brackets a steady-clock sample around `clock_gettime`, maps the origin through that pair, and records the half-bracket width as `uncertainty_ns`. Other platforms export the steady-clock epoch and label it `steady_clock`. Chrome `ts` remains microseconds with three decimal places, so joins are precise only at that exported event-timestamp resolution plus the stated clock calibration uncertainty. Each `thread_name` event includes `args.native_tid` when exposed by the platform (Linux TID or Windows thread ID); synthetic Chrome trace `tid` values remain unchanged.
 
 ## Shader registers
 

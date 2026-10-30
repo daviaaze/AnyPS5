@@ -9,11 +9,16 @@
 #ifndef _WIN32
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
+#if defined(__linux__)
+#include "prx/libkernel/DirectMemory/DirectMemory.hpp"
+#include "prx/libkernel/include/Api.hpp"
+#endif
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
 #include <array>
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -22,6 +27,7 @@
 #include <iostream>
 #include <mutex>
 #include <span>
+#include <vector>
 
 #ifdef _WIN32
 int main() {
@@ -48,12 +54,23 @@ std::uint8_t* mapping = nullptr;
 std::uint64_t mappingBytes = 0;
 int backing = -1;
 
-bool Resolve(std::uintptr_t address, std::size_t bytes, int* file, std::uint64_t* offset) {
+constexpr std::size_t SegmentBytes = 65536;
+bool fragmented = false;
+std::array<std::size_t, 8> segmentOffsets{1, 14, 3, 12, 5, 10, 7, 8};
+
+bool Resolve(std::uintptr_t address, std::size_t bytes, GuestArena::SharedBackingVisitor visitor, void* context) {
     const auto begin = reinterpret_cast<std::uintptr_t>(mapping);
-    if (address < begin || address + bytes > begin + mappingBytes) return false;
-    *file = dup(backing);
-    *offset = address - begin;
-    return *file >= 0;
+    if (visitor == nullptr || bytes == 0 || address < begin || address - begin > mappingBytes || bytes > mappingBytes - (address - begin)) return false;
+    if (!fragmented) return visitor(context, backing, address - begin, bytes);
+    auto offset = static_cast<std::size_t>(address - begin);
+    while (bytes != 0) {
+        const auto within = offset % SegmentBytes;
+        const auto count = std::min(bytes, SegmentBytes - within);
+        if (!visitor(context, backing, segmentOffsets[offset / SegmentBytes] * SegmentBytes + within, count)) return false;
+        offset += count;
+        bytes -= count;
+    }
+    return true;
 }
 
 std::uint64_t UdmabufLimitBytes() {
@@ -76,9 +93,237 @@ bool DmaBufImport(const AgcDriver::VulkanDevice& device, std::uint64_t address, 
     return import != nullptr && import->dmaBuf;
 }
 
+#if defined(__linux__)
+int AnonymousOnly() {
+    const int udmabuf = open("/dev/udmabuf", O_RDWR | O_CLOEXEC);
+    if (udmabuf < 0) {
+        std::printf("skipped, /dev/udmabuf is unavailable\n");
+        return VulkanTestSkipped;
+    }
+    close(udmabuf);
+    constexpr int Protection = 0x33; // CPU read/write and GPU read/write.
+    constexpr int Fixed = 0x10;
+    for (const std::size_t bytes : {SegmentBytes, 8 * SegmentBytes, 16 * SegmentBytes}) {
+        struct Mapping {
+            void* address = nullptr;
+            std::size_t bytes;
+            ~Mapping() {
+                if (address != nullptr) sceKernelMunmap(reinterpret_cast<std::uint64_t>(address), bytes);
+            }
+        } sourceMapping{nullptr, bytes}, destinationMapping{nullptr, bytes};
+        auto device = OpenVulkanTestDevice();
+        if (!device) return VulkanTestSkipped;
+        if (!AgcDriver::VulkanDeviceTestAccess::ContextOf(*device).dmaBufImport) {
+            std::printf("skipped, device does not support dma-buf imports\n");
+            return VulkanTestSkipped;
+        }
+        Require(DoMapAnon(&sourceMapping.address, bytes, Protection, 0, SegmentBytes) == 0,
+                "anonymous import: cannot map source");
+        Require(DoMapAnon(&destinationMapping.address, bytes, Protection, 0, SegmentBytes) == 0,
+                "anonymous import: cannot map destination");
+        auto* const source = static_cast<std::uint8_t*>(sourceMapping.address);
+        auto* const destination = static_cast<std::uint8_t*>(destinationMapping.address);
+        const auto sourceAddress = reinterpret_cast<std::uint64_t>(source);
+        const auto destinationAddress = reinterpret_cast<std::uint64_t>(destination);
+        Require(sourceAddress % SegmentBytes == 0 && destinationAddress % SegmentBytes == 0,
+                "anonymous import: mappings are not 64 KiB aligned");
+        std::vector<std::uint8_t> expected(bytes);
+        const auto Import = [&](std::uint64_t address) {
+            GuestAllocations::Mapped ranges;
+            const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+            for (const auto& range : lease) {
+                if (range->address == address) ranges.push_back(range);
+            }
+            Require(ranges.size() == 1, "anonymous import: real mapping is not registered");
+            device->ImportGuestMemory(ranges, GuestAllocations::GuestAllocationsGeneration_nid_postfix(), false);
+            Require(DmaBufImport(*device, address, bytes),
+                    "anonymous import: real mapping fell back instead of importing dma-buf");
+        };
+        const auto CopyAndVerify = [&] {
+            std::memset(destination, 0, bytes);
+            {
+                std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+                const auto outcome = device->CopyBuffer(destinationAddress, sourceAddress, bytes, 0, bytes, 0, 0, 0,
+                    [](std::span<const std::byte>, std::uint64_t) {});
+                Require(outcome.path == 1, "anonymous import: zero-CPU-copy transfer did not use GPU");
+                device->WaitIdle();
+            }
+            Require(std::memcmp(destination, expected.data(), bytes) == 0,
+                    "anonymous import: GPU copy returned incorrect backing contents");
+        };
+        const auto FillAndVerify = [&](std::uint32_t value) {
+            constexpr std::size_t offset = 3 * SegmentBytes - 4096;
+            constexpr std::size_t count = 8192;
+            {
+                std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+                const std::array<std::uint32_t, 4> pattern{value, value, value, value};
+                Require(device->FillBuffer(sourceAddress + offset, count, pattern),
+                        "anonymous import: GPU fill was refused");
+                device->WaitIdle();
+            }
+            for (std::size_t i = 0; i < count; i += sizeof(value))
+                std::memcpy(expected.data() + offset + i, &value, sizeof(value));
+            Require(std::memcmp(source, expected.data(), bytes) == 0,
+                    "anonymous import: GPU fill missed backing or corrupted untouched neighbors");
+        };
+        for (std::size_t i = 0; i < bytes; ++i)
+            expected[i] = static_cast<std::uint8_t>((i * 37 + i / SegmentBytes + 19) % 251);
+        std::memcpy(source, expected.data(), bytes);
+        Import(destinationAddress);
+        Import(sourceAddress);
+        CopyAndVerify();
+        if (bytes > SegmentBytes) {
+            FillAndVerify(0xA1B2C3D4u);
+            CopyAndVerify();
+        }
+        void* replacement = source;
+        Require(sceKernelMapFlexibleMemory(&replacement, bytes, Protection, Fixed) == 0 && replacement == source,
+                "anonymous import: fixed flexible replacement failed");
+        Require(std::all_of(source, source + bytes, [](std::uint8_t value) { return value == 0; }),
+                "anonymous import: fixed replacement retained old contents");
+        for (std::size_t i = 0; i < bytes; ++i)
+            expected[i] = static_cast<std::uint8_t>((i * 13 + i / SegmentBytes + 107) % 253);
+        std::memcpy(source, expected.data(), bytes);
+        Import(sourceAddress);
+        CopyAndVerify();
+        if (bytes > SegmentBytes) {
+            FillAndVerify(0x6E5D4C3Bu);
+            CopyAndVerify();
+        }
+        device->WaitIdle();
+        device.reset();
+        Require(sceKernelMunmap(sourceAddress, bytes) == 0, "anonymous import: cannot retire source mapping");
+        sourceMapping.address = nullptr;
+        Require(sceKernelMunmap(destinationAddress, bytes) == 0, "anonymous import: cannot retire destination mapping");
+        destinationMapping.address = nullptr;
+    }
+    std::cout << "AGC real anonymous dma-buf import tests passed\n";
+    return 0;
+}
+#endif
+
+int FragmentedOnly() {
+    constexpr std::size_t Bytes = 8 * SegmentBytes;
+    constexpr std::size_t PhysicalBytes = 16 * SegmentBytes;
+    auto device = OpenVulkanTestDevice();
+    if (!device) return VulkanTestSkipped;
+    if (!AgcDriver::VulkanDeviceTestAccess::ContextOf(*device).dmaBufImport) {
+        std::printf("skipped, device does not support dma-buf imports\n");
+        return VulkanTestSkipped;
+    }
+    struct Owned {
+        void* reservation = MAP_FAILED;
+        std::uint8_t* physical = nullptr;
+        std::uint8_t* destination = nullptr;
+        bool sourceRegistered = false;
+        bool destinationRegistered = false;
+        ~Owned() {
+            if (sourceRegistered) GuestAllocations::Mutation().Remove(mapping);
+            if (destinationRegistered) GuestAllocations::Mutation().Remove(destination);
+            GuestArena::GuestArenaSetSharedBacking_nid_postfix(nullptr);
+            if (reservation != MAP_FAILED) munmap(reservation, Bytes + SegmentBytes);
+            if (physical) munmap(physical, PhysicalBytes);
+            std::free(destination);
+            if (backing >= 0) close(backing);
+            backing = -1;
+            mapping = nullptr;
+            mappingBytes = 0;
+            fragmented = false;
+        }
+    } owned;
+    backing = memfd_create("anyps5-fragmented-import-test", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    Require(backing >= 0 && ftruncate(backing, PhysicalBytes) == 0, "fragmented import: cannot create backing");
+    Require(fcntl(backing, F_ADD_SEALS, F_SEAL_SHRINK) == 0, "fragmented import: cannot seal backing");
+    auto* physical = mmap(nullptr, PhysicalBytes, PROT_READ | PROT_WRITE, MAP_SHARED, backing, 0);
+    Require(physical != MAP_FAILED, "fragmented import: cannot map physical backing");
+    owned.physical = static_cast<std::uint8_t*>(physical);
+    std::array<std::uint8_t, PhysicalBytes> expected{};
+    for (std::size_t i = 0; i < PhysicalBytes; ++i) expected[i] = static_cast<std::uint8_t>(0x20 + i / SegmentBytes);
+    std::memcpy(physical, expected.data(), PhysicalBytes);
+    owned.reservation = mmap(nullptr, Bytes + SegmentBytes, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    Require(owned.reservation != MAP_FAILED, "fragmented import: cannot reserve VA");
+    const auto aligned = (reinterpret_cast<std::uintptr_t>(owned.reservation) + SegmentBytes - 1) & ~(std::uintptr_t(SegmentBytes) - 1);
+    mapping = reinterpret_cast<std::uint8_t*>(aligned);
+    mappingBytes = Bytes;
+    fragmented = true;
+    for (std::size_t i = 0; i < segmentOffsets.size(); ++i) {
+        Require(mmap(mapping + i * SegmentBytes, SegmentBytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED,
+                     backing, segmentOffsets[i] * SegmentBytes) == mapping + i * SegmentBytes,
+                "fragmented import: cannot map segment");
+    }
+    owned.destination = static_cast<std::uint8_t*>(std::aligned_alloc(SegmentBytes, Bytes));
+    Require(owned.destination != nullptr, "fragmented import: cannot allocate destination");
+    GuestArena::GuestArenaSetSharedBacking_nid_postfix(Resolve);
+    const auto Register = [](std::uint8_t* memory) {
+        GuestAllocations::Mutation().Add(memory, Bytes, true, true, true);
+        GuestAllocations::Mapped ranges;
+        for (const auto& range : GuestAllocations::GuestAllocationsAcquire_nid_postfix()) {
+            if (range->address == reinterpret_cast<std::uint64_t>(memory)) ranges.push_back(range);
+        }
+        Require(ranges.size() == 1, "fragmented import: allocation not registered");
+        return ranges;
+    };
+    const auto source = reinterpret_cast<std::uint64_t>(mapping);
+    const auto destination = reinterpret_cast<std::uint64_t>(owned.destination);
+    owned.destinationRegistered = true;
+    const auto destinationRanges = Register(owned.destination);
+    device->ImportGuestMemory(destinationRanges, GuestAllocations::GuestAllocationsGeneration_nid_postfix(), false);
+    const auto ImportSource = [&] {
+        owned.sourceRegistered = true;
+        const auto ranges = Register(mapping);
+        device->ImportGuestMemory(ranges, GuestAllocations::GuestAllocationsGeneration_nid_postfix(), false);
+        Require(DmaBufImport(*device, source, Bytes), "fragmented import: source fell back instead of importing dma-buf");
+    };
+    const auto CopyAndVerify = [&] {
+        std::memset(owned.destination, 0, Bytes);
+        {
+            std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            const auto outcome = device->CopyBuffer(destination, source, Bytes, 0, Bytes, 0, 0, 0,
+                [](std::span<const std::byte>, std::uint64_t) {});
+            Require(outcome.path == 1, "fragmented import: copy did not use GPU");
+            device->WaitIdle();
+        }
+        for (std::size_t i = 0; i < Bytes; ++i)
+            Require(owned.destination[i] == expected[segmentOffsets[i / SegmentBytes] * SegmentBytes + i % SegmentBytes],
+                    "fragmented import: GPU copy has incorrect virtual segment order");
+    };
+    const auto FillAndVerify = [&](std::size_t offset, std::size_t bytes, std::uint32_t value) {
+        {
+            std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            const std::array<std::uint32_t, 4> pattern{value, value, value, value};
+            Require(device->FillBuffer(source + offset, bytes, pattern), "fragmented import: GPU fill was refused");
+            device->WaitIdle();
+        }
+        std::array<std::uint8_t, 4> pattern{};
+        std::memcpy(pattern.data(), &value, sizeof(value));
+        for (std::size_t i = 0; i < bytes; ++i) {
+            const auto va = offset + i;
+            expected[segmentOffsets[va / SegmentBytes] * SegmentBytes + va % SegmentBytes] = pattern[i % 4];
+        }
+        Require(std::memcmp(owned.physical, expected.data(), PhysicalBytes) == 0,
+                "fragmented import: GPU fill corrupted physical backing or neighbors");
+    };
+    ImportSource();
+    CopyAndVerify();
+    FillAndVerify(3 * SegmentBytes - 4096, 8192, 0xA1B2C3D4u);
+    GuestAllocations::Mutation().Remove(mapping);
+    owned.sourceRegistered = false;
+    Require(mmap(mapping + 4 * SegmentBytes, SegmentBytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED,
+                 backing, 0) == mapping + 4 * SegmentBytes, "fragmented import: cannot remap segment");
+    segmentOffsets[4] = 0;
+    std::memset(owned.physical, 0xc3, SegmentBytes);
+    std::memset(expected.data(), 0xc3, SegmentBytes);
+    ImportSource();
+    CopyAndVerify();
+    FillAndVerify(4 * SegmentBytes, SegmentBytes, 0x6E5D4C3Bu);
+    device->WaitIdle();
+    std::cout << "AGC fragmented dma-buf import tests passed\n";
+    return 0;
 }
 
-int main() {
+}
+
+int main(int argc, char** argv) {
     try {
         const int udmabuf = open("/dev/udmabuf", O_RDWR | O_CLOEXEC);
         if (udmabuf < 0) {
@@ -86,6 +331,10 @@ int main() {
             return VulkanTestSkipped;
         }
         close(udmabuf);
+#if defined(__linux__)
+        if (argc == 2 && std::strcmp(argv[1], "--anonymous-only") == 0) return AnonymousOnly();
+#endif
+        if (argc == 2 && std::strcmp(argv[1], "--fragmented-only") == 0) return FragmentedOnly();
         if (UdmabufLimitBytes() > LargestTestedLimit) {
             std::printf("skipped, udmabuf size_limit_mb is above %llu: a range above it is too large to map\n", static_cast<unsigned long long>(LargestTestedLimit >> 20u));
             return VulkanTestSkipped;

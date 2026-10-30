@@ -197,23 +197,29 @@ void CheckCopy(AgcDriver::VulkanDevice& device) {
     Require(munmap_nid_postfix(destination, BlockBytes) == 0, "copy destination unmap failed");
     Require(!Imported(device, destination), "GPU copy destination remained imported after guest unmap");
 }
-
 void CheckDirectRelease(AgcDriver::VulkanDevice& device) {
     std::int64_t physical = 0;
-    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, BlockBytes, BlockBytes, 0, &physical) == 0, "guest direct allocation failed");
+    std::int64_t neighborPhysical = 0;
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, 2 * BlockBytes, BlockBytes, 0, &physical) == 0, "guest direct allocation failed");
+    Require(sceKernelAllocateDirectMemory(physical + 2 * BlockBytes, physical + 3 * BlockBytes, BlockBytes, BlockBytes, 0, &neighborPhysical) == 0 &&
+            neighborPhysical == physical + 2 * BlockBytes, "guest direct neighbor allocation was not contiguous");
     void* first = nullptr;
     void* second = nullptr;
+    void* neighbor = nullptr;
     Require(sceKernelMapDirectMemory(&first, BlockBytes, 0x33, 0, physical, BlockBytes) == 0, "first direct view mapping failed");
     Require(sceKernelMapDirectMemory(&second, BlockBytes, 0x33, 0, physical, BlockBytes) == 0 && second != first, "second direct view mapping failed");
+    Require(sceKernelMapDirectMemory(&neighbor, BlockBytes, 0x33, 0, neighborPhysical, BlockBytes) == 0, "direct neighbor mapping failed");
     {
         GuestAllocations::Mutation mutation;
         const auto firstRange = mutation.Find(first);
         const auto secondRange = mutation.Find(second);
-        Require(firstRange.readable && firstRange.writable && firstRange.gpu && secondRange.readable && secondRange.writable && secondRange.gpu, "direct views did not register their requested CPU and GPU access");
+        const auto neighborRange = mutation.Find(neighbor);
+        Require(firstRange.readable && firstRange.writable && firstRange.gpu && secondRange.readable && secondRange.writable && secondRange.gpu &&
+                neighborRange.readable && neighborRange.writable && neighborRange.gpu, "direct views did not register their requested CPU and GPU access");
     }
     std::memset(first, 0, BlockBytes);
     static_cast<std::uint8_t*>(first)[BlockBytes - 1] = 0x5a;
-    Require(static_cast<const std::uint8_t*>(second)[BlockBytes - 1] == 0x5a, "direct views do not share their physical backing");
+    std::memset(neighbor, 0xa7, BlockBytes);
     auto* destination = Map();
     {
         std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
@@ -224,13 +230,28 @@ void CheckDirectRelease(AgcDriver::VulkanDevice& device) {
         Require(firstCopy.path == 1 && secondCopy.path == 1, "direct views were not read through GPU import transfers");
         Require(Imported(device, first) && Imported(device, second), "both direct view imports were not retained before release");
     }
-    Require(sceKernelReleaseDirectMemory(physical, BlockBytes) == 0, "guest direct release failed");
+    Require(sceKernelReleaseDirectMemory(physical, 2 * BlockBytes) == 0, "guest direct release failed");
     Require(!Imported(device, first) && !Imported(device, second), "direct release retained an imported virtual view");
     Require(!AgcDriver::Graphics::RegisteredReadableCovers(Address(first), BlockBytes) && !AgcDriver::Graphics::RegisteredReadableCovers(Address(second), BlockBytes), "direct release left a virtual view registered");
     CheckPattern(destination);
     CheckPattern(static_cast<const std::byte*>(destination) + FillBytes);
     Require(Imported(device, destination), "direct release retired the unrelated copy destination");
-    Require(munmap_nid_postfix(destination, BlockBytes) == 0, "direct release copy destination unmap failed");
+    const auto* neighborBytes = static_cast<const std::uint8_t*>(neighbor);
+    for (std::size_t offset = 0; offset < BlockBytes; ++offset)
+        Require(neighborBytes[offset] == 0xa7, "direct release changed adjacent physical backing");
+    std::int64_t reusedPhysical = -1;
+    Require(sceKernelAllocateDirectMemory(physical, physical + 2 * BlockBytes, 2 * BlockBytes, BlockBytes, 0, &reusedPhysical) == 0 &&
+            reusedPhysical == physical, "released physical range could not be reused at its original offset");
+    void* reused = nullptr;
+    Require(sceKernelMapDirectMemory(&reused, 2 * BlockBytes, 0x33, 0, reusedPhysical, BlockBytes) == 0, "reused direct range mapping failed");
+    const auto* reusedBytes = static_cast<const std::uint8_t*>(reused);
+    for (std::size_t offset = 0; offset < 2 * BlockBytes; ++offset)
+        Require(reusedBytes[offset] == 0, "reused released physical backing was not zeroed");
+    Require(sceKernelMunmap(reinterpret_cast<std::uintptr_t>(reused), 2 * BlockBytes) == 0, "reused direct range unmap failed");
+    Require(sceKernelReleaseDirectMemory(reusedPhysical, 2 * BlockBytes) == 0, "reused direct range release failed");
+    Require(sceKernelMunmap(reinterpret_cast<std::uintptr_t>(neighbor), BlockBytes) == 0, "direct neighbor unmap failed");
+    Require(sceKernelReleaseDirectMemory(neighborPhysical, BlockBytes) == 0, "direct neighbor release failed");
+    Require(sceKernelMunmap(reinterpret_cast<std::uintptr_t>(destination), BlockBytes) == 0, "direct release copy destination unmap failed");
     Require(!Imported(device, destination), "direct release copy destination remained imported after unmap");
 }
 

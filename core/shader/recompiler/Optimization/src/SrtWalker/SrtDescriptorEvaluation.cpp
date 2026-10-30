@@ -114,6 +114,18 @@ bool evaluateRuntimeSources(const IrResourcePlan& program, std::span<const std::
         cleanEvaluator.ReportInaccessibleReads(nullptr);
         cleanEvaluator.ReportNullRootReads(nullptr);
     }
+    std::vector<std::uint8_t> footprintFlatSlots(program.srtReads.size(), 0u);
+    for (const auto& accessPlan : program.bufferAccessPlans) {
+        if (!accessPlan.complete || accessPlan.failed) continue;
+        for (const auto& access : accessPlan.accesses) {
+            for (const auto* source : {&access.index, &access.offset, &access.soffset}) {
+                if (source->kind == BufferUniformSource::Kind::CapturedFlatSlot && source->value < program.srtReads.size()) {
+                    const auto flatOffset = program.srtReads[source->value].flatOffset;
+                    if (flatOffset < footprintFlatSlots.size()) footprintFlatSlots[flatOffset] = 1u;
+                }
+            }
+        }
+    }
     InaccessibleRead inaccessible;
     std::uint32_t nullRoots = 0;
     if (evaluateFlat && poison != nullptr) {
@@ -170,13 +182,19 @@ bool evaluateRuntimeSources(const IrResourcePlan& program, std::span<const std::
             // the slot's leaf; reads nested in its address cone land among the other reads.
             auto* trace = runtime.readTrace;
             const bool pure = trace != nullptr && read.flatOffset < program.pureFlatSlots.size() && program.pureFlatSlots[read.flatOffset] != 0u;
-            if (pure) {
+            const bool footprint = trace != nullptr && read.flatOffset < footprintFlatSlots.size() && footprintFlatSlots[read.flatOffset] != 0u;
+            // Footprint inputs stay patchable leaves, but also invalidate data-only classification.
+            if (pure || footprint) {
                 trace->leaf = TNode::SrtRead(program, slot).Value();
                 trace->leafSlot = read.flatOffset;
+                trace->leafStructural = footprint;
             }
             inaccessible = {};
             const bool evaluated = read.flatOffset < flattened.size() && selected.Evaluate(TNode::SrtRead(program, slot), flattened[read.flatOffset]);
-            if (pure) trace->leaf = nullptr;
+            if (pure || footprint) {
+                trace->leaf = nullptr;
+                trace->leafStructural = false;
+            }
             if (!evaluated && inaccessible.read != nullptr) {
                 if (debug) std::fprintf(stderr, "[srt] flat offset %u reads inaccessible 0x%llx at pc 0x%x: poisoned\n", read.flatOffset, static_cast<unsigned long long>(inaccessible.address), inaccessible.read->Flags<MemoryFlags>().pc);
                 flattened[read.flatOffset] = 0u;

@@ -19,6 +19,9 @@
 #include <sys/utsname.h>
 #include <unistd.h>
 #endif
+#if defined(__linux__)
+#include <sys/syscall.h>
+#endif
 #if defined(_MSC_VER) && !defined(__clang__)
 #include <intrin.h>
 #elif defined(__x86_64__) || defined(__i386__)
@@ -34,7 +37,9 @@ namespace AgcDriver {
 namespace {
 
 using Clock = std::chrono::steady_clock;
-constexpr std::size_t GpuRangeCapacity = TraceThread::DefaultCapacity;
+std::filesystem::path traceDirectory();
+std::mutex summaryFileMutex;
+
 
 struct Session {
     std::mutex mutex;
@@ -47,6 +52,8 @@ struct Session {
     bool intervalOpen = false;
     std::uint64_t intervalFirstPresent = 0;
     double intervalGpuBusy = 0;
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
     std::vector<std::vector<TraceThread::Total>> intervalBase;
     std::vector<Clock::time_point> intervalPresents;
     Clock::time_point first{};
@@ -54,20 +61,117 @@ struct Session {
     std::uint64_t firstPresent = 0;
     double gpuBusyAtOpen = 0;
     std::optional<TraceClockSample> gpuClock;
+    std::optional<TraceClockSample> latestGpuClock;
     std::vector<Clock::time_point> presents;
     bool bench = false;
     TraceBenchIntervals benchIntervals;
     std::uint64_t benchDropped = 0;
 };
+struct TraceEventCheckpoint {
+    TraceSummary summary;
+    std::vector<TraceThread::Snapshot> threads;
+    std::vector<Clock::time_point> presents;
+    Clock::time_point origin{};
+    std::size_t presenter = 0;
+    std::uint64_t firstPresent = 0;
+    std::uint64_t process = 0;
+    std::uint64_t superseded = 0;
+};
+
+class TraceEventWriter {
+public:
+    explicit TraceEventWriter(std::function<void(const TraceEventCheckpoint&)> write)
+        : write(std::move(write)), worker([this] { run(); }) {}
+
+    ~TraceEventWriter() { Stop(); }
+
+    void Write(TraceEventCheckpoint checkpoint) {
+        {
+            std::lock_guard lock(mutex);
+            if (failure) std::rethrow_exception(failure);
+            if (stopping) throw std::runtime_error("trace event writer is stopping");
+            if (pending) ++superseded;
+            checkpoint.superseded = superseded;
+            pending = std::move(checkpoint);
+        }
+        changed.notify_one();
+    }
+
+    void Stop() {
+        std::lock_guard stopLock(stopMutex);
+        {
+            std::lock_guard lock(mutex);
+            stopping = true;
+        }
+        changed.notify_one();
+        if (worker.joinable()) worker.join();
+        if (failure) std::rethrow_exception(failure);
+    }
+
+private:
+    void run() noexcept {
+        try {
+            for (;;) {
+                TraceEventCheckpoint checkpoint;
+                {
+                    std::unique_lock lock(mutex);
+                    changed.wait(lock, [&] { return stopping || pending.has_value(); });
+                    if (!pending) return;
+                    checkpoint = std::move(*pending);
+                    pending.reset();
+                }
+                checkpoint.summary.traceSnapshotsSuperseded = checkpoint.superseded;
+                write(checkpoint);
+            }
+        } catch (...) {
+            std::lock_guard lock(mutex);
+            failure = std::current_exception();
+        }
+    }
+
+    std::function<void(const TraceEventCheckpoint&)> write;
+    std::mutex stopMutex;
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::optional<TraceEventCheckpoint> pending;
+    std::exception_ptr failure;
+    std::uint64_t superseded = 0;
+    bool stopping = false;
+    std::thread worker;
+};
+
+std::unique_ptr<TraceEventWriter>& eventWriter() {
+    static std::unique_ptr<TraceEventWriter> output;
+    return output;
+}
+
+void enqueueTraceCheckpoint(TraceEventCheckpoint checkpoint) {
+    const auto name = checkpoint.summary.trace;
+    if (!eventWriter()) {
+        eventWriter() = std::make_unique<TraceEventWriter>([directory = traceDirectory(), name](const TraceEventCheckpoint& current) {
+            try {
+                const auto events = TraceFormat::Events(current.process, current.origin, current.threads,
+                    current.presenter, current.presents, current.firstPresent, current.summary.window,
+                    current.summary.traceWindowClosed.value_or(false), current.superseded, current.summary.traceGpuTrackAvailable);
+                std::filesystem::create_directories(directory);
+                TraceFile::ReplaceGzip(directory / name, events);
+                std::lock_guard lock(summaryFileMutex);
+                TraceFile::AppendLine(directory / "aps5-summary.jsonl",
+                    TraceFormat::Summary(current.summary, current.threads, current.presents));
+            } catch (const std::exception& error) {
+                std::fprintf(stderr, "[trace] writing %s failed: %s\n", name.c_str(), error.what());
+                std::fflush(stderr);
+                throw;
+            }
+        });
+    }
+    eventWriter()->Write(std::move(checkpoint));
+}
+
 
 Session& session() {
     static auto& state = *new Session();
     return state;
-}
-
-std::unique_ptr<ProfileOutput>& writer() {
-    static std::unique_ptr<ProfileOutput> output;
-    return output;
 }
 
 std::unique_ptr<ProfileOutput>& summaryWriter() {
@@ -90,6 +194,17 @@ std::uint64_t processId() {
     return GetCurrentProcessId();
 #else
     return static_cast<std::uint64_t>(::getpid());
+#endif
+}
+
+std::uint64_t nativeThreadId() {
+#if defined(_WIN32)
+    return static_cast<std::uint64_t>(GetCurrentThreadId());
+#elif defined(__linux__) && defined(SYS_gettid)
+    const auto tid = ::syscall(SYS_gettid);
+    return tid > 0 ? static_cast<std::uint64_t>(tid) : 0;
+#else
+    return 0;
 #endif
 }
 
@@ -203,8 +318,51 @@ TraceSummary identity(std::uint32_t width, std::uint32_t height, const VulkanDev
 
 std::vector<std::vector<TraceThread::Total>> totalsOf(const std::vector<std::unique_ptr<TraceThread>>& threads) {
     std::vector<std::vector<TraceThread::Total>> result;
-    for (const auto& thread : threads) result.push_back(thread->Collect().totals);
+    for (const auto& thread : threads) result.push_back(thread->CollectTotals());
     return result;
+}
+struct TraceSnapshotData {
+    std::vector<TraceThread::Snapshot> threads;
+    TraceGpuSnapshot gpu;
+};
+
+TraceSnapshotData captureTraceSnapshot(const std::vector<std::unique_ptr<TraceThread>>& threads, bool active, bool includeGpu) {
+    std::vector<std::size_t> available;
+    available.reserve(threads.size() + 1);
+    for (const auto& thread : threads) available.push_back(active ? thread->BufferedEventCount() : 0);
+    available.push_back(active && includeGpu ? PerformanceTrace::BufferedGpuRangeCount() : 0);
+    const auto budget = TraceSnapshotBudget::Allocate(available, TraceThread::MaximumSnapshotEvents);
+    TraceSnapshotData capture;
+    capture.threads.reserve(threads.size());
+    for (std::size_t index = 0; index < threads.size(); ++index)
+        capture.threads.push_back(active ? threads[index]->Collect(budget[index]) : threads[index]->CollectSummary());
+    if (active && includeGpu) capture.gpu = PerformanceTrace::CollectGpuRanges(budget.back());
+    return capture;
+}
+
+std::optional<TraceThread::Snapshot> gpuTraceSnapshot(const TraceGpuSnapshot& source, const TraceClockSample& first,
+    const TraceClockSample& last, Clock::time_point origin) {
+    if (last.gpuNs <= first.gpuNs || last.cpu <= first.cpu) return std::nullopt;
+    TraceThread::Snapshot snapshot;
+    snapshot.name = "gpu";
+    snapshot.slices = TraceFormat::GpuSlices(source.ranges, first, last, origin);
+    snapshot.eventsLost = source.overwritten;
+    if (source.firstOverwrittenNs)
+        snapshot.eventsFullAt = TraceFormat::GpuTime(*source.firstOverwrittenNs, first, last);
+    snapshot.eventsOmitted = source.omitted;
+    if (source.firstOmittedNs)
+        snapshot.eventsOmittedAt = TraceFormat::GpuTime(*source.firstOmittedNs, first, last);
+    if (!snapshot.slices.empty()) {
+        snapshot.retainedFrom = snapshot.slices.front().begin;
+        snapshot.retainedThrough = snapshot.slices.front().begin;
+        for (const auto& slice : snapshot.slices) {
+            if (slice.begin < *snapshot.retainedFrom) snapshot.retainedFrom = slice.begin;
+            const auto through = slice.begin + slice.length;
+            if (through > *snapshot.retainedThrough) snapshot.retainedThrough = through;
+        }
+    }
+    snapshot.dropped = snapshot.eventsLost != 0 || snapshot.eventsOmitted != 0;
+    return snapshot;
 }
 
 double seconds(Clock::duration elapsed) {
@@ -217,7 +375,7 @@ void PerformanceTrace::BindThread(const char* name, std::size_t capacity) {
     if (!Configured() || local != nullptr) return;
     const bool windowed = std::getenv("APS5_TRACE_FRAMES") != nullptr || std::getenv("APS5_TRACE_SECONDS") != nullptr;
     if (windowed && capacity == TraceThread::DefaultCapacity) capacity = TraceThread::ParseCapacity(std::getenv("APS5_TRACE_EVENTS"));
-    auto bound = std::make_unique<TraceThread>(name, presentCount, windowed ? capacity : 0, buffering);
+    auto bound = std::make_unique<TraceThread>(name, presentCount, windowed ? capacity : 0, buffering, nativeThreadId());
     auto& state = session();
     std::lock_guard lock(state.mutex);
     local = bound.get();
@@ -235,6 +393,7 @@ void PerformanceTrace::OpenInterval(Clock::time_point now, std::uint64_t present
     summaryWriter() = std::make_unique<ProfileOutput>([directory = traceDirectory()](std::string_view text) {
         try {
             std::filesystem::create_directories(directory);
+            std::lock_guard lock(summaryFileMutex);
             TraceFile::AppendLine(directory / "aps5-summary.jsonl", text);
         } catch (const std::exception& error) {
             std::fprintf(stderr, "[trace] appending to aps5-summary.jsonl failed: %s\n", error.what());
@@ -248,14 +407,23 @@ void PerformanceTrace::OpenInterval(Clock::time_point now, std::uint64_t present
 void PerformanceTrace::FlushInterval(Clock::time_point now, std::uint32_t width, std::uint32_t height, const VulkanDevice* device) {
     auto& state = session();
     state.intervalBase.resize(state.threads.size());
-    std::vector<TraceThread::Snapshot> snapshots;
+    std::size_t presenter = 0;
+    if (state.windowOpen && state.gpuClock && device != nullptr) {
+        TraceClockSample sample;
+        if (device->CalibrateClock(sample.gpuNs, sample.cpu)
+            && state.latestGpuClock && sample.gpuNs > state.latestGpuClock->gpuNs && sample.cpu > state.latestGpuClock->cpu)
+            state.latestGpuClock = sample;
+    }
+    const bool gpuCalibrationReady = state.gpuClock && state.latestGpuClock
+        && state.latestGpuClock->gpuNs > state.gpuClock->gpuNs && state.latestGpuClock->cpu > state.gpuClock->cpu;
+    auto capture = captureTraceSnapshot(state.threads, state.windowOpen, gpuCalibrationReady);
+    auto& snapshots = capture.threads;
     for (std::size_t index = 0; index < state.threads.size(); ++index) {
-        auto snapshot = state.threads[index]->Collect();
+        if (state.threads[index].get() == PerformanceTrace::local) presenter = index;
+        auto& snapshot = snapshots[index];
         auto totals = std::move(snapshot.totals);
-        snapshot.slices = {};
         snapshot.totals = TraceFormat::Since(totals, state.intervalBase[index]);
         state.intervalBase[index] = std::move(totals);
-        snapshots.push_back(std::move(snapshot));
     }
     auto summary = identity(width, height, device);
     summary.window = state.interval->Describe();
@@ -263,6 +431,24 @@ void PerformanceTrace::FlushInterval(Clock::time_point now, std::uint32_t width,
     summary.gpuBusyMs = VulkanDevice::PresentCounts().gpuBusyMs - state.intervalGpuBusy;
     summary.interval = std::make_pair(seconds(state.intervalPresents.front() - state.first), seconds(now - state.first));
     summaryWriter()->Write(TraceFormat::Summary(summary, snapshots, state.intervalPresents));
+    if (state.windowOpen && state.window && !state.presents.empty()) {
+        auto checkpointSummary = summary;
+        checkpointSummary.window = "rolling snapshot; declared " + state.window->Describe();
+        checkpointSummary.traceWindowClosed = false;
+        checkpointSummary.traceGpuTrackAvailable = false;
+        if (gpuCalibrationReady) {
+            if (auto gpu = gpuTraceSnapshot(capture.gpu, *state.gpuClock, *state.latestGpuClock, state.presents.front())) {
+                checkpointSummary.traceGpuTrackAvailable = true;
+                snapshots.push_back(std::move(*gpu));
+            }
+        }
+        checkpointSummary.trace = "aps5-trace-" + checkpointSummary.commit + "-" + std::to_string(processId()) + ".json.gz";
+        std::vector<Clock::time_point> checkpointPresents;
+        for (const auto at : state.intervalPresents) if (at >= state.presents.front()) checkpointPresents.push_back(at);
+        const auto skippedPresents = state.intervalPresents.size() - checkpointPresents.size();
+        enqueueTraceCheckpoint(TraceEventCheckpoint{std::move(checkpointSummary), std::move(snapshots), std::move(checkpointPresents),
+            state.presents.front(), presenter, state.intervalFirstPresent + skippedPresents, processId()});
+    }
     if (!state.bench) return;
     TraceBench::Keep(state.benchIntervals, std::make_shared<const TraceBenchInterval>(TraceBenchInterval{summary.interval->first, summary.interval->second, summary.firstPresent, width, height, summary.gpuBusyMs, TraceFormat::FrameMicroseconds(state.intervalPresents)}), state.benchDropped);
     if (!benchWriter()) {
@@ -287,6 +473,8 @@ void PerformanceTrace::Present(std::uint32_t width, std::uint32_t height, const 
     BindThread("presenter");
     auto& state = session();
     std::lock_guard lock(state.mutex);
+    state.width = width;
+    state.height = height;
     if (!state.started) {
         state.window = TraceWindow::Parse(std::getenv("APS5_TRACE_FRAMES"), std::getenv("APS5_TRACE_SECONDS"));
         state.interval = TraceInterval::Parse(std::getenv("APS5_TRACE_SUMMARY_EVERY"));
@@ -313,13 +501,14 @@ void PerformanceTrace::Present(std::uint32_t width, std::uint32_t height, const 
         state.firstPresent = present;
         state.gpuBusyAtOpen = VulkanDevice::PresentCounts().gpuBusyMs;
         TraceClockSample clock;
-        if (device != nullptr && device->CalibrateClock(clock.gpuNs, clock.cpu)) state.gpuClock = clock;
-        {
-            std::lock_guard gpu(gpuMutex);
-            gpuRanges.clear();
-            gpuLost = 0;
-            gpuRanges.reserve(GpuRangeCapacity);
+        if (device != nullptr && device->CalibrateClock(clock.gpuNs, clock.cpu)) {
+            state.gpuClock = clock;
+            state.latestGpuClock = clock;
+        } else {
+            state.gpuClock.reset();
+            state.latestGpuClock.reset();
         }
+        PerformanceTrace::ResetGpuRanges(TraceThread::ParseCapacity(std::getenv("APS5_TRACE_EVENTS")));
         state.presents.push_back(now);
         presentCount.fetch_add(1, std::memory_order_relaxed);
         buffering.store(true, std::memory_order_relaxed);
@@ -340,48 +529,75 @@ void PerformanceTrace::Present(std::uint32_t width, std::uint32_t height, const 
     buffering.store(false, std::memory_order_relaxed);
     recording.store(state.interval.has_value(), std::memory_order_relaxed);
 
-    std::vector<TraceThread::Snapshot> snapshots;
     std::size_t presenter = 0;
     state.windowBase.resize(state.threads.size());
-    for (std::size_t index = 0; index < state.threads.size(); ++index) {
+    for (std::size_t index = 0; index < state.threads.size(); ++index)
         if (state.threads[index].get() == local) presenter = index;
-        snapshots.push_back(state.threads[index]->Collect());
-        snapshots.back().totals = TraceFormat::Since(snapshots.back().totals, state.windowBase[index]);
-    }
-    std::vector<TraceThread::Slice> gpuSlices;
     TraceClockSample clock;
-    if (state.gpuClock && device != nullptr && device->CalibrateClock(clock.gpuNs, clock.cpu)) {
-        std::lock_guard gpu(gpuMutex);
-        gpuSlices = TraceFormat::GpuSlices(gpuRanges, *state.gpuClock, clock, state.presents.front());
-        snapshots.push_back({"gpu", gpuSlices, {}, gpuLost != 0, gpuLost});
+    if (state.gpuClock && device != nullptr && device->CalibrateClock(clock.gpuNs, clock.cpu)
+        && state.latestGpuClock && clock.gpuNs > state.latestGpuClock->gpuNs && clock.cpu > state.latestGpuClock->cpu)
+        state.latestGpuClock = clock;
+    const bool gpuCalibrationReady = state.gpuClock && state.latestGpuClock
+        && state.latestGpuClock->gpuNs > state.gpuClock->gpuNs && state.latestGpuClock->cpu > state.gpuClock->cpu;
+    auto capture = captureTraceSnapshot(state.threads, true, gpuCalibrationReady);
+    auto& snapshots = capture.threads;
+    for (std::size_t index = 0; index < snapshots.size(); ++index)
+        snapshots[index].totals = TraceFormat::Since(snapshots[index].totals, state.windowBase[index]);
+    bool gpuTrackAvailable = false;
+    if (gpuCalibrationReady) {
+        if (auto gpu = gpuTraceSnapshot(capture.gpu, *state.gpuClock, *state.latestGpuClock, state.presents.front())) {
+            gpuTrackAvailable = true;
+            snapshots.push_back(std::move(*gpu));
+        }
     }
     const auto process = processId();
     auto summary = identity(width, height, device);
     summary.window = state.window->Describe();
+    summary.traceWindowClosed = true;
+    summary.traceGpuTrackAvailable = gpuTrackAvailable;
     summary.firstPresent = state.firstPresent;
     summary.gpuBusyMs = VulkanDevice::PresentCounts().gpuBusyMs - state.gpuBusyAtOpen;
     summary.trace = "aps5-trace-" + summary.commit + "-" + std::to_string(process) + ".json.gz";
-    auto events = TraceFormat::Events(process, state.presents.front(), snapshots, presenter, state.presents, state.firstPresent);
-    auto& output = writer();
-    output = std::make_unique<ProfileOutput>([directory = traceDirectory(), name = summary.trace, line = TraceFormat::Summary(summary, snapshots, state.presents)](std::string_view text) {
-        try {
-            std::filesystem::create_directories(directory);
-            TraceFile::WriteGzip(directory / name, text);
-            TraceFile::AppendLine(directory / "aps5-summary.jsonl", line);
-            std::fprintf(stderr, "[trace] wrote %s and its line in aps5-summary.jsonl\n", name.c_str());
-            std::fflush(stderr);
-        } catch (const std::exception& error) {
-            std::fprintf(stderr, "[trace] writing %s failed: %s\n", name.c_str(), error.what());
-            std::fflush(stderr);
-            throw;
-        }
-    }, std::numeric_limits<std::size_t>::max());
-    ProfilePrint_nid_no_patch("[trace] closed at present %llu, writing %s (%zu bytes of JSON)\n", static_cast<unsigned long long>(present), summary.trace.c_str(), events.size());
-    output->Write(std::move(events));
+    ProfilePrint_nid_no_patch("[trace] closed at present %llu, checkpointing %s\n", static_cast<unsigned long long>(present), summary.trace.c_str());
+    enqueueTraceCheckpoint(TraceEventCheckpoint{std::move(summary), std::move(snapshots), state.presents,
+        state.presents.front(), presenter, state.firstPresent, process});
 }
 
 void PerformanceTrace::StopOutput() {
-    if (writer()) writer()->Stop();
+    auto& state = session();
+    {
+        std::lock_guard lock(state.mutex);
+        if (state.windowOpen && state.window && !state.presents.empty()) {
+            buffering.store(false, std::memory_order_relaxed);
+            recording.store(state.interval.has_value(), std::memory_order_relaxed);
+            const bool gpuCalibrationReady = state.gpuClock && state.latestGpuClock
+                && state.latestGpuClock->gpuNs > state.gpuClock->gpuNs && state.latestGpuClock->cpu > state.gpuClock->cpu;
+            auto capture = captureTraceSnapshot(state.threads, true, gpuCalibrationReady);
+            auto& snapshots = capture.threads;
+            std::size_t presenter = 0;
+            for (std::size_t index = 0; index < snapshots.size(); ++index)
+                if (snapshots[index].name == "presenter") presenter = index;
+            bool gpuTrackAvailable = false;
+            if (gpuCalibrationReady) {
+                if (auto gpu = gpuTraceSnapshot(capture.gpu, *state.gpuClock, *state.latestGpuClock, state.presents.front())) {
+                    gpuTrackAvailable = true;
+                    snapshots.push_back(std::move(*gpu));
+                }
+            }
+            const auto process = processId();
+            auto summary = identity(state.width, state.height, nullptr);
+            summary.window = "partial lifecycle stop; declared " + state.window->Describe();
+            summary.traceWindowClosed = false;
+            summary.traceGpuTrackAvailable = gpuTrackAvailable;
+            summary.firstPresent = state.firstPresent;
+            summary.trace = "aps5-trace-" + summary.commit + "-" + std::to_string(process) + ".json.gz";
+            summary.gpuBusyMs = VulkanDevice::PresentCounts().gpuBusyMs - state.gpuBusyAtOpen;
+            enqueueTraceCheckpoint(TraceEventCheckpoint{std::move(summary), std::move(snapshots), state.presents,
+                state.presents.front(), presenter, state.firstPresent, process});
+            state.windowOpen = false;
+        }
+    }
+    if (eventWriter()) eventWriter()->Stop();
     if (summaryWriter()) summaryWriter()->Stop();
     if (benchWriter()) benchWriter()->Stop();
 }

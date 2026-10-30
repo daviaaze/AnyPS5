@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <mutex>
 #include <vector>
 
 #include "prx/libkernel/KernelErrors.hpp"
@@ -33,6 +34,7 @@ struct DirectMemoryView {
 
 std::vector<DirectMemoryView> DirectMemoryViews(int64_t start, size_t len);
 void UnmapDirectMemoryViews(const std::vector<DirectMemoryView>& views);
+std::unique_lock<std::mutex> DirectMemoryMapLock(int64_t start, size_t len);
 bool DirectMemoryFind(int64_t offset, bool findNext, int64_t* start, int64_t* end, int* memoryType);
 void DirectMemoryRetype(int64_t start, size_t len, int memoryType);
 int DirectMemoryLargestFree(int64_t searchStart, int64_t searchEnd, size_t alignment, int64_t* startOut, size_t* sizeOut);

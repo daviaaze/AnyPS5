@@ -2199,6 +2199,10 @@ void ResolvePreparedGraphics(const ShaderSnapshot& front, const std::shared_ptr<
         return;
     }
     std::vector<std::shared_ptr<const ShaderSnapshot>> fragments;
+    if (!transaction.Tracks(front) && CommittedLink(front, fragment, primitiveType)) {
+        transaction.Commit();
+        return;
+    }
     {
         const auto& current = transaction.Read(front);
         const bool newFragment = fragment && !std::ranges::any_of(current.fragments, [&](const auto& entry) { return entry.lock() == fragment; });

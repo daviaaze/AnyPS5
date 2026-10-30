@@ -22,6 +22,9 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#if defined(__linux__)
+#include <time.h>
+#endif
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -30,12 +33,19 @@
 #include <iterator>
 #include <limits>
 #include <map>
+#include <optional>
 #include <mutex>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <tuple>
 #include <unordered_map>
+#if defined(__GLIBC__) && defined(__GLIBC_PREREQ)
+#if __GLIBC_PREREQ(2, 33)
+#include <malloc.h>
+#define APS5_RECORDER_HAS_MALLINFO2 1
+#endif
+#endif
 #include "prx/libc/include/general/AtomicSharedPtr.hpp"
 
 namespace AgcDriver::Graphics {
@@ -43,10 +53,54 @@ namespace AgcDriver::Graphics {
 namespace {
 
 Recorder* activeRecorder = nullptr;
+// Logical cache references across all recorders, not distinct allocations or RSS.
+// Each relaxed gauge is sampled independently; caches can share the same buffer.
+std::atomic<std::uint64_t> aggregateLiveRecorders{0};
+std::atomic<std::uint64_t> aggregateStorageBytes{0}, aggregateStorageEntries{0};
+std::atomic<std::uint64_t> aggregateDrawInputBytes{0}, aggregateDrawInputEntries{0};
+std::atomic<std::uint64_t> aggregateUnwrittenBytes{0}, aggregateUnwrittenEntries{0};
 
 bool DrawProfiled() {
     static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     return profiled;
+}
+std::optional<std::chrono::nanoseconds> threadCpuNow() {
+#if defined(__linux__)
+    timespec value{};
+    if (::clock_gettime(CLOCK_THREAD_CPUTIME_ID, &value) != 0) return std::nullopt;
+    return std::chrono::seconds(value.tv_sec) + std::chrono::nanoseconds(value.tv_nsec);
+#else
+    return std::nullopt;
+#endif
+}
+
+void recordVkSubmitWindow(double wallUs, std::optional<double> threadCpuUs) {
+    static std::mutex mutex;
+    static auto lastReport = std::chrono::steady_clock::now();
+    static std::uint64_t count = 0;
+    static std::uint64_t cpuSamples = 0;
+    static double wallTotalUs = 0;
+    static double wallMaxUs = 0;
+    static double cpuTotalUs = 0;
+    std::lock_guard lock(mutex);
+    ++count;
+    wallTotalUs += wallUs;
+    wallMaxUs = std::max(wallMaxUs, wallUs);
+    if (threadCpuUs) {
+        ++cpuSamples;
+        cpuTotalUs += *threadCpuUs;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - lastReport < std::chrono::seconds(10)) return;
+    const auto span = std::chrono::duration<double>(now - lastReport).count();
+    lastReport = now;
+    AgcDriver::ProfilePrint_nid_no_patch(
+        "[recorder] vkQueueSubmit window %.1f s: %llu calls, wall %.1f ms total / %.1f us mean / %.1f us max, thread CPU %.1f ms total (%llu samples)\n",
+        span, static_cast<unsigned long long>(count), wallTotalUs / 1000.0,
+        count != 0 ? wallTotalUs / static_cast<double>(count) : 0.0, wallMaxUs,
+        cpuTotalUs / 1000.0, static_cast<unsigned long long>(cpuSamples));
+    count = cpuSamples = 0;
+    wallTotalUs = wallMaxUs = cpuTotalUs = 0;
 }
 
 std::uint64_t syncCounts[5] = {};
@@ -165,9 +219,6 @@ std::string ThreadSyncReport() {
 }
 // Unlocked timeline waits (WaitSerial): count and time, for the [recorder] line.
 std::atomic<std::uint64_t> unlockedWaits{0}, unlockedWaitedUs{0};
-// vkQueueSubmit calls and their time (APS5_PROFILE_DRAW; Submit runs under the GpuMutex).
-std::uint64_t submitCount = 0;
-double submitUs = 0, submitMaxUs = 0;
 // Threads inside a timeline wait with the GpuMutex released (WaitSerial, syncThroughUnlocked): a
 // recorder's teardown, after its Sync() made every wait satisfiable, waits until they left the
 // semaphore before destroying it. Counted per recorder id (a small fixed array; the waiter cannot
@@ -1011,10 +1062,68 @@ private:
     std::chrono::steady_clock::time_point start;
 };
 
+// Diagnostic only: retain scalar writer descriptions while the existing GPU lock
+// is held. SyncThrough can release that lock and invalidate the recorder itself.
+struct CapturedHookWait {
+    using Clock = std::chrono::steady_clock;
+    std::uint64_t address;
+    std::size_t bytes;
+    Clock::time_point start{};
+    GuestMemory::PacketTag packet{};
+    GuestMemory::ReadSite readSite = GuestMemory::ReadSite::Store;
+    std::uint64_t frameBatch = 0;
+    int exceptions = 0;
+    std::array<std::optional<Recorder::PendingWriteInfo>, 2> writers{};
+
+    CapturedHookWait(std::uint64_t address, std::size_t bytes) : address(address), bytes(bytes) {
+        if (!DrawProfiled() || !PerformanceTrace::CapturingRawWindow()) return;
+        start = Clock::now();
+        packet = GuestMemory::CurrentPacket();
+        readSite = GuestMemory::CurrentReadSite();
+        frameBatch = TraceBatchTag;
+        exceptions = std::uncaught_exceptions();
+    }
+
+    void NoteWriter(const Recorder& recorder, std::size_t source) {
+        if (start != Clock::time_point{}) writers[source] = recorder.DescribePendingWrite(address, bytes);
+    }
+
+    ~CapturedHookWait() noexcept {
+        if (start == Clock::time_point{}) return;
+        const auto end = Clock::now();
+        const auto ms = std::chrono::duration<double, std::milli>(end - start).count();
+        if (ms < 50.0) return;
+        static std::atomic<std::uint64_t> records{0};
+        const auto record = records.fetch_add(1, std::memory_order_relaxed);
+        if (record >= 512) {
+            const auto dropped = record - 511;
+            if ((dropped & (dropped - 1)) == 0) std::fprintf(stderr, "[hooksync] capture cap=512 dropped_so_far=%llu\n", static_cast<unsigned long long>(dropped));
+            return;
+        }
+        std::fprintf(stderr, "[hooksync] capture_id=%llu address=0x%llx bytes=%zu readsite=%s source_queue=0x%x source_opcode=0x%x frame_trace_batch=%llu mono_begin_ns=%lld mono_end_ns=%lld hook_wall_ms=%.3f exception=%d\n",
+                static_cast<unsigned long long>(record), static_cast<unsigned long long>(address), bytes,
+                GuestMemory::ReadSiteName(readSite), packet.queue, packet.opcode,
+                static_cast<unsigned long long>(frameBatch),
+                static_cast<long long>(std::chrono::duration_cast<std::chrono::nanoseconds>(start.time_since_epoch()).count()),
+                static_cast<long long>(std::chrono::duration_cast<std::chrono::nanoseconds>(end.time_since_epoch()).count()),
+                ms, std::uncaught_exceptions() > exceptions ? 1 : 0);
+        for (std::size_t source = 0; source < writers.size(); ++source) {
+            if (!writers[source]) continue;
+            const auto& writer = *writers[source];
+            std::fprintf(stderr, "[hooksync] capture_id=%llu sync_source=%zu predicted_writer_serial=%llu writer_open=%d writer_signaled=%d writer_range=0x%llx-0x%llx batches_to_finish=%zu\n",
+                    static_cast<unsigned long long>(record), source + 1,
+                    static_cast<unsigned long long>(writer.serial), writer.open ? 1 : 0, writer.signaled ? 1 : 0,
+                    static_cast<unsigned long long>(writer.rangeBegin), static_cast<unsigned long long>(writer.rangeEnd),
+                    writer.batchesToFinish);
+        }
+    }
+};
+
 // GuestMemory flush hook: a CPU access to memory that recorded GPU work will write waits for that
 // work first; then storage image results pending for the range are stored. The recorder is only
 // dereferenced under the GpuMutex (it is destroyed with its device under that lock).
 void FlushForAccess(std::uint64_t address, std::size_t bytes) {
+    CapturedHookWait capture(address, bytes);
     hookCalls.fetch_add(1, std::memory_order_relaxed);
     // A label this worker queued but has not recorded writes the range: in queue order the label
     // precedes this access, so the group is recorded first (it then notes the range as a pending
@@ -1036,6 +1145,7 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Hook);
         std::lock_guard gpu(GuestMemory::GpuMutex());
         if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->PendingWriteOverlaps(address, bytes)) {
+            capture.NoteWriter(*recorder, 0);
             const HookSyncScope attribution(*recorder, address, bytes);
             Recorder::CountSync(1);
             // The wait runs without the mutex when this acquisition is the outermost one (a stage-A
@@ -1075,6 +1185,7 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Hook);
         std::lock_guard gpu(GuestMemory::GpuMutex());
         if (auto* recorder = Recorder::Active(); recorder != nullptr) {
+            capture.NoteWriter(*recorder, 1);
             const RecordedStoreSyncScope attribution(*recorder, address, bytes, classification, stored, HookSyncProfiled() ? RecordedStoreKey() : HookSyncKey{});
             Recorder::CountSync(2);
             if (HookFullSync() || completionDepth != 0) recorder->Sync();
@@ -1083,7 +1194,7 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
     }
 }
 
-}
+} // namespace
 
 struct Recorder::ProgressWatcher {
     std::mutex mutex;
@@ -1163,7 +1274,10 @@ Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(co
         cmdPushConstants = context.Function<PFN_vkCmdPushConstants>("vkCmdPushConstants");
         cmdDispatch = context.Function<PFN_vkCmdDispatch>("vkCmdDispatch");
     }
-    if (!timelineSemaphores) return;
+    if (!timelineSemaphores) {
+        if (DrawProfiled()) aggregateLiveRecorders.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     // The timeline starts at 0 and every Submit signals its serial (1, 2, ...): a value that only
     // grows, so a thread waiting for it outside the mutex can never observe a reset or a reused
     // handle (the batch fences are pooled and reset in release()). A failure here only disables the
@@ -1177,6 +1291,7 @@ Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(co
         std::fprintf(stderr, "[gpu] timeline semaphore creation failed (Vulkan result %d); drains wait under the GPU mutex\n", static_cast<int>(result));
         timeline = VK_NULL_HANDLE;
     }
+    if (DrawProfiled()) aggregateLiveRecorders.fetch_add(1, std::memory_order_relaxed);
 }
 
 Recorder::~Recorder() {
@@ -1249,6 +1364,15 @@ Recorder::~Recorder() {
     // Sync() above waited for every batch, so no submission still signals the timeline.
     if (timeline != VK_NULL_HANDLE) context.Function<PFN_vkDestroySemaphore>("vkDestroySemaphore")(context.device, timeline, nullptr);
     timeline = VK_NULL_HANDLE;
+    if (DrawProfiled()) {
+        aggregateLiveRecorders.fetch_sub(1, std::memory_order_relaxed);
+        aggregateStorageBytes.fetch_sub(drawSnapshotPools[0].bytes, std::memory_order_relaxed);
+        aggregateStorageEntries.fetch_sub(drawSnapshotPools[0].recency.size(), std::memory_order_relaxed);
+        aggregateDrawInputBytes.fetch_sub(drawSnapshotPools[1].bytes, std::memory_order_relaxed);
+        aggregateDrawInputEntries.fetch_sub(drawSnapshotPools[1].recency.size(), std::memory_order_relaxed);
+        aggregateUnwrittenBytes.fetch_sub(unwrittenBytes, std::memory_order_relaxed);
+        aggregateUnwrittenEntries.fetch_sub(unwrittenSnapshots.size(), std::memory_order_relaxed);
+    }
 }
 
 std::optional<std::chrono::steady_clock::time_point> Recorder::PendingLabelSince() {
@@ -1346,7 +1470,7 @@ void Recorder::CloseLabelGroup(std::uint64_t trackerGeneration) {
         // inside the group) may have landed the value already, and a CPU store between that and
         // this close is not newer than the generation.
         const auto found = recorded.find(dword);
-        if (found != recorded.end() && found->second.stamp == stamp && found->second.batch != nullptr && !found->second.batch->submitted) found->second.generation = trackerGeneration;
+        if (found != recorded.end() && found->second.stamp == stamp && found->second.batch != nullptr && !found->second.batch->submitting.load(std::memory_order_acquire) && !found->second.batch->submitted) found->second.generation = trackerGeneration;
     }
     // A poller that refused the group as unclosed re-consults the table on the next generation.
     writeGeneration.fetch_add(1, std::memory_order_release);
@@ -2621,7 +2745,8 @@ void Recorder::readSamples(Batch& batch) {
 
 void Recorder::readGpuTiming(Batch& batch) {
     if (batch.queries == VK_NULL_HANDLE || batch.timedKeys.empty()) return;
-    std::vector<std::uint64_t> stamps(batch.timedKeys.size() * 2);
+    auto& stamps = gpuTimingStamps;
+    stamps.resize(batch.timedKeys.size() * 2);
     const auto result = context.Function<PFN_vkGetQueryPoolResults>("vkGetQueryPoolResults")(context.device, batch.queries, 0, static_cast<std::uint32_t>(stamps.size()), stamps.size() * sizeof(std::uint64_t), stamps.data(), sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT);
     if (result != VK_SUCCESS) return;
     const auto period = context.limits.timestampPeriod;
@@ -2636,7 +2761,8 @@ void Recorder::readGpuTiming(Batch& batch) {
     static auto lastReport = std::chrono::steady_clock::now();
     // The union of the timed ranges (class ranges nest program ranges: a copy's transfer inside
     // its class range) against the batch span gives what no range covers.
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> intervals;
+    auto& intervals = gpuTimingIntervals;
+    intervals.clear();
     intervals.reserve(batch.timedKeys.size());
     std::unique_lock lock(timingMutex);
     for (std::size_t i = 0; i < batch.timedKeys.size(); ++i) {
@@ -2721,7 +2847,7 @@ std::uint64_t Recorder::NewestSubmitted(std::chrono::steady_clock::time_point* s
 }
 
 std::size_t Recorder::UnsignaledBatches() const {
-    return static_cast<std::size_t>(std::count_if(inFlight.begin(), inFlight.end(), [&](const auto& batch) { return !signaled(*batch); }));
+    return submitting.size() + static_cast<std::size_t>(std::count_if(inFlight.begin(), inFlight.end(), [&](const auto& batch) { return !signaled(*batch); }));
 }
 
 void Recorder::Keep(std::shared_ptr<void> object, std::size_t bytes) {
@@ -2753,7 +2879,8 @@ void Recorder::KeepBytes(const void* owner, std::size_t bytes) {
 void Recorder::BoundKeptBytes() {
     if (!GuestMemory::GpuMutex().HeldByThisThread()) return;
     if (open != nullptr && open->keptBytes >= KeptBytesBudget) Submit();
-    if (DeferredBytes() != 0 && inFlightKeptBytes + DeferredBytes() > 2 * KeptBytesBudget) DestroyDeferred(TakeDeferred(), false);
+    if (DeferredBytes() != 0 && inFlightKeptBytes + submittingKeptBytes + DeferredBytes() > 2 * KeptBytesBudget) DestroyDeferred(TakeDeferred(), false);
+    if (inFlightKeptBytes + submittingKeptBytes > 2 * KeptBytesBudget && !submitting.empty()) waitForSubmissions();
     while (!inFlight.empty() && inFlightKeptBytes > 2 * KeptBytesBudget) {
         auto batch = std::move(inFlight.front());
         inFlight.pop_front();
@@ -2769,6 +2896,12 @@ std::size_t SnapshotPool(Recorder::SnapshotUse use) {
 
 void Recorder::eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry) {
     auto& pool = drawSnapshotPools[SnapshotPool(std::get<1>(entry->first))];
+    if (DrawProfiled()) {
+        auto& totalBytes = SnapshotPool(std::get<1>(entry->first)) == 0 ? aggregateStorageBytes : aggregateDrawInputBytes;
+        auto& totalEntries = SnapshotPool(std::get<1>(entry->first)) == 0 ? aggregateStorageEntries : aggregateDrawInputEntries;
+        totalBytes.fetch_sub(std::get<2>(entry->first), std::memory_order_relaxed);
+        totalEntries.fetch_sub(1, std::memory_order_relaxed);
+    }
     pool.bytes -= std::get<2>(entry->first);
     pool.recency.erase(entry->second.recent);
     drawSnapshots.erase(entry);
@@ -2787,6 +2920,10 @@ Recorder::UploadSlice Recorder::DrawUpload(std::size_t bytes) {
 
 void Recorder::retireUnwrittenSnapshots(const std::array<std::uint64_t, 3>& stamp) {
     if (stamp == unwrittenStamp) return;
+    if (DrawProfiled()) {
+        aggregateUnwrittenBytes.fetch_sub(unwrittenBytes, std::memory_order_relaxed);
+        aggregateUnwrittenEntries.fetch_sub(unwrittenSnapshots.size(), std::memory_order_relaxed);
+    }
     unwrittenSnapshots.clear();
     unwrittenBytes = 0;
     unwrittenStamp = stamp;
@@ -2803,16 +2940,24 @@ std::shared_ptr<Buffer> Recorder::UnwrittenDrawSnapshot(std::uint64_t address, s
 void Recorder::NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, std::shared_ptr<Buffer> buffer, VkDeviceSize offset) {
     retireUnwrittenSnapshots(stamp);
     if (const auto found = unwrittenSnapshots.find(address); found != unwrittenSnapshots.end()) {
+        if (DrawProfiled()) {
+            aggregateUnwrittenBytes.fetch_sub(found->second.bytes, std::memory_order_relaxed);
+            aggregateUnwrittenEntries.fetch_sub(1, std::memory_order_relaxed);
+        }
         unwrittenBytes -= found->second.bytes;
         unwrittenSnapshots.erase(found);
     }
     if (unwrittenSnapshots.size() >= UnwrittenSnapshotEntries || bytes > DrawSnapshotBudget - unwrittenBytes) return;
     unwrittenSnapshots.emplace(address, UnwrittenSnapshot{bytes, std::move(buffer), offset});
     unwrittenBytes += bytes;
+    if (DrawProfiled()) {
+        aggregateUnwrittenBytes.fetch_add(bytes, std::memory_order_relaxed);
+        aggregateUnwrittenEntries.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
-std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived, std::uint64_t generation, VkDeviceSize* offset) {
-    auto found = use == SnapshotUse::Vertex ? drawSnapshots.lower_bound({address, use, bytes}) : drawSnapshots.find({address, use, bytes});
+std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived, std::uint64_t generation, VkDeviceSize* offset, std::uint64_t indexClamp) {
+    auto found = use == SnapshotUse::Vertex ? drawSnapshots.lower_bound({address, use, bytes, 0}) : drawSnapshots.find({address, use, bytes, indexClamp});
     if (found == drawSnapshots.end() || std::get<0>(found->first) != address || std::get<1>(found->first) != use) {
         if (use != SnapshotUse::Storage || offset == nullptr) return {};
         return containingDrawSnapshot(address, bytes, offset);
@@ -2835,11 +2980,11 @@ std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, st
 std::shared_ptr<Buffer> Recorder::containingDrawSnapshot(std::uint64_t address, std::size_t bytes, VkDeviceSize* offset) {
     const VkDeviceSize alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4);
     const auto registry = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
-    auto entry = drawSnapshots.upper_bound({address, SnapshotUse::Storage, std::numeric_limits<std::size_t>::max()});
+    auto entry = drawSnapshots.upper_bound({address, SnapshotUse::Storage, std::numeric_limits<std::size_t>::max(), 0});
     for (std::size_t probe = 0; probe < ContainingSnapshotProbes && entry != drawSnapshots.begin(); ++probe) {
         --entry;
-        const auto& [start, use, held] = entry->first;
-        if (use != SnapshotUse::Storage || start + held < address + bytes || (address - start) % alignment != 0) continue;
+        const auto& [start, use, held, indexClamp] = entry->first;
+        if (use != SnapshotUse::Storage || indexClamp != 0 || start + held < address + bytes || (address - start) % alignment != 0) continue;
         if (entry->second.registryGeneration != registry || !GuestMemory::UnchangedSince(address, bytes, entry->second.generation)) continue;
         auto& recency = drawSnapshotPools[SnapshotPool(use)].recency;
         recency.splice(recency.end(), recency, entry->second.recent);
@@ -2896,19 +3041,19 @@ bool Recorder::refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, s
     return true;
 }
 
-void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use, std::uint32_t derived) {
+void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use, std::uint32_t derived, std::uint64_t indexClamp) {
     const bool storage = use == SnapshotUse::Storage;
     const auto budget = storage ? DrawSnapshotBudget : DrawInputBudget;
     const auto maxEntries = storage ? DrawSnapshotEntries : DrawInputEntries;
     auto& pool = drawSnapshotPools[SnapshotPool(use)];
     if (generation == 0 || bytes > budget) return;
     if (use == SnapshotUse::Vertex) {
-        for (auto it = drawSnapshots.lower_bound({address, use, 0}); it != drawSnapshots.end() && std::get<0>(it->first) == address && std::get<1>(it->first) == use && std::get<2>(it->first) <= bytes;) eraseDrawSnapshot(it++);
-    } else if (const auto found = drawSnapshots.find({address, use, bytes}); found != drawSnapshots.end()) {
+        for (auto it = drawSnapshots.lower_bound({address, use, 0, 0}); it != drawSnapshots.end() && std::get<0>(it->first) == address && std::get<1>(it->first) == use && std::get<2>(it->first) <= bytes;) eraseDrawSnapshot(it++);
+    } else if (const auto found = drawSnapshots.find({address, use, bytes, indexClamp}); found != drawSnapshots.end()) {
         eraseDrawSnapshot(found);
     }
     while (!pool.recency.empty() && (pool.bytes + bytes > budget || pool.recency.size() >= maxEntries)) eraseDrawSnapshot(drawSnapshots.find(pool.recency.front()));
-    const DrawSnapshotKey key{address, use, bytes};
+    const DrawSnapshotKey key{address, use, bytes, indexClamp};
     pool.recency.push_back(key);
     try {
         drawSnapshots.emplace(key, DrawSnapshot{generation, registryGeneration, std::prev(pool.recency.end()), std::move(buffer), derived});
@@ -2917,10 +3062,16 @@ void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::u
         throw;
     }
     pool.bytes += bytes;
+    if (DrawProfiled()) {
+        auto& totalBytes = storage ? aggregateStorageBytes : aggregateDrawInputBytes;
+        auto& totalEntries = storage ? aggregateStorageEntries : aggregateDrawInputEntries;
+        totalBytes.fetch_add(bytes, std::memory_order_relaxed);
+        totalEntries.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 bool Recorder::KnownHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::optional<std::uint32_t>& highest) {
-    const auto found = indexRanges.find({address, use, bytes});
+    const auto found = indexRanges.find({address, use, bytes, 0});
     if (found == indexRanges.end()) return false;
     if (found->second.registryGeneration != GuestAllocations::GuestAllocationsGeneration_nid_postfix() || !GuestMemory::UnchangedSince(address, bytes, found->second.generation)) {
         indexRangeRecency.erase(found->second.recent);
@@ -2935,7 +3086,7 @@ bool Recorder::KnownHighestIndex(std::uint64_t address, std::size_t bytes, Snaps
 void Recorder::KeepHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint64_t generation, std::uint64_t registryGeneration, std::optional<std::uint32_t> highest) {
     Require(use != SnapshotUse::Storage && use != SnapshotUse::Vertex, "a highest index belongs to an index buffer");
     if (generation == 0) return;
-    const DrawSnapshotKey key{address, use, bytes};
+    const DrawSnapshotKey key{address, use, bytes, 0};
     if (const auto found = indexRanges.find(key); found != indexRanges.end()) {
         indexRangeRecency.erase(found->second.recent);
         indexRanges.erase(found);
@@ -2961,7 +3112,7 @@ void Recorder::OnComplete(std::function<void()> action) {
 }
 
 bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel, int value, std::int64_t word) {
-    CaptureTrace::Log("buffer-write batch=%llu address=%llx bytes=%zu label=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, ownLabel);
+    CaptureTrace::Log("buffer-write batch=%llu address=%llx bytes=%zu label=%d", static_cast<unsigned long long>(OpenSerial()), static_cast<unsigned long long>(address), bytes, ownLabel);
     if (bytes == 0) return false;
     ensureOpen();
     const auto end = address + bytes;
@@ -3081,6 +3232,7 @@ void Recorder::publishPendingWrites(std::span<const std::pair<std::uint64_t, std
             merged->insert(merged->end(), additions.begin(), additions.end());
         } else {
             if (open != nullptr) merged->insert(merged->end(), open->writes.begin(), open->writes.end());
+            for (const auto& batch : submitting) merged->insert(merged->end(), batch->writes.begin(), batch->writes.end());
             for (const auto& batch : inFlight) merged->insert(merged->end(), batch->writes.begin(), batch->writes.end());
             for (const auto* batch : finishing) merged->insert(merged->end(), batch->writes.begin(), batch->writes.end());
         }
@@ -3113,6 +3265,9 @@ bool Recorder::PendingWriteOverlaps(std::uint64_t address, std::size_t bytes) co
     if (published != nullptr && !SnapshotOverlaps(published.get(), address, bytes)) return false;
     const auto end = address + bytes;
     if (open != nullptr && overlaps(*open, address, end)) return true;
+    for (const auto& batch : submitting) {
+        if (overlaps(*batch, address, end)) return true;
+    }
     for (const auto& batch : inFlight) {
         if (overlaps(*batch, address, end)) return true;
     }
@@ -3128,6 +3283,9 @@ std::uint64_t Recorder::PendingWriterSerial(std::uint64_t address, std::size_t b
     const auto end = address + bytes;
     const auto writes = [&](const Batch& batch) { return overlaps(batch, address, end) || readOverlap(batch, address, end, ReadKind::AddressBased).has_value(); };
     if (open != nullptr && writes(*open)) return OpenSerial();
+    for (auto it = submitting.rbegin(); it != submitting.rend(); ++it) {
+        if (writes(**it)) return (*it)->serial;
+    }
     for (auto it = inFlight.rbegin(); it != inFlight.rend(); ++it) {
         if (writes(**it)) return (*it)->serial;
     }
@@ -3142,6 +3300,9 @@ bool Recorder::PendingWriteSettled(std::uint64_t address, std::size_t bytes) con
     if (bytes == 0) return true;
     const auto end = address + bytes;
     if (open != nullptr && overlaps(*open, address, end)) return false;
+    for (const auto& batch : submitting) {
+        if (overlaps(*batch, address, end)) return false;
+    }
     for (const auto& batch : inFlight) {
         if (overlaps(*batch, address, end) && !signaled(*batch)) return false;
     }
@@ -3165,6 +3326,7 @@ std::uint64_t Recorder::NewestWriteNote(std::uint64_t address, std::size_t bytes
     };
     if (open != nullptr) scan(*open);
     for (const auto& batch : inFlight) scan(*batch);
+    for (const auto& batch : submitting) scan(*batch);
     return newest;
 }
 
@@ -3179,6 +3341,7 @@ std::vector<Recorder::PendingWrite> Recorder::PendingWritesOver(std::uint64_t ad
     };
     if (open != nullptr) scan(*open);
     for (const auto& batch : inFlight) scan(*batch);
+    for (const auto& batch : submitting) scan(*batch);
     return found;
 }
 
@@ -3186,6 +3349,7 @@ void Recorder::PendingWriteRanges(std::vector<std::pair<std::uint64_t, std::uint
     ranges.clear();
     if (open != nullptr) ranges.insert(ranges.end(), open->writes.begin(), open->writes.end());
     for (const auto& batch : inFlight) ranges.insert(ranges.end(), batch->writes.begin(), batch->writes.end());
+    for (const auto& batch : submitting) ranges.insert(ranges.end(), batch->writes.begin(), batch->writes.end());
 }
 
 bool Recorder::ReadTracking() {
@@ -3193,7 +3357,7 @@ bool Recorder::ReadTracking() {
 }
 
 void Recorder::NotePendingRead(std::uint64_t address, std::size_t bytes, ReadKind kind) {
-    CaptureTrace::Log("buffer-read batch=%llu address=%llx bytes=%zu kind=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, static_cast<int>(kind));
+    CaptureTrace::Log("buffer-read batch=%llu address=%llx bytes=%zu kind=%d", static_cast<unsigned long long>(OpenSerial()), static_cast<unsigned long long>(address), bytes, static_cast<int>(kind));
     if (bytes == 0 || !ReadTrackingEnabled()) return;
     ensureOpen();
     open->reads.push_back({address, address + bytes, kind});
@@ -3204,7 +3368,7 @@ void Recorder::NotePendingReads(std::span<const std::pair<std::uint64_t, std::ui
     if (ranges.empty() || !ReadTrackingEnabled()) return;
     ensureOpen();
     for (const auto& [begin, end] : ranges) {
-        CaptureTrace::Log("buffer-read batch=%llu address=%llx bytes=%llu kind=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), static_cast<int>(kind));
+        CaptureTrace::Log("buffer-read batch=%llu address=%llx bytes=%llu kind=%d", static_cast<unsigned long long>(OpenSerial()), static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), static_cast<int>(kind));
         if (end > begin) open->reads.push_back({begin, end, kind});
     }
     readsNoted.fetch_add(ranges.size(), std::memory_order_relaxed);
@@ -3277,7 +3441,12 @@ bool Recorder::PendingReadOverlaps(std::uint64_t address, std::size_t bytes, boo
             return true;
         }
     }
-    // Newest first: the batch most likely still running decides without a status query per batch.
+    for (auto it = submitting.rbegin(); it != submitting.rend(); ++it) {
+        if (const auto kind = readOverlap(**it, address, end)) {
+            readHits[static_cast<std::size_t>(*kind)].fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+    }
     for (auto it = inFlight.rbegin(); it != inFlight.rend(); ++it) {
         const auto kind = readOverlap(**it, address, end);
         if (!kind.has_value()) continue;
@@ -3295,7 +3464,10 @@ std::optional<Recorder::PendingReadInfo> Recorder::DescribePendingRead(std::uint
     if (bytes == 0) return std::nullopt;
     const auto end = address + bytes;
     if (open != nullptr) {
-        if (const auto kind = readOverlap(*open, address, end)) return PendingReadInfo{submissions + 1, open->queue, *kind, true, false};
+        if (const auto kind = readOverlap(*open, address, end)) return PendingReadInfo{OpenSerial(), open->queue, *kind, true, false};
+    }
+    for (auto it = submitting.rbegin(); it != submitting.rend(); ++it) {
+        if (const auto kind = readOverlap(**it, address, end)) return PendingReadInfo{(*it)->serial, (*it)->queue, *kind, false, false};
     }
     for (auto it = inFlight.rbegin(); it != inFlight.rend(); ++it) {
         if (const auto kind = readOverlap(**it, address, end)) return PendingReadInfo{(*it)->serial, (*it)->queue, *kind, false, signaled(**it)};
@@ -3312,29 +3484,30 @@ Recorder::ReadStatistics Recorder::ReadCounts() {
 std::optional<Recorder::PendingWriteInfo> Recorder::DescribePendingWrite(std::uint64_t address, std::size_t bytes) const {
     if (bytes == 0) return std::nullopt;
     const auto end = address + bytes;
-    // The same choice SyncThrough makes: the open batch forces a full Sync, otherwise the newest
-    // overlapping in-flight batch is the target. Of that batch's ranges the first overlapping one
-    // is reported (a dispatch notes each written V# once, so it is the range the access hit).
     const auto firstOverlap = [&](const Batch& batch) -> const std::pair<std::uint64_t, std::uint64_t>* {
         for (const auto& range : batch.writes) {
             if (address < range.second && range.first < end) return &range;
         }
         return nullptr;
     };
-    // With SyncThrough disabled every hit is a full Sync: the open batch (if any) is submitted and
-    // everything in flight finishes, whichever batch noted the range.
     const bool syncAll = !SyncThroughEnabled();
-    const auto allBatches = inFlight.size() + (open != nullptr ? 1 : 0);
+    const auto allBatches = inFlight.size() + submitting.size() + (open != nullptr ? 1 : 0);
+    const auto newestSerial = reservedSubmissions > submissions ? reservedSubmissions : submissions;
     if (open != nullptr) {
-        if (const auto* range = firstOverlap(*open)) return PendingWriteInfo{submissions + 1, true, false, range->first, range->second, inFlight.size() + 1};
+        if (const auto* range = firstOverlap(*open)) return PendingWriteInfo{OpenSerial(), true, false, range->first, range->second, allBatches};
     }
-    std::size_t finished = inFlight.size();
+    std::size_t finished = submitting.size() + inFlight.size();
+    for (auto it = submitting.rbegin(); it != submitting.rend(); ++it, --finished) {
+        const auto* range = firstOverlap(**it);
+        if (range == nullptr) continue;
+        if (syncAll) return PendingWriteInfo{newestSerial, false, false, range->first, range->second, allBatches};
+        return PendingWriteInfo{(*it)->serial, false, false, range->first, range->second, finished};
+    }
     for (auto it = inFlight.rbegin(); it != inFlight.rend(); ++it, --finished) {
         const auto* range = firstOverlap(**it);
         if (range == nullptr) continue;
-        // In flight means submitted, so the fence is live; signaled = the GPU already ran it.
         const bool signaled = fenceStatus((*it)->fence) == VK_SUCCESS;
-        if (syncAll) return PendingWriteInfo{submissions + (open != nullptr ? 1 : 0), open != nullptr, signaled, range->first, range->second, allBatches};
+        if (syncAll) return PendingWriteInfo{newestSerial, false, signaled, range->first, range->second, allBatches};
         return PendingWriteInfo{(*it)->serial, false, signaled, range->first, range->second, finished};
     }
     return std::nullopt;
@@ -3343,6 +3516,9 @@ std::optional<Recorder::PendingWriteInfo> Recorder::DescribePendingWrite(std::ui
 bool Recorder::HasCompletions() const {
     if (open != nullptr && !open->completions.empty()) return true;
     for (const auto& batch : inFlight) {
+        if (!batch->completions.empty()) return true;
+    }
+    for (const auto& batch : submitting) {
         if (!batch->completions.empty()) return true;
     }
     return false;
@@ -3479,10 +3655,14 @@ bool Recorder::unsignaled(std::uint64_t serial) const {
     for (const auto& batch : inFlight) {
         if (batch->serial == serial) return fenceStatus(batch->fence) != VK_SUCCESS;
     }
+    for (const auto& batch : submitting) {
+        if (batch->serial == serial) return true;
+    }
     return false;
 }
 
 void Recorder::AfterCompletions(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool storedOnGpu) {
+    if (open == nullptr && !submitting.empty()) waitForSubmissions();
     Require(open != nullptr || !inFlight.empty(), "no batch to append a completion label to");
     Batch& batch = open != nullptr ? *open : *inFlight.back();
     std::vector<std::byte> copy(bytes.begin(), bytes.end());
@@ -3528,6 +3708,7 @@ void Recorder::AfterCompletions(std::uint64_t address, std::span<const std::byte
 }
 
 bool Recorder::AfterRecordedWork(std::function<void()> action) {
+    if (open == nullptr && !submitting.empty()) waitForSubmissions();
     if (Idle()) return false;
     Batch& batch = open != nullptr ? *open : *inFlight.back();
     batch.completions.push_back(std::move(action));
@@ -3570,6 +3751,7 @@ void Recorder::NoteWrittenBack(std::uint64_t address, std::size_t bytes) {
     };
     if (recorder->open != nullptr) count(*recorder->open);
     for (auto& batch : recorder->inFlight) count(*batch);
+    for (auto& batch : recorder->submitting) count(*batch);
 }
 
 bool Recorder::writtenBackSince(std::uint64_t sequence, std::uint64_t begin, std::uint64_t end) {
@@ -3589,12 +3771,9 @@ void Recorder::HoldNextSubmit(VkSemaphore semaphore, std::uint64_t value) {
 
 void Recorder::Submit() {
     PerformanceTimer frameTiming("Recorder.Submit");
-    // The work count is cleared even when nothing is open: the driver counts a dispatch after its
-    // call returns (outside the mutex), so a submit by another thread in between leaves a stale
-    // count behind, and the callers that act on it would otherwise take the mutex for nothing at
-    // every packet or submission end until a real batch is next submitted.
     if (activeRecorder == this) workSinceSubmit.store(0, std::memory_order_relaxed);
     dropStaleHoldKept();
+    if (context.queueLane != nullptr && GuestMemory::GpuMutex().HeldByThisThread()) publishSubmissions();
     if (open == nullptr) return;
     GuestMemory::AssertGpuLockHeld("Recorder::Submit");
     if (!open->keyStores.empty()) recordKeyStores(false);
@@ -3608,16 +3787,12 @@ void Recorder::Submit() {
     if (segments && pendingSamples.size() >= SampleFoldCapacity) foldSegments();
     if (BarrierValidate()) validateBatchEnds.fetch_add(1, std::memory_order_relaxed);
     if (open->hostReadOwed && !hostReadCovered) {
-        // A fence makes nothing visible to the host: a lean draw's writes (no download barrier of
-        // its own) get the batch's one here.
         recordBarrier(open->commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
         CountBarriers(CommandClass::Draw);
     }
     EndGpuTiming(open->batchTiming);
     if (!GpuTimingEnabled()) reportBarriers();
     if (FlipReadCheck()) {
-        // A CPU write into a noted read after this collect (and so possibly before the GPU read
-        // it) fails UnchangedSince at the presenter's check (VulkanDevice RetirePresents).
         for (const auto& [begin, end] : notedReads(*open)) open->readGeneration = std::max(open->readGeneration, GuestMemory::CollectWrites(begin, end - begin));
     }
     auto batch = std::move(open);
@@ -3632,15 +3807,17 @@ void Recorder::Submit() {
     VkSubmitInfo submission{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submission.commandBufferCount = 1;
     submission.pCommandBuffers = &batch->commands;
-    // The timeline reaches this batch's serial when it completes (see WaitSerial).
-    const std::uint64_t serial = submissions + 1;
+    const bool outsideMutex = context.queueLane != nullptr;
+    // The timeline reaches this batch's reserved serial when it completes (see WaitSerial).
+    const std::uint64_t serial = outsideMutex ? reservedSubmissions + 1 : submissions + 1;
+    batch->serial = serial;
     std::string tokensStr = "[";
     for (std::size_t i = 0; i < batch->drawTraceTokens.size(); ++i) {
         if (i > 0) tokensStr += ",";
         tokensStr += std::to_string(batch->drawTraceTokens[i]);
     }
     tokensStr += "]";
-    CaptureTrace::Log("submit batch=%llu tokens=%s", static_cast<unsigned long long>(serial), tokensStr.c_str());
+    CaptureTrace::Log("submit batch=%llu tokens=%s reads=%zu writes=%zu", static_cast<unsigned long long>(serial), tokensStr.c_str(), batch->reads.size(), batch->writes.size());
     VkTimelineSemaphoreSubmitInfoKHR timelineInfo{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO_KHR};
     const VkSemaphore hold = std::exchange(submitHold, VK_NULL_HANDLE);
     const std::uint64_t holdValue = submitHoldValue;
@@ -3659,22 +3836,77 @@ void Recorder::Submit() {
         submission.pSignalSemaphores = &timeline;
     }
     if (hold != VK_NULL_HANDLE || timeline != VK_NULL_HANDLE) submission.pNext = &timelineInfo;
-    const auto submitStart = std::chrono::steady_clock::now();
-    const auto result = function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence);
-    if (result == VK_ERROR_DEVICE_LOST) {
-        const auto idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
-        if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST) std::terminate();
+    const auto submitFunction = function(queueSubmit, "vkQueueSubmit");
+    std::chrono::steady_clock::time_point submitStart{};
+    std::chrono::steady_clock::time_point submittedAt{};
+    const auto submitBatch = [&](Batch* target) {
+        submitStart = std::chrono::steady_clock::now();
+        const bool profile = DrawProfiled();
+        const auto cpuStart = profile ? threadCpuNow() : std::nullopt;
+        const auto pureSubmitStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const auto result = submitFunction(context.queue, 1, &submission, target->fence);
+        if (profile) {
+            const auto returnedAt = std::chrono::steady_clock::now();
+            const auto cpuEnd = threadCpuNow();
+            std::optional<double> cpuUs;
+            if (cpuStart && cpuEnd && *cpuEnd >= *cpuStart)
+                cpuUs = std::chrono::duration<double, std::micro>(*cpuEnd - *cpuStart).count();
+            recordVkSubmitWindow(std::chrono::duration<double, std::micro>(returnedAt - pureSubmitStart).count(), cpuUs);
+        }
+        if (result == VK_ERROR_DEVICE_LOST) {
+            const auto idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
+            if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST) std::terminate();
+        }
+        submittedAt = std::chrono::steady_clock::now();
+        return result;
+    };
+    VkResult result;
+    if (outsideMutex) {
+        QueueLane::Turn turn(*context.queueLane);
+        submitting.push_back(std::move(batch));
+        reservedSubmissions = serial;
+        auto* pending = submitting.back().get();
+        pending->submitting.store(true, std::memory_order_release);
+        submittingKeptBytes += pending->keptBytes;
+        if (activeRecorder == this) pendingLabelSince.store(NoPendingLabel, std::memory_order_release);
+        std::exception_ptr queueException;
+        result = VK_SUCCESS;
+        auto& gpuMutex = GuestMemory::GpuMutex();
+        const auto unlockDepth = gpuMutex.DepthOnThisThread();
+        for (auto count = unlockDepth; count != 0; --count) gpuMutex.unlock();
+        try {
+            turn.Enter();
+            result = submitBatch(pending);
+        } catch (...) {
+            queueException = std::current_exception();
+            result = VK_ERROR_UNKNOWN;
+        }
+        pending->submitResult = result;
+        pending->submitCompletedAt = submittedAt == std::chrono::steady_clock::time_point{} ? std::chrono::steady_clock::now() : submittedAt;
+        pending->submitComplete.store(true, std::memory_order_release);
+        {
+            std::lock_guard lock(submissionWaitMutex);
+            ++submissionGeneration;
+        }
+        submissionWait.notify_all();
+        turn.Finish();
+        for (auto count = unlockDepth; count != 0; --count) gpuMutex.lock();
+        publishSubmissions();
+        if (queueException != nullptr) std::rethrow_exception(queueException);
+        Check(result, "vkQueueSubmit recorder");
+        if (DrawProfiled()) {
+            if (auto* frame = PerformanceContext::Current()) frame->Add(frame->Get("Recorder", "submit"), submittedAt - submitStart);
+        }
+        return;
     }
+    result = submitBatch(batch.get());
     Check(result, "vkQueueSubmit recorder");
     batch->submitted = true;
     batch->serial = ++submissions;
+    publishedSubmissions.store(batch->serial, std::memory_order_release);
     batch->submittedAt = std::chrono::steady_clock::now();
     CaptureTrace::Log("submit-confirmed batch=%llu tokens=%s", static_cast<unsigned long long>(batch->serial), tokensStr.c_str());
     if (DrawProfiled()) {
-        const auto us = std::chrono::duration<double, std::micro>(batch->submittedAt - submitStart).count();
-        ++submitCount;
-        submitUs += us;
-        submitMaxUs = std::max(submitMaxUs, us);
         if (auto* frame = PerformanceContext::Current()) frame->Add(frame->Get("Recorder", "submit"), batch->submittedAt - submitStart);
     }
     {
@@ -3694,8 +3926,103 @@ void Recorder::Submit() {
     if (activeRecorder == this) pendingLabelSince.store(NoPendingLabel, std::memory_order_release);
 }
 
+void Recorder::publishSubmissions() {
+    GuestMemory::AssertGpuLockHeld("Recorder::publishSubmissions");
+    bool changed = false;
+    while (!submitting.empty() && submitting.front()->submitComplete.load(std::memory_order_acquire)) {
+        const auto result = submitting.front()->submitResult;
+        if (result != VK_SUCCESS) {
+            auto batch = std::move(submitting.front());
+            submitting.pop_front();
+            submittingKeptBytes -= batch->keptBytes;
+            {
+                std::lock_guard lock(submissionFailureMutex);
+                if (submissionFailureSerial == 0) {
+                    submissionFailureSerial = batch->serial;
+                    submissionFailureResult = result;
+                }
+            }
+            discard(std::move(batch));
+            changed = true;
+            continue;
+        }
+        inFlight.push_back(std::move(submitting.front()));
+        submitting.pop_front();
+        auto& batch = *inFlight.back();
+        submittingKeptBytes -= batch.keptBytes;
+        batch.submitted = true;
+        batch.submittedAt = batch.submitCompletedAt;
+        submissions = batch.serial;
+        publishedSubmissions.store(batch.serial, std::memory_order_release);
+        {
+            std::lock_guard lock(completedMutex);
+            newestSubmitted = batch.serial;
+            newestSubmittedAt = batch.submittedAt;
+        }
+        inFlightKeptBytes += batch.keptBytes;
+        batch.submitting.store(false, std::memory_order_release);
+        if (timeline != VK_NULL_HANDLE) {
+            if (!progressWatcher) {
+                progressWatcher = std::make_unique<ProgressWatcher>(context.device, timeline, context.Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR"),
+                                                                    context.Function<PFN_vkGetSemaphoreCounterValueKHR>("vkGetSemaphoreCounterValueKHR"));
+            }
+            progressWatcher->Submitted(batch.serial);
+        }
+        changed = true;
+    }
+    if (changed) {
+        {
+            std::lock_guard lock(submissionWaitMutex);
+            ++submissionGeneration;
+        }
+        submissionWait.notify_all();
+    }
+}
+
+void Recorder::checkSubmissionFailure(std::uint64_t serial) const {
+    std::lock_guard lock(submissionFailureMutex);
+    if (submissionFailureSerial != 0 && serial >= submissionFailureSerial) Check(submissionFailureResult, "vkQueueSubmit recorder");
+}
+
+void Recorder::waitForSubmissions() {
+    auto& gpuMutex = GuestMemory::GpuMutex();
+    const auto target = reservedSubmissions;
+    for (;;) {
+        publishSubmissions();
+        if (submitting.empty() || submitting.front()->serial > target) break;
+        std::unique_lock lock(submissionWaitMutex);
+        if (submitting.empty() || submitting.front()->serial > target || submitting.front()->submitComplete.load(std::memory_order_acquire)) continue;
+        const auto generation = submissionGeneration;
+        const auto unlockDepth = gpuMutex.DepthOnThisThread();
+        for (auto count = unlockDepth; count != 0; --count) gpuMutex.unlock();
+        submissionWait.wait(lock, [&] { return submissionGeneration != generation; });
+        lock.unlock();
+        for (auto count = unlockDepth; count != 0; --count) gpuMutex.lock();
+    }
+}
+
+void Recorder::waitForSubmittingOverlap(std::uint64_t address, std::uint64_t end) {
+    auto& gpuMutex = GuestMemory::GpuMutex();
+    for (;;) {
+        publishSubmissions();
+        const auto overlapping = std::find_if(submitting.rbegin(), submitting.rend(), [&](const auto& batch) { return overlaps(*batch, address, end); });
+        if (overlapping == submitting.rend()) break;
+        std::unique_lock lock(submissionWaitMutex);
+        if ((*overlapping)->submitComplete.load(std::memory_order_acquire)) continue;
+        const auto generation = submissionGeneration;
+        const auto unlockDepth = gpuMutex.DepthOnThisThread();
+        for (auto count = unlockDepth; count != 0; --count) gpuMutex.unlock();
+        submissionWait.wait(lock, [&] { return submissionGeneration != generation; });
+        lock.unlock();
+        for (auto count = unlockDepth; count != 0; --count) gpuMutex.lock();
+    }
+}
+
+
+
 std::uint64_t Recorder::SubmitAndEpoch() {
     Submit();
+    if (context.queueLane != nullptr) waitForSubmissions();
     return inFlight.empty() ? 0 : submissions;
 }
 
@@ -3745,6 +4072,15 @@ VkResult WaitTimeline(VkDevice device, VkSemaphore timeline, PFN_vkWaitSemaphore
 void Recorder::WaitSerial(std::uint64_t serial) {
     PerformanceTimer frameTiming("Recorder.WaitSerial");
     if (timeline == VK_NULL_HANDLE || serial == 0) return;
+    checkSubmissionFailure(serial);
+    while (publishedSubmissions.load(std::memory_order_acquire) < serial) {
+        std::unique_lock lock(submissionWaitMutex);
+        const auto generation = submissionGeneration;
+        checkSubmissionFailure(serial);
+        if (publishedSubmissions.load(std::memory_order_acquire) >= serial) break;
+        submissionWait.wait(lock, [&] { return submissionGeneration != generation; });
+    }
+    checkSubmissionFailure(serial);
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const UnlockedWaiter waiter{id};
@@ -3791,6 +4127,7 @@ void Recorder::Sync() {
     const auto source = std::exchange(announcedSource, 4);
     const void* site = std::exchange(announcedSite, nullptr);
     Submit();
+    if (context.queueLane != nullptr) waitForSubmissions();
     // Counted only when something is waited for: an idle recorder's Sync is free and would only
     // swamp the site table with the callers that check nothing first.
     const auto previousSite = inFlight.empty() ? activeSyncSite : BeginSyncSite(source, site != nullptr ? site : __builtin_return_address(0));
@@ -3850,6 +4187,7 @@ void Recorder::SyncThrough(std::uint64_t address, std::size_t bytes, bool waitUn
         Sync();
         return;
     }
+    if (context.queueLane != nullptr) waitForSubmittingOverlap(address, end);
     const auto source = std::exchange(announcedSource, 4);
     const void* site = std::exchange(announcedSite, nullptr);
     std::uint64_t targetSerial = 0;
@@ -3942,8 +4280,10 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
     std::uint64_t targetSerial = 0;
     if (!SyncThroughEnabled() || (open != nullptr && overlaps(*open, address, end))) {
         Submit();
+        if (context.queueLane != nullptr) waitForSubmissions();
         targetSerial = submissions;
     } else {
+        if (context.queueLane != nullptr) waitForSubmittingOverlap(address, end);
         for (auto it = inFlight.rbegin(); it != inFlight.rend(); ++it) {
             if (overlaps(**it, address, end)) {
                 targetSerial = (*it)->serial;
@@ -3969,10 +4309,15 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
     const RestoreSyncSite restoreSite{BeginSyncSite(source, site)};
     const bool profile = DrawProfiled();
     const bool trace = TraceCapSync();
+    const bool captureWait = profile && PerformanceTrace::CapturingRawWindow();
+    const auto frameTraceBatch = TraceBatchTag;
+    const auto sourcePacket = GuestMemory::CurrentPacket();
     const auto readSite = GuestMemory::CurrentReadSite();
     const auto newestSerial = submissions;
     std::size_t batchesToTarget = 0, unsignaledAtStart = 0, targetRanges = 0;
     std::pair<std::uint64_t, std::uint64_t> hit{0, 0};
+    std::uint32_t targetQueue = GuestMemory::NoPacket;
+    bool targetSignaled = false;
     std::chrono::steady_clock::time_point targetSubmittedAt{};
     std::map<std::uint32_t, std::uint64_t> aheadByQueue;
     if (profile || trace) {
@@ -3981,8 +4326,11 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
             if (batch->serial > targetSerial) break;
             ++batchesToTarget;
             ++aheadByQueue[batch->queue];
-            if (status(context.device, batch->fence) != VK_SUCCESS) ++unsignaledAtStart;
+            const bool signaled = status(context.device, batch->fence) == VK_SUCCESS;
+            if (!signaled) ++unsignaledAtStart;
             if (batch->serial != targetSerial) continue;
+            targetQueue = batch->queue;
+            targetSignaled = signaled;
             targetSubmittedAt = batch->submittedAt;
             targetRanges = batch->writes.size();
             for (const auto& range : batch->writes) {
@@ -4034,11 +4382,24 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
         for (const auto& [queue, count] : aheadByQueue) stats.aheadByQueue[queue] += count;
         if (std::chrono::steady_clock::now() - stats.lastReport > std::chrono::seconds(10)) ReportSyncWaits(stats);
     }
-    if (trace) {
-        static std::atomic<int> lines{0};
-        if (lines.fetch_add(1) < 600) {
-            const auto packet = GuestMemory::CurrentPacket();
-            std::fprintf(stderr, "[capsync] sync q0x%x %s %s 0x%llx+0x%llx: target %llu (newest %llu), %zu batches up to it (%zu unsignaled at the start), target noted %zu ranges, hit 0x%llx+0x%llx, GPU wait %.1f ms\n", packet.queue, PacketName(packet.opcode).c_str(), GuestMemory::ReadSiteName(readSite), static_cast<unsigned long long>(address), static_cast<unsigned long long>(end - address), static_cast<unsigned long long>(targetSerial), static_cast<unsigned long long>(newestSerial), batchesToTarget, unsignaledAtStart, targetRanges, static_cast<unsigned long long>(hit.first), static_cast<unsigned long long>(hit.second - hit.first), ms);
+    if (trace || (captureWait && ms >= 50.0)) {
+        static std::atomic<std::uint64_t> traceLines{0}, captureLines{0};
+        const auto line = (trace ? traceLines : captureLines).fetch_add(1, std::memory_order_relaxed);
+        const std::uint64_t limit = trace ? 600 : 512;
+        if (line < limit) {
+            std::fprintf(stderr, "[capsync] sync q0x%x %s %s 0x%llx+0x%llx: target %llu (newest %llu), %zu batches up to it (%zu unsignaled at the start), target noted %zu ranges, hit 0x%llx+0x%llx, GPU wait %.1f ms frame_trace_batch=%llu target_queue=0x%x target_signaled_at_start=%d gpu_wait_begin_ns=%lld gpu_wait_end_ns=%lld vk_result=%d\n",
+                    sourcePacket.queue, PacketName(sourcePacket.opcode).c_str(), GuestMemory::ReadSiteName(readSite),
+                    static_cast<unsigned long long>(address), static_cast<unsigned long long>(end - address),
+                    static_cast<unsigned long long>(targetSerial), static_cast<unsigned long long>(newestSerial),
+                    batchesToTarget, unsignaledAtStart, targetRanges,
+                    static_cast<unsigned long long>(hit.first), static_cast<unsigned long long>(hit.second - hit.first), ms,
+                    static_cast<unsigned long long>(frameTraceBatch), targetQueue, targetSignaled ? 1 : 0,
+                    static_cast<long long>(std::chrono::duration_cast<std::chrono::nanoseconds>(start.time_since_epoch()).count()),
+                    static_cast<long long>(std::chrono::duration_cast<std::chrono::nanoseconds>(waited.time_since_epoch()).count()),
+                    static_cast<int>(result));
+        } else if (!trace) {
+            const auto dropped = line - limit + 1;
+            if ((dropped & (dropped - 1)) == 0) std::fprintf(stderr, "[capsync] capture cap=512 dropped_so_far=%llu\n", static_cast<unsigned long long>(dropped));
         }
     }
     if (!RecorderAlive(myId)) {
@@ -4063,6 +4424,7 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
 
 bool Recorder::Reap() {
     PerformanceTimer frameTiming("Recorder.Reap");
+    if (context.queueLane != nullptr) publishSubmissions();
     dropStaleHoldKept();
     const bool profile = DrawProfiled();
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -4080,7 +4442,7 @@ bool Recorder::Reap() {
         holdCounters.reapBatches += retired;
         holdCounters.reapMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
     }
-    return inFlight.empty();
+    return inFlight.empty() && submitting.empty();
 }
 
 void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool releaseNow) {
@@ -4137,7 +4499,20 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
                     const auto& h = holdCounters;
                     AgcDriver::ProfilePrint_nid_no_patch("[recorder] %llu syncs waited %.1f s for the GPU in total (sources, count/wait: idle %llu/%.1fs, pending write %llu/%.1fs, recorded store %llu/%.1fs, address-based %llu/%.1fs, other %llu/%.1fs); hook %llu calls, %llu locked; %llu targeted syncs left %llu batches in flight; snapshot %llu rebuilds %.0f ms, %llu notes covered; %llu unlocked timeline waits %.1f s; %llu submissions, %zu label entries, %llu completion labels pending; fence waits by thread (count/wait):%s; top sync sites (source@caller syncs/batches/wait):%s; under holds (cumulative): %llu completions ran %.0f ms (kept objects released %.0f ms), pending-write syncs from completions: %llu skipped, %llu waited %.0f ms; %llu reaps (%llu with work) retired %llu batches in %.0f ms; hook waits unlocked %llu / %.0f ms GPU (pending write %llu / %.0f ms, recorded store %llu / %.0f ms) + %.0f ms relock (%llu found the recorder torn down), locked %llu; deferred releases: on the release thread %llu batches (%llu objects) in %.0f ms, inline %llu batches (%llu objects) in %.0f ms (%llu batches over the queue bound of %zu), queue max %llu batches, %llu pending\n",static_cast<unsigned long long>(waits), waitedMs / 1000, static_cast<unsigned long long>(syncCounts[0]), syncWaitedMs[0] / 1000, static_cast<unsigned long long>(syncCounts[1]), syncWaitedMs[1] / 1000, static_cast<unsigned long long>(syncCounts[2]), syncWaitedMs[2] / 1000, static_cast<unsigned long long>(syncCounts[3]), syncWaitedMs[3] / 1000, static_cast<unsigned long long>(syncCounts[4]), syncWaitedMs[4] / 1000, static_cast<unsigned long long>(hookCalls.load()), static_cast<unsigned long long>(hookLocks.load()), static_cast<unsigned long long>(targetedSyncs.load()), static_cast<unsigned long long>(batchesLeftInFlight.load()), static_cast<unsigned long long>(snapshotRebuilds), snapshotRebuildMs, static_cast<unsigned long long>(snapshotCovered), static_cast<unsigned long long>(unlockedWaits.load()), unlockedWaitedUs.load() / 1e6, static_cast<unsigned long long>(recorder.submissions), recorder.PendingLabels(), static_cast<unsigned long long>(completionLabels.load()), ThreadSyncReport().c_str(), SyncSiteReport().c_str(), static_cast<unsigned long long>(h.completions), h.completionMs, h.keptReleaseMs, static_cast<unsigned long long>(h.completionSyncsSkipped), static_cast<unsigned long long>(h.completionSyncsWaited), h.completionSyncWaitMs, static_cast<unsigned long long>(h.reaps), static_cast<unsigned long long>(h.reapsWithWork), static_cast<unsigned long long>(h.reapBatches), h.reapMs, static_cast<unsigned long long>(h.hookUnlockedWaits), h.hookUnlockedWaitMs, static_cast<unsigned long long>(h.hookUnlockedWaitsBySource[1]), h.hookUnlockedWaitMsBySource[1], static_cast<unsigned long long>(h.hookUnlockedWaitsBySource[2]), h.hookUnlockedWaitMsBySource[2], h.hookRelockMs, static_cast<unsigned long long>(h.hookUnlockedTornDown), static_cast<unsigned long long>(h.hookLockedWaits), static_cast<unsigned long long>(threadReleases.load()), static_cast<unsigned long long>(threadObjects.load()), threadReleaseUs.load() / 1000.0, static_cast<unsigned long long>(inlineReleases.load()), static_cast<unsigned long long>(inlineObjects.load()), inlineReleaseUs.load() / 1000.0, static_cast<unsigned long long>(inlineOverBound.load()), ReleaseQueueBound(), static_cast<unsigned long long>(releaseQueueMax.load()), static_cast<unsigned long long>(deferredPending.load()));
                     AgcDriver::ProfilePrint_nid_no_patch("[recorder] completion label stores: %llu run, %llu skipped (no CPU write-back overlapped them); %llu counted pending at a write-back; %llu write-backs over a tracked label; %llu write-back completions pending\n", static_cast<unsigned long long>(completionStoresRun.load()), static_cast<unsigned long long>(completionStoresSkipped.load()), static_cast<unsigned long long>(completionLabelsCountedLate.load()), static_cast<unsigned long long>(writeBacksOverLabels.load()), static_cast<unsigned long long>(writeBackCompletions.load()));
-                    AgcDriver::ProfilePrint_nid_no_patch("[recorder] submits %llu, vkQueueSubmit mean %.1f us, max %.1f us\n", static_cast<unsigned long long>(submitCount), submitCount != 0 ? submitUs / static_cast<double>(submitCount) : 0.0, submitMaxUs);
+                    AgcDriver::ProfilePrint_nid_no_patch("[recorder-residency] logical cache references, independently sampled (not distinct allocations/RSS): recorders=%llu storage_bytes=%llu storage_entries=%llu draw_input_bytes=%llu draw_input_entries=%llu unwritten_bytes=%llu unwritten_entries=%llu\n",
+                        static_cast<unsigned long long>(aggregateLiveRecorders.load(std::memory_order_relaxed)),
+                        static_cast<unsigned long long>(aggregateStorageBytes.load(std::memory_order_relaxed)),
+                        static_cast<unsigned long long>(aggregateStorageEntries.load(std::memory_order_relaxed)),
+                        static_cast<unsigned long long>(aggregateDrawInputBytes.load(std::memory_order_relaxed)),
+                        static_cast<unsigned long long>(aggregateDrawInputEntries.load(std::memory_order_relaxed)),
+                        static_cast<unsigned long long>(aggregateUnwrittenBytes.load(std::memory_order_relaxed)),
+                        static_cast<unsigned long long>(aggregateUnwrittenEntries.load(std::memory_order_relaxed)));
+#if defined(APS5_RECORDER_HAS_MALLINFO2)
+                    const auto allocator = ::mallinfo2();
+                    AgcDriver::ProfilePrint_nid_no_patch("[recorder-allocator] process-wide glibc allocator accounting (not RSS or component ownership): arena_bytes=%zu uordblks_bytes=%zu fordblks_bytes=%zu hblkhd_bytes=%zu hblks=%zu\n",
+                        allocator.arena, allocator.uordblks, allocator.fordblks,
+                        allocator.hblkhd, allocator.hblks);
+#endif
                     const auto reads = Recorder::ReadCounts();
                     AgcDriver::ProfilePrint_nid_no_patch("[recorder] in-place reads: %llu noted, %llu queries, hits by reader: dispatch element %llu, gpu copy %llu, address-based %llu, indirect %llu, storage upload %llu, copy source %llu, draw input %llu; %llu hits on signaled batches ignored\n", static_cast<unsigned long long>(reads.noted), static_cast<unsigned long long>(reads.queries), static_cast<unsigned long long>(reads.hits[0]), static_cast<unsigned long long>(reads.hits[1]), static_cast<unsigned long long>(reads.hits[2]), static_cast<unsigned long long>(reads.hits[3]), static_cast<unsigned long long>(reads.hits[4]), static_cast<unsigned long long>(reads.hits[5]), static_cast<unsigned long long>(reads.hits[6]), static_cast<unsigned long long>(reads.staleIgnored));
                 }
@@ -4241,7 +4616,7 @@ void Recorder::discard(std::unique_ptr<Batch> batch) noexcept {
     if (batch->completionLabelCount != 0) completionLabels.fetch_sub(batch->completionLabelCount, std::memory_order_acq_rel);
     if (batch->completionStoreCount != 0) completionStores.fetch_sub(batch->completionStoreCount, std::memory_order_acq_rel);
     if (batch->writeBackCompletionCount != 0) writeBackCompletions.fetch_sub(batch->writeBackCompletionCount, std::memory_order_acq_rel);
-    if (activeRecorder == this) pendingLabelSince.store(NoPendingLabel, std::memory_order_release);
+    if (activeRecorder == this && open == nullptr) pendingLabelSince.store(NoPendingLabel, std::memory_order_release);
     release(*batch);
     try {
         publishPendingWrites();

@@ -71,7 +71,8 @@ Counts Compile(std::uint32_t uses) {
     request.context.compute = ShaderComputeStageInfo{{32u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
     request.context.memory = memory;
     request.useCache = false;
-    return Count(Recompile(request).spirv.Words());
+    const auto compiled = Recompile(request);
+    return Count(compiled.spirv.Words());
 }
 
 }

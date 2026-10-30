@@ -25,6 +25,9 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#if defined(__linux__)
+#include <time.h>
+#endif
 
 namespace AgcDriver {
 class TraceThread;
@@ -141,6 +144,7 @@ public:
     using Clock = std::chrono::steady_clock;
     static constexpr std::size_t DefaultCapacity = 262144;
     static constexpr std::size_t MaximumCapacity = 4194304;
+    static constexpr std::size_t MaximumSnapshotEvents = 1048576;
     static constexpr Clock::duration MinimumSlice = std::chrono::microseconds(20);
 
     static std::size_t ParseCapacity(const char* events) {
@@ -171,18 +175,23 @@ public:
 
     struct Snapshot {
         std::string name;
-        std::span<const Slice> slices;
+        std::vector<Slice> slices;
         std::vector<Total> totals;
         bool dropped = false;
         std::uint64_t eventsLost = 0;
         std::optional<Clock::time_point> eventsFullAt;
         bool totalsFull = false;
+        std::uint64_t nativeTid = 0;
+        std::optional<Clock::time_point> retainedFrom;
+        std::uint64_t eventsOmitted = 0;
+        std::optional<Clock::time_point> eventsOmittedAt;
+        std::optional<Clock::time_point> retainedThrough;
     };
 
     inline static const std::atomic<bool> AlwaysBuffering{true};
 
-    TraceThread(std::string name, const std::atomic<std::uint64_t>& presents, std::size_t capacity = DefaultCapacity, const std::atomic<bool>& buffering = AlwaysBuffering)
-        : name(std::move(name)), presents(presents), buffering(buffering), slices(std::make_unique<Slice[]>(capacity)), capacity(capacity) {}
+    TraceThread(std::string name, const std::atomic<std::uint64_t>& presents, std::size_t capacity = DefaultCapacity, const std::atomic<bool>& buffering = AlwaysBuffering, std::uint64_t nativeTid = 0)
+        : name(std::move(name)), nativeTid(nativeTid), presents(presents), buffering(buffering), slices(std::make_unique<Slice[]>(capacity)), capacity(capacity) {}
 
     TraceThread(const TraceThread&) = delete;
     TraceThread& operator=(const TraceThread&) = delete;
@@ -191,6 +200,7 @@ public:
         const auto length = end - begin;
         account(scope, stage, length);
         if (!buffering.load(std::memory_order_relaxed)) return;
+        std::lock_guard lock(eventMutex);
         const auto present = presents.load(std::memory_order_relaxed);
         if (!sampled || present != sampledPresent) {
             if (sampled) append({nullptr, nullptr, sampleBegin, folded});
@@ -202,18 +212,64 @@ public:
         if (length < MinimumSlice) folded += length;
         else append({scope, stage, begin, length, TraceBatchTag});
     }
+    std::size_t BufferedEventCount() const {
+        std::lock_guard lock(eventMutex);
+        return used.load(std::memory_order_relaxed);
+    }
 
-    Snapshot Collect() const {
-        Snapshot snapshot{name, {slices.get(), used.load(std::memory_order_acquire)}, {}, false};
+
+    std::vector<Total> CollectTotals() const {
+        std::vector<Total> totals;
         for (const auto& entry : entries) {
             const auto* scope = entry.scope.load(std::memory_order_acquire);
             if (scope == nullptr) continue;
-            snapshot.totals.push_back({scope, entry.stage.load(std::memory_order_relaxed), Clock::duration(entry.length.load(std::memory_order_relaxed)), entry.count.load(std::memory_order_relaxed)});
+            totals.push_back({scope, entry.stage.load(std::memory_order_relaxed), Clock::duration(entry.length.load(std::memory_order_relaxed)), entry.count.load(std::memory_order_relaxed)});
         }
-        snapshot.eventsLost = lost.load(std::memory_order_acquire);
-        if (snapshot.eventsLost != 0) snapshot.eventsFullAt = Clock::time_point(Clock::duration(firstLost.load(std::memory_order_relaxed)));
+        return totals;
+    }
+
+    Snapshot CollectSummary() const {
+        Snapshot snapshot;
+        snapshot.name = name;
+        snapshot.nativeTid = nativeTid;
+        snapshot.totals = CollectTotals();
         snapshot.totalsFull = totalsFull.load(std::memory_order_relaxed);
-        snapshot.dropped = snapshot.eventsLost != 0 || snapshot.totalsFull;
+        snapshot.dropped = snapshot.totalsFull;
+        return snapshot;
+    }
+    Snapshot Collect(std::size_t maximumEvents = std::numeric_limits<std::size_t>::max()) const {
+        Snapshot snapshot;
+        snapshot.name = name;
+        snapshot.nativeTid = nativeTid;
+        {
+            std::lock_guard lock(eventMutex);
+            const auto count = used.load(std::memory_order_relaxed);
+            const auto keep = std::min(count, maximumEvents);
+            snapshot.slices.reserve(keep);
+            const auto overwritten = lost.load(std::memory_order_relaxed);
+            const auto oldest = capacity == 0 ? 0 : static_cast<std::size_t>(overwritten % capacity);
+            snapshot.eventsOmitted = count - keep;
+            if (snapshot.eventsOmitted != 0 && count != 0)
+                snapshot.eventsOmittedAt = slices[oldest].begin;
+            const auto first = capacity == 0 ? 0 : (oldest + count - keep) % capacity;
+            for (std::size_t index = 0; index < keep; ++index)
+                snapshot.slices.push_back(slices[(first + index) % capacity]);
+            snapshot.eventsLost = overwritten;
+            if (snapshot.eventsLost != 0)
+                snapshot.eventsFullAt = Clock::time_point(Clock::duration(firstLost.load(std::memory_order_relaxed)));
+            if (!snapshot.slices.empty()) {
+                snapshot.retainedFrom = snapshot.slices.front().begin;
+                snapshot.retainedThrough = snapshot.slices.front().begin;
+                for (const auto& slice : snapshot.slices) {
+                    if (slice.begin < *snapshot.retainedFrom) snapshot.retainedFrom = slice.begin;
+                    const auto through = slice.scope == nullptr ? slice.begin : slice.begin + slice.length;
+                    if (through > *snapshot.retainedThrough) snapshot.retainedThrough = through;
+                }
+            }
+        }
+        snapshot.totals = CollectTotals();
+        snapshot.totalsFull = totalsFull.load(std::memory_order_relaxed);
+        snapshot.dropped = snapshot.eventsLost != 0 || snapshot.eventsOmitted != 0 || snapshot.totalsFull;
         return snapshot;
     }
 
@@ -226,15 +282,18 @@ private:
     };
 
     void append(const Slice& slice) {
-        const auto index = used.load(std::memory_order_relaxed);
-        if (index == capacity) {
-            const auto count = lost.load(std::memory_order_relaxed);
-            if (count == 0) firstLost.store(slice.begin.time_since_epoch().count(), std::memory_order_relaxed);
-            lost.store(count + 1, std::memory_order_release);
+        if (capacity == 0) return;
+        const auto count = used.load(std::memory_order_relaxed);
+        if (count < capacity) {
+            slices[count] = slice;
+            used.store(count + 1, std::memory_order_relaxed);
             return;
         }
-        slices[index] = slice;
-        used.store(index + 1, std::memory_order_release);
+        const auto overwritten = lost.load(std::memory_order_relaxed);
+        if (overwritten == 0)
+            firstLost.store(slice.begin.time_since_epoch().count(), std::memory_order_relaxed);
+        slices[static_cast<std::size_t>(overwritten % capacity)] = slice;
+        lost.store(overwritten + 1, std::memory_order_relaxed);
     }
 
     void account(const char* scope, const char* stage, Clock::duration length) {
@@ -257,10 +316,12 @@ private:
     }
 
     const std::string name;
+    const std::uint64_t nativeTid;
     const std::atomic<std::uint64_t>& presents;
     const std::atomic<bool>& buffering;
     const std::unique_ptr<Slice[]> slices;
     const std::size_t capacity;
+    mutable std::mutex eventMutex;
     std::atomic<std::size_t> used{0};
     std::atomic<std::uint64_t> lost{0};
     std::atomic<Clock::rep> firstLost{0};
@@ -271,6 +332,41 @@ private:
     Clock::time_point sampleBegin{};
     Clock::duration folded{};
 };
+class TraceSnapshotBudget {
+public:
+    static std::vector<std::size_t> Allocate(std::span<const std::size_t> available, std::size_t budget) {
+        std::vector<std::size_t> result(available.size());
+        std::vector<std::size_t> order;
+        order.reserve(available.size());
+        for (std::size_t index = 0; index < available.size(); ++index)
+            if (available[index] != 0) order.push_back(index);
+        std::stable_sort(order.begin(), order.end(), [&](std::size_t left, std::size_t right) {
+            return available[left] < available[right];
+        });
+        std::size_t remaining = budget;
+        std::size_t firstActive = 0;
+        for (; firstActive < order.size(); ++firstActive) {
+            const auto active = order.size() - firstActive;
+            const auto share = remaining / active;
+            const auto index = order[firstActive];
+            if (available[index] > share) break;
+            result[index] = available[index];
+            remaining -= available[index];
+        }
+        const auto active = order.size() - firstActive;
+        if (active == 0) return result;
+        const auto share = remaining / active;
+        auto extra = remaining % active;
+        for (std::size_t position = firstActive; position < order.size(); ++position) {
+            const auto index = order[position];
+            const auto grant = share + (extra != 0 ? 1 : 0);
+            if (extra != 0) --extra;
+            result[index] = std::min(available[index], grant);
+        }
+        return result;
+    }
+};
+
 
 struct TraceHost {
     std::string cpu;
@@ -297,6 +393,9 @@ struct TraceSummary {
     std::uint64_t firstPresent = 0;
     double gpuBusyMs = 0;
     std::string trace;
+    std::optional<bool> traceWindowClosed;
+    std::uint64_t traceSnapshotsSuperseded = 0;
+    std::optional<bool> traceGpuTrackAvailable;
     std::optional<std::pair<double, double>> interval;
     std::optional<TraceHost> host;
     std::optional<TraceTitle> title;
@@ -440,6 +539,13 @@ struct TraceClockSample {
     double gpuNs = 0;
     std::chrono::steady_clock::time_point cpu{};
 };
+struct TraceGpuSnapshot {
+    std::vector<TraceGpuRange> ranges;
+    std::uint64_t overwritten = 0;
+    std::optional<double> firstOverwrittenNs;
+    std::uint64_t omitted = 0;
+    std::optional<double> firstOmittedNs;
+};
 
 class TraceFormat {
 public:
@@ -472,7 +578,22 @@ public:
     }
 
     static std::string Events(std::uint64_t process, Clock::time_point origin, std::span<const TraceThread::Snapshot> threads, std::size_t presenter, std::span<const Clock::time_point> presents, std::uint64_t firstPresent) {
-        std::string output = "{\"traceEvents\":[\n";
+#if defined(__linux__) && (defined(__GLIBCXX__) || defined(_LIBCPP_VERSION))
+        // Calibrate steady_clock against CLOCK_MONOTONIC at export time; the
+        // bracket bounds the cross-clock sampling uncertainty.
+        const auto steadyBefore = Clock::now();
+        timespec monotonic{};
+        if (::clock_gettime(CLOCK_MONOTONIC, &monotonic) != 0) throw std::runtime_error("clock_gettime(CLOCK_MONOTONIC) failed");
+        const auto steadyAfter = Clock::now();
+        const auto steadyMidpoint = steadyBefore + (steadyAfter - steadyBefore) / 2;
+        const auto originNs = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::nanoseconds(monotonic.tv_sec * 1'000'000'000LL + monotonic.tv_nsec) - (steadyMidpoint - origin)).count();
+        const auto uncertaintyNs = std::chrono::duration_cast<std::chrono::nanoseconds>(steadyAfter - steadyBefore).count() / 2;
+        std::string output = "{\"clock\":{\"name\":\"steady_clock\",\"domain\":\"CLOCK_MONOTONIC\",\"origin_ns\":" + std::to_string(originNs) + ",\"uncertainty_ns\":" + std::to_string(uncertaintyNs);
+#else
+        const auto originNs = std::chrono::duration_cast<std::chrono::nanoseconds>(origin.time_since_epoch()).count();
+        std::string output = "{\"clock\":{\"name\":\"steady_clock\",\"domain\":\"steady_clock\",\"origin_ns\":" + std::to_string(originNs);
+#endif
+        output += "},\"traceEvents\":[\n";
         bool first = true;
         const auto event = [&](std::string_view name, const char* phase, Clock::time_point at, std::size_t tid) {
             if (!first) output += ",\n";
@@ -491,6 +612,14 @@ public:
             event("thread_name", "M", origin, tid);
             output += ",\"args\":{\"name\":";
             AppendString(output, thread.name);
+            if (thread.nativeTid != 0) output += ",\"native_tid\":" + std::to_string(thread.nativeTid);
+            if (thread.retainedFrom && thread.retainedThrough) {
+                output += ",\"retained_from_s\":" + number(std::chrono::duration<double>(*thread.retainedFrom - origin).count());
+                output += ",\"retained_through_s\":" + number(std::chrono::duration<double>(*thread.retainedThrough - origin).count());
+                output += ",\"retained_event_count\":" + std::to_string(thread.slices.size());
+            }
+            output += ",\"events_omitted_in_snapshot\":" + std::to_string(thread.eventsOmitted);
+            output += ",\"events_overwritten\":" + std::to_string(thread.eventsLost);
             output += "}}";
             std::vector<TraceThread::Slice> slices(thread.slices.begin(), thread.slices.end());
             std::stable_sort(slices.begin(), slices.end(), [](const auto& a, const auto& b) { return a.begin != b.begin ? a.begin < b.begin : a.length > b.length; });
@@ -508,26 +637,52 @@ public:
                 output += text;
             }
             if (thread.eventsFullAt) {
-                event("trace buffer full", "i", *thread.eventsFullAt, tid);
-                output += ",\"s\":\"t\",\"args\":{\"events_lost\":" + std::to_string(thread.eventsLost) + "}}";
+                event("trace buffer overwritten", "i", *thread.eventsFullAt, tid);
+                output += ",\"s\":\"t\",\"args\":{\"events_overwritten\":" + std::to_string(thread.eventsLost) + "}}";
+            }
+            if (thread.eventsOmittedAt) {
+                event("trace snapshot events omitted", "i", *thread.eventsOmittedAt, tid);
+                output += ",\"s\":\"t\",\"args\":{\"events_omitted_in_snapshot\":" + std::to_string(thread.eventsOmitted) + "}}";
             }
         }
-        for (std::size_t index = 0; index + 1 < presents.size(); ++index) {
+        for (std::size_t index = 0; index < presents.size(); ++index) {
             event("present", "i", presents[index], presenter + 1);
             output += ",\"s\":\"g\",\"args\":{\"present\":" + std::to_string(firstPresent + index) + "}}";
         }
         output += "\n]}\n";
         return output;
     }
+    static std::string Events(std::uint64_t process, Clock::time_point origin, std::span<const TraceThread::Snapshot> threads, std::size_t presenter, std::span<const Clock::time_point> presents, std::uint64_t firstPresent, std::string_view declaredWindow, bool complete, std::uint64_t supersededSnapshots, std::optional<bool> gpuTrackAvailable = std::nullopt) {
+        auto output = Events(process, origin, threads, presenter, presents, firstPresent);
+        const auto insertion = output.find(",\"traceEvents\":[");
+        if (insertion == std::string::npos) throw std::logic_error("trace events array is missing");
+        std::string metadata = ",\"capture\":{\"mode\":\"rolling_snapshot\",\"declared_window\":";
+        AppendString(metadata, declaredWindow);
+        metadata += ",\"declared_window_closed\":";
+        metadata += complete ? "true" : "false";
+        metadata += ",\"snapshot_superseded\":" + std::to_string(supersededSnapshots);
+        metadata += ",\"producer_synchronization\":\"per-thread mutex while trace buffering is enabled\"";
+        if (gpuTrackAvailable) {
+            metadata += ",\"gpu_track_available\":";
+            metadata += *gpuTrackAvailable ? "true" : "false";
+        }
+        metadata += "}";
+        output.insert(insertion, metadata);
+        return output;
+    }
 
-    static std::vector<TraceThread::Slice> GpuSlices(std::span<const TraceGpuRange> ranges, const TraceClockSample& first, const TraceClockSample& last, Clock::time_point origin) {
+
+    static Clock::time_point GpuTime(double gpuNs, const TraceClockSample& first, const TraceClockSample& last) {
         const double gpuSpan = last.gpuNs - first.gpuNs;
         const double scale = gpuSpan > 0 ? std::chrono::duration<double, std::nano>(last.cpu - first.cpu).count() / gpuSpan : 1.0;
-        const auto map = [&](double gpuNs) { return first.cpu + std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double, std::nano>((gpuNs - first.gpuNs) * scale)); };
+        return first.cpu + std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double, std::nano>((gpuNs - first.gpuNs) * scale));
+    }
+
+    static std::vector<TraceThread::Slice> GpuSlices(std::span<const TraceGpuRange> ranges, const TraceClockSample& first, const TraceClockSample& last, Clock::time_point origin) {
         std::vector<TraceThread::Slice> slices;
         for (const auto& range : ranges) {
-            const auto begin = map(range.beginNs);
-            const auto end = map(range.endNs);
+            const auto begin = GpuTime(range.beginNs, first, last);
+            const auto end = GpuTime(range.endNs, first, last);
             if (end <= begin || begin < origin) continue;
             slices.push_back({range.name, nullptr, begin, end - begin, range.batch});
         }
@@ -595,16 +750,20 @@ public:
             std::string name;
             std::uint64_t eventsLost = 0;
             std::optional<Clock::time_point> eventsFullAt;
+            std::uint64_t eventsOmitted = 0;
+            std::optional<Clock::time_point> eventsOmittedAt;
             bool totalsFull = false;
         };
         std::vector<DroppedThread> droppedList;
         for (const auto& thread : threads) {
             dropped = dropped || thread.dropped;
-            if (thread.eventsLost != 0 || thread.totalsFull) {
+            if (thread.eventsLost != 0 || thread.eventsOmitted != 0 || thread.totalsFull) {
                 auto entry = std::find_if(droppedList.begin(), droppedList.end(), [&](const DroppedThread& candidate) { return candidate.name == thread.name; });
                 if (entry == droppedList.end()) entry = droppedList.insert(droppedList.end(), DroppedThread{thread.name});
                 entry->eventsLost += thread.eventsLost;
+                entry->eventsOmitted += thread.eventsOmitted;
                 if (thread.eventsLost != 0 && thread.eventsFullAt && (!entry->eventsFullAt || *thread.eventsFullAt < *entry->eventsFullAt)) entry->eventsFullAt = thread.eventsFullAt;
+                if (thread.eventsOmitted != 0 && thread.eventsOmittedAt && (!entry->eventsOmittedAt || *thread.eventsOmittedAt < *entry->eventsOmittedAt)) entry->eventsOmittedAt = thread.eventsOmittedAt;
                 entry->totalsFull = entry->totalsFull || thread.totalsFull;
             }
             Clock::duration busy{};
@@ -629,6 +788,8 @@ public:
         }
         output += "},\"trace_dropped\":";
         output += dropped ? "true" : "false";
+        if (summary.traceWindowClosed) output += ",\"trace_window_closed\":" + std::string(*summary.traceWindowClosed ? "true" : "false");
+        if (summary.traceGpuTrackAvailable) output += ",\"trace_gpu_track_available\":" + std::string(*summary.traceGpuTrackAvailable ? "true" : "false");
         if (!droppedList.empty()) {
             std::string droppedThreads;
             for (const auto& entry : droppedList) {
@@ -636,13 +797,19 @@ public:
                 AppendString(droppedThreads, entry.name);
                 droppedThreads += ":{";
                 if (entry.eventsLost != 0) {
-                    if (entry.eventsFullAt && !presents.empty() && *entry.eventsFullAt >= presents.front() && *entry.eventsFullAt <= presents.back()) droppedThreads += "\"events_full_after_s\":" + number(std::chrono::duration<double>(*entry.eventsFullAt - presents.front()).count()) + ",";
-                    droppedThreads += "\"events_lost\":" + std::to_string(entry.eventsLost) + ",";
+                    if (entry.eventsFullAt && !presents.empty() && *entry.eventsFullAt >= presents.front() && *entry.eventsFullAt <= presents.back()) droppedThreads += "\"events_overwrite_started_after_s\":" + number(std::chrono::duration<double>(*entry.eventsFullAt - presents.front()).count()) + ",";
+                    droppedThreads += "\"events_overwritten\":" + std::to_string(entry.eventsLost) + ",";
+                }
+                if (entry.eventsOmitted != 0) {
+                    droppedThreads += "\"events_omitted_in_snapshot\":" + std::to_string(entry.eventsOmitted) + ",";
+                    if (entry.eventsOmittedAt && !presents.empty() && *entry.eventsOmittedAt >= presents.front() && *entry.eventsOmittedAt <= presents.back())
+                        droppedThreads += "\"snapshot_omitted_after_s\":" + number(std::chrono::duration<double>(*entry.eventsOmittedAt - presents.front()).count()) + ",";
                 }
                 droppedThreads += std::string("\"totals_full\":") + (entry.totalsFull ? "true" : "false") + "}";
             }
             output += ",\"trace_dropped_threads\":{" + droppedThreads + "}";
         }
+        output += ",\"trace_snapshots_superseded\":" + std::to_string(summary.traceSnapshotsSuperseded);
         output += ",\"trace\":";
         AppendString(output, summary.trace);
         output += "}\n";
@@ -736,17 +903,57 @@ public:
         return configured;
     }
 
+    // Interval summaries also set Recording(); only this flag identifies the
+    // bounded raw-event window, rather than menu/startup summary collection.
+    static bool CapturingRawWindow() {
+        return buffering.load(std::memory_order_relaxed);
+    }
+
     static void BindThread(const char* name, std::size_t capacity = TraceThread::DefaultCapacity);
     static void Present(std::uint32_t width, std::uint32_t height, const VulkanDevice* device);
 
     static void GpuRange(const char* name, double beginNs, double endNs, std::uint64_t batch = 0) {
         if (!buffering.load(std::memory_order_relaxed)) return;
         std::lock_guard lock(gpuMutex);
-        if (gpuRanges.size() == gpuRanges.capacity()) {
-            ++gpuLost;
+        if (gpuRanges.size() < gpuRanges.capacity()) {
+            gpuRanges.push_back({name, beginNs, endNs, batch});
             return;
         }
-        gpuRanges.push_back({name, beginNs, endNs, batch});
+        if (gpuRanges.empty()) return;
+        const auto oldest = static_cast<std::size_t>(gpuLost % gpuRanges.size());
+        if (gpuLost == 0) gpuFirstLostNs = gpuRanges[oldest].beginNs;
+        gpuRanges[oldest] = {name, beginNs, endNs, batch};
+        ++gpuLost;
+    }
+
+    static std::size_t BufferedGpuRangeCount() {
+        std::lock_guard lock(gpuMutex);
+        return gpuRanges.size();
+    }
+
+    static TraceGpuSnapshot CollectGpuRanges(std::size_t maximumEvents) {
+        std::lock_guard lock(gpuMutex);
+        TraceGpuSnapshot snapshot;
+        const auto count = gpuRanges.size();
+        const auto keep = std::min(count, maximumEvents);
+        snapshot.ranges.reserve(keep);
+        snapshot.overwritten = gpuLost;
+        if (gpuLost != 0) snapshot.firstOverwrittenNs = gpuFirstLostNs;
+        snapshot.omitted = count - keep;
+        const auto oldest = gpuRanges.empty() ? 0 : static_cast<std::size_t>(gpuLost % gpuRanges.size());
+        if (snapshot.omitted != 0) snapshot.firstOmittedNs = gpuRanges[oldest].beginNs;
+        const auto first = count == 0 ? 0 : (oldest + count - keep) % count;
+        for (std::size_t index = 0; index < keep; ++index)
+            snapshot.ranges.push_back(gpuRanges[(first + index) % count]);
+        return snapshot;
+    }
+
+    static void ResetGpuRanges(std::size_t capacity) {
+        std::lock_guard lock(gpuMutex);
+        gpuRanges.clear();
+        gpuLost = 0;
+        gpuFirstLostNs = 0;
+        gpuRanges.reserve(capacity);
     }
 
     static bool Recording() {
@@ -773,6 +980,7 @@ private:
     inline static std::mutex gpuMutex;
     inline static std::vector<TraceGpuRange> gpuRanges;
     inline static std::uint64_t gpuLost = 0;
+    inline static double gpuFirstLostNs = 0;
 };
 
 }

@@ -2588,8 +2588,15 @@ void copyCommitted(std::uint64_t address, std::span<std::byte> destination) {
         std::memcpy(destination.data(), reinterpret_cast<const void*>(address), destination.size());
         return;
     }
-    std::memset(destination.data(), 0, destination.size());
-    for (const auto& [begin, end] : CommittedRanges(address, destination.size())) std::memcpy(destination.data() + (begin - address), reinterpret_cast<const void*>(begin), static_cast<std::size_t>(end - begin));
+    const auto ranges = CommittedRanges(address, destination.size());
+    auto cursor = address;
+    for (const auto& [begin, end] : ranges) {
+        if (cursor < begin) std::memset(destination.data() + (cursor - address), 0, static_cast<std::size_t>(begin - cursor));
+        std::memcpy(destination.data() + (begin - address), reinterpret_cast<const void*>(begin), static_cast<std::size_t>(end - begin));
+        cursor = end;
+    }
+    const auto limit = address + destination.size();
+    if (cursor < limit) std::memset(destination.data() + (cursor - address), 0, static_cast<std::size_t>(limit - cursor));
 }
 
 }

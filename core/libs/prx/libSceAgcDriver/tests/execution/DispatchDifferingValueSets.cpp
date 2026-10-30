@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -15,6 +16,7 @@
 #include <sys/mman.h>
 #endif
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -23,6 +25,8 @@
 #include <initializer_list>
 #include <iostream>
 #include <string>
+#include <span>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -33,7 +37,7 @@ using AgcDriver::DriverDetail::Driver;
 constexpr std::array<std::uint32_t, 7> Code{0xf4080100u, 0xfa000000u, 0xbf8cc07fu, 0x7e020280u, 0xe0702000u, 0x80010100u, 0xbf810000u};
 constexpr std::size_t SrtOffset = 4096;
 constexpr std::size_t OutputOffset = 8192;
-constexpr std::size_t BlockBytes = 65536;
+constexpr std::size_t BlockBytes = 524288;
 
 class GuestBlock {
 public:
@@ -74,16 +78,33 @@ void WriteSrt(const GuestBlock& block, std::uint32_t records) {
     std::memcpy(block.Bytes(SrtOffset), words.data(), sizeof(words));
 }
 
-void Dispatch(const GuestBlock& block) {
-    const auto kernel = block.At(0);
+void Dispatch(const GuestBlock& block, bool footprint = false) {
+    const auto kernel = block.At(footprint ? 256 : 0);
     const auto srt = block.At(SrtOffset);
+    const auto label = block.At(12288);
+    const std::array<std::uint32_t, 1> zero{0};
+    AgcDriver::GuestMemory::Write(label, std::as_bytes(std::span(zero)));
     std::vector<std::uint32_t> words;
     for (const auto& packet : {Pm4(0x76, {0x20c, static_cast<std::uint32_t>(kernel >> 8u)}), Pm4(0x76, {0x20d, static_cast<std::uint32_t>(kernel >> 40u) & 0xffu}), Pm4(0x76, {0x207, 64}), Pm4(0x76, {0x208, 1}), Pm4(0x76, {0x209, 1}), Pm4(0x76, {0x213, 2u << 1u}), Pm4(0x76, {0x240, static_cast<std::uint32_t>(srt)}), Pm4(0x76, {0x241, static_cast<std::uint32_t>(srt >> 32u)}), Pm4(0x15, {1, 1, 1, 0x41})}) {
         words.insert(words.end(), packet.begin(), packet.end());
     }
+    if (footprint) {
+        // Eight 64-thread groups meet the normal address-staging threshold. The
+        // atomic region therefore takes device-local staging even with host import.
+        words[words.size() - 4] = 8;
+    }
+    const auto release = Pm4(0x49, {0x0030c514u, 1u << 29u, static_cast<std::uint32_t>(label), static_cast<std::uint32_t>(label >> 32u), 1, 0, 0});
+    words.insert(words.end(), release.begin(), release.end());
     Packet dcb{words.data(), static_cast<std::uint32_t>(words.size()), 0, {}};
     Require(sceAgcDriverSubmitDcb(&dcb) == 0, "dispatch differing value sets: the dispatch submission failed");
-    AgcDriverWaitIdle_nid_postfix();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    std::array<std::uint32_t, 1> completed{};
+    do {
+        AgcDriver::GuestMemory::Read(label, std::as_writable_bytes(std::span(completed)));
+        if (completed[0] == 1) break;
+        std::this_thread::yield();
+    } while (std::chrono::steady_clock::now() < deadline);
+    Require(completed[0] == 1, "dispatch differing value sets: dispatch completion label timed out");
 }
 
 struct Totals {
@@ -112,6 +133,92 @@ void AlternatingValueSets(const GuestBlock& block) {
     Require(totals.matched == 3, "the three dispatches bringing a value set seen before did not all match it (" + std::to_string(totals.matched) + ")");
 }
 
+void CapturedIndexTransferFootprint(const GuestBlock& block) {
+    constexpr std::uint32_t records = 15000;
+    constexpr std::size_t indexOffset = 65536;
+    constexpr std::size_t outputOffset = 131072;
+    constexpr std::array<std::uint32_t, 23> code{
+        0xf40c0100u, 0xfa000000u, 0xbf8cc07fu,
+        0xf4000504u, 0xfa000000u, 0xbf8cc07fu,
+        0x7e000214u, 0x7e020287u, 0xe0c86000u, 0x80010100u, 0xbf8c3f70u,
+        0x7e040214u, 0x7e0602ffu, 0x55667788u, 0x7e0802ffu, 0x11223344u, 0x7e0a02ffu, 0xa1b2c3d4u,
+        0xe0742004u, 0x80010302u, 0xe0702010u, 0x80010502u, 0xbf810000u};
+    std::memcpy(block.Bytes(256), code.data(), sizeof(code));
+    const auto output = block.At(outputOffset);
+    const auto indexAddress = block.At(indexOffset);
+    std::array<std::uint32_t, 8> root{
+        static_cast<std::uint32_t>(output),
+        static_cast<std::uint32_t>((output >> 32u) & 0xffffu) | (20u << 16u),
+        records, 0x00005204u,
+        static_cast<std::uint32_t>(indexAddress), static_cast<std::uint32_t>(indexAddress >> 32u), 0, 0};
+    AgcDriver::GuestMemory::Write(block.At(SrtOffset), std::as_bytes(std::span(root)));
+    std::vector<std::uint32_t> expected(records * 5);
+    for (std::size_t word = 0; word < expected.size(); ++word) expected[word] = 0x10000000u + static_cast<std::uint32_t>(word);
+    AgcDriver::GuestMemory::Write(output, std::as_bytes(std::span(expected)));
+    std::vector<std::uint32_t> actual(expected.size());
+    // Warm the unchanged variant, then keep the shader, root and descriptor fixed.
+    // Only the independently captured scalar word changes; this was incorrectly
+    // eligible for data-only refresh, retaining the first capture's 0:20 hull.
+    constexpr std::array<std::uint32_t, 10> indices{0, 0, 0, 14999, 7, 0, 14999, 7, 0, 0};
+    for (const auto index : indices) {
+        const std::array<std::uint32_t, 1> indexWord{index};
+        // The preceding release completed before this ordered guest write.
+        AgcDriver::GuestMemory::Write(indexAddress, std::as_bytes(std::span(indexWord)));
+        Dispatch(block, true);
+        expected[index * 5] += 7u * 512u;
+        expected[index * 5 + 1] = 0x55667788u;
+        expected[index * 5 + 2] = 0x11223344u;
+        expected[index * 5 + 4] = 0xa1b2c3d4u;
+        AgcDriver::GuestMemory::Read(output, std::as_writable_bytes(std::span(actual)));
+        for (std::size_t word = 0; word < expected.size(); ++word) {
+            if (actual[word] != expected[word]) {
+                Require(false,
+                        "captured index transfer footprint: index=" + std::to_string(index) +
+                        " record=" + std::to_string(word / 5) + " dword=" + std::to_string(word % 5) +
+                        " actual=" + std::to_string(actual[word]) + " expected=" + std::to_string(expected[word]));
+            }
+        }
+    }
+    const std::array<std::uint32_t, 1> linearIndex{1u};
+    AgcDriver::GuestMemory::Write(indexAddress, std::as_bytes(std::span(linearIndex)));
+    Dispatch(block, true);
+    expected[5] += 7u * 512u;
+    expected[6] = 0x55667788u;
+    expected[7] = 0x11223344u;
+    expected[9] = 0xa1b2c3d4u;
+    AgcDriver::GuestMemory::Read(output, std::as_writable_bytes(std::span(actual)));
+    for (std::size_t word = 0; word < expected.size(); ++word) {
+        if (actual[word] != expected[word]) {
+            Require(false,
+                    "captured index linear transfer footprint: index=1 record=" + std::to_string(word / 5) +
+                    " dword=" + std::to_string(word % 5) +
+                    " actual=" + std::to_string(actual[word]) + " expected=" + std::to_string(expected[word]));
+        }
+    }
+    // Keep the ordinary linear descriptor as a control, then enable the
+    // descriptor swizzle with indexStride zero. At index one, the shader's
+    // atomic and stores address byte offsets 4, 36, 68 and 132 respectively;
+    // linear planning instead bounds record one to bytes 20..40.
+    root[1] |= 1u << 31u;
+    AgcDriver::GuestMemory::Write(block.At(SrtOffset), std::as_bytes(std::span(root)));
+    const std::array<std::uint32_t, 1> swizzledIndex{1u};
+    AgcDriver::GuestMemory::Write(indexAddress, std::as_bytes(std::span(swizzledIndex)));
+    Dispatch(block, true);
+    expected[1] += 7u * 512u;
+    expected[9] = 0x55667788u;
+    expected[17] = 0x11223344u;
+    expected[33] = 0xa1b2c3d4u;
+    AgcDriver::GuestMemory::Read(output, std::as_writable_bytes(std::span(actual)));
+    for (std::size_t word = 0; word < expected.size(); ++word) {
+        if (actual[word] != expected[word]) {
+            Require(false,
+                    "captured index swizzled transfer footprint: index=1 record=" + std::to_string(word / 5) +
+                    " dword=" + std::to_string(word % 5) +
+                    " actual=" + std::to_string(actual[word]) + " expected=" + std::to_string(expected[word]));
+        }
+    }
+}
+
 }
 
 int main() {
@@ -128,8 +235,11 @@ int main() {
             if (!device) return VulkanTestSkipped;
         }
         GuestBlock block;
+        const std::array<std::uint32_t, 1> initialIndex{0};
+        AgcDriver::GuestMemory::Write(block.At(65536), std::as_bytes(std::span(initialIndex)));
         std::memcpy(block.Bytes(0), Code.data(), sizeof(Code));
         AlternatingValueSets(block);
+        CapturedIndexTransferFootprint(block);
         AgcDriverShutdown_nid_postfix();
         std::puts("dispatch differing value sets: the differing statistics recognize a value set they saw before");
         return 0;

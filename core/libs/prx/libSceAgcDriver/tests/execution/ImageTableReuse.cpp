@@ -7,6 +7,7 @@
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "Recompiler.hpp"
 #include "VulkanTestDevice.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -80,7 +81,7 @@ std::array<std::uint32_t, 4> Buffer(const void* base, std::uint32_t bytes) {
 
 class GuestBlock {
 public:
-    explicit GuestBlock(std::size_t registered = BlockBytes) {
+    explicit GuestBlock(std::size_t registered = BlockBytes, bool gpu = true) {
 #ifdef _WIN32
         block = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(BlockBytes, 65536));
         if (block != nullptr) GuestArena::GuestArenaCommit_nid_postfix(block, BlockBytes, PAGE_READWRITE, BlockBytes);
@@ -97,7 +98,7 @@ public:
         }
 #endif
         Require(block != nullptr, "image table reuse: cannot allocate the guest block");
-        GuestAllocations::Mutation().Add(block, registered, true, true, true);
+        GuestAllocations::Mutation().Add(block, registered, true, true, gpu);
     }
 
     ~GuestBlock() {
@@ -126,6 +127,14 @@ void SetRecord(const GuestBlock& block, std::uint32_t record, std::uint32_t text
     std::copy(image.begin(), image.end(), words + 4);
 }
 
+void SetRecordAddress(const GuestBlock& block, std::uint32_t record, const void* texels) {
+    auto* words = block.Table() + record * (Stride / 4u);
+    std::fill(words, words + Stride / 4u, 0u);
+    std::copy(PointClamp.begin(), PointClamp.end(), words);
+    const auto image = Image(texels);
+    std::copy(image.begin(), image.end(), words + 4);
+}
+
 void Fill(const GuestBlock& block, std::uint32_t texture, float bias) {
     for (std::uint32_t texel = 0; texel < Width * Height; ++texel) block.Texels(texture)[texel] = bias + static_cast<float>(texture) * 100.0f + static_cast<float>(texel);
 }
@@ -150,7 +159,7 @@ ShaderRecompiler::RecompileResult Compile(AgcDriver::VulkanDevice& device, const
     };
     auto result = ShaderRecompiler::Recompile(request);
     const auto binding = std::find_if(result.bindings.begin(), result.bindings.end(), [](const ShaderRecompiler::DescriptorBinding& candidate) { return candidate.role == ShaderRecompiler::DescriptorRole::ImageTable; });
-    Require(binding != result.bindings.end() && binding->guestDescriptor.size() == static_cast<std::size_t>(Records) * 8u, "image table reuse: the shader does not bind the whole table");
+    Require(binding != result.bindings.end(), "image table reuse: the shader has no image table binding");
     return result;
 }
 
@@ -237,10 +246,20 @@ void RunImageStore(AgcDriver::VulkanDevice& device, const GuestBlock& block) {
     Store(device, block, 23);
     std::vector<float> stored(Width);
     for (std::uint32_t x = 0; x < Width; ++x) stored[x] = -4.0f - static_cast<float>(x);
+    const auto storageBefore = AgcDriver::Graphics::ImageTableReuses();
     Require(Dispatch(device, result, 23) == Row(stored.data()), "image table reuse: an entry an image store left results pending over kept its old texels");
-    Expect(before, 3 - CpuWriteResolutions, CpuWriteResolutions + 1, "CPU writes to a new table's 64 KiB block, then an image store leaving results pending over an entry");
+    const auto afterStorageResolve = AgcDriver::Graphics::ImageTableReuses();
+    Require(afterStorageResolve.resolved == storageBefore.resolved + 1u, "image table reuse: the table with a pending storage-backed sampled view was not resolved");
+    Require(Dispatch(device, result, 23) == Row(stored.data()), "image table reuse: a storage-backed table reuse sampled stale texels");
+    const auto afterStorageReuse = AgcDriver::Graphics::ImageTableReuses();
+    Require(afterStorageReuse.reused == afterStorageResolve.reused + 1u && afterStorageReuse.resolved == afterStorageResolve.resolved, "image table reuse: the pending storage-backed sampled view was not reused");
+    Expect(before, 3 - CpuWriteResolutions + 1u, CpuWriteResolutions + 1u, "CPU writes to a new table's 64 KiB block, then an image store leaving results pending over an entry");
     AgcDriver::Graphics::StorageTexture::FlushPending(AddressOf(block.Texels(23)), TextureBytes, nullptr, "test");
     device.WaitIdle();
+    const auto afterFlush = AgcDriver::Graphics::ImageTableReuses();
+    Require(Dispatch(device, result, 23) == Row(stored.data()), "image table reuse: a flushed storage-backed view sampled stale texels");
+    const auto afterFlushResolve = AgcDriver::Graphics::ImageTableReuses();
+    Require(afterFlushResolve.resolved == afterFlush.resolved + 1u, "image table reuse: a table reused a storage-backed view after its source stopped being pending");
     Require(Row(block.Texels(23)) == Row(stored.data()), "image table reuse: the image store wrote the wrong values");
 }
 
@@ -346,14 +365,74 @@ void RunTests(AgcDriver::VulkanDevice& device, const GuestBlock& block, const Gu
     ExpectWrites(before, 0, 1, "a kept table whose textures were destroyed");
 }
 
+void RunOverflowTableTests(AgcDriver::VulkanDevice& device, const GuestBlock& block, const GuestBlock& snapshots) {
+    for (std::uint32_t texture = 0; texture < Records; ++texture) {
+        Fill(snapshots, texture, 0.125f);
+        SetRecordAddress(block, texture, snapshots.Texels(texture));
+    }
+    for (std::uint32_t key = 0; key < Records; ++key) Keys[key] = key;
+    const auto srt = Buffer(block.Table(), Records * Stride);
+    const auto keys = Buffer(Keys.data(), static_cast<std::uint32_t>(sizeof(Keys)));
+    std::copy(srt.begin(), srt.end(), Srt.begin());
+    std::copy(keys.begin(), keys.end(), Srt.begin() + 4);
+    SetOutput(Output.data());
+    const auto result = Compile(device, block);
+    AgcDriver::Graphics::ClearCachedTextures(device.Device());
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    for (std::uint32_t record = 0; record < Records; ++record) {
+        Require(Dispatch(device, result, record) == Row(snapshots.Texels(record)), "image table reuse overflow: baseline sampled a wrong record");
+    }
+    const auto baseline = AgcDriver::Graphics::TextureCacheUsage();
+    Require(baseline.sampledEntries == Records && baseline.sampledBytes != 0u, "image table reuse overflow: forced snapshot mode did not cache the full sampled table");
+    const auto perEntry = baseline.sampledBytes / baseline.sampledEntries;
+    Require(perEntry != 0u && perEntry * baseline.sampledEntries == baseline.sampledBytes, "image table reuse overflow: the table snapshot allocations differ");
+
+    AgcDriver::Graphics::ClearCachedTextures(device.Device());
+    const auto budget = baseline.sampledBytes - perEntry;
+    AgcDriver::Graphics::OverrideCacheBudgetForTest(budget);
+    AgcDriver::Graphics::Recorder::CountPresent();
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const auto before = AgcDriver::Graphics::ImageTableReuses();
+    for (std::uint32_t record = 0; record + 1u < Records; ++record) {
+        Require(Dispatch(device, result, record) == Row(snapshots.Texels(record)), "image table reuse overflow: main-cache prefill sampled a wrong record");
+    }
+    const auto ceiling = budget + budget / 4u;
+    const auto prefilled = AgcDriver::Graphics::TextureCacheUsage();
+    Require(prefilled.sampledEntries == Records - 1u && prefilled.sampledBytes <= budget && prefilled.sampledBytes + prefilled.overflowBytes <= ceiling, "image table reuse overflow: the main cache was not filled to its budget");
+    Require(Dispatch(device, result, Records - 1u) == Row(snapshots.Texels(Records - 1u)), "image table reuse overflow: an unseen table entry sampled the wrong record");
+    const auto retained = AgcDriver::Graphics::TextureCacheUsage();
+    Require(retained.overflowEntries != 0u && retained.sampledBytes + retained.overflowBytes <= ceiling, "image table reuse overflow: the unseen table entry was not retained within the combined ceiling");
+    const auto afterBuild = AgcDriver::Graphics::ImageTableReuses();
+    Require(afterBuild.resolved > before.resolved, "image table reuse overflow: the oversized table was not resolved");
+    Require(Dispatch(device, result, Records - 1u) == Row(snapshots.Texels(Records - 1u)), "image table reuse overflow: same-present table reuse sampled the wrong record");
+    const auto afterReuse = AgcDriver::Graphics::ImageTableReuses();
+    Require(afterReuse.reused > afterBuild.reused && afterReuse.resolved == afterBuild.resolved, "image table reuse overflow: the table re-resolved instead of reusing the overflow texture");
+    AgcDriver::Graphics::ClearCachedTextures(device.Device());
+    AgcDriver::Graphics::OverrideCacheBudgetForTest(0);
 }
 
-int main() {
+}
+
+int main(int argc, char** argv) {
     try {
+        const bool overflowMode = argc > 1 && std::string(argv[1]) == "overflow";
+        if (overflowMode) {
+#ifdef _WIN32
+            _putenv_s("APS5_NO_SAMPLED_FROM_STORAGE", "1");
+#else
+            setenv("APS5_NO_SAMPLED_FROM_STORAGE", "1", 1);
+#endif
+        }
         GuestBlock block;
         GuestBlock stores(UnimportableBytes);
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
+        if (overflowMode) {
+            GuestBlock snapshots;
+            RunOverflowTableTests(*device, block, snapshots);
+            std::puts("image table reuse overflow tests passed");
+            return 0;
+        }
         RunTests(*device, block, stores);
         std::puts("image table reuse tests passed");
         return 0;

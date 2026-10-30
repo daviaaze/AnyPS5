@@ -434,8 +434,10 @@ bool SrtTape::compute(Frame& frame, const Node& node, std::uint64_t& result) con
             if (frame.runtime.userDataUse != nullptr) frame.runtime.userDataUse->reads.emplace_back(address, origin);
             if (node.loaded && frame.runtime.accessible != nullptr && !frame.runtime.accessible(frame.runtime.userContext, address, sizeof(std::uint32_t))) return false;
             if (auto* trace = frame.runtime.readTrace; trace != nullptr) {
-                if (node.source == trace->leaf) trace->leaves.emplace_back(trace->leafSlot, address);
-                else trace->otherReads.push_back(address);
+                if (node.source == trace->leaf) {
+                    trace->leaves.emplace_back(trace->leafSlot, address);
+                    if (trace->leafStructural) trace->otherReads.push_back(address);
+                } else trace->otherReads.push_back(address);
             }
             const auto reader = node.clean ? frame.runtime.readSpecializationMemory : frame.runtime.readMemory;
             std::uint32_t word = 0;
@@ -582,6 +584,7 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
         std::vector<std::uint32_t> pending;
         std::vector<DescriptorValue> evaluated;
         std::vector<std::uint32_t> flattened;
+        std::vector<std::uint8_t> footprintFlatSlots;
     };
     struct ScratchStorage {};
     auto& scratch = HostThreadLocal<Scratch, ScratchStorage>();
@@ -649,18 +652,39 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
     }
     auto& flattened = scratch.flattened;
     flattened.assign(plan.srtReads.size(), 0u);
+    auto& footprintFlatSlots = scratch.footprintFlatSlots;
+    footprintFlatSlots.assign(plan.srtReads.size(), 0u);
+    if (trace != nullptr) {
+        for (const auto& accessPlan : plan.bufferAccessPlans) {
+            if (!accessPlan.complete || accessPlan.failed) continue;
+            for (const auto& access : accessPlan.accesses) {
+                for (const auto* source : {&access.index, &access.offset, &access.soffset}) {
+                    if (source->kind == BufferUniformSource::Kind::CapturedFlatSlot && source->value < plan.srtReads.size()) {
+                        const auto flatOffset = plan.srtReads[source->value].flatOffset;
+                        if (flatOffset < footprintFlatSlots.size()) footprintFlatSlots[flatOffset] = 1u;
+                    }
+                }
+            }
+        }
+    }
     for (std::size_t slot = 0; slot < plan.srtReads.size(); ++slot) {
         const auto& read = plan.srtReads[slot];
         if (read.flatOffset >= activeFlat.size()) return refuse();
         if (activeFlat[read.flatOffset] == 0u) continue;
         const bool pure = trace != nullptr && read.flatOffset < plan.pureFlatSlots.size() && plan.pureFlatSlots[read.flatOffset] != 0u;
-        if (pure) {
+        const bool footprint = trace != nullptr && footprintFlatSlots[read.flatOffset] != 0u;
+        // Footprint inputs stay patchable leaves, but also invalidate data-only classification.
+        if (pure || footprint) {
             trace->leaf = read.value->Resolve();
             trace->leafSlot = read.flatOffset;
+            trace->leafStructural = footprint;
         }
         std::uint64_t word = 0;
         const bool ok = read.flatOffset < flattened.size() && evaluate(frame, flatRoots[slot], word);
-        if (pure) trace->leaf = nullptr;
+        if (pure || footprint) {
+            trace->leaf = nullptr;
+            trace->leafStructural = false;
+        }
         if (!ok) return refuse();
         flattened[read.flatOffset] = static_cast<std::uint32_t>(word);
     }

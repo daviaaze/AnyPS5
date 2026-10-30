@@ -117,7 +117,7 @@ void CheckCachedImage(AgcDriver::VulkanDevice& device, bool sampled, bool draw) 
     binding.imageShape = ShaderRecompiler::DescriptorImageShape::Image2D;
     binding.imageWritten = {false};
     binding.imageSamplers = {0u};
-    binding.guestDescriptor = {static_cast<std::uint32_t>(address >> 8u), static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (20u << 20u) | (((Side - 1u) & 3u) << 30u), ((Side - 1u) >> 2u) | ((Side - 1u) << 14u), 0xfacu | (9u << 28u), 0u, 0u, 0u, 0u};
+    binding.guestDescriptor = ShaderRecompiler::SharedValues<std::uint32_t>(std::vector<std::uint32_t>{static_cast<std::uint32_t>(address >> 8u), static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (20u << 20u) | (((Side - 1u) & 3u) << 30u), ((Side - 1u) >> 2u) | ((Side - 1u) << 14u), 0xfacu | (9u << 28u), 0u, 0u, 0u, 0u});
     ShaderRecompiler::RecompileResult vertex;
     ShaderRecompiler::RecompileResult program;
     program.bindings.push_back(binding);
@@ -194,11 +194,12 @@ void CheckMultisampleTable(AgcDriver::VulkanDevice& device) {
     map.role = ShaderRecompiler::DescriptorRole::ImageTableMap;
     map.binding = static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::ImageTableMap);
     map.count = 1;
-    map.guestDescriptor.resize(Abi::HeaderWords + 1u);
-    map.guestDescriptor[Abi::HeaderVersion] = Abi::Version;
-    map.guestDescriptor[Abi::HeaderElementCount] = 1u;
-    map.guestDescriptor[Abi::HeaderElementFaults] = Abi::HeaderWords;
-    map.guestDescriptor[Abi::HeaderSamplerFaults] = Abi::HeaderWords + 1u;
+    std::vector<std::uint32_t> mapWords(Abi::HeaderWords + 1u);
+    mapWords[Abi::HeaderVersion] = Abi::Version;
+    mapWords[Abi::HeaderElementCount] = 1u;
+    mapWords[Abi::HeaderElementFaults] = Abi::HeaderWords;
+    mapWords[Abi::HeaderSamplerFaults] = Abi::HeaderWords + 1u;
+    map.guestDescriptor = ShaderRecompiler::SharedValues<std::uint32_t>(std::move(mapWords));
     program.bindings.push_back(map);
     ShaderRecompiler::DescriptorBinding image{};
     image.kind = ShaderRecompiler::DescriptorKind::SampledImage;
@@ -210,7 +211,7 @@ void CheckMultisampleTable(AgcDriver::VulkanDevice& device) {
     image.imageWritten = {false};
     image.imageSamplers = {0u};
     const auto address = block.Address();
-    image.guestDescriptor = {static_cast<std::uint32_t>(address >> 8u), static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (56u << 20u) | (((Side - 1u) & 3u) << 30u), ((Side - 1u) >> 2u) | ((Side - 1u) << 14u), 0xfacu | (2u << 16u) | (0x1bu << 20u) | (14u << 28u), 0u, 2u << 4u, 0u, 0u};
+    image.guestDescriptor = ShaderRecompiler::SharedValues<std::uint32_t>(std::vector<std::uint32_t>{static_cast<std::uint32_t>(address >> 8u), static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (56u << 20u) | (((Side - 1u) & 3u) << 30u), ((Side - 1u) >> 2u) | ((Side - 1u) << 14u), 0xfacu | (2u << 16u) | (0x1bu << 20u) | (14u << 28u), 0u, 2u << 4u, 0u, 0u});
     program.bindings.push_back(image);
     const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
     ShaderResources resources(context, shader);

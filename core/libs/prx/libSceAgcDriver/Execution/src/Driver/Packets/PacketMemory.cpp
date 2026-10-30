@@ -12,10 +12,27 @@
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <chrono>
+#if defined(__linux__)
+#include <time.h>
+#endif
 #include <limits>
+
+namespace {
+double threadCpuMicroseconds() {
+#if defined(__linux__)
+    timespec value{};
+    if (::clock_gettime(CLOCK_THREAD_CPUTIME_ID, &value) != 0) return -1.0;
+    return static_cast<double>(value.tv_sec) * 1'000'000.0 + static_cast<double>(value.tv_nsec) / 1'000.0;
+#else
+    return -1.0;
+#endif
+}
+}
 
 namespace AgcDriver::DriverDetail {
 
@@ -467,10 +484,30 @@ void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<c
 
 void Driver::submitDueAfterCommit(VulkanDevice* localDevice) {
     if (localDevice == nullptr) return;
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    using Clock = std::chrono::steady_clock;
+    const auto checkStart = profile ? Clock::now() : Clock::time_point{};
     const auto pending = Graphics::Recorder::PendingLabelSince();
-    const bool due = pending.has_value() && std::chrono::steady_clock::now() - *pending >= labelFlushDeadline();
+    const bool due = pending.has_value() && Clock::now() - *pending >= labelFlushDeadline();
     const bool capped = batchCap() != 0 && Graphics::Recorder::RecordedWorkSinceSubmit() >= batchCap();
-    if (due || capped) localDevice->SubmitRecorded(true);
+    const bool eligible = due || capped;
+    const auto checkEnd = profile ? Clock::now() : Clock::time_point{};
+    double submitWallUs = 0;
+    double submitCpuUs = -1;
+    if (eligible) {
+        const auto submitStart = profile ? Clock::now() : Clock::time_point{};
+        const auto cpuStart = profile ? threadCpuMicroseconds() : -1.0;
+        localDevice->SubmitRecorded(true);
+        if (profile) {
+            const auto submitEnd = Clock::now();
+            const auto cpuEnd = threadCpuMicroseconds();
+            submitWallUs = std::chrono::duration<double, std::micro>(submitEnd - submitStart).count();
+            if (cpuStart >= 0 && cpuEnd >= cpuStart) submitCpuUs = cpuEnd - cpuStart;
+        }
+    }
+    if (profile)
+        Graphics::NoteSubmitAttribution(due, capped, eligible,
+            std::chrono::duration<double, std::micro>(checkEnd - checkStart).count(), submitWallUs, submitCpuUs);
 }
 
 }

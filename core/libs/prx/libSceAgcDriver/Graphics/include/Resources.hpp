@@ -38,6 +38,7 @@ private:
     bool slab = false;
     VkBufferUsageFlags usage;
     VkMemoryPropertyFlags properties;
+    std::uint32_t memoryType = 0;
     std::shared_ptr<BufferPool> cache;
 };
 

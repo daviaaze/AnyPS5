@@ -130,6 +130,8 @@ struct StageCapture {
     std::uint32_t pushOffset = 0;
     ShaderRecompiler::SrtUserDataUse userDataUse;
     std::uint64_t userDataMask = ~std::uint64_t{0};
+    std::shared_ptr<const SelectedRequestBacking> selectedRequest;
+    bool captureSelectedRequest = false;
 };
 
 struct RelocatableUserWord {
@@ -162,6 +164,12 @@ struct DrawRelocationCounters {
 };
 
 bool DecodeProgramsCurrent(const DrawDecode& decode, const ShaderRegistry& registry);
+std::shared_ptr<const SelectedRequestBacking> RetainSelectedDrawRequest(const ShaderRecompiler::PreparedShaderInvocation& invocation);
+void CaptureSelectedDrawRequests(std::span<const DrawProgram> programs, std::span<const StageCapture> captures,
+        std::span<const std::shared_ptr<DispatchVariant>> matched,
+        std::span<const ShaderRecompiler::MemoryRegion> memory,
+        std::span<const ShaderRecompiler::LinkedProgram> linked,
+        VulkanDevice::DrawTraceContext& trace, std::size_t subdraw);
 
 }
 

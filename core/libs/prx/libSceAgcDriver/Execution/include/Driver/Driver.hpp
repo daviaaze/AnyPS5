@@ -59,6 +59,8 @@ public:
     void Shutdown();
     void WaitIdle();
     std::uint64_t DispatchesAdoptedAhead() const;
+    void ResetCommandStorageAcquisitionsForTesting();
+    std::uint64_t CommandStorageAcquisitionsForTesting();
     void CheckFailure();
     void ReportFailure(std::exception_ptr error);
     void Submit(const Packet* packet, std::uint32_t queue, bool cpuFlip = false);
@@ -118,8 +120,10 @@ private:
     void checkStopping() const;
     std::uint32_t reserveEopFlip(const FlipInfo& info, std::uint32_t token);
     static bool& onWorkerThread();
-    static void copyCommands(Submission& submission, const std::uint32_t* guest, std::size_t words);
     static bool copySegment(Submission& submission, const std::uint32_t* guest, std::size_t words, std::size_t& budget);
+    static void copyCommands(Submission& submission, const std::uint32_t* guest, std::size_t words);
+    void acquireCommandStorage(Submission& submission, std::uint32_t queue);
+    void recycleCommandStorageLocked(QueueWorker& worker, std::vector<std::uint32_t>& commands);
     static void readRegisterLists(Submission& submission);
     void waitForFlipRoom(const Submission& submission);
     void holdFlipBehindWorker(const Submission& submission);
@@ -371,6 +375,8 @@ private:
     std::condition_variable changed;
 
     std::map<std::uint32_t, QueueWorker> workers;
+    std::size_t pooledCommandBuffers = 0;
+    std::size_t pooledCommandBytes = 0;
     std::atomic<std::uint64_t> frameSerial{0};
     std::shared_ptr<FrameTiming> pendingFrameTiming;
 
@@ -463,6 +469,7 @@ private:
     std::uint32_t idleWaiters = 0;
     std::uint64_t queue0Executing = 0;
     std::deque<std::uint64_t> queue0Uncommitted;
+    std::uint64_t commandStorageAcquisitions = 0;
     std::atomic<std::uint32_t> orderHolders{0};
     std::atomic<std::uint32_t> runningWorkers{0};
     std::atomic<std::uint64_t> idleEpoch{0};

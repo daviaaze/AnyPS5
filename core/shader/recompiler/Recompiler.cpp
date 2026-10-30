@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <cstddef>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -16,6 +17,7 @@
 #include "ShaderDiskCache.hpp"
 #include <list>
 #include <functional>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <set>
@@ -370,6 +372,7 @@ constexpr std::size_t ResultMemoSets = 64;
 constexpr std::size_t ResultMemoWays = 4;
 using ResultMemoTable = std::array<ResultMemoEntry, ResultMemoSets * ResultMemoWays>;
 
+
 struct SourceEntry : std::enable_shared_from_this<SourceEntry> {
     std::mutex mutex;
     // The code the entry was built for: the key carries only a hash of it, so a candidate entry is
@@ -387,6 +390,7 @@ struct SourceEntry : std::enable_shared_from_this<SourceEntry> {
     std::vector<std::shared_ptr<const CompiledVariant>> variants;
     std::vector<EmissionFailure> emissionFailures;
     std::unique_ptr<ResultMemoTable> memo;
+
     std::uint64_t memoClock = 0;
 };
 
@@ -453,16 +457,18 @@ bool sameLayout(const BindingLayout& left, const BindingLayout& right);
 std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPreparationContext* preparation = nullptr, bool reclaim = true, const SourceHandle* preparedHandle = nullptr) {
     static PrimedSharedMutex mutex;
     // Entries whose code hashes alike share a bucket; the code comparison picks the right one.
-    static std::unordered_map<std::vector<std::uint64_t>, std::vector<std::shared_ptr<SourceEntry>>, SourceKeyHash> sources;
+    static std::unordered_map<std::vector<std::uint64_t>, std::vector<std::weak_ptr<SourceEntry>>, SourceKeyHash> sources;
     struct SourceKeyStorage {};
     auto& key = HostThreadLocal<std::vector<std::uint64_t>, SourceKeyStorage>();
-    RecompileCacheKey::Build(request, key);
+    RecompileCacheKey::BuildInterface(request, key);
+    key.push_back(request.shader.code.size());
+    key.push_back(RecompileCacheKey::HashCode(request.shader.code));
     key.push_back(HostSubgroupSize(request));
     const auto find = [&]() -> std::shared_ptr<SourceEntry> {
         const auto found = sources.find(key);
         if (found == sources.end()) return nullptr;
-        for (const auto& entry : found->second) {
-            if (std::equal(entry->code.begin(), entry->code.end(), request.shader.code.begin(), request.shader.code.end())) return entry;
+        for (const auto& candidate : found->second) {
+            if (auto entry = candidate.lock(); entry != nullptr && std::equal(entry->code.begin(), entry->code.end(), request.shader.code.begin(), request.shader.code.end())) return entry;
         }
         return nullptr;
     };
@@ -479,15 +485,19 @@ std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPr
             source->code.assign(request.shader.code.begin(), request.shader.code.end());
             source->linkedCallFallbacks.assign(request.context.linkedCallFallbacks.begin(), request.context.linkedCallFallbacks.end());
             auto& bucket = sources[key];
+            std::erase_if(bucket, [](const auto& candidate) { return candidate.expired(); });
             if (!bucket.empty()) {
-                // A second entry under one key is a code hash collision (or the unhashed key with
-                // identical code, which cannot happen); each is reported under the profile switch.
                 static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
                 static std::uint64_t collisions = 0;
                 ++collisions;
                 if (profile) std::fprintf(stderr, "[recompile] source key collision %llu: %zu entries share a key (%zu code words)\n", static_cast<unsigned long long>(collisions), bucket.size() + 1, request.shader.code.size());
             }
             bucket.push_back(source);
+            static std::uint64_t inserts = 0;
+            if (++inserts % 1024u == 0u) std::erase_if(sources, [](auto& item) {
+                std::erase_if(item.second, [](const auto& candidate) { return candidate.expired(); });
+                return item.second.empty();
+            });
         }
     }
     {
@@ -748,6 +758,30 @@ struct SpecializedModule {
     bool pushData = false;
 };
 
+void scanSpecializedBindings(SpecializedModule& module, std::span<const std::uint32_t> words) {
+    std::map<std::uint32_t, std::uint32_t> bindingNumbers;
+    std::unordered_set<std::uint32_t> functionLdsBuffer;
+    for (std::size_t cursor = 5; cursor < words.size();) {
+        const auto count = words[cursor] >> 16u;
+        const auto op = static_cast<spv::Op>(words[cursor] & 0xffffu);
+        if (op == spv::OpDecorate && count == 4u && words[cursor + 2u] == spv::DecorationBinding) bindingNumbers.emplace(words[cursor + 1u], words[cursor + 3u]);
+        if (op == spv::OpDecorate && count == 4u && words[cursor + 2u] == spv::DecorationDescriptorSet && words[cursor + 3u] == PixelFunctionLdsDescriptorSet) functionLdsBuffer.insert(words[cursor + 1u]);
+        if (op == spv::OpVariable && count >= 4u && !functionLdsBuffer.contains(words[cursor + 2u])) {
+            if (const auto found = bindingNumbers.find(words[cursor + 2u]); found != bindingNumbers.end()) module.bindings.push_back(found->second);
+            module.pushData |= words[cursor + 3u] == spv::StorageClassPushConstant;
+        }
+        cursor += count;
+    }
+}
+
+std::shared_ptr<const SpecializedModule> specializedModuleFromWords(std::vector<std::uint32_t> words, std::span<const PipelineSpecializationConstant> constants) {
+    auto module = std::make_shared<SpecializedModule>();
+    scanSpecializedBindings(*module, words);
+    module->spirv = InternSpirv(std::move(words));
+    module->specializationId = constants.empty() ? 0u : nextVariantId();
+    return module;
+}
+
 std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
     auto source = SpecializeVertexInputTypes(artifact, classes);
     std::map<std::uint32_t, std::uint32_t> supplied;
@@ -838,78 +872,75 @@ std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledSh
         }
         cursor += count;
     }
-    materialized = std::move(compact);
 #if ANYPS5_ENABLE_SPIRV_TOOLS
-    materialized = ValidateAndOptimizeSpirv(materialized, target.vulkanVersion, target.spirvVersion, target.nonConstantImageOffsets, false);
-#endif
-    auto module = std::make_shared<SpecializedModule>();
-    std::map<std::uint32_t, std::uint32_t> bindingNumbers;
-    std::unordered_set<std::uint32_t> functionLdsBuffer;
-    for (std::size_t cursor = 5; cursor < materialized.size();) {
-        const auto count = materialized[cursor] >> 16u;
-        const auto op = static_cast<spv::Op>(materialized[cursor] & 0xffffu);
-        if (op == spv::OpDecorate && count == 4u && materialized[cursor + 2u] == spv::DecorationBinding) bindingNumbers.emplace(materialized[cursor + 1u], materialized[cursor + 3u]);
-        if (op == spv::OpDecorate && count == 4u && materialized[cursor + 2u] == spv::DecorationDescriptorSet && materialized[cursor + 3u] == PixelFunctionLdsDescriptorSet) functionLdsBuffer.insert(materialized[cursor + 1u]);
-        if (op == spv::OpVariable && count >= 4u && !functionLdsBuffer.contains(materialized[cursor + 2u])) {
-            if (const auto found = bindingNumbers.find(materialized[cursor + 2u]); found != bindingNumbers.end()) module->bindings.push_back(found->second);
-            module->pushData |= materialized[cursor + 3u] == spv::StorageClassPushConstant;
-        }
-        cursor += count;
+    if (compact != materialized) {
+        compact = ValidateAndOptimizeSpirv(compact, target.vulkanVersion, target.spirvVersion, target.nonConstantImageOffsets, false);
     }
-    module->spirv = InternSpirv(std::move(materialized));
-    module->specializationId = constants.empty() ? 0u : nextVariantId();
-    return module;
+#endif
+    materialized = std::move(compact);
+    return specializedModuleFromWords(std::move(materialized), constants);
 }
 
 struct SpecializedModuleEntry {
     std::once_flag ready;
     std::exception_ptr failure;
     std::shared_ptr<const SpecializedModule> module;
+    std::vector<std::byte> key;
 };
-
 struct PreparedModuleEntry {
     std::once_flag ready;
     std::exception_ptr failure;
     std::shared_ptr<const SpecializedModule> module;
     DescriptorBindingPlan bindings;
+    std::shared_ptr<void> moduleCacheOwner;
 };
 
 struct PreparedBindingPlan {
     std::once_flag ready;
     std::exception_ptr failure;
     DescriptorBindingPlan bindings;
+    std::vector<std::uint64_t> key;
     PrimedSharedMutex mutex;
     std::map<std::vector<std::uint32_t>, std::shared_ptr<PreparedModuleEntry>> modules;
 };
+
 
 struct RegistrationModuleEntry {
     std::once_flag ready;
     std::exception_ptr failure;
     std::shared_ptr<const SpecializedModule> module;
+    std::shared_ptr<void> moduleCacheOwner;
 };
 
-std::shared_ptr<const SpecializedModule> registrationModule(std::uint64_t variantId, std::span<const std::uint32_t> moduleKey, const std::function<std::shared_ptr<const SpecializedModule>()>& specialize) {
+std::shared_ptr<const SpecializedModule> registrationModule(std::uint64_t variantId, std::span<const std::uint32_t> moduleKey, const std::function<std::shared_ptr<const SpecializedModule>(std::shared_ptr<void>&)>& specialize, std::shared_ptr<void>& cacheOwner) {
     std::vector<std::uint64_t> key{variantId};
     key.insert(key.end(), moduleKey.begin(), moduleKey.end());
     static PrimedSharedMutex mutex;
-    static std::map<std::vector<std::uint64_t>, std::shared_ptr<RegistrationModuleEntry>> modules;
+    static std::map<std::vector<std::uint64_t>, std::weak_ptr<RegistrationModuleEntry>> modules;
+    static std::uint64_t inserts = 0;
     std::shared_ptr<RegistrationModuleEntry> entry;
     {
         std::shared_lock lock(mutex);
-        if (const auto found = modules.find(key); found != modules.end()) entry = found->second;
+        if (const auto found = modules.find(key); found != modules.end()) entry = found->second.lock();
     }
     if (entry == nullptr) {
         std::unique_lock lock(mutex);
-        const auto found = modules.find(key);
-        entry = found != modules.end() ? found->second : modules.emplace(key, std::make_shared<RegistrationModuleEntry>()).first->second;
+        auto& slot = modules[key];
+        entry = slot.lock();
+        if (entry == nullptr) {
+            entry = std::make_shared<RegistrationModuleEntry>();
+            slot = entry;
+            if (++inserts % 1024u == 0u) std::erase_if(modules, [](const auto& item) { return item.second.expired(); });
+        }
     }
     std::call_once(entry->ready, [&] {
         try {
-            entry->module = specialize();
+            entry->module = specialize(entry->moduleCacheOwner);
         } catch (...) {
             entry->failure = std::current_exception();
         }
     });
+    cacheOwner = entry;
     if (entry->failure) std::rethrow_exception(entry->failure);
     return entry->module;
 }
@@ -941,17 +972,46 @@ std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& 
     }
     key.push_back(exports.size());
     for (const auto mapping : exports) key.push_back(mapping);
+    std::uint64_t hash = 0xcbf29ce484222325ull;
+    for (const auto value : key) {
+        hash ^= value;
+        hash *= 0x100000001b3ull;
+    }
     static PrimedSharedMutex mutex;
-    static std::map<std::vector<std::uint64_t>, std::shared_ptr<PreparedBindingPlan>> plans;
+    static std::unordered_map<std::uint64_t, std::vector<std::weak_ptr<PreparedBindingPlan>>> plans;
+    static std::uint64_t inserts = 0;
     std::shared_ptr<PreparedBindingPlan> plan;
     {
         std::shared_lock lock(mutex);
-        if (const auto found = plans.find(key); found != plans.end()) plan = found->second;
+        if (const auto found = plans.find(hash); found != plans.end()) {
+            for (const auto& candidate : found->second) {
+                if (auto live = candidate.lock(); live != nullptr && live->key == key) {
+                    plan = std::move(live);
+                    break;
+                }
+            }
+        }
     }
     if (plan == nullptr) {
         std::unique_lock lock(mutex);
-        const auto found = plans.find(key);
-        plan = found != plans.end() ? found->second : plans.emplace(key, std::make_shared<PreparedBindingPlan>()).first->second;
+        auto& candidates = plans[hash];
+        for (auto candidate = candidates.begin(); candidate != candidates.end();) {
+            if (auto live = candidate->lock()) {
+                if (live->key == key) plan = std::move(live);
+                ++candidate;
+            } else {
+                candidate = candidates.erase(candidate);
+            }
+        }
+        if (plan == nullptr) {
+            plan = std::make_shared<PreparedBindingPlan>();
+            plan->key = key;
+            candidates.emplace_back(plan);
+            if (++inserts % 1024u == 0u) std::erase_if(plans, [](auto& bucket) {
+                std::erase_if(bucket.second, [](const auto& candidate) { return candidate.expired(); });
+                return bucket.second.empty();
+            });
+        }
     }
     std::call_once(plan->ready, [&] {
         try {
@@ -964,31 +1024,191 @@ std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& 
     return plan;
 }
 
-std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
-    struct ModuleKeyStorage {};
-    auto& key = HostThreadLocal<std::vector<std::uint64_t>, ModuleKeyStorage>();
-    key.clear();
-    key.push_back(artifact.variantId);
-    for (const auto& constant : constants) key.push_back((static_cast<std::uint64_t>(constant.id) << 32u) | constant.value);
+std::string specializationRole(std::uint32_t id) {
+    namespace S = PipelineSpecialization;
+    const auto at = [](const char* name, std::uint32_t index, const char* part) { return std::string(name) + "[" + std::to_string(index) + "]" + part; };
+    if (id < S::ImageBase) {
+        static constexpr const char* parts[] = {".stride", ".format", ".presence", ".misalignment"};
+        return at("buffer", id / S::BufferWords, parts[id % S::BufferWords]);
+    }
+    if (id < S::VertexBase) {
+        static constexpr const char* parts[] = {".mode", ".dst_sel_x", ".dst_sel_y", ".dst_sel_z", ".dst_sel_w"};
+        const auto local = id - S::ImageBase;
+        return at("image", local / S::ImageWords, parts[local % S::ImageWords]);
+    }
+    if (id < S::PushDataOffset) return at("vertex", (id - S::VertexBase) / S::VertexWords, "");
+    if (id == S::PushDataOffset) return "push_data_offset";
+    if (id >= S::ExportBase && id < S::ExportPackingBase) return at("export", (id - S::ExportBase) / 4u, ".swizzle");
+    if (id >= S::ExportPackingBase && id < S::DualSourceBlend) return "export_packing";
+    if (S::IsWorkgroupOffset(id)) return "workgroup_offset";
+    if (id >= S::HeapCountBase && id < S::MipCountBase) return at("heap", id - S::HeapCountBase, ".active_count");
+    if (id >= S::MipCountBase && id < S::StoreQuantizeBase) return at("storage_image", id - S::MipCountBase, ".mip_count");
+    if (id >= S::StoreQuantizeBase && id < S::DescriptorIndexBase) {
+        static constexpr const char* parts[] = {".quantize", ".scale", ".reciprocal", ".snorm"};
+        const auto local = id - S::StoreQuantizeBase;
+        return at("store", local / S::StoreQuantizeWords, parts[local % S::StoreQuantizeWords]);
+    }
+    if (id >= S::DescriptorIndexBase && id < S::CompareBase) {
+        const auto local = id - S::DescriptorIndexBase;
+        return at("heap", local / S::DescriptorIndexStride, (".active_index[" + std::to_string(local % S::DescriptorIndexStride) + "]").c_str());
+    }
+    if (id >= S::CompareBase && id < S::FoldOffsetBase) return at("compare", (id - S::CompareBase) / S::CompareWords, "");
+    if (id >= S::FoldOffsetBase && id < S::UnnormalizedBaseLevelBase) return at("sampler", id - S::FoldOffsetBase, ".fold_offset");
+    if (id >= S::UnnormalizedBaseLevelBase) return at("sampler", id - S::UnnormalizedBaseLevelBase, ".unnormalized_base_level");
+    return "other";
+}
+
+void reportSpecializationChurn(std::uint64_t variantId, std::span<const PipelineSpecializationConstant> constants) {
+    struct Seen {
+        std::vector<PipelineSpecializationConstant> last;
+        std::uint64_t keys = 0;
+        std::uint64_t suppressed = 0;
+    };
+    static constexpr std::uint64_t LoggedMisses = 64;
+    static std::mutex mutex;
+    static std::unordered_map<std::uint64_t, Seen> variants;
+    std::string changes;
+    std::uint64_t keys = 0, suppressed = 0;
+    {
+        std::lock_guard lock(mutex);
+        auto& seen = variants[variantId];
+        keys = seen.keys++;
+        if (keys != 0) {
+            if (keys <= LoggedMisses) {
+                std::map<std::uint32_t, std::pair<std::optional<std::uint32_t>, std::optional<std::uint32_t>>> diff;
+                for (const auto& constant : seen.last) diff[constant.id].first = constant.value;
+                for (const auto& constant : constants) diff[constant.id].second = constant.value;
+                char text[64];
+                for (const auto& [id, values] : diff) {
+                    if (values.first == values.second) continue;
+                    const auto show = [](const std::optional<std::uint32_t>& value) { return value ? std::to_string(*value) + "(0x" + [&] { char hex[16]; std::snprintf(hex, sizeof(hex), "%x", *value); return std::string(hex); }() + ")" : std::string("absent"); };
+                    changes += specializationRole(id) + "=" + show(values.first) + "->" + show(values.second) + " ";
+                }
+            } else {
+                suppressed = ++seen.suppressed;
+            }
+        }
+        seen.last.assign(constants.begin(), constants.end());
+    }
+    if (keys == 0) return;
+    if (keys <= LoggedMisses) {
+        std::fprintf(stderr, "[specchurn] variant 0x%llx miss with %llu prior keys, changed:%s\n", static_cast<unsigned long long>(variantId), static_cast<unsigned long long>(keys), changes.empty() ? " none (non-constant key part)" : changes.c_str());
+    } else if ((suppressed & (suppressed - 1u)) == 0u) {
+        std::fprintf(stderr, "[specchurn] variant 0x%llx %llu prior keys, %llu further misses not itemized\n", static_cast<unsigned long long>(variantId), static_cast<unsigned long long>(keys), static_cast<unsigned long long>(suppressed));
+    }
+}
+
+std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target, std::shared_ptr<void>& cacheOwner) {
+    std::vector<std::byte> diskKey;
+    ShaderDiskCache::BuildSpecializationKey({
+        .source = artifact.spirv.ContentHash(),
+        .sourceWords = artifact.spirv.size(),
+        .vertexInputPatches = artifact.vertexInputPatches,
+        .stencilReferences = !artifact.stencilReferences.empty(),
+        .classes = classes,
+        .constants = constants,
+        .vulkanVersion = target.vulkanVersion,
+        .spirvVersion = target.spirvVersion,
+        .nonConstantImageOffsets = target.nonConstantImageOffsets,
+        .spirvTools = ANYPS5_ENABLE_SPIRV_TOOLS != 0
+    }, diskKey);
+    const auto hashDiskKey = [&](std::uint64_t seed) {
+        std::uint64_t hash = seed;
+        for (const auto byte : diskKey) {
+            hash ^= std::to_integer<std::uint8_t>(byte);
+            hash *= 0x100000001b3ull;
+        }
+        return hash;
+    };
+    const auto key = std::pair{hashDiskKey(0xcbf29ce484222325ull), hashDiskKey(0x9e3779b97f4a7c15ull)};
     static PrimedSharedMutex mutex;
-    static std::map<std::vector<std::uint64_t>, std::shared_ptr<SpecializedModuleEntry>> modules;
+    static std::map<std::pair<std::uint64_t, std::uint64_t>, std::vector<std::weak_ptr<SpecializedModuleEntry>>> modules;
+    static std::uint64_t inserts = 0;
     std::shared_ptr<SpecializedModuleEntry> entry;
+    bool inserted = false;
     {
         std::shared_lock lock(mutex);
-        if (const auto found = modules.find(key); found != modules.end()) entry = found->second;
+        if (const auto found = modules.find(key); found != modules.end()) {
+            for (const auto& candidate : found->second) {
+                if (auto live = candidate.lock(); live != nullptr && live->key == diskKey) {
+                    entry = std::move(live);
+                    break;
+                }
+            }
+        }
     }
     if (entry == nullptr) {
         std::unique_lock lock(mutex);
-        const auto found = modules.find(key);
-        entry = found != modules.end() ? found->second : modules.emplace(key, std::make_shared<SpecializedModuleEntry>()).first->second;
+        auto& candidates = modules[key];
+        for (auto candidate = candidates.begin(); candidate != candidates.end();) {
+            if (auto live = candidate->lock()) {
+                if (live->key == diskKey) entry = std::move(live);
+                ++candidate;
+            } else {
+                candidate = candidates.erase(candidate);
+            }
+        }
+        inserted = entry == nullptr;
+        if (inserted) {
+            entry = std::make_shared<SpecializedModuleEntry>();
+            entry->key = diskKey;
+            candidates.emplace_back(entry);
+            if (++inserts % 1024u == 0u) std::erase_if(modules, [](auto& bucket) {
+                std::erase_if(bucket.second, [](const auto& candidate) { return candidate.expired(); });
+                return bucket.second.empty();
+            });
+        }
     }
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (profile && inserted) reportSpecializationChurn(artifact.variantId, constants);
+    static std::atomic<std::uint64_t> builtCount{0}, builtNs{0}, builtMaxNs{0}, builtMaxWords{0};
+    static std::atomic<std::uint64_t> diskCount{0}, diskNs{0}, memoryHits{0};
+    static std::atomic<std::int64_t> lastReportNs{0};
+    static std::mutex reportMutex;
     std::call_once(entry->ready, [&] {
         try {
-            entry->module = buildSpecializedModule(artifact, classes, constants, target);
+            const auto started = std::chrono::steady_clock::now();
+            std::vector<std::uint32_t> words;
+            const bool diskHit = ShaderDiskCache::LoadSpecialized(diskKey, words);
+            if (diskHit) {
+                entry->module = specializedModuleFromWords(std::move(words), constants);
+            } else {
+                entry->module = buildSpecializedModule(artifact, classes, constants, target);
+                ShaderDiskCache::StoreSpecialized(diskKey, entry->module->spirv);
+            }
+            if (profile) {
+                const auto ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
+                if (diskHit) {
+                    diskCount.fetch_add(1, std::memory_order_relaxed);
+                    diskNs.fetch_add(ns, std::memory_order_relaxed);
+                } else {
+                    builtCount.fetch_add(1, std::memory_order_relaxed);
+                    builtNs.fetch_add(ns, std::memory_order_relaxed);
+                    auto maxNs = builtMaxNs.load(std::memory_order_relaxed);
+                    while (maxNs < ns && !builtMaxNs.compare_exchange_weak(maxNs, ns, std::memory_order_relaxed)) {}
+                    auto maxWords = builtMaxWords.load(std::memory_order_relaxed);
+                    while (maxWords < entry->module->spirv.size() && !builtMaxWords.compare_exchange_weak(maxWords, entry->module->spirv.size(), std::memory_order_relaxed)) {}
+                }
+            }
         } catch (...) {
             entry->failure = std::current_exception();
         }
     });
+    if (profile) {
+        if (!inserted) memoryHits.fetch_add(1, std::memory_order_relaxed);
+        const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        auto last = lastReportNs.load(std::memory_order_relaxed);
+        if (last == 0) lastReportNs.compare_exchange_strong(last, now, std::memory_order_relaxed);
+        else if (now - last >= std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::seconds(10)).count() && lastReportNs.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+            std::lock_guard lock(reportMutex);
+            std::fprintf(stderr, "[specialize] (10 s): %llu built in %.1f ms (max %.1f ms, %llu words max), %llu disk hits in %.1f ms, %llu memory hits\n",
+                static_cast<unsigned long long>(builtCount.exchange(0, std::memory_order_relaxed)), builtNs.exchange(0, std::memory_order_relaxed) / 1e6,
+                builtMaxNs.exchange(0, std::memory_order_relaxed) / 1e6, static_cast<unsigned long long>(builtMaxWords.exchange(0, std::memory_order_relaxed)),
+                static_cast<unsigned long long>(diskCount.exchange(0, std::memory_order_relaxed)), diskNs.exchange(0, std::memory_order_relaxed) / 1e6,
+                static_cast<unsigned long long>(memoryHits.exchange(0, std::memory_order_relaxed)));
+        }
+    }
+    cacheOwner = entry;
     if (entry->failure) std::rethrow_exception(entry->failure);
     return entry->module;
 }
@@ -1047,6 +1267,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         result.userDataRegisterReads |= reg >= request.context.userDataBaseRegister && index < 64u ? std::uint64_t{1} << index : ~std::uint64_t{0};
     }
     const auto plan = preparedBindingPlan(variant, snapshot, request.context.pixel ? std::span<const std::uint8_t>(request.context.pixel->targetExportMapping) : std::span<const std::uint8_t>{}, request.target.registrationModules);
+    result.preparedPlanOwner = plan;
     const DescriptorBindingPlan* bindingPlan = &plan->bindings;
     std::shared_ptr<PreparedModuleEntry> entry;
     struct LocalModuleKeyStorage {};
@@ -1137,11 +1358,18 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
                     constants.push_back({first + 5u, kind});
                 }
             }
-            const auto module = artifact.registrationModule && plan->bindings.specialization.empty() ? registrationModule(artifact.variantId, moduleKey, [&] { return specializeModule(variant.artifact, vertexClasses, constants, request.target); }) : specializeModule(variant.artifact, vertexClasses, constants, request.target);
+            std::shared_ptr<void> moduleCacheOwner;
+            std::shared_ptr<const SpecializedModule> module;
+            if (artifact.registrationModule && plan->bindings.specialization.empty()) {
+                module = registrationModule(artifact.variantId, moduleKey, [&](std::shared_ptr<void>& owner) { return specializeModule(variant.artifact, vertexClasses, constants, request.target, owner); }, moduleCacheOwner);
+            } else {
+                module = specializeModule(variant.artifact, vertexClasses, constants, request.target, moduleCacheOwner);
+            }
             if (variant.bindings.layout.UsesPushData() && !module->pushData) throw std::runtime_error("specialization removed the prepared push constant interface");
             auto selected = DescriptorBindingBuilder{}.Select(plan->bindings, module->bindings);
             entry->bindings = std::move(selected);
             entry->module = module;
+            entry->moduleCacheOwner = std::move(moduleCacheOwner);
         };
         std::call_once(entry->ready, [&] {
             try {
@@ -1184,7 +1412,9 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         } else {
             const auto data = std::ranges::find_if(result.bindings, [](const DescriptorBinding& binding) { return binding.role == DescriptorRole::ShaderData; });
             if (data == result.bindings.end() || first + layout.runtimeStateDwords > data->guestDescriptor.size()) throw std::runtime_error("vertex selector state lies outside the shader data");
-            std::copy_n(runtimeSelectors.begin(), layout.runtimeStateDwords, data->guestDescriptor.begin() + first);
+            auto dataWords = data->guestDescriptor.Copy();
+            std::copy_n(runtimeSelectors.begin(), layout.runtimeStateDwords, dataWords.begin() + first);
+            data->guestDescriptor = SharedValues<std::uint32_t>(std::move(dataWords));
         }
     }
     result.shaderDataUserWords = std::move(bindings.shaderDataUserWords);
@@ -1194,7 +1424,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         for (const auto& poison : tables.poison) result.imageTablePoison.push_back({poison.words, poison.dwordCount, poison.resource, static_cast<std::uint32_t>(poison.reason)});
         result.imageTableRanges = snapshot.tables.ranges;
         result.imageTableReadRanges.reserve(snapshot.tables.tables.size());
-        for (const auto& table : snapshot.tables.tables) result.imageTableReadRanges.push_back(table.readRanges.Copy());
+        for (const auto& table : snapshot.tables.tables) result.imageTableReadRanges.emplace_back(table.readRanges);
         result.imageTableShader = snapshot.tables.shader;
         result.imageTableFaults = tables.faults;
     }
@@ -1207,17 +1437,49 @@ bool sameLayout(const BindingLayout& left, const BindingLayout& right) {
 
 }
 
+SpecializedModuleBindings ScanSpecializedModuleBindings(std::span<const std::uint32_t> words) {
+    SpecializedModule module;
+    scanSpecializedBindings(module, words);
+    return {std::move(module.bindings), module.pushData};
+}
+
+SpecializedModuleCacheData BuildSpecializedModuleForCache(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
+    const auto module = buildSpecializedModule(artifact, classes, constants, target);
+    return {module->spirv, module->bindings, module->pushData, module->specializationId};
+}
+
 SharedSpirv InternSpirv(std::vector<std::uint32_t> words) {
     SharedSpirv spirv(std::move(words));
     const auto hash = spirv.ContentHash();
     static std::mutex mutex;
-    static std::unordered_map<std::uint64_t, std::vector<SharedSpirv>> interned;
+    static std::map<std::uint64_t, std::vector<std::weak_ptr<SharedSpirv::Holder>>> interned;
+    static auto cleanupCursor = interned.end();
     std::lock_guard lock(mutex);
-    auto& candidates = interned[hash.low ^ (hash.high * 0x9e3779b97f4a7c15ull)];
-    for (const auto& candidate : candidates) {
-        if (candidate.ContentHash() == hash && candidate == spirv) return candidate;
+    const auto key = hash.low ^ (hash.high * 0x9e3779b97f4a7c15ull);
+    if (cleanupCursor == interned.end()) cleanupCursor = interned.begin();
+    if (cleanupCursor != interned.end()) {
+        auto current = cleanupCursor++;
+        auto& staleCandidates = current->second;
+        staleCandidates.erase(std::remove_if(staleCandidates.begin(), staleCandidates.end(), [](const auto& candidate) { return candidate.expired(); }), staleCandidates.end());
+        if (staleCandidates.empty()) {
+            interned.erase(current);
+        }
     }
-    candidates.push_back(spirv);
+    auto bucket = interned.find(key);
+    if (bucket != interned.end()) {
+        auto& candidates = bucket->second;
+        for (auto candidate = candidates.begin(); candidate != candidates.end();) {
+            if (auto holder = candidate->lock()) {
+                const SharedSpirv live = SharedSpirv::FromInternedHolder(std::move(holder));
+                if (live.ContentHash() == hash && live == spirv) return live;
+                ++candidate;
+            } else {
+                candidate = candidates.erase(candidate);
+            }
+        }
+    }
+    spirv.holder->interned = true;
+    interned[key].emplace_back(spirv.holder);
     return spirv;
 }
 
@@ -1337,7 +1599,9 @@ RecompileResult recompileOnce(const RecompileRequest& request) {
     }
     const auto source = getSource(request);
     materializer.Materialize(*acquirePlan(request, source, true), runtime, snapshot);
-    return materializeVariant(*source, request, snapshot);
+    auto result = materializeVariant(*source, request, snapshot);
+    result.sourceOwner = source;
+    return result;
 }
 
 RecompileResult RecompileImpl(const RecompileRequest& request) {
@@ -1416,6 +1680,14 @@ std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapsh
     mixDescriptors(snapshot.samplers);
     mixWords(snapshot.flattenedSrt);
     mixWords(snapshot.userData);
+    mix(snapshot.bufferFootprints.size());
+    for (const auto& footprint : snapshot.bufferFootprints) {
+        mix(footprint.bounded);
+        mix(footprint.readBegin);
+        mix(footprint.readEnd);
+        mix(footprint.writeBegin);
+        mix(footprint.writeEnd);
+    }
     mix(static_cast<std::uint64_t>(snapshot.uniformFill.kind));
     mix(snapshot.uniformFill.resource);
     for (const auto stride : snapshot.uniformFill.groupStride) mix(stride);
@@ -1575,13 +1847,21 @@ void ReleaseUndrawnResourcePlan(const SourceHandle& handle) {
 
 namespace {
 
-// The capture's materialization; with pure flat slots in the plan the walk's read addresses are
-// traced into the capture (ResourceCapture::readTrace).
+// The capture's materialization; pure and buffer-footprint flat-slot reads are traced into the capture.
 void materializeCapture(ResourceCapture& capture, const SrtRuntime& runtime) {
     const auto& plan = *capture.plan;
     SrtRuntime traced = runtime;
     traced.userDataUse = &capture.userDataUse;
-    if (std::none_of(plan.pureFlatSlots.begin(), plan.pureFlatSlots.end(), [](std::uint8_t pure) { return pure != 0u; })) {
+    const bool hasPureReads = std::ranges::any_of(plan.pureFlatSlots, [](std::uint8_t pure) { return pure != 0u; });
+    const bool hasFootprintReads = std::ranges::any_of(plan.bufferAccessPlans, [&](const BufferAccessPlan& accessPlan) {
+        if (!accessPlan.complete || accessPlan.failed) return false;
+        return std::ranges::any_of(accessPlan.accesses, [&](const BufferAccessRecord& access) {
+            return (access.index.kind == BufferUniformSource::Kind::CapturedFlatSlot && access.index.value < plan.srtReads.size()) ||
+                (access.offset.kind == BufferUniformSource::Kind::CapturedFlatSlot && access.offset.value < plan.srtReads.size()) ||
+                (access.soffset.kind == BufferUniformSource::Kind::CapturedFlatSlot && access.soffset.value < plan.srtReads.size());
+        });
+    });
+    if (!hasPureReads && !hasFootprintReads) {
         ResourceMaterializer{}.Materialize(plan, traced, capture.snapshot);
         return;
     }

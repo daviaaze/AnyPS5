@@ -15,6 +15,11 @@
 
 namespace AgcDriver::Graphics {
 
+struct ImageMemoryTiming {
+    double vkAllocateMilliseconds = 0;
+    std::uint64_t vkAllocateCalls = 0;
+    std::uint64_t poolHits = 0;
+};
 struct BufferAllocation {
     VkBuffer buffer;
     VkDeviceMemory memory;
@@ -49,12 +54,14 @@ struct SlabSlot {
 // slot count (the bound applies to each tier below, and is held to a sixth of the device's
 // maxMemoryAllocationCount so the three tiers keep half of it free).
 //
-// The size classes and the exact-size allocations are retained in two tiers with a budget each:
-// the multi-MiB texture scratch buffers that come back from a batch (GPU-direct uploads and
-// write-backs of storage images) filled the one budget, so every one returned evicted hundreds of
-// the 256-byte copied-region buffers to fit, and those then missed on every build (81869 misses
-// and 80850 evictions per run, each a Vulkan create or destroy under the pool mutex, 3.5 s per
-// run). APS5_BUFFER_POOL_SHARED=1 keeps one tier as before.
+// Small copied-region buffers retain a separate 64 MiB budget; all larger host allocations
+// share one 512 MiB least-recently-used tier without fixed reservations by size.
+// APS5_BUFFER_POOL_SHARED=1 keeps one tier as before.
+// Host-visible 1–4 MiB power-of-two requests may use 8 MiB medium slabs (two 4 MiB slots).
+// Their full backing bytes reserve the existing 512 MiB large-tier budget until the block is
+// freed; cached medium slices count toward the tier's slot bound but are not charged again.
+// Retained nonslab allocations share the remaining budget. Blocks freed by eviction release
+// their reservation immediately. APS5_NO_MEDIUM_BUFFER_SLABS=1 restores dedicated allocations.
 class BufferPool {
 public:
     explicit BufferPool(const Context& context);
@@ -66,19 +73,24 @@ public:
     // The size a buffer for `bytes` is created with: its size class, or `bytes` itself when large.
     static std::size_t Capacity(std::size_t bytes, VkMemoryPropertyFlags properties);
     static VkBufferUsageFlags Usage(VkBufferUsageFlags usage, VkMemoryPropertyFlags properties);
-    VkDeviceMemory AllocateMemory(const VkMemoryAllocateInfo& allocation, const char* operation, std::optional<std::uint32_t> hostType = std::nullopt, std::uint32_t* allocatedType = nullptr, bool newImage = false);
+    VkDeviceMemory AllocateMemory(const VkMemoryAllocateInfo& allocation, const char* operation, std::optional<std::uint32_t> hostType = std::nullopt, std::uint32_t* allocatedType = nullptr, bool newImage = false, ImageMemoryTiming* timing = nullptr);
     static VkDeviceSize ImageBudget(VkDeviceSize deviceBudget);
-    VkDeviceMemory TakeImageMemory(const VkMemoryAllocateInfo& allocation, const char* operation, std::optional<std::uint32_t> hostType = std::nullopt, std::uint32_t* allocatedType = nullptr, bool newImage = false);
+    VkDeviceMemory TakeImageMemory(const VkMemoryAllocateInfo& allocation, const char* operation, std::optional<std::uint32_t> hostType = std::nullopt, std::uint32_t* allocatedType = nullptr, bool newImage = false, ImageMemoryTiming* timing = nullptr, VkDeviceSize* allocatedBytes = nullptr);
     void PutImageMemory(VkDeviceMemory memory, VkDeviceSize bytes, std::uint32_t memoryType) noexcept;
     std::size_t RetainedImages();
+    std::optional<BufferAllocation> TakeHostTransfer(std::size_t bytes, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, VkDeviceSize requirementSize, VkDeviceSize alignment, std::uint32_t typeBits, std::uint32_t selectedType);
     std::optional<BufferAllocation> Take(std::size_t bytes, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     void Put(const BufferAllocation& allocation) noexcept;
+    void NotePresent() noexcept;
     VkDeviceSize ReclaimIdleDevice(VkDeviceSize bytes, std::chrono::steady_clock::time_point now);
     static bool SlabEligible(std::size_t capacity, VkDeviceSize alignment, VkDeviceSize size, VkDeviceSize atom);
     static VkDeviceSize SlabBlockBytes(std::size_t capacity);
+    // A null memory handle means medium reservation/backing allocation was unavailable; callers
+    // use a dedicated allocation in that case.
     SlabSlot TakeSlot(const Context& context, std::uint32_t memoryType, std::size_t capacity, bool addressable);
     VkDeviceSize PutSlot(VkDeviceMemory memory, VkDeviceSize offset) noexcept;
     std::size_t SlabBlocks();
+    VkDeviceSize MediumSlabBytes();
 
 private:
     struct SlabBlock {
@@ -87,6 +99,7 @@ private:
         VkDeviceSize slotBytes = 0;
         std::vector<std::uint32_t> free;
         std::uint32_t used = 0;
+        bool medium = false;
         std::uint64_t slab = 0;
     };
     struct Slab {
@@ -95,10 +108,13 @@ private:
         std::size_t emptyBlocks = 0;
     };
     static std::uint64_t SlabKey(std::uint32_t memoryType, std::size_t capacity, bool addressable);
+    bool reserveMediumBlock(VkDeviceSize bytes);
+    void releaseMediumBlock(VkDeviceSize bytes) noexcept;
     void freeBlock(SlabBlock& block) noexcept;
     struct Slot {
         BufferAllocation allocation;
         std::uint64_t lastUse;
+        std::uint64_t lastPresent;
         std::list<Slot*>::iterator order;
     };
     struct SlotKey {
@@ -169,25 +185,32 @@ private:
     std::uint64_t imageEvictions = 0;
     std::list<Slot*> imageOrder;
     std::uint64_t clock = 0;
+    std::shared_ptr<std::atomic<std::uint64_t>> sharedPresentEpoch;
+    std::atomic<std::uint64_t> localPresentEpoch{0};
+    std::atomic<std::uint64_t>* presentEpoch = nullptr;
     std::optional<std::chrono::steady_clock::time_point> idleRead;
     std::uint64_t idleClock = 0;
     std::uint64_t reclaimBefore = 0;
+    std::uint64_t scannedPresentGeneration = 0;
     std::uint64_t scannedIdleClock = 0;
     AgcDriver::Mutex slabMutex;
+    VkDeviceSize mediumSlabBytes = 0;
     std::unordered_map<std::uint64_t, Slab> slabs;
     std::unordered_map<VkDeviceMemory, std::unique_ptr<SlabBlock>> slabBlocks;
     static constexpr VkDeviceSize budget = 512ull * 1024 * 1024;
     // The small tier's own budget (slots of at most half a MiB each): pinned host memory the large
     // tier's budget does not count.
     static constexpr VkDeviceSize smallBudget = 64ull * 1024 * 1024;
-    // Requests of this size and more keep their exact size and go to the large tier.
+    // Rare host giants must not displace the texture staging working set.
+    static constexpr VkDeviceSize hostGiantLimit = budget / 4u;
+    // Requests of this size and more keep their exact size.
     static constexpr std::size_t classLimit = std::size_t{1} << 20u;
     static constexpr unsigned deviceClassBits = 3;
     static constexpr std::size_t defaultSlots = 4096;
 };
 
 std::shared_ptr<BufferPool> GetBufferPool(const Context& context);
-VkDeviceMemory AllocateImageMemory(const Context& context, const VkMemoryAllocateInfo& allocation, std::uint32_t mask, const char* operation, std::uint32_t* allocatedType = nullptr, bool newImage = false);
+VkDeviceMemory AllocateImageMemory(const Context& context, const VkMemoryAllocateInfo& allocation, std::uint32_t mask, const char* operation, std::uint32_t* allocatedType = nullptr, bool newImage = false, ImageMemoryTiming* timing = nullptr, VkDeviceSize* allocatedBytes = nullptr);
 void ReleaseImageMemory(const Context& context, VkDeviceMemory memory, VkDeviceSize bytes, std::uint32_t memoryType) noexcept;
 
 }

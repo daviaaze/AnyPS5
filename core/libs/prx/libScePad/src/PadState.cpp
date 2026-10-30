@@ -228,14 +228,23 @@ PadData BuildData(PadSlot& slot, const PadInputState& state, std::uint64_t chang
 }
 
 Pad::InputCommandFile::Input InjectedInput(std::uint64_t now) {
-    static Pad::InputCommandFile commands([] {
+    static Pad::InputCommandFile commands(
+        [] {
 #ifdef _WIN32
-        const auto* path = _wgetenv(L"APS5_PAD_INPUT_FILE");
+            const auto* path = _wgetenv(L"APS5_PAD_INPUT_FILE");
 #else
-        const auto* path = std::getenv("APS5_PAD_INPUT_FILE");
+            const auto* path = std::getenv("APS5_PAD_INPUT_FILE");
 #endif
-        return path ? std::filesystem::path(path) : std::filesystem::path{};
-    }());
+            return path ? std::filesystem::path(path) : std::filesystem::path{};
+        }(),
+        [] {
+#ifdef _WIN32
+            const auto* path = _wgetenv(L"APS5_PAD_INPUT_ACK_FILE");
+#else
+            const auto* path = std::getenv("APS5_PAD_INPUT_ACK_FILE");
+#endif
+            return path ? std::filesystem::path(path) : std::filesystem::path{};
+        }());
     static Pad::InputCommandFile::Input lastInjected;
     const auto injected = commands.Poll(now);
     if (injected != lastInjected) {

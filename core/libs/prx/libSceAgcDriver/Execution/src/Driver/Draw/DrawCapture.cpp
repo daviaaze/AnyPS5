@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include "ControlFlow/RequestSerializer.hpp"
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -17,8 +18,103 @@
 
 namespace AgcDriver::DriverDetail {
 
-namespace {
 
+// Only diagnostic-eligible cache variants retain this backing. Captured memory
+// and current user data are deliberately rebound at the final draw snapshot.
+struct SelectedRequestBacking {
+    std::shared_ptr<const ShaderRecompiler::SourceHandle> source;
+    ShaderRecompiler::RecompileRequest request;
+    std::vector<std::uint32_t> uncachedCode;
+    std::vector<std::byte> header;
+    std::vector<std::uint32_t> linkedFallbacks;
+    std::vector<std::uint32_t> capabilities;
+    std::vector<std::string> extensionStrings;
+    std::vector<std::string_view> extensions;
+    struct LinkedBacking {
+        std::vector<std::uint32_t> code;
+        std::vector<std::byte> header;
+        std::vector<std::uint32_t> userData;
+    };
+    std::vector<LinkedBacking> linkedBacking;
+    std::vector<ShaderRecompiler::LinkedProgram> linked;
+
+    explicit SelectedRequestBacking(const ShaderRecompiler::PreparedShaderInvocation& invocation)
+        : source(invocation.Handle()), request(invocation.Request()),
+          header(request.shader.header.begin(), request.shader.header.end()),
+          linkedFallbacks(request.context.linkedCallFallbacks.begin(), request.context.linkedCallFallbacks.end()),
+          capabilities(request.target.supportedCapabilities.begin(), request.target.supportedCapabilities.end()) {
+        if (source == nullptr) uncachedCode.assign(request.shader.code.begin(), request.shader.code.end());
+        request.shader.code = {};
+        request.shader.header = header;
+        request.context.userData = {};
+        request.context.memory = {};
+        request.context.linkedCallFallbacks = linkedFallbacks;
+        request.target.supportedCapabilities = capabilities;
+        extensionStrings.reserve(request.target.supportedExtensions.size());
+        for (auto extension : request.target.supportedExtensions) extensionStrings.emplace_back(extension);
+        extensions.reserve(extensionStrings.size());
+        for (const auto& extension : extensionStrings) extensions.emplace_back(extension);
+        request.target.supportedExtensions = extensions;
+        if (request.graphics) {
+            const auto programs = request.graphics->linkedPrograms;
+            linkedBacking.reserve(programs.size());
+            linked.reserve(programs.size());
+            for (const auto& program : programs) {
+                auto& owned = linkedBacking.emplace_back();
+                owned.code.assign(program.binary.code.begin(), program.binary.code.end());
+                owned.header.assign(program.binary.header.begin(), program.binary.header.end());
+                owned.userData.assign(program.userData.begin(), program.userData.end());
+                auto copy = program;
+                copy.binary.code = owned.code;
+                copy.binary.header = owned.header;
+                copy.userData = owned.userData;
+                linked.push_back(copy);
+            }
+            request.graphics->linkedPrograms = linked;
+        }
+    }
+};
+
+std::shared_ptr<const SelectedRequestBacking> RetainSelectedDrawRequest(const ShaderRecompiler::PreparedShaderInvocation& invocation) {
+    return std::make_shared<const SelectedRequestBacking>(invocation);
+}
+
+void CaptureSelectedDrawRequests(std::span<const DrawProgram> programs, std::span<const StageCapture> captures,
+        std::span<const std::shared_ptr<DispatchVariant>> matched,
+        std::span<const ShaderRecompiler::MemoryRegion> memory,
+        std::span<const ShaderRecompiler::LinkedProgram> linked,
+        VulkanDevice::DrawTraceContext& trace, std::size_t subdraw) {
+    if (trace.payloadOrdinal == 0) return;
+    for (std::size_t i = 0; i < std::min<std::size_t>(programs.size(), 5); ++i) {
+        const auto backing = captures[i].selectedRequest != nullptr ? captures[i].selectedRequest
+                : matched[i] != nullptr ? matched[i]->selectedRequest : nullptr;
+        if (backing == nullptr) {
+            std::fprintf(stderr, "[draw-request] ordinal=%llu stage=%zu subdraw=%zu status=no-selected-context\n",
+                    static_cast<unsigned long long>(trace.payloadOrdinal), i, subdraw);
+            continue;
+        }
+        auto request = backing->request;
+        request.shader.code = backing->source != nullptr ? ShaderRecompiler::GetPreparedCode(*backing->source) : std::span<const std::uint32_t>(backing->uncachedCode);
+        request.context.userData = programs[i].userData;
+        request.context.memory = memory;
+        auto currentLinked = backing->linked;
+        for (auto& program : currentLinked) {
+            const auto current = std::find_if(linked.begin(), linked.end(), [&](const auto& candidate) {
+                return candidate.role == program.role && candidate.binary.stage == program.binary.stage
+                        && candidate.binary.codeAddress == program.binary.codeAddress;
+            });
+            if (current != linked.end()) program.userData = current->userData;
+        }
+        if (request.graphics) request.graphics->linkedPrograms = currentLinked;
+        const auto serialized = ShaderRecompiler::RequestSerializer{}.Serialize(request);
+        const auto* compiled = captures[i].compiled != nullptr ? captures[i].compiled.get()
+                : matched[i] != nullptr ? matched[i]->compiled.get() : nullptr;
+        trace.requestBytes += Graphics::CaptureDrawRequest(trace, i, subdraw, request.shader.codeAddress,
+                compiled != nullptr ? compiled->variantId : 0, serialized);
+    }
+}
+
+namespace {
 void TraceMaterializationFailure(std::uint64_t token, const Submission& submission, std::size_t packetOffset, std::size_t stage, const char* phase, const std::exception_ptr& failure) {
     if (token == 0) return;
     const char* type = "unknown";
@@ -82,6 +178,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
             throw;
         }
     }();
+    if (profile) phaseTiming.Phase(DrawRowCaptureLookup);
     timing.Mark("prepared_invocation");
     auto& stageCapture = stageCaptures[i];
     stageCapture.forgetSerial = GuestMemory::ForgetSerial();
@@ -110,6 +207,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
             throw named(error, shaderMemory.Regions());
         }
     }();
+    if (profile) phaseTiming.Phase(DrawRowCapture);
 
     stageCapture.regions = shaderMemory.TakeRecentRegions();
     stageCapture.supplied = shaderMemory.SuppliedBlocks();
@@ -124,7 +222,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     if (traceCapSync()) traceCapture("draw-capture", program.binary.codeAddress, submission.queue, memory, Graphics::Recorder::ThreadWaitedMs() - waitedBefore);
     if (profile) {
         ++captures;
-        phaseTiming.Phase(DrawRowCapture);
+        phaseTiming.Phase(DrawRowCaptureRegions);
 
             const auto waited = std::min(Graphics::Recorder::ThreadWaitedMs() - waitedBefore, phaseMs[DrawRowCapture]);
             phaseMs[DrawRowCapture] -= waited;
@@ -155,6 +253,9 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     try {
         stageCapture.compiled = invocation.Materialize(*capture);
         stageCapture.capture = capture;
+        // CaptureInvocation can replace the invocation when converted samples
+        // require a retry; retain the final selected source/context, not the first.
+        if (stageCapture.captureSelectedRequest) stageCapture.selectedRequest = RetainSelectedDrawRequest(invocation);
     } catch (const std::exception& error) {
         TraceMaterializationFailure(traceToken, submission, packetOffset, i, "capture-or-materialize", std::current_exception());
         throw named(error, request.context.memory);
@@ -180,7 +281,7 @@ void Driver::recordStageDataPositions(DispatchVariant& variant, const ShaderReco
     for (std::size_t b = 0; b < compiled.bindings.size(); ++b) {
         if (compiled.bindings[b].role != ShaderRecompiler::DescriptorRole::FlattenedSrt) continue;
         variant.flatBinding = static_cast<std::uint32_t>(b);
-        static_cast<void>(DataWordPositions(variant.runs, capture.readTrace.leaves, capture.readTrace.otherReads, variant.words, compiled.bindings[b].guestDescriptor, variant.dataPositions, variant.dataSlots));
+        static_cast<void>(DataWordPositions(variant.runs, capture.readTrace.leaves, capture.readTrace.otherReads, variant.words, compiled.bindings[b].guestDescriptor.Span(), variant.dataPositions, variant.dataSlots));
         break;
     }
     if (variant.dataPositions.empty() || decodeReads.empty()) return;
@@ -222,6 +323,7 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
             if (stageCapture.compiled == nullptr || !CacheableResult(*stageCapture.compiled)) continue;
             auto variant = std::make_shared<DispatchVariant>();
             variant->compiled = stageCapture.compiled;
+            variant->selectedRequest = stageCapture.selectedRequest;
             if (programs[i].binary.stage == ShaderRecompiler::ShaderStage::Mesh) {
                 std::copy_n(programs[i].userData.begin() + ShaderRecompiler::MeshIndexBufferUserWord, variant->meshIndexDescriptor.size(), variant->meshIndexDescriptor.begin());
             }

@@ -262,9 +262,14 @@ void Driver::applyShaderDataPatches(DispatchVariant& variant) {
     for (const auto& [slot, value] : variant.shaderDataPatches) {
         const auto at = static_cast<std::size_t>(slot) * sizeof(std::uint32_t);
         if (at + sizeof(std::uint32_t) <= rebased->pushConstants.size()) std::memcpy(rebased->pushConstants.data() + at, &value, sizeof(value));
-        for (auto& binding : rebased->bindings) {
-            if (binding.role == ShaderRecompiler::DescriptorRole::ShaderData && slot < binding.guestDescriptor.size()) binding.guestDescriptor[slot] = value;
+    }
+    for (auto& binding : rebased->bindings) {
+        if (binding.role != ShaderRecompiler::DescriptorRole::ShaderData || binding.guestDescriptor.empty()) continue;
+        auto words = binding.guestDescriptor.Copy();
+        for (const auto& [slot, value] : variant.shaderDataPatches) {
+            if (slot < words.size()) words[slot] = value;
         }
+        binding.guestDescriptor = ShaderRecompiler::SharedValues<std::uint32_t>(std::move(words));
     }
     variant.compiled = std::move(rebased);
     variant.shaderDataPatches.clear();

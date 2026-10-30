@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstring>
 #include <iostream>
+#include <memory>
 #include <span>
 #include <string>
 #include <vector>
@@ -152,6 +153,51 @@ void ScalarReads(AgcDriver::VulkanDevice& device) {
     }
 }
 
+void PrefetchedVariants(AgcDriver::VulkanDevice& device) {
+    constexpr std::array<std::uint32_t, 8> scalarCode{
+        0x34020082u, 0xf4200200u, 0xfa000004u, 0xbf8cc07fu,
+        0x7e040208u, 0xe0701000u, 0x80010201u, 0xbf810000u
+    };
+    std::array<std::uint32_t, 8> userData{};
+    const auto input = BufferDescriptor(Input.data(), InputBytes);
+    const auto output = BufferDescriptor(Output.data(), sizeof(Output));
+    std::copy(input.begin(), input.end(), userData.begin());
+    std::copy(output.begin(), output.end(), userData.begin() + 4);
+    auto request = Request(userData, device.ComputeTarget(Lanes), {});
+    std::uint32_t expectedScalar = 0;
+    std::memcpy(&expectedScalar, Input.data() + 4u, sizeof(expectedScalar));
+
+    request.shader.code = Code;
+    request.shader.codeAddress = reinterpret_cast<std::uintptr_t>(Code.data());
+    const auto vectorResult = ShaderRecompiler::Recompile(request);
+    request.shader.code = scalarCode;
+    request.shader.codeAddress = reinterpret_cast<std::uintptr_t>(scalarCode.data());
+    const auto scalarResult = ShaderRecompiler::Recompile(request);
+    auto vectorPipeline = std::make_shared<const ShaderRecompiler::RecompileResult>(vectorResult);
+    auto scalarPipeline = std::make_shared<const ShaderRecompiler::RecompileResult>(scalarResult);
+    device.PrefetchComputePipeline(vectorPipeline);
+    device.PrefetchComputePipeline(scalarPipeline);
+
+    const auto verify = [&](const ShaderRecompiler::RecompileResult& shader, bool scalar) {
+        Output.fill(Fill);
+        device.Dispatch(shader, 1u, 1u, 1u);
+        device.WaitIdle();
+        for (std::uint32_t lane = 0; lane < Lanes; ++lane) {
+            std::uint32_t expected = 0;
+            if (scalar) expected = expectedScalar;
+            else std::memcpy(&expected, Input.data() + lane * 4u, sizeof(expected));
+            Require(Output[lane] == expected,
+                std::string("prefetched ") + (scalar ? "scalar" : "vector") + " variant lane " +
+                std::to_string(lane) + " is " + Hex(Output[lane]) + ", expected " + Hex(expected));
+        }
+    };
+    verify(*vectorPipeline, false);
+    verify(*scalarPipeline, true);
+    verify(*vectorPipeline, false);
+    verify(*scalarPipeline, true);
+}
+
+
 }
 
 int main() {
@@ -160,7 +206,7 @@ int main() {
         if (!device) return VulkanTestSkipped;
         for (std::uint32_t index = 0; index < InputBytes; ++index) Input[index] = static_cast<std::uint8_t>(index * 41u + 3u + (index >> 3u));
         Run(*device, false);
-        Run(*device, true);
+        PrefetchedVariants(*device);
         ScalarReads(*device);
         std::puts("buffer descriptor runtime tests passed");
         return 0;

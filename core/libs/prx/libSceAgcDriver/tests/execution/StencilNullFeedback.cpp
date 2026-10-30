@@ -156,8 +156,11 @@ void AttachNullImages(ShaderRecompiler::RecompileResult& result, const ShaderRec
     const std::array<std::uint32_t, 8> words{static_cast<std::uint32_t>(address >> 8u), static_cast<std::uint32_t>(address >> 40u) | (format << 20u) | (((Width - 1u) & 3u) << 30u), ((Width - 1u) >> 2u) | ((Height - 1u) << 14u), 0xfacu | (9u << 28u), 0u, 0u, 0u, 0u};
     const auto set = target.registrationModules ? Runtime::FragmentDescriptorSet : Runtime::DescriptorSet;
     const auto binding = Runtime::BindingNumber(Runtime::Stage::Fragment, static_cast<Runtime::Binding>(StorageFloat2DHeap));
-    ShaderRecompiler::DescriptorBinding images{ShaderRecompiler::DescriptorKind::StorageImage, ShaderRecompiler::DescriptorRole::GuestImages, set, binding, ImageElements, std::vector<std::uint32_t>(ImageElements * words.size())};
-    std::copy(words.begin(), words.end(), images.guestDescriptor.begin());
+    ShaderRecompiler::DescriptorBinding images{ShaderRecompiler::DescriptorKind::StorageImage, ShaderRecompiler::DescriptorRole::GuestImages, set, binding, ImageElements};
+    std::vector<std::uint32_t> descriptorWords;
+    descriptorWords.reserve(ImageElements * words.size());
+    for (std::uint32_t element = 0; element < ImageElements; ++element) descriptorWords.insert(descriptorWords.end(), words.begin(), words.end());
+    images.guestDescriptor = ShaderRecompiler::SharedValues<std::uint32_t>(std::move(descriptorWords));
     images.imageShape = ShaderRecompiler::DescriptorImageShape::Image2D;
     images.imageWritten = {false, false};
     images.imageAtomic = {false, false};

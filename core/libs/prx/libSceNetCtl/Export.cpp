@@ -20,6 +20,8 @@
 #include <sys/sysctl.h>
 #endif
 #endif
+#include <chrono>
+#include <cstdlib>
 #include <atomic>
 #include <cstdint>
 #include <cstddef>
@@ -244,7 +246,27 @@ static bool HostHasAddress(int family) {
     cache.seen[slot] = generation;
     return value;
 #else
-    return QueryHostHasAddress(family);
+    static const long long ttl_ms = [] {
+        const char* text = std::getenv("APS5_NETCTL_ADDRESS_CACHE_MS");
+        if (!text || !*text) return 1000LL;
+        char* end = nullptr;
+        const long long value = std::strtoll(text, &end, 10);
+        return (*end == '\0' && value >= 0) ? value : 1000LL;
+    }();
+    if (ttl_ms == 0) return QueryHostHasAddress(family);
+    const int slot = family == AF_INET ? 0 : family == AF_INET6 ? 1 : 2;
+    if (slot == 2 && family != AF_UNSPEC) return QueryHostHasAddress(family);
+    static std::mutex lock;
+    static std::chrono::steady_clock::time_point expires[3] = {};
+    static bool cached[3] = {};
+    static bool value[3] = {};
+    std::lock_guard guard(lock);
+    const auto now = std::chrono::steady_clock::now();
+    if (cached[slot] && now < expires[slot]) return value[slot];
+    value[slot] = QueryHostHasAddress(family);
+    cached[slot] = true;
+    expires[slot] = now + std::chrono::milliseconds(ttl_ms);
+    return value[slot];
 #endif
 }
 

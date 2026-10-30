@@ -452,15 +452,19 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
         physical.kind = PhysicalKindFor(compact.kind);
         physical.role = RoleFor(compact.kind);
         if (physical.role == DescriptorRole::GuestBuffers) {
+            std::vector<BufferTransferFootprint> footprints;
+            footprints.reserve(compact.resources.size());
             for (const auto resource : compact.resources) {
                 const auto& buffer = info.buffers.at(resource);
                 physical.bufferAtomic.push_back(buffer.atomic);
                 physical.bufferWritten.push_back(buffer.written || buffer.atomic);
                 physical.bufferRead.push_back(buffer.read);
                 physical.bufferExtent.push_back(buffer.maxByteExtent);
+                footprints.push_back(resource < snapshot.bufferFootprints.size() ? snapshot.bufferFootprints[resource] : BufferTransferFootprint{});
                 if (buffer.written || buffer.atomic) ++entry.writtenBuffers;
                 else ++entry.readOnlyBuffers;
             }
+            physical.bufferFootprints = SharedValues<BufferTransferFootprint>(std::move(footprints));
         } else if (physical.role == DescriptorRole::GuestImages) {
             const auto& modes = info.runtimeImageModes.at(compact.resources.front());
             const auto shape = std::ranges::find_if(modes, [&](const ImageResource& mode) { return DescriptorBindingForImage(mode) == compact.kind; });
@@ -576,40 +580,48 @@ void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, con
     std::size_t writtenHere = 0;
     std::size_t readOnlyHere = 0;
     for (const auto& entry : plan.bindings) {
+        std::vector<std::uint32_t> descriptorWords;
         auto physical = entry.descriptor;
         switch (physical.role) {
-        case DescriptorRole::GuestBuffers:
-            physical.guestDescriptor = GuestBuffersDescriptor(entry.resources, snapshot);
+        case DescriptorRole::GuestBuffers: {
+            descriptorWords = GuestBuffersDescriptor(entry.resources, snapshot);
+            std::vector<BufferTransferFootprint> footprints;
+            footprints.reserve(entry.resources.size());
+            for (const auto resource : entry.resources) {
+                footprints.push_back(resource < snapshot.bufferFootprints.size() ? snapshot.bufferFootprints[resource] : BufferTransferFootprint{});
+            }
+            physical.bufferFootprints = SharedValues<BufferTransferFootprint>(std::move(footprints));
             writtenHere += entry.writtenBuffers;
             readOnlyHere += entry.readOnlyBuffers;
             break;
+        }
         case DescriptorRole::GuestImages:
-            physical.guestDescriptor.reserve(entry.resources.size() * 8u);
+            descriptorWords.reserve(entry.resources.size() * 8u);
             for (std::size_t element = 0; element < entry.resources.size(); ++element) {
                 const auto& descriptor = snapshot.images.at(entry.resources[element]);
                 if (descriptor.dwordCount != 8u) fail("invalid runtime image descriptor width");
                 if (!entry.inactive.empty() && entry.inactive[element]) {
-                    physical.guestDescriptor.insert(physical.guestDescriptor.end(), 8u, 0u);
+                    descriptorWords.insert(descriptorWords.end(), 8u, 0u);
                     continue;
                 }
-                const auto offset = physical.guestDescriptor.size();
-                physical.guestDescriptor.insert(physical.guestDescriptor.end(), descriptor.dwords.begin(), descriptor.dwords.begin() + 8);
-                if (entry.identityImageSwizzle[element]) physical.guestDescriptor[offset + 3u] = (physical.guestDescriptor[offset + 3u] & ~0xfffu) | ShaderImageIdentitySwizzle;
+                const auto offset = descriptorWords.size();
+                descriptorWords.insert(descriptorWords.end(), descriptor.dwords.begin(), descriptor.dwords.begin() + 8);
+                if (entry.identityImageSwizzle[element]) descriptorWords[offset + 3u] = (descriptorWords[offset + 3u] & ~0xfffu) | ShaderImageIdentitySwizzle;
             }
             break;
         case DescriptorRole::GuestSamplers:
-            physical.guestDescriptor = GuestSamplersDescriptor(entry.resources, snapshot);
+            descriptorWords = GuestSamplersDescriptor(entry.resources, snapshot);
             for (const auto element : entry.samplerFilterElements) {
-                auto& filter = physical.guestDescriptor.at(element * 4u + 2u);
-                filter = PointFilteredSamplerWord(physical.guestDescriptor.at(element * 4u), filter);
+                auto& filter = descriptorWords.at(element * 4u + 2u);
+                filter = PointFilteredSamplerWord(descriptorWords.at(element * 4u), filter);
             }
             break;
         case DescriptorRole::ImageTable:
         case DescriptorRole::ImageStorageTable:
             if (tables == nullptr) fail("DescriptorBindingBuilder::Populate image table elements were not resolved");
-            physical.guestDescriptor.reserve(tables->elements.size() * 8u);
+            descriptorWords.reserve(tables->elements.size() * 8u);
             for (const auto& element : tables->elements) {
-                physical.guestDescriptor.insert(physical.guestDescriptor.end(), element.words.begin(), element.words.end());
+                descriptorWords.insert(descriptorWords.end(), element.words.begin(), element.words.end());
                 ImageResource shape;
                 shape.dimension = element.dimension;
                 physical.imageShapes.push_back(ImageShapeForResource(shape));
@@ -626,11 +638,11 @@ void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, con
             break;
         case DescriptorRole::SamplerTable:
             if (tables == nullptr) fail("DescriptorBindingBuilder::Populate sampler table elements were not resolved");
-            physical.guestDescriptor.reserve(tables->samplers.size() * 4u);
+            descriptorWords.reserve(tables->samplers.size() * 4u);
             for (const auto& element : tables->samplers) {
-                const auto first = physical.guestDescriptor.size();
-                physical.guestDescriptor.insert(physical.guestDescriptor.end(), element.words.begin(), element.words.end());
-                if (element.point) physical.guestDescriptor[first + 2u] = PointFilteredSamplerWord(physical.guestDescriptor[first], physical.guestDescriptor[first + 2u]);
+                const auto first = descriptorWords.size();
+                descriptorWords.insert(descriptorWords.end(), element.words.begin(), element.words.end());
+                if (element.point) descriptorWords[first + 2u] = PointFilteredSamplerWord(descriptorWords[first], descriptorWords[first + 2u]);
                 physical.samplerDepthCompare.push_back(element.compare);
             }
             physical.count = static_cast<std::uint32_t>(tables->samplers.size());
@@ -643,16 +655,17 @@ void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, con
             if (snapshot.flattenedSrt.empty()) {
                 fail("DescriptorBindingBuilder::Populate flattened SRT snapshot is empty");
             }
-            physical.guestDescriptor = snapshot.flattenedSrt;
+            descriptorWords = snapshot.flattenedSrt;
             break;
         case DescriptorRole::ShaderData:
-            physical.guestDescriptor = std::move(shaderData);
+            descriptorWords = std::move(shaderData);
             break;
         case DescriptorRole::Gds:
         case DescriptorRole::BdaPagetable:
         case DescriptorRole::FaultBuffer:
             break;
         }
+        if (physical.role != DescriptorRole::ImageTableMap) physical.guestDescriptor = SharedValues<std::uint32_t>(std::move(descriptorWords));
 
         if (physical.role == DescriptorRole::GuestBuffers || physical.role == DescriptorRole::GuestImages || physical.role == DescriptorRole::GuestSamplers) {
             if (physical.count == 0u || physical.guestDescriptor.size() % physical.count != 0u) {

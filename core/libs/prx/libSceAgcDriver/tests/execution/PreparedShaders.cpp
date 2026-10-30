@@ -1,5 +1,6 @@
 #include "VulkanTestDevice.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include "ShaderDiskCache.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
@@ -103,6 +104,85 @@ void NullPixelAtDraw(AgcDriver::VulkanDevice& device) {
     static_cast<void>(AgcDriver::DriverDetail::InvocationFor(snapshot, 0, request));
     Require(AgcDriver::DriverDetail::SourceHandleFor(snapshot, 0, request) == snapshot.prepared->entries.back().handle && snapshot.prepared->entries.size() == 2, "the null pixel program was prepared again for the same draw");
 }
+
+void RetiredSourceLifetime() {
+    using namespace AgcDriver::DriverDetail;
+    using namespace ShaderRecompiler;
+    constexpr std::uint64_t address = 0x7fff0000u;
+    std::array<std::uint32_t, 1> codeA{0xbf810000u};
+    std::array<std::uint32_t, 2> codeB{0xbf800000u, 0xbf810000u};
+    std::array<std::uint32_t, 4> users{};
+    const ShaderComputeStageInfo compute{{1, 1, 1}, 0u, {false, false, false}, false, 1};
+    SpirvTarget target{};
+    target.vulkanVersion = 0x00403000u;
+    target.spirvVersion = 0x00010600u;
+    target.subgroupSize = 32u;
+    target.bdaAbiVersion = 1u;
+    std::weak_ptr<SourceEntry> retiredSource;
+    std::weak_ptr<const IrResourcePlan> retiredPlan;
+    std::weak_ptr<const RecompileResult> retiredResult;
+    std::weak_ptr<const ShaderSnapshot> retiredSnapshot;
+    std::shared_ptr<ShaderRegistry> registry;
+    std::shared_ptr<const ShaderRegistry> oldRegistry;
+    {
+        auto a = std::make_shared<ShaderSnapshot>(ShaderSnapshot{address, 0x1234u, 0u, {codeA.begin(), codeA.end()}, {}});
+        a->header.resize(sizeof(Shader));
+        RecompileRequest requestA{{ShaderStage::Compute, address, a->code, 0u, {}}, {32u, 0u, users, compute, {}, {}, {}}, target, {0u, 0u, 0u, 128u}};
+        auto handleA = PrepareShader(requestA);
+        a->prepared->entries.push_back({0u, handleA});
+        PublishRegisteredShader(registry, a);
+        auto invocation = InvocationFor(*a, 0u, requestA);
+        SrtRuntime runtime{};
+        runtime.userData = users;
+        auto capture = invocation.Capture(runtime);
+        auto result = invocation.Materialize(*capture);
+        retiredSource = handleA->source;
+        retiredPlan = capture->plan;
+        retiredResult = result;
+        retiredSnapshot = a;
+
+        auto b = std::make_shared<ShaderSnapshot>(ShaderSnapshot{address, 0x1234u, 0u, {codeB.begin(), codeB.end()}, {}});
+        b->header.resize(sizeof(Shader));
+        RecompileRequest requestB{{ShaderStage::Compute, address, b->code, 0u, {}}, {32u, 0u, users, compute, {}, {}, {}}, target, {0u, 0u, 0u, 128u}};
+        b->prepared->entries.push_back({0u, PrepareShader(requestB)});
+        oldRegistry = registry;
+        PublishRegisteredShader(registry, b);
+        Require(RegisteredProgram(*oldRegistry, address, {0u}) == a, "replacing a shader invalidated a still-owned registry snapshot");
+        const auto stillUsable = invocation.Materialize(*capture);
+        Require(stillUsable->Identity() == result->Identity(), "an in-flight invocation changed identity across shader replacement");
+        handleA.reset();
+        result.reset();
+        capture.reset();
+        a.reset();
+    }
+    Require(!retiredSnapshot.expired(), "the old registry did not keep the replaced shader snapshot alive");
+    oldRegistry.reset();
+    Require(retiredSnapshot.expired(), "the replaced shader snapshot remained alive after its registry owner was released");
+    const bool sourceExpiredWithBRegistered = retiredSource.expired();
+    const bool resultExpiredWithBRegistered = retiredResult.expired();
+    std::fprintf(stderr, "[retired-source-lifetime] source-expired-with-B=%u result-expired-with-B=%u\n", sourceExpiredWithBRegistered, resultExpiredWithBRegistered);
+    Require(sourceExpiredWithBRegistered && resultExpiredWithBRegistered, "retired source or memo result remained alive while replacement B was registered");
+    registry.reset();
+    ShaderDiskCache::Flush();
+    const bool planExpiredWithoutOwners = retiredPlan.expired();
+    std::fprintf(stderr, "[retired-source-lifetime] plan-expired-without-owners=%u\n", planExpiredWithoutOwners);
+    Require(planExpiredWithoutOwners, "retired resource plan remained alive after all owners and the disk writer were released");
+    constexpr std::uint64_t legacyAddress = address + 0x1000u;
+    std::array<std::uint32_t, 1> legacyCode{0xbf810000u};
+    RecompileRequest legacyRequest{{ShaderStage::Compute, legacyAddress, legacyCode, 0u, {}}, {32u, 0u, users, compute, {}, {}, {}}, target, {0u, 0u, 0u, 128u}};
+    std::weak_ptr<SourceEntry> legacySource;
+    {
+        const auto first = Recompile(legacyRequest);
+        auto sourceHandle = ResolveSource(legacyRequest);
+        legacySource = sourceHandle->source;
+        sourceHandle.reset();
+        const auto second = Recompile(legacyRequest);
+        Require(!first.spirv.empty() && second.cacheHit && first.variantId == second.variantId && first.Identity() == second.Identity(), "a live legacy result did not preserve shader-cache reuse and output");
+        Require(!legacySource.expired(), "a live legacy Recompile value did not retain its source cache entry");
+    }
+    Require(legacySource.expired(), "the legacy Recompile value kept its source cache entry after its lifetime ended");
+}
+
 
 void Run(AgcDriver::VulkanDevice& device) {
     NullPixelAtDraw(device);
@@ -1294,10 +1374,14 @@ void AbiDeferredRectanglePairs() {
 }
 
 void CommittedAbis() {
+    alignas(256) static auto frontCode = FrontCode;
+    alignas(256) static auto pixelCode = PassthroughPixelCode;
     static AbiHeader front;
     static AbiHeader pixel;
-    DescribeFront(front);
-    DescribeAbi(pixel, PassthroughPixelCode, 1, {{0x8, ProgramLow(PassthroughPixelCode.data())}, {0x9, ProgramHigh(PassthroughPixelCode.data())}, {0xa, 0}, {0xb, 0}}, {{0x1b6, 1}, {0x1b3, 2}, {0x1b4, 2}, {0x191, 0}, {0x1c5, 4}});
+    DescribeAbi(front, frontCode, 2, {{0xc8, ProgramLow(frontCode.data())}, {0xc9, ProgramHigh(frontCode.data())}, {0x8b, 0}, {0x8a, 0}, {0xca, 0}, {0xcb, 0}, {0xcc, 0}}, {{0x2d5, 0x2000}});
+    front.shader.specials = &front.specials;
+    front.specials.dispatch_modifier = 0x8000;
+    DescribeAbi(pixel, pixelCode, 1, {{0x8, ProgramLow(pixelCode.data())}, {0x9, ProgramHigh(pixelCode.data())}, {0xa, 0}, {0xb, 0}}, {{0x1b6, 1}, {0x1b3, 2}, {0x1b4, 2}, {0x191, 0}, {0x1c5, 4}});
     for (auto* header : {&front, &pixel}) AgcDriverRegisterShader_nid_postfix(&header->shader);
     const std::array<const Shader*, 2> stages{&front.shader, &pixel.shader};
     const std::array<ShaderRegister, 1> primitive{{{0x242, 4}}};
@@ -1335,10 +1419,22 @@ void CommittedAbis() {
         AgcDriver::DriverDetail::ShaderSnapshot unrelated{};
         AgcDriver::DriverDetail::ShaderPreparationTransaction open;
         static_cast<void>(open.Read(unrelated));
-        repeated = std::async(std::launch::async, resolve);
+        std::promise<void> repeating;
+        auto repeatedStarted = repeating.get_future();
+        repeated = std::async(std::launch::async, [&] {
+            repeating.set_value();
+            resolve();
+        });
+        repeatedStarted.get();
         unblocked = repeated.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
         repeatedBuilds = ShaderRecompiler::FrontEndBuilds() - before;
-        other = std::async(std::launch::async, resolveOther);
+        std::promise<void> adding;
+        auto otherStarted = adding.get_future();
+        other = std::async(std::launch::async, [&] {
+            adding.set_value();
+            resolveOther();
+        });
+        otherStarted.get();
         const auto started = std::chrono::steady_clock::now();
         while (ShaderRecompiler::FrontEndBuilds() == before + repeatedBuilds && std::chrono::steady_clock::now() - started < std::chrono::seconds(10)) std::this_thread::yield();
         excluded = other.wait_for(std::chrono::milliseconds(500)) == std::future_status::timeout && committedAbis() == abisBefore;
@@ -1346,8 +1442,8 @@ void CommittedAbis() {
     }
     repeated.get();
     other.get();
-    Require(unblocked && repeatedBuilds == 0, "resolving ABIs the shaders already had waited for another thread's shader preparation, or prepared them again");
-    Require(excluded, "a new ABI was published beside a shader preparation that had read prepared state");
+    Require(unblocked && repeatedBuilds == 0, "resolving committed ABIs waited for another thread's preparation or rebuilt them");
+    Require(excluded, "a new ABI was not excluded until transaction commit");
 }
 
 void RelocatedHeaders() {
@@ -1419,7 +1515,12 @@ int main(int argc, char** argv) {
     try {
         const std::string_view abiMode = argc == 2 ? argv[1] : "";
         const bool abiDeferred = abiMode == "--abi-deferred-compute" || abiMode == "--abi-deferred-concurrent" || abiMode == "--abi-deferred-pixel" || abiMode == "--abi-deferred-stages" || abiMode == "--abi-deferred-rectangle" || abiMode == "--abi-deferred-undecodable-state" || abiMode == "--abi-deferred-registration-failure" || abiMode == "--abi-deferred-vertex-inputs" || abiMode == "--abi-deferred-rectangle-pairs";
-        Require(argc == 1 || abiDeferred || (argc == 2 && (std::string_view(argv[1]) == "--indirect" || std::string_view(argv[1]) == "--fail-before-registration" || std::string_view(argv[1]) == "--deferred" || std::string_view(argv[1]) == "--deferred-undecodable" || std::string_view(argv[1]) == "--registered-workgroup" || std::string_view(argv[1]) == "--lazy")), "invalid test arguments");
+        const bool committedAbis = abiMode == "--committed-abis";
+        Require(argc == 1 || abiDeferred || committedAbis || (argc == 2 && (abiMode == "--retired-source-lifetime" || std::string_view(argv[1]) == "--indirect" || std::string_view(argv[1]) == "--fail-before-registration" || std::string_view(argv[1]) == "--deferred" || std::string_view(argv[1]) == "--deferred-undecodable" || std::string_view(argv[1]) == "--registered-workgroup" || std::string_view(argv[1]) == "--lazy")), "invalid test arguments");
+        if (abiMode == "--retired-source-lifetime") {
+            RetiredSourceLifetime();
+            return 0;
+        }
         if (abiDeferred) {
             if (!OpenVulkanTestDevice()) return VulkanTestSkipped;
             if (abiMode == "--abi-deferred-compute") AbiDeferredCompute();
@@ -1432,6 +1533,13 @@ int main(int argc, char** argv) {
             else if (abiMode == "--abi-deferred-rectangle-pairs") AbiDeferredRectanglePairs();
             else AbiDeferredRectangle();
             std::cout << "shader ABI deferral tests passed: " << abiMode << '\n';
+            return 0;
+        }
+        if (committedAbis) {
+            if (!OpenVulkanTestDevice()) return VulkanTestSkipped;
+            CommittedAbis();
+            AgcDriverShutdown_nid_postfix();
+            std::cout << "committed shader ABI publication tests passed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--lazy") {

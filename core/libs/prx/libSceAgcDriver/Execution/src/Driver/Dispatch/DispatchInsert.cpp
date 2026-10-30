@@ -46,7 +46,7 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
             for (std::size_t b = 0; b < compiledResult->bindings.size(); ++b) {
                 if (compiledResult->bindings[b].role != ShaderRecompiler::DescriptorRole::FlattenedSrt) continue;
                 fresh->flatBinding = static_cast<std::uint32_t>(b);
-                dataCounts = DataWordPositions(fresh->runs, capture->readTrace.leaves, capture->readTrace.otherReads, fresh->words, compiledResult->bindings[b].guestDescriptor, fresh->dataPositions, fresh->dataSlots);
+                dataCounts = DataWordPositions(fresh->runs, capture->readTrace.leaves, capture->readTrace.otherReads, fresh->words, compiledResult->bindings[b].guestDescriptor.Span(), fresh->dataPositions, fresh->dataSlots);
                 break;
             }
         }

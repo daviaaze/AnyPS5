@@ -3,6 +3,7 @@
 
 #include "IntermediateRepresentation/IrProgram.hpp"
 #include "Optimization/SrtWalker.hpp"
+#include "IntermediateRepresentation/SharedValues.hpp"
 #include "ImageTableAbi.hpp"
 #include <array>
 #include <cstdint>
@@ -37,7 +38,7 @@ struct ImageTablePoisonRecord {
 };
 
 struct ResolvedImageTables {
-    std::vector<std::uint32_t> map;
+    SharedValues<std::uint32_t> map;
     std::vector<ImageTableElement> elements;
     std::vector<ImageTableSamplerElement> samplers;
     std::vector<ImageTablePoisonRecord> poison;

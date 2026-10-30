@@ -97,7 +97,8 @@ Counts Compile(bool byteAccess, bool vertex = false) {
     else request.context.compute = ShaderComputeStageInfo{{32u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
     request.context.memory = memory;
     request.useCache = false;
-    return Count(Recompile(request).spirv.Words());
+    const auto result = Recompile(request);
+    return Count(result.spirv.Words());
 }
 
 }

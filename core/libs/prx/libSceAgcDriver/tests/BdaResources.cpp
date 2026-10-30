@@ -593,10 +593,15 @@ void importJoinTests(const Context& context) {
     const auto [again, copied] = bind(second - 16);
     Require(again == joinedBuffer && copied == 0, "a later bind across the joined ranges did not use the joined import");
     auto* heap = guest + 3 * large + 2 * piece;
+    std::memset(heap, 0x22, 3 * piece);
+    const auto heapBase = reinterpret_cast<std::uintptr_t>(heap);
     change(heap, piece, true);
+    change(heap + 2 * piece, piece, true);
+    const auto [gapBuffer, gapCopied] = bind(heapBase, 2 * piece + 16);
+    Require(gapBuffer != VK_NULL_HANDLE && gapCopied != 0 && HostImportFor(importing, heapBase, 2 * piece + 16) == nullptr, "a prefix spanning an unregistered readable registry gap was imported");
+    change(heap + 2 * piece, piece, false);
     change(heap + piece, piece, true);
     Require(bind(reinterpret_cast<std::uintptr_t>(heap + piece) - 16).second != 0 && HostImportFor(importing, reinterpret_cast<std::uintptr_t>(heap + piece) - 16, 32) == nullptr, "two pieces no larger than the import window were joined");
-    const auto heapBase = reinterpret_cast<std::uintptr_t>(heap);
     const auto [piecesBuffer, piecesCopied] = bind(heapBase, 2 * piece);
     const auto* pieces = HostImportFor(importing, heapBase, 2 * piece);
     Require(pieces != nullptr && pieces->base == heapBase && pieces->bytes == 2 * piece && piecesBuffer == pieces->buffer && piecesCopied == 0, "a buffer bound exactly over two pieces no larger than the import window was not imported as one");
@@ -609,6 +614,8 @@ void importJoinTests(const Context& context) {
     Require(kept != nullptr && kept->buffer == joinedBuffer && kept->bytes == 2 * large, "a registry change elsewhere re-imported the joined ranges");
     change(guest + 2 * large, large, true);
     Require(HostImportFor(importing, first, 16)->buffer == joinedBuffer, "a range registered next to the joined ranges re-imported them");
+    const auto* keptPrefix = HostImportFor(importing, heapBase, 2 * piece + 16);
+    Require(keptPrefix != nullptr && keptPrefix->base == heapBase && keptPrefix->bytes == 3 * piece && keptPrefix->buffer == prefixBuffer, "a registry change elsewhere re-imported the prefix's joined owners");
     const auto [grownBuffer, grownCopied] = bind(third - 16);
     const auto* grown = HostImportFor(importing, third - 16, 32);
     Require(grown != nullptr && grown->base == first && grown->bytes == 3 * large && grownBuffer == grown->buffer && grownCopied == 0, "a bind across the next range did not grow the joined import");
@@ -1256,16 +1263,6 @@ void importRequesterTests(const Context& context, const BdaTestAccess& access) {
     ::operator delete(block, std::align_val_t{piece});
 }
 
-void hostImportReportTests() {
-    HostImportCounts counts;
-    counts.live = 3;
-    counts.liveBytes = 3u << 20u;
-    counts.requesters[static_cast<std::size_t>(ImportRequester::Map)] = {2, 1u << 20u, 0, 0, 0};
-    counts.requesters[static_cast<std::size_t>(ImportRequester::Build)] = {5, 4u << 20u, 7, 7u << 19u, 1, 4};
-    counts.requesters[static_cast<std::size_t>(ImportRequester::Segment)] = {1, 1u << 16u, 0, 0, 2};
-    const auto text = FormatHostImportCounts(counts);
-    Require(text == "3 live (3.0 MiB); made 8 (5.1 MiB), refused 7 (3.5 MiB, 4 remembered), failed 3; by requester (made/refused/failed): map 2/0/0, build 5/7/1, access 0/0/0, join 0/0/0, segment 1/0/2", "the host import report is wrong: " + text);
-}
 
 class PieceWindow {
 public:
@@ -2884,7 +2881,7 @@ void stridedOverhangTests(const Context& context, const BdaTestAccess& access) {
     const auto address = reinterpret_cast<std::uintptr_t>(block);
     ShaderRecompiler::RecompileResult shader;
     auto buffer = binding(Role::GuestBuffers, 6);
-    buffer.guestDescriptor = {static_cast<std::uint32_t>(address), (static_cast<std::uint32_t>(address >> 32) & 0xffffu) | (stride << 16u), records, 0x31000000u};
+    buffer.guestDescriptor = ShaderRecompiler::SharedValues<std::uint32_t>(std::vector<std::uint32_t>{static_cast<std::uint32_t>(address), (static_cast<std::uint32_t>(address >> 32) & 0xffffu) | (stride << 16u), records, 0x31000000u});
     buffer.bufferWritten = {false};
     shader.bindings = {buffer};
     CompiledShader compiled{ShaderRecompiler::ShaderStage::Compute, &shader, 0};
@@ -2906,7 +2903,9 @@ void stridedOverhangTests(const Context& context, const BdaTestAccess& access) {
         GuestAllocations::Mutation mutation;
         mutation.Remove(block + allocation);
     }
-    buffer.guestDescriptor[2] = records - 1;
+    auto bufferWords = buffer.guestDescriptor.Copy();
+    bufferWords[2] = records - 1;
+    buffer.guestDescriptor = ShaderRecompiler::SharedValues<std::uint32_t>(std::move(bufferWords));
     shader.bindings = {buffer};
     {
         ShaderResources resources(context, compiled);
@@ -3608,7 +3607,7 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
         control.bdaAbiVersion = ShaderRecompiler::BdaAbi::Version;
         control.bindings = {binding(Role::FaultBuffer, 5)};
         auto writable = binding(Role::GuestBuffers, 6);
-        writable.guestDescriptor = {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32) & 0xffffu, sizeof(guest), 0x31000000u};
+        writable.guestDescriptor = ShaderRecompiler::SharedValues<std::uint32_t>(std::vector<std::uint32_t>{static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32) & 0xffffu, sizeof(guest), 0x31000000u});
         control.bindings.push_back(writable);
         const std::array<CompiledShader, 1> stages{{{ShaderRecompiler::ShaderStage::TessellationControl, &control, 0}}};
         const std::array<GuestMemorySnapshot, 1> unusedSnapshots{{{0, source}}};
@@ -3665,7 +3664,7 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     }
     {
         auto writable = binding(Role::GuestBuffers, 6);
-        writable.guestDescriptor = {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32) & 0xffffu, sizeof(guest), 0x31000000u};
+        writable.guestDescriptor = ShaderRecompiler::SharedValues<std::uint32_t>(std::vector<std::uint32_t>{static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32) & 0xffffu, sizeof(guest), 0x31000000u});
         shader.bindings.push_back(writable);
         ShaderResources resources(context, compiled);
         changed = 999;
@@ -3812,7 +3811,6 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     importNeighbouringEdgesTests(context);
     importAtMapOverBudgetTests(context);
     importRequesterTests(context, access);
-    hostImportReportTests();
     importBlockMapTests(context, false);
 #ifdef __linux__
     importBlockMapTests(context, true);

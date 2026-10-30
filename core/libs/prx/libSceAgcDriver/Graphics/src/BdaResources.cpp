@@ -280,14 +280,14 @@ void BdaResources::CheckFault() const {
     }
     std::ostringstream message;
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::UnlinkedCall) {
-        message << "shader stage " << report.stage << " called address 0x" << std::hex << report.address << " at program counter 0x" << report.instruction << ", which no linked callee of that call matches";
+        message << "GPU BDA unlinked call: stage " << report.stage << " called address 0x" << std::hex << report.address << " at program counter 0x" << report.instruction << ", which no linked callee of that call matches";
         throw std::runtime_error(message.str());
     }
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::WindowLaneSpill) {
         message << "shader stage " << report.stage << ": a relative write stored " << report.bytes << " in lane " << (report.address >> 32u) << " of vector window slot " << (report.address & 0xffffffffu) << ", which holds a scalar spilled with v_writelane_b32 that a later v_readlane_b32 was replaced with";
         throw std::runtime_error(message.str());
     }
-    message << "BDA access failed: address=0x" << std::hex << report.address << " instruction=0x" << report.instruction << std::dec << " bytes=" << report.bytes << " stage=" << report.stage << " reason=" << static_cast<std::uint32_t>(report.reason);
+    message << "BDA access failed (origin=gpu-bda): address=0x" << std::hex << report.address << " instruction=0x" << report.instruction << std::dec << " bytes=" << report.bytes << " stage=" << report.stage << " reason=" << static_cast<std::uint32_t>(report.reason);
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::Permission && table != nullptr) {
         const auto bytes = table->Bytes();
         ShaderRecompiler::BdaAbi::Header header{};
@@ -329,11 +329,22 @@ void BdaResources::checkSrtGuard() const {
     const auto record = guard & ((1u << Abi::SrtGuardStageShift) - 1u);
     const auto found = std::find_if(srtGuards.begin(), srtGuards.end(), [&](const SrtGuardFaults& candidate) { return candidate.stage == stage; });
     const auto* guards = found != srtGuards.end() ? &*found : srtGuards.size() == 1 ? &srtGuards.front() : nullptr;
-    Require(guards != nullptr && record + 2u < guards->flattenedSrt.size(), "a guarded SRT read faulted without its poison record");
+    if (guards == nullptr || record + 2u >= guards->flattenedSrt.size()) {
+        std::ostringstream message;
+        message << "a guarded SRT read faulted without its poison record: raw-guard=0x" << std::hex << std::setw(8) << std::setfill('0') << guard << std::dec << " stage=" << stage << " record=" << record << " metadata=[";
+        for (std::size_t index = 0; index < srtGuards.size(); ++index) {
+            if (index != 0) message << ", ";
+            message << "(stage=" << srtGuards[index].stage << ", words=" << srtGuards[index].flattenedSrt.size() << ")";
+        }
+        message << "] chosen=";
+        if (guards != nullptr) message << "(stage=" << guards->stage << ", words=" << guards->flattenedSrt.size() << ")";
+        else message << "none";
+        Require(false, message.str());
+    }
     const auto& words = guards->flattenedSrt;
     const auto address = static_cast<std::uint64_t>(words[record + 1u]) | (static_cast<std::uint64_t>(words[record + 2u]) << 32u);
     std::ostringstream message;
-    message << "BDA access failed: address=0x" << std::hex << address << " instruction=0x" << words[record] << std::dec << " bytes=4 stage=" << stage << " reason=" << static_cast<std::uint32_t>(Abi::FaultReason::Unmapped);
+    message << "BDA access failed (origin=guarded-srt): address=0x" << std::hex << address << " instruction=0x" << words[record] << std::dec << " bytes=4 stage=" << stage << " reason=" << static_cast<std::uint32_t>(Abi::FaultReason::Unmapped) << " poison-record=" << record;
     throw std::runtime_error(message.str());
 }
 
