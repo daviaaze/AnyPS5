@@ -224,7 +224,6 @@ public:
     std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, bool movedOnly = false) const;
     // Record before the render pass, after PrepareDrawBindings. Sources remain owned by the draw.
     std::size_t CaptureDrawPayload(Recorder& recorder, VkCommandBuffer commands, std::span<const CompiledShader> shaders, const std::shared_ptr<DrawBindings>& drawBindings, std::uint64_t ordinal, std::size_t maxBytes) const;
-    std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const;
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder, const ColorTarget* target) const;
     static std::uint64_t BytesUpToTarget(std::uint64_t address, std::uint64_t bytes, std::uint64_t stride, const ColorTarget* target);
     enum class MoveRefusal : std::size_t { None, Shape, NotGuest, Written, Limit, Inaccessible, Overlap, Bindings, Count };

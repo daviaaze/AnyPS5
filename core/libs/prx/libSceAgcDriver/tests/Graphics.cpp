@@ -6426,7 +6426,7 @@ void changedDrawWordsLifetimeTests() {
         for (std::size_t i = 0; i < expected.size(); ++i) expected[i] = 0x12340000u + static_cast<std::uint32_t>(i);
         setGuestDescriptor(incoming.bindings[0], expected);
         const std::array<CompiledShader, 1> stages{{{ShaderRecompiler::ShaderStage::Vertex, &incoming, 0}}};
-        auto moved = resources.MovedReadOnlyBuffers(stages, recorder);
+        auto moved = resources.MovedReadOnlyBuffers(stages, recorder, &state.color);
         Require(moved.has_value() && moved->size() == 1, "changed draw words did not select one snapshot");
         incoming.bindings.clear();
         mock.writes.clear();

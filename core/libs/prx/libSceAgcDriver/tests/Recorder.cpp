@@ -13443,5 +13443,8 @@ int main(int argc, char** argv) {
         recorder.Activate();
         std::cout << "Recorder read tracking and label tests passed\n";
         return 0;
+    } catch (const std::exception& error) {
+        std::cerr << error.what() << '\n';
+        return 1;
     }
 }
