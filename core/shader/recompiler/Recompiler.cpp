@@ -812,19 +812,20 @@ void scanSpecializedBindings(SpecializedModule& module, std::span<const std::uin
     }
 }
 
-std::shared_ptr<const SpecializedModule> specializedModuleFromWords(std::vector<std::uint32_t> words, std::span<const PipelineSpecializationConstant> constants) {
-    auto module = std::make_shared<SpecializedModule>();
-    scanSpecializedBindings(*module, words);
-    module->spirv = InternSpirv(std::move(words));
-    module->specializationId = constants.empty() ? 0u : nextVariantId();
-    return module;
-}
-
-std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
 struct SpecializedSpirv {
     std::shared_ptr<const SpecializedModule> module;
     SharedSpirv spirv;
 };
+
+SpecializedSpirv specializedModuleFromWords(std::vector<std::uint32_t> words, std::span<const PipelineSpecializationConstant> constants) {
+    auto module = std::make_shared<SpecializedModule>();
+    scanSpecializedBindings(*module, words);
+    auto spirv = InternSpirv(std::move(words));
+    module->hash = spirv.ContentHash();
+    module->spirv = spirv.Weaken();
+    module->specializationId = constants.empty() ? 0u : nextVariantId();
+    return {std::move(module), std::move(spirv)};
+}
 
 std::vector<std::uint32_t> specializeWords(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
     auto source = SpecializeVertexInputTypes(artifact, classes);
@@ -921,8 +922,20 @@ std::vector<std::uint32_t> specializeWords(const CompiledShaderArtifact& artifac
         compact = ValidateAndOptimizeSpirv(compact, target.vulkanVersion, target.spirvVersion, target.nonConstantImageOffsets, false);
     }
 #endif
-    materialized = std::move(compact);
-    return specializedModuleFromWords(std::move(materialized), constants);
+    return compact;
+}
+
+SpecializedSpirv buildSpecializedModule(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
+    return specializedModuleFromWords(specializeWords(artifact, classes, constants, target), constants);
+}
+
+SharedSpirv specializedWords(const SpecializedModule& module, const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
+    std::lock_guard lock(module.mutex);
+    if (auto spirv = module.spirv.Lock(); !spirv.empty()) return spirv;
+    auto spirv = InternSpirv(specializeWords(artifact, classes, constants, target));
+    if (spirv.ContentHash() != module.hash) throw std::runtime_error("ShaderRecompiler: a specialized module built again from its key differs from its first build");
+    module.spirv = spirv.Weaken();
+    return spirv;
 }
 
 struct SpecializedModuleEntry {
@@ -956,13 +969,12 @@ struct RegistrationModuleEntry {
     std::shared_ptr<void> moduleCacheOwner;
 };
 
-std::shared_ptr<const SpecializedModule> registrationModule(std::uint64_t variantId, std::span<const std::uint32_t> moduleKey, const std::function<std::shared_ptr<const SpecializedModule>(std::shared_ptr<void>&)>& specialize, std::shared_ptr<void>& cacheOwner) {
 SharedSpirv lockedWords(const SpecializedModule& module) {
     std::lock_guard lock(module.mutex);
     return module.spirv.Lock();
 }
 
-SpecializedSpirv registrationModule(std::uint64_t variantId, std::span<const std::uint32_t> moduleKey, const std::function<SpecializedSpirv()>& specialize) {
+SpecializedSpirv registrationModule(std::uint64_t variantId, std::span<const std::uint32_t> moduleKey, const std::function<SpecializedSpirv(std::shared_ptr<void>&)>& specialize, std::shared_ptr<void>& cacheOwner) {
     std::vector<std::uint64_t> key{variantId};
     key.insert(key.end(), moduleKey.begin(), moduleKey.end());
     static PrimedSharedMutex mutex;
@@ -986,7 +998,7 @@ SpecializedSpirv registrationModule(std::uint64_t variantId, std::span<const std
     SharedSpirv built;
     std::call_once(entry->ready, [&] {
         try {
-            auto specialized = specialize();
+            auto specialized = specialize(entry->moduleCacheOwner);
             entry->module = std::move(specialized.module);
             built = std::move(specialized.spirv);
         } catch (...) {
@@ -996,7 +1008,14 @@ SpecializedSpirv registrationModule(std::uint64_t variantId, std::span<const std
     cacheOwner = entry;
     if (entry->failure) std::rethrow_exception(entry->failure);
     if (built.empty()) built = lockedWords(*entry->module);
-    if (built.empty()) built = specialize().spirv;
+    if (built.empty()) {
+        auto specialized = specialize(entry->moduleCacheOwner);
+        if (specialized.module->hash != entry->module->hash || specialized.module->specializationId != entry->module->specializationId ||
+            specialized.module->bindings != entry->module->bindings || specialized.module->pushData != entry->module->pushData) {
+            throw std::runtime_error("ShaderRecompiler: a registration module rebuilt from its key differs from its first build");
+        }
+        built = std::move(specialized.spirv);
+    }
     return {entry->module, std::move(built)};
 }
 
@@ -1153,7 +1172,7 @@ void reportSpecializationChurn(std::uint64_t variantId, std::span<const Pipeline
     }
 }
 
-std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target, std::shared_ptr<void>& cacheOwner) {
+SpecializedSpirv specializeModule(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target, std::shared_ptr<void>& cacheOwner) {
     std::vector<std::byte> diskKey;
     ShaderDiskCache::BuildSpecializationKey({
         .source = artifact.spirv.ContentHash(),
@@ -1220,17 +1239,16 @@ std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderAr
     static std::atomic<std::uint64_t> diskCount{0}, diskNs{0}, memoryHits{0};
     static std::atomic<std::int64_t> lastReportNs{0};
     static std::mutex reportMutex;
+    SharedSpirv built;
     std::call_once(entry->ready, [&] {
         try {
             const auto started = std::chrono::steady_clock::now();
             std::vector<std::uint32_t> words;
             const bool diskHit = ShaderDiskCache::LoadSpecialized(diskKey, words);
-            if (diskHit) {
-                entry->module = specializedModuleFromWords(std::move(words), constants);
-            } else {
-                entry->module = buildSpecializedModule(artifact, classes, constants, target);
-                ShaderDiskCache::StoreSpecialized(diskKey, entry->module->spirv);
-            }
+            auto specialized = diskHit ? specializedModuleFromWords(std::move(words), constants) : buildSpecializedModule(artifact, classes, constants, target);
+            entry->module = std::move(specialized.module);
+            built = std::move(specialized.spirv);
+            if (!diskHit) ShaderDiskCache::StoreSpecialized(diskKey, built);
             if (profile) {
                 const auto ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
                 if (diskHit) {
@@ -1242,7 +1260,7 @@ std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderAr
                     auto maxNs = builtMaxNs.load(std::memory_order_relaxed);
                     while (maxNs < ns && !builtMaxNs.compare_exchange_weak(maxNs, ns, std::memory_order_relaxed)) {}
                     auto maxWords = builtMaxWords.load(std::memory_order_relaxed);
-                    while (maxWords < entry->module->spirv.size() && !builtMaxWords.compare_exchange_weak(maxWords, entry->module->spirv.size(), std::memory_order_relaxed)) {}
+                    while (maxWords < built.size() && !builtMaxWords.compare_exchange_weak(maxWords, built.size(), std::memory_order_relaxed)) {}
                 }
             }
         } catch (...) {
@@ -1417,7 +1435,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
             const auto found = plan->modules.find(moduleKey);
             entry = found != plan->modules.end() ? found->second : plan->modules.emplace(moduleKey, std::make_shared<PreparedModuleEntry>()).first->second;
         }
-        const auto specialize = [&] {
+        const auto specialize = [&](std::shared_ptr<void>& moduleCacheOwner) {
             auto constants = plan->bindings.specialization;
             std::size_t index = 0;
             if (variant.bindings.layout.UsesPushData()) constants.push_back({PipelineSpecialization::PushDataOffset, moduleKey[index++]});
@@ -1442,13 +1460,16 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
                     constants.push_back({first + 5u, kind});
                 }
             }
-            std::shared_ptr<void> moduleCacheOwner;
-            std::shared_ptr<const SpecializedModule> module;
             if (artifact.registrationModule && plan->bindings.specialization.empty()) {
-                module = registrationModule(artifact.variantId, moduleKey, [&](std::shared_ptr<void>& owner) { return specializeModule(variant.artifact, vertexClasses, constants, request.target, owner); }, moduleCacheOwner);
-            } else {
-                module = specializeModule(variant.artifact, vertexClasses, constants, request.target, moduleCacheOwner);
+                return registrationModule(artifact.variantId, moduleKey, [&](std::shared_ptr<void>& owner) { return specializeModule(variant.artifact, vertexClasses, constants, request.target, owner); }, moduleCacheOwner);
             }
+            return specializeModule(variant.artifact, vertexClasses, constants, request.target, moduleCacheOwner);
+        };
+        SharedSpirv built;
+        const auto prepare = [&] {
+            std::shared_ptr<void> moduleCacheOwner;
+            auto specialized = specialize(moduleCacheOwner);
+            const auto& module = specialized.module;
             if (variant.bindings.layout.UsesPushData() && !module->pushData) throw std::runtime_error("specialization removed the prepared push constant interface");
             auto selected = DescriptorBindingBuilder{}.Select(plan->bindings, module->bindings);
             entry->bindings = std::move(selected);
@@ -1466,7 +1487,14 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         if (entry->failure) std::rethrow_exception(entry->failure);
         const auto& module = entry->module;
         if (built.empty()) built = lockedWords(*module);
-        if (built.empty()) built = specialize().spirv;
+        if (built.empty()) {
+            auto specialized = specialize(entry->moduleCacheOwner);
+            if (specialized.module->hash != module->hash || specialized.module->specializationId != module->specializationId ||
+                specialized.module->bindings != module->bindings || specialized.module->pushData != module->pushData) {
+                throw std::runtime_error("ShaderRecompiler: a prepared module rebuilt from its key differs from its first build");
+            }
+            built = std::move(specialized.spirv);
+        }
         result.specializationId = module->specializationId;
         result.spirv = std::move(built);
         bindingPlan = &entry->bindings;
@@ -1532,8 +1560,8 @@ SpecializedModuleBindings ScanSpecializedModuleBindings(std::span<const std::uin
 }
 
 SpecializedModuleCacheData BuildSpecializedModuleForCache(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
-    const auto module = buildSpecializedModule(artifact, classes, constants, target);
-    return {module->spirv, module->bindings, module->pushData, module->specializationId};
+    auto built = buildSpecializedModule(artifact, classes, constants, target);
+    return {std::move(built.spirv), built.module->bindings, built.module->pushData, built.module->specializationId};
 }
 
 SharedSpirv InternSpirv(std::vector<std::uint32_t> words) {
@@ -2089,7 +2117,8 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
         if (profile) counters.populateNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
         counters.misses.fetch_add(1, std::memory_order_relaxed);
     }
-    result->cacheHit = cacheHit;
+    // Memoized results must not retain the source whose memo table retains the result.
+    result->sourceOwner.reset();
     std::shared_ptr<const RecompileResult> shared = std::move(result);
     const auto bytes = resultBytes(*shared);
     const auto insert = [&](std::unique_ptr<ResultMemoTable>& table, std::uint64_t at, std::uint64_t key, std::shared_ptr<const MemoPatch> recipe, bool count) {

@@ -953,15 +953,15 @@ struct BackingFile {
 };
 
 bool sharedBacking(const Context& context, std::uint64_t base, std::uint64_t bytes, BackingFile& backing) {
-    return context.dmaBufImport && GuestArena::GuestArenaSharedBacking_nid_postfix(static_cast<std::uintptr_t>(base), static_cast<std::size_t>(bytes), &backing.file, &backing.offset);
+    if (!context.dmaBufImport || bytes == 0 || bytes > SIZE_MAX ||
+        base > UINTPTR_MAX || bytes > UINTPTR_MAX - base) return false;
+    backing.expected = bytes;
+    return GuestArena::GuestArenaSharedBacking_nid_postfix(static_cast<std::uintptr_t>(base),
+        static_cast<std::size_t>(bytes), &BackingFile::record, &backing) && backing.covered == bytes;
 }
 
 bool sharedBacking(const Context& context, const HostImport& entry, BackingFile& backing) {
-    if (!context.dmaBufImport || entry.bytes == 0 || entry.bytes > SIZE_MAX ||
-        entry.base > UINTPTR_MAX || entry.bytes > UINTPTR_MAX - entry.base) return false;
-    backing.expected = entry.bytes;
-    return GuestArena::GuestArenaSharedBacking_nid_postfix(static_cast<std::uintptr_t>(entry.base),
-        static_cast<std::size_t>(entry.bytes), &BackingFile::record, &backing) && backing.covered == entry.bytes;
+    return sharedBacking(context, entry.base, entry.bytes, backing);
 }
 
 const char* createFragmentedDmaBufImport(const Context& context, HostImport& entry, BackingFile& backing, VkResult& failure) {
