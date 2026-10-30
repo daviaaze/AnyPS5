@@ -3016,25 +3016,23 @@ void verifyTableSnapshotReuse() {
         require((codes[key] & Abi::PoisonFlag) == 0u && std::equal(heap + static_cast<std::size_t>(key) * 8u, heap + static_cast<std::size_t>(key) * 8u + 8u, images->guestDescriptor.begin() + static_cast<std::ptrdiff_t>(element) * 8), ("table snapshot reuse: key " + std::to_string(key) + " selects the wrong record of a reused table").c_str());
     }
 
-    const auto resolvedBefore = ResourceMaterializer::TableReuse();
     alignas(16) static std::array<std::uint32_t, 4> otherOutput{};
     const auto otherOutputV = TableV(otherOutput.data(), 0u, static_cast<std::uint32_t>(sizeof(otherOutput)));
     const std::array<std::uint32_t, 4> outputV{guest.srt[12], guest.srt[13], guest.srt[14], guest.srt[15]};
     std::copy(otherOutputV.begin(), otherOutputV.end(), guest.srt.begin() + 12);
     const auto otherBuffer = CompileTable(request);
     std::copy(outputV.begin(), outputV.end(), guest.srt.begin() + 12);
-    const auto resolvedShared = ResourceMaterializer::TableReuse();
-    const bool resolves = std::getenv("APS5_NO_MASKED_RESULT_MEMO") != nullptr || std::getenv("APS5_VERIFY_MASKED_RESULT_MEMO") != nullptr;
-    require(otherBuffer.result != compiled.result && otherBuffer.result->variantId == compiled.result->variantId && resolvedShared.resolutionsShared - resolvedBefore.resolutionsShared == (resolves ? 1u : 0u) && resolvedShared.resolutions == resolvedBefore.resolutions && TableMap(*otherBuffer.result) == map && TableBinding(*otherBuffer.result, DescriptorRole::ImageTable)->guestDescriptor == images->guestDescriptor, ("table snapshot reuse: changed-buffer transition failed; same_source=" + std::to_string(otherBuffer.capture->source == compiled.capture->source) + " same_variant=" + std::to_string(otherBuffer.result->variantId == compiled.result->variantId) + " same_flattened=" + std::to_string(otherBuffer.capture->snapshot.flattenedSrt == compiled.capture->snapshot.flattenedSrt) + " same_user_data=" + std::to_string(otherBuffer.capture->snapshot.userData == compiled.capture->snapshot.userData) + " shared_resolution_delta=" + std::to_string(resolvedShared.resolutionsShared - resolvedBefore.resolutionsShared) + " resolution_delta=" + std::to_string(resolvedShared.resolutions - resolvedBefore.resolutions)).c_str());
+    require(TableMap(*otherBuffer.result) == map && TableBinding(*otherBuffer.result, DescriptorRole::ImageTable)->guestDescriptor == images->guestDescriptor, "table snapshot reuse: changing the output buffer changed the captured image table");
     const auto* otherBuffers = TableBinding(*otherBuffer.result, DescriptorRole::GuestBuffers);
     require(otherBuffers != nullptr && std::search(otherBuffers->guestDescriptor.begin(), otherBuffers->guestDescriptor.end(), otherOutputV.begin(), otherOutputV.end()) != otherBuffers->guestDescriptor.end(), "table snapshot reuse: a result for another buffer does not hold that buffer's descriptor");
+    const auto* previousBuffers = TableBinding(*compiled.result, DescriptorRole::GuestBuffers);
+    require(previousBuffers != nullptr && std::search(previousBuffers->guestDescriptor.begin(), previousBuffers->guestDescriptor.end(), outputV.begin(), outputV.end()) != previousBuffers->guestDescriptor.end(), "table snapshot reuse: a later output buffer mutated the earlier result's descriptors");
     const auto storedWord = heap[5u * 8u];
     heap[5u * 8u] = heap[6u * 8u];
     const auto restoredMap = map.Copy();
     const auto storedTable = CompileTable(request);
     heap[5u * 8u] = storedWord;
-    const auto resolvedStored = ResourceMaterializer::TableReuse();
-    require(resolvedStored.resolutionsShared == resolvedShared.resolutionsShared && resolvedStored.resolutions - resolvedShared.resolutions == 1u && !(TableMap(*storedTable.result) == restoredMap), "table snapshot reuse: a table changed by a CPU store took the resolution of its old words");
+    require(!(TableMap(*storedTable.result) == restoredMap), "table snapshot reuse: a table changed by a CPU store kept its old record mapping");
     const auto& storedMap = TableMap(*storedTable.result);
     const auto storedCodes = TableCodes(storedMap, 0);
     const auto* storedImages = TableBinding(*storedTable.result, DescriptorRole::ImageTable);

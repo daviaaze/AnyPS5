@@ -229,6 +229,12 @@ bool& publishOnCpu() {
     return HostThreadLocal<bool, PublishOnCpuStorage>();
 }
 
+bool DiagnoseIdleShadow() {
+    static const bool enabled = std::getenv("APS5_DIAG_IDLE_SHADOW") != nullptr;
+    return enabled;
+}
+
+
 std::atomic<void (*)(std::uint64_t, std::uint64_t)> publishSelectedHook{nullptr};
 
 bool recordCopiesOnCpu(const UnitShadow& shadow, const std::vector<SlabCopies>& copies, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges, std::uint64_t bytes, std::uint64_t checked) {
@@ -262,14 +268,17 @@ bool recordCopiesOnCpu(const UnitShadow& shadow, const std::vector<SlabCopies>& 
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
     Recorder::CountBarriers(Recorder::CommandClass::ShadowPublish);
     recorder->EndGpuTiming(timing, bytes);
-    recorder->NotePendingWrites(ranges);
-    recorder->OnComplete([host, pieces = std::move(pieces), checked] {
+    const bool diagnose = DiagnoseIdleShadow();
+    recorder->OnComplete([host, pieces = std::move(pieces), checked, diagnose] {
         host->Invalidate();
         for (const auto& piece : pieces) {
             for (std::uint64_t at = piece.address; at < piece.address + piece.size;) {
                 const auto next = std::min(piece.address + piece.size, (at & ~(UnitBytes - 1)) + UnitBytes);
                 const auto bytes = static_cast<std::size_t>(next - at);
-                if (GuestMemory::UnchangedSinceCollected(at, bytes, checked)) GuestMemory::StoreOwnBytes(at, host->Bytes().subspan(static_cast<std::size_t>(piece.offset + (at - piece.address)), bytes));
+                const auto offset = static_cast<std::size_t>(piece.offset + (at - piece.address));
+                const bool unchanged = GuestMemory::UnchangedSinceCollected(at, bytes, checked);
+                if (diagnose) std::fprintf(stderr, "[idle-shadow-diag] completion address=%llx bytes=%zu checked=%llu source-byte=%02x unchanged=%d\n", static_cast<unsigned long long>(at), bytes, static_cast<unsigned long long>(checked), std::to_integer<unsigned>(host->Bytes()[offset]), unchanged ? 1 : 0);
+                if (unchanged) GuestMemory::StoreOwnBytes(at, host->Bytes().subspan(offset, bytes));
                 else Stats().staleDroppedCpu.fetch_add(1, std::memory_order_relaxed);
                 at = next;
             }
@@ -378,6 +387,13 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
         std::lock_guard lock(registry.mutex);
         std::vector<std::uint8_t> changed, cpu;
         changedUnits(*shadow, first, last, changed, cpu);
+        const bool diagnose = DiagnoseIdleShadow();
+        std::size_t diagnosed = 0;
+        for (auto unit = first; unit <= last; ++unit) {
+            const auto k = static_cast<std::size_t>(unit - first);
+            if (!selected[k] || !shadow->Live(unit)) continue;
+            if (diagnose && diagnosed++ < 4) std::fprintf(stderr, "[idle-shadow-diag] selection unit=%llu generation=%llu changed=%u cpu=%u selected=1\n", static_cast<unsigned long long>(unit), static_cast<unsigned long long>(shadow->generation[unit]), static_cast<unsigned>(changed[k]), static_cast<unsigned>(cpu[k]));
+        }
         std::uint32_t ended = 0;
         for (auto unit = first; unit <= last; ++unit) {
             const auto k = static_cast<std::size_t>(unit - first);
@@ -416,6 +432,7 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
         shadow->liveUnits -= ended;
     }
     if (units == 0) return 0;
+    if (DiagnoseIdleShadow()) std::fprintf(stderr, "[idle-shadow-diag] selected-units=%zu selected-bytes=%llu slab-runs=%zu checked=%llu\n", units, static_cast<unsigned long long>(bytes), copies.size(), static_cast<unsigned long long>(checked));
     Stats().published[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
     Stats().publishedBytes[static_cast<std::size_t>(reason)].fetch_add(bytes, std::memory_order_relaxed);
     if (tracePublishesLeft.load(std::memory_order_relaxed) > 0 && tracePublishesLeft.fetch_sub(1, std::memory_order_relaxed) > 0) {

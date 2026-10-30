@@ -2351,6 +2351,7 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
         const bool allocation = std::string_view(step) == "vkAllocateMemory";
         const bool exhausted = result == VK_ERROR_OUT_OF_HOST_MEMORY || result == VK_ERROR_OUT_OF_DEVICE_MEMORY;
         const bool pressure = allocation && exhausted;
+        if (allocation) state.allocationFailed = true;
         if (allocation && !pressure) {
             static std::mutex loggedMutex;
             static std::set<int> logged;
@@ -2366,14 +2367,13 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
                 BackingFile backing;
                 const char* dmaBuf = sharedBacking(context, entry, backing) ? "failed" : "unavailable";
 #endif
-                std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx failed at %s (%d), not memory pressure; dma-buf fallback %s; the range falls back to copies and the import budget is kept, requested by %s (logged once per error)\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), step, static_cast<int>(result), dmaBuf, ImportRequesterName(requester));
+                std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx failed at %s (%d), not memory pressure; dma-buf fallback %s; the range falls back to copies without pinning a new import-budget ceiling, requested by %s (logged once per error)\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), step, static_cast<int>(result), dmaBuf, ImportRequesterName(requester));
             }
             state.allocationFailures = 0;
         } else {
             if (!pressure) state.allocationFailures = 0;
             std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx failed at %s (%d); falling back to copies, requested by %s\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), step, static_cast<int>(result), ImportRequesterName(requester));
             if (pressure) {
-                state.allocationFailed = true;
                 if (++state.allocationFailures >= 3 || state.liveBytes + bytes + budget / 8 >= budget) {
                     state.ceiling = std::max<std::uint64_t>(state.liveBytes, 1);
                     std::fprintf(stderr, "[gpu] host import budget lowered to the %.1f MiB live after vkAllocateMemory failed %s\n", state.liveBytes / 1048576.0, state.allocationFailures >= 3 ? "3 times in a row" : "within an eighth of the budget");

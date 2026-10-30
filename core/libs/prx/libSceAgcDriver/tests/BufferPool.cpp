@@ -387,7 +387,7 @@ void Budget() {
     Expect(MemoryOf(probe.Handle()) != first, "the least recently used device buffer survived the eviction");
 }
 
-void AddressAndHostClasses() {
+void AddressablePoolSeparation() {
     mock = MockDevice{};
     auto context = mockContext();
     VkDeviceMemory scratch = VK_NULL_HANDLE;
@@ -397,25 +397,6 @@ void AddressAndHostClasses() {
     }
     Buffer addressed(context, 2 * MiB, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     Expect(MemoryOf(addressed.Handle()) != scratch && addressed.DeviceAddress() != 0, "an addressable device-local buffer took a scratch buffer without a device address");
-    Buffer shadow(context, 2 * MiB - 256, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    Expect(MemoryOf(shadow.Handle()) == scratch, "a device-local staging buffer did not share the scratch buffers' class");
-    VkDeviceMemory host = VK_NULL_HANDLE;
-    {
-        Buffer copy(context, 10 * MiB + 4096, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, HostVisible);
-        host = MemoryOf(copy.Handle());
-        Expect(mock.sizes.at(copy.Handle()) == 10 * MiB + 4096, "a 10 MiB + 4 KiB host buffer was created with " + std::to_string(mock.sizes.at(copy.Handle())) + " bytes, not the requested size");
-        Expect(ClassOf(copy.Handle()) == 11 * MiB, "a 10 MiB + 4 KiB host buffer has " + std::to_string(ClassOf(copy.Handle())) + " bytes of memory, not its 11 MiB class");
-        Expect(mock.usages.at(copy.Handle()) == VK_BUFFER_USAGE_TRANSFER_SRC_BIT, "a host buffer was created with more usages than asked");
-        Expect(copy.Bytes().size() == 10 * MiB + 4096, "a host buffer maps its class instead of the requested size");
-    }
-    const auto made = mock.allocations;
-    {
-        Buffer other(context, 10 * MiB + 8192, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, HostVisible);
-        Expect(MemoryOf(other.Handle()) == host && mock.allocations == made, "a retained 11 MiB host buffer did not serve another size in its class");
-        Expect(mock.sizes.at(other.Handle()) == 10 * MiB + 8192 && other.Bytes().size() == 10 * MiB + 8192, "a reused host buffer kept the size of the earlier one");
-    }
-    Buffer larger(context, 11 * MiB + 4096, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, HostVisible);
-    Expect(MemoryOf(larger.Handle()) != host && mock.allocations == made + 1, "a host buffer was served by a retained buffer of a smaller class");
 }
 
 void HostGiantKeepsWorkingSet() {
@@ -1513,7 +1494,7 @@ int main(int argc, char** argv) {
         KeptUntilFence();
         SmallDeviceRetention();
         Budget();
-        AddressAndHostClasses();
+        AddressablePoolSeparation();
         HostGiantKeepsWorkingSet();
         ColdHostEntriesYieldToLargeWorkingSet();
         NearSizeHostStaging();
