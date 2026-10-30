@@ -5712,7 +5712,7 @@ bool unitShadowTests(const Device& device, Recorder& recorder) {
     return true;
 }
 
-void idlePublishWaitTests(const Device& device, Recorder& recorder) {
+bool idlePublishWaitTests(const Device& device, Recorder& recorder) {
     using namespace AgcDriver::GuestMemory;
     const auto& context = device.GetContext();
     constexpr std::uint64_t unit = 65536;
@@ -5744,7 +5744,7 @@ void idlePublishWaitTests(const Device& device, Recorder& recorder) {
     const auto* import = HostImportFor(context, address, bytes);
     if (import == nullptr || !Watched(address, bytes)) {
         std::cout << "host import of the idle publish test block refused or not watched: idle publish wait not tested\n";
-        return;
+        return false;
     }
     recorder.Sync();
     CollectWritesUncached(address, bytes);
@@ -5786,6 +5786,7 @@ void idlePublishWaitTests(const Device& device, Recorder& recorder) {
     Require(words[5 * unit] == 0x55 && words[6 * unit - 1] == 0x55, "the label flush's publish did not land: the unit read as written after its retile, so the publish dropped it as stale");
     Require(pending, "a publish of a flush other than the idle one was waited");
     std::cout << "idle publish wait verified\n";
+    return true;
 }
 
 void storageRefreshTests(const Device& device, Recorder& recorder, bool watched) {
@@ -13078,8 +13079,7 @@ int main(int argc, char** argv) {
                 std::cout << "skipped, unit shadows or host imports are unavailable\n";
                 return 77;
             }
-            idlePublishWaitTests(device, recorder);
-            return 0;
+            return idlePublishWaitTests(device, recorder) ? 0 : 77;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--unit-shadow-only") {
             if (!AgcDriver::Graphics::UnitShadowEnabled() || device.GetContext().hostImportAlignment == 0) {
