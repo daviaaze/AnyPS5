@@ -71,6 +71,7 @@ public:
     BufferPool(const BufferPool&) = delete;
     BufferPool& operator=(const BufferPool&) = delete;
     // The size a buffer for `bytes` is created with: its size class, or `bytes` itself when large.
+    static std::size_t Capacity(std::size_t bytes);
     static std::size_t Capacity(std::size_t bytes, VkMemoryPropertyFlags properties);
     static VkBufferUsageFlags Usage(VkBufferUsageFlags usage, VkMemoryPropertyFlags properties);
     VkDeviceMemory AllocateMemory(const VkMemoryAllocateInfo& allocation, const char* operation, std::optional<std::uint32_t> hostType = std::nullopt, std::uint32_t* allocatedType = nullptr, bool newImage = false, ImageMemoryTiming* timing = nullptr);
@@ -207,6 +208,7 @@ private:
     static constexpr std::size_t classLimit = std::size_t{1} << 20u;
     static constexpr unsigned deviceClassBits = 3;
     static constexpr std::size_t defaultSlots = 4096;
+    static constexpr std::size_t exactSizeScan = 64;
 };
 
 std::shared_ptr<BufferPool> GetBufferPool(const Context& context);

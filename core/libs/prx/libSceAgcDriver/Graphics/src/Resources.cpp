@@ -1,11 +1,15 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DeferredDestruction.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include <algorithm>
 #include <exception>
+#ifdef __APPLE__
+#include <cstring>
+#endif
 
 namespace AgcDriver::Graphics {
 
@@ -44,7 +48,12 @@ struct BufferCtorTiming {
     }
 };
 
-
+#ifdef __APPLE__
+void ClearPooledTail(void* mapping, std::size_t size, VkDeviceSize mappedBytes, VkMemoryPropertyFlags properties) {
+    if (mapping == nullptr || (properties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) == 0 || mappedBytes <= size) return;
+    std::memset(static_cast<std::byte*>(mapping) + size, 0, static_cast<std::size_t>(mappedBytes - size));
+}
+#endif
 VkDeviceSize ClassAllocationBytes(const VkMemoryRequirements& requirements, std::size_t capacity) {
     const auto alignment = std::max<VkDeviceSize>(requirements.alignment, 1);
     return std::max<VkDeviceSize>(requirements.size, (static_cast<VkDeviceSize>(capacity) + alignment - 1) / alignment * alignment);
@@ -101,6 +110,9 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
         offset = allocation->offset;
         slab = allocation->slab;
         timing.slab = slab;
+#ifdef __APPLE__
+        ClearPooledTail(mapping, size, std::min<VkDeviceSize>(capacity, allocationBytes), properties);
+#endif
         if (allocation->bufferBytes != size) {
             context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);
             buffer = VK_NULL_HANDLE;
@@ -165,6 +177,9 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
                 memory = hostTransfer->memory;
                 mapping = hostTransfer->mapping;
                 allocationBytes = hostTransfer->allocationBytes;
+#ifdef __APPLE__
+                ClearPooledTail(mapping, size, allocationBytes, properties);
+#endif
                 capacity = hostTransfer->bytes;
                 offset = hostTransfer->offset;
                 memoryType = hostTransfer->memoryType;
@@ -193,6 +208,9 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
                 initializeAddress(usage);
                 if (timing.enabled) timing.bindAddressMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stage).count();
                 mapping = slot.mapping;
+#ifdef __APPLE__
+                ClearPooledTail(mapping, size, allocationBytes, properties);
+#endif
                 ready = true;
                 finish();
                 return;
@@ -268,7 +286,7 @@ void Buffer::Invalidate() {
     Check(context.Function<PFN_vkInvalidateMappedMemoryRanges>("vkInvalidateMappedMemoryRanges")(context.device, 1, &range), "vkInvalidateMappedMemoryRanges");
 }
 
-DeviceBuffer::DeviceBuffer(const Context& context, std::size_t size, VkBufferUsageFlags usage) : context(context), size(size), capacity(BufferPool::Capacity(size, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)), usage(BufferPool::Usage(usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+DeviceBuffer::DeviceBuffer(const Context& context, std::size_t size, VkBufferUsageFlags usage) : context(context), size(size), capacity(BufferPool::Capacity(size)), usage(BufferPool::Usage(usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
     Require(size != 0, "zero-sized device buffer");
     cache = GetBufferPool(context);
     if (const auto allocation = cache->Take(size, this->usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
@@ -510,7 +528,10 @@ void CommandBatch::Submit() {
     timing.Mark("command_end");
     Check(OnQueue(context.queueLane, [] { return GuestMemory::GpuMutex().DepthOnThisThread(); },
         [] { GuestMemory::GpuMutex().unlock(); }, [] { GuestMemory::GpuMutex().lock(); },
-        [&] { return context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.queue, 1, &submission, fence); }), "vkQueueSubmit graphics");
+        [&] {
+            DestroyDeferredAtIdle(context);
+            return context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.queue, 1, &submission, fence);
+        }), "vkQueueSubmit graphics")
     pending = true;
     submitted = true;
     timing.Mark("queue_submit");

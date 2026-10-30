@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <mutex>
 
@@ -484,6 +485,10 @@ bool BufferPool::DeviceTiered(VkMemoryPropertyFlags properties) {
     return (properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 && (properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0 && DeviceTierEnabled();
 }
 
+std::size_t BufferPool::Capacity(std::size_t bytes) {
+    return Capacity(bytes, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+}
+
 std::size_t BufferPool::Capacity(std::size_t bytes, VkMemoryPropertyFlags properties) {
     constexpr std::size_t smallest = 256;
     if (exactSizes()) return bytes;
@@ -530,9 +535,14 @@ std::optional<BufferAllocation> BufferPool::Take(std::size_t bytes, VkBufferUsag
         ++tier.misses;
         return std::nullopt;
     }
-    auto result = found->second.back().allocation;
-    found->second.pop_back();
-    if (found->second.empty()) tier.free.erase(found);
+    auto& slots = found->second;
+    const auto newest = std::prev(slots.end());
+    auto chosen = newest;
+    for (std::size_t scanned = 1; chosen->allocation.bufferBytes != bytes && scanned < exactSizeScan && chosen != slots.begin(); ++scanned) --chosen;
+    if (chosen->allocation.bufferBytes != bytes) chosen = newest;
+    auto result = chosen->allocation;
+    slots.erase(chosen);
+    if (slots.empty()) tier.free.erase(found);
     --tier.slots;
     tier.retainedBytes -= retainedCharge(result);
     ++tier.hits;

@@ -33,6 +33,7 @@ void FlushCachedTextures(VkDevice device);
 void ClearCachedTextures(VkDevice device);
 std::uint64_t ReleaseTextureCaches(std::uint64_t bytes, bool newImage = false);
 std::uint64_t TextureCacheBudget(const VkPhysicalDeviceMemoryProperties& memory);
+std::uint64_t StorageTextureCeiling(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported);
 std::uint64_t StorageTextureBudget(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported, std::uint64_t sampledBytes, std::uint64_t storageBytes);
 std::uint64_t SampledTextureBudget(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported, std::uint64_t textureBytes, std::uint64_t storageBytes = 0);
 bool SampledBudgetReportDue(std::uint64_t reported, std::uint64_t budget, std::chrono::steady_clock::duration sinceReport);
@@ -67,6 +68,7 @@ std::shared_ptr<StorageTexture> CachedStorageLayers(const Context& context, cons
 // would return); a true answer counts as a use for the cache's eviction order, as a lookup would.
 bool StorageImageCached(const Context& context, const StorageTexture* image);
 bool StorageImageServesKeys(const StorageTexture& image, std::uint64_t dccAddress);
+std::shared_ptr<StorageTexture> RepeatStorageSurface(const Context& context, const GuestTextureResource& resource, const std::shared_ptr<StorageTexture>& stored);
 
 // Defined in Texture.cpp beside the pending-results registry, for the fast Revalidate below: whether
 // a storage image other than `except` has results pending in [address, address + bytes).
@@ -223,6 +225,8 @@ public:
     // Record before the render pass, after PrepareDrawBindings. Sources remain owned by the draw.
     std::size_t CaptureDrawPayload(Recorder& recorder, VkCommandBuffer commands, std::span<const CompiledShader> shaders, const std::shared_ptr<DrawBindings>& drawBindings, std::uint64_t ordinal, std::size_t maxBytes) const;
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const;
+    std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder, const ColorTarget* target) const;
+    static std::uint64_t BytesUpToTarget(std::uint64_t address, std::uint64_t bytes, std::uint64_t stride, const ColorTarget* target);
     enum class MoveRefusal : std::size_t { None, Shape, NotGuest, Written, Limit, Inaccessible, Overlap, Bindings, Count };
     struct MoveProof {
         MoveRefusal refusal = MoveRefusal::None;
@@ -326,9 +330,21 @@ public:
     }
     // Whether RefreshData would record anything for `shader` (the per-word compare; verification).
     bool DataWordsDiffer(const CompiledShader& shader) const;
+    std::size_t BindingCount() const { return bindings.size(); }
     // Why the fast proof of a Revalidate left the object to the full walk (the [rescache]
     // revalidate line's reasons); Count: it did not.
     enum class FastFail : std::size_t { NoRecord, Collect, Pending, Evicted, Changed, Keys, ClearedView, StorageKeys, Depth, Replaced, Audit, Count };
+    struct CollectRefusals {
+        std::uint64_t sampled = 0;
+        std::uint64_t storage = 0;
+        std::uint64_t uncommitted = 0;
+        std::uint64_t unwatched = 0;
+        std::uint64_t other = 0;
+        std::uint64_t surfaces = 0;
+        std::uint64_t bytes = 0;
+    };
+    static CollectRefusals CollectRefusalCounts();
+    static std::array<std::uint64_t, static_cast<std::size_t>(FastFail::Count)> FullWalkNanoseconds();
     // Why a Pending failure was left to the full walk instead of the own-object refresh (T1, see
     // refreshOwnObjects); Count: it was not.
     enum class OwnRefreshFallback : std::size_t { Disabled, Snapshot, Keys, ForeignView, SurfaceKey, NotImported, Uncached, Rerun, Count };
@@ -411,7 +427,7 @@ private:
         ShaderRecompiler::SharedValues<std::uint32_t> map;
         std::vector<std::pair<std::size_t, std::uint32_t>> mapUpdates;
         std::vector<ShaderRecompiler::ImageTableEntryPoison> poison;
-        std::vector<std::string> messages;
+        std::vector<std::shared_ptr<const std::string>> messages;
         std::uint32_t elementBase = 0;
         std::uint32_t set = 0;
         std::size_t firstSampler = 0;
@@ -473,6 +489,7 @@ private:
     std::size_t addGuestBuffer(std::span<const std::uint32_t> words, const ColorTarget* target, std::uint64_t indexAddress, std::size_t indexBytes, bool written, bool atomic, bool read, std::uint32_t extent);
     std::uint64_t guestBufferBytes(std::span<const std::uint32_t> words) const;
     std::size_t addDataBuffer(std::span<const std::uint32_t> words);
+    void requireGuestBuffers(std::span<const MovedBuffer> moved = {}) const;
     // Stage A: the layout entry of an image binding (samplers are taken at once, the sampler cache
     // locks itself); stage B looks the sampled textures and storage images up (resolveImageBinding).
     void addImageBinding(const ShaderRecompiler::DescriptorBinding& binding, VkShaderStageFlags flags);
@@ -529,6 +546,7 @@ private:
     void release() noexcept;
     void prepareAddressBindings(std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots);
     VkDescriptorBufferInfo descriptor(Allocation& allocation);
+    VkDescriptorBufferInfo wholeDwordRange(VkDescriptorBufferInfo info) const;
     void noteReusable();
     void reportDescriptorCaches() const;
     // What a sampled texture was proved current against when the build (or the last full Revalidate)
@@ -563,6 +581,8 @@ private:
         bool storage;
         bool viewUncompressed;
         bool sourceEligible = false;
+        bool depthCompare = false;
+        bool sourceRefreshed = false;
     };
     // `serialBefore` is StorageTexture::PendingSerial() loaded before any check of this Revalidate;
     // `refreshed` the surfaces refreshOwnObjects resolved earlier in the same Revalidate (empty on

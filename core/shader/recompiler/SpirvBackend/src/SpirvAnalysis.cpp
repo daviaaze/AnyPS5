@@ -504,12 +504,13 @@ std::unordered_set<const IrValue*> WaveUniformValues(const IrProgram& program) {
         changed = false;
         for (const IrBlock* block : program.BlockOrder()) {
             for (const IrValue* inst : block->Instructions()) {
+                auto& entry = varying[inst];
+                if (entry) continue;
                 bool lanes = !UniformSource(*inst) && LaneSource(program, *inst);
                 for (std::size_t index = 0; !lanes && !UniformSource(*inst) && index < inst->ArgumentCount(); index++) {
                     if (inst->Argument(index) != nullptr) lanes = isVarying(inst->Argument(index));
                 }
-                auto& entry = varying[inst];
-                if (lanes && !entry) {
+                if (lanes) {
                     entry = true;
                     changed = true;
                 }
