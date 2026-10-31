@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/TableWaits.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DeferredDestruction.hpp"
@@ -541,7 +542,10 @@ void CommandBatch::Wait() {
     Require(submitted, "command batch has not been submitted");
     if (!pending) return;
     PerformanceTimer timing("Graphics.Wait");
-    const auto result = context.Function<PFN_vkWaitForFences>("vkWaitForFences")(context.device, 1, &fence, VK_TRUE, 5'000'000'000ULL);
+    const auto result = [&] {
+        TableWaits::Timer tableWait(TableWaits::BatchWait);
+        return context.Function<PFN_vkWaitForFences>("vkWaitForFences")(context.device, 1, &fence, VK_TRUE, 5'000'000'000ULL);
+    }();
     timing.Mark("fence_wait");
     if (result == VK_SUCCESS || result == VK_ERROR_DEVICE_LOST) pending = false;
     Check(result, "vkWaitForFences graphics");

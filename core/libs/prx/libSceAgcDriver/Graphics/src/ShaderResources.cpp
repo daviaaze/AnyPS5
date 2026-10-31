@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/TableWaits.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -194,7 +195,7 @@ UncachedImages& Uncached() {
 
 void noteUncached(const std::shared_ptr<StorageTexture>& image) {
     auto& uncached = Uncached();
-    std::lock_guard lock(uncached.mutex);
+    std::lock_guard lock(TableWaits::Acquire(TableWaits::UncachedMutex, uncached.mutex), std::adopt_lock);
     uncached.images.push_back(image);
     uncached.any.store(true, std::memory_order_release);
 }
@@ -268,7 +269,7 @@ void dropUncachedViews(TextureCache& cache) {
     if (!uncached.any.load(std::memory_order_acquire)) return;
     std::vector<std::weak_ptr<StorageTexture>> images;
     {
-        std::lock_guard lock(uncached.mutex);
+        std::lock_guard lock(TableWaits::Acquire(TableWaits::UncachedMutex, uncached.mutex), std::adopt_lock);
         images.swap(uncached.images);
         uncached.any.store(false, std::memory_order_release);
     }
@@ -523,6 +524,16 @@ void reportTextureCounters() {
     AgcDriver::ProfilePrint_nid_no_patch("[textures] sampled created: %llu from storage images, %llu snapshots (%llu snapshot reads over recorded writes inside cachedTexture, %llu storage-path fallbacks); stage-A records %llu: %llu fast hits, %llu full lookups; storage images %llu hits, %llu created, %llu own-object refreshes; image tables %llu reused, %llu resolved; untracked snapshots %llu kept by the write-watch hint, %llu compared\n", count(counters.fromStorage), count(counters.snapshots), count(counters.pendingReads), count(counters.storageFallbacks), count(counters.records), count(counters.fastHits), count(counters.fastMisses), count(counters.storageHits), count(counters.storageCreated), count(counters.ownRefreshes), count(counters.tablesReused), count(counters.tablesResolved), count(counters.untrackedKept), count(counters.untrackedCompared));
     AgcDriver::ProfilePrint_nid_no_patch("[table-reuse-denied] first reason per resolved image table: epoch0 %llu, capacity %llu, written image %llu, no sampled binding %llu, no lookup record %llu, lookup returned another object %llu, dcc address with uncompressed keys %llu, snapshot generation or storage proof %llu, table state changed %llu, keys not uncompressed %llu, table no longer current %llu, storage pending serial changed %llu, state changed at the end %llu; lookups that did not reuse: written table %llu, no sampled binding %llu, no remembered table %llu, remembered table no longer current %llu, texture left the cache %llu, pending serial changed %llu; same table remembered but state differs: epoch %llu, unwatch serial %llu, allocations %llu, depth surfaces %llu\n", count(counters.tableDenied[1]), count(counters.tableDenied[2]), count(counters.tableDenied[3]), count(counters.tableDenied[4]), count(counters.tableDenied[5]), count(counters.tableDenied[6]), count(counters.tableDenied[7]), count(counters.tableDenied[8]), count(counters.tableDenied[9]), count(counters.tableDenied[10]), count(counters.tableDenied[11]), count(counters.tableDenied[12]), count(counters.tableDenied[13]), count(counters.tableMiss[1]), count(counters.tableMiss[2]), count(counters.tableMiss[3]), count(counters.tableMiss[4]), count(counters.tableMiss[5]), count(counters.tableMiss[6]), count(counters.tableStale[0]), count(counters.tableStale[1]), count(counters.tableStale[2]), count(counters.tableStale[3]));
     AgcDriver::ProfilePrint_nid_no_patch("[table-element-time] sampled table elements (cumulative since start): pending-write completion %.1f ms, lookup %.1f ms; %llu elements over 20 ms took %.1f ms in total, slowest %.1f ms\n", counters.tableCpwNs.load(std::memory_order_relaxed) / 1e6, counters.tableLookupNs.load(std::memory_order_relaxed) / 1e6, count(counters.tableSlowCount), counters.tableSlowNs.load(std::memory_order_relaxed) / 1e6, counters.tableMaxNs.load(std::memory_order_relaxed) / 1e6);
+    auto& waits = TableWaits::Get();
+    std::string sites;
+    for (std::size_t site = 0; site < TableWaits::Count; ++site) {
+        const auto waited = waits.count[site].load(std::memory_order_relaxed);
+        if (waited == 0) continue;
+        char text[96];
+        std::snprintf(text, sizeof(text), " %s %.1f ms/%llu", TableWaits::Names[site], waits.ns[site].load(std::memory_order_relaxed) / 1e6, static_cast<unsigned long long>(waited));
+        sites += text;
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[table-waits] resolveImageTables (cumulative since start, inclusive where sites nest): %llu calls, %.1f ms wall; waits (ms/count):%s\n", count(waits.scopes), waits.scopeNs.load(std::memory_order_relaxed) / 1e6, sites.empty() ? " none" : sites.c_str());
 }
 
 // What the sampled-texture lookups on this thread proved their returned objects current against,
@@ -650,7 +661,7 @@ std::shared_ptr<StorageTexture> sampledStorageSource(const Context& context, con
     const auto surface = std::make_pair(resource.baseAddress, guestBytes);
     const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     {
-        std::lock_guard lock(failures.mutex);
+        std::lock_guard lock(TableWaits::Acquire(TableWaits::FailuresMutex, failures.mutex), std::adopt_lock);
         if (const auto it = failures.generations.find(surface); it != failures.generations.end()) {
             if (it->second == generation) {
                 counters.storageFallbacks.fetch_add(1, std::memory_order_relaxed);
@@ -663,7 +674,7 @@ std::shared_ptr<StorageTexture> sampledStorageSource(const Context& context, con
         return cachedStorageTexture(context, {}, resource, 0, guestBytes);
     } catch (const std::exception& error) {
         counters.storageFallbacks.fetch_add(1, std::memory_order_relaxed);
-        std::lock_guard lock(failures.mutex);
+        std::lock_guard lock(TableWaits::Acquire(TableWaits::FailuresMutex, failures.mutex), std::adopt_lock);
         if (failures.generations.size() < 4096 && failures.generations.emplace(surface, generation).second) std::fprintf(stderr, "[textures] sampled texture 0x%llx (%ux%u format %u) keeps the snapshot path: %s\n", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, error.what());
         return nullptr;
     }
@@ -702,7 +713,7 @@ std::uint64_t storageBudget(const Context& context, std::uint64_t required = 0) 
         std::uint64_t ceiling{0};
     } cached;
     const auto now = std::chrono::steady_clock::now();
-    std::lock_guard lock(cached.mutex);
+    std::lock_guard lock(TableWaits::Acquire(TableWaits::StorageBudgetMutex, cached.mutex), std::adopt_lock);
     const auto read = [&] {
         VkPhysicalDeviceMemoryBudgetPropertiesEXT reported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
         VkPhysicalDeviceMemoryProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
@@ -897,7 +908,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     auto& counters = TextureCounts();
     const auto address = resource.baseAddress;
     const auto bytes = static_cast<std::size_t>(guestBytes);
-    static_cast<void>(FlushDepthPlanes(address, bytes));
+    static_cast<void>(TableWaits::Timed(TableWaits::FlushDepthPlanes, [&] { return FlushDepthPlanes(address, bytes); }));
     // A storage image whose results for this surface (or for a mip chain containing it) are still on
     // the GPU supplies the texture by a view of it; anything else needs those results in guest
     // memory first.
@@ -958,7 +969,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     // UnchangedSince (here and on a cache hit) looks at them: the checks only compare stamped blocks,
     // so a write the game made since the last walk is invisible until a collect stamps its page. The
     // walk is memoized per packet, so a texture viewed from a storage image repeats it for free.
-    auto generation = GuestMemory::CollectWrites(address, bytes);
+    auto generation = TableWaits::Timed(TableWaits::CollectWrites, [&] { return GuestMemory::CollectWrites(address, bytes); });
     if (source != nullptr && !GuestMemory::UnchangedSince(address, bytes, source->GenerationFor(address, bytes))) {
         // The CPU wrote the memory while results were pending: Refresh merges them the usual way.
         refreshForView(*source, resource);
@@ -974,9 +985,9 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     }();
     bool stagedFlushed = false;
     const bool flushAsked = (source == nullptr || stagedClear) && !clearThroughKeys;
-    if (flushAsked && StorageTexture::FlushPending(address, bytes, nullptr, "sampled texture")) {
+    if (flushAsked && TableWaits::Timed(TableWaits::StorageFlushPending, [&] { return StorageTexture::FlushPending(address, bytes, nullptr, "sampled texture"); })) {
         if (profile) LookupOutcomes::Add(LookupOutcomes::PendingFlush, flushStart);
-        generation = GuestMemory::CollectWrites(address, bytes);
+        generation = TableWaits::Timed(TableWaits::CollectWrites, [&] { return GuestMemory::CollectWrites(address, bytes); });
         if (stagedClear) {
             stagedFlushed = true;
             keys = DccKeys::Uncompressed;
@@ -1017,7 +1028,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> committed;
     if (source == nullptr && generation == 0) {
         std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
-        if (const auto partial = GuestMemory::CollectCommittedWrites(address, bytes, ranges); partial != 0) {
+        if (const auto partial = TableWaits::Timed(TableWaits::CollectWrites, [&] { return GuestMemory::CollectCommittedWrites(address, bytes, ranges); }); partial != 0) {
             snapshotGeneration = partial;
             committed = std::move(ranges);
         }
@@ -1025,7 +1036,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     const auto untracked = source == nullptr && generation == 0 && !committed.has_value() && *keys == DccKeys::Uncompressed ? untrackedKey(address, bytes) : std::array<std::uint64_t, 4>{};
     auto& cache = Textures();
     const auto key = MakeTextureKey(context.device, words, components, depthCompare);
-    std::lock_guard lock(cache.mutex);
+    std::lock_guard lock(TableWaits::Acquire(TableWaits::SampledCacheMutex, cache.mutex), std::adopt_lock);
     const CacheHold held(sampledCacheHeld);
     expireOverflow(cache);
     dropUncachedViews(cache);
@@ -1258,7 +1269,7 @@ std::shared_ptr<StorageTexture> evictStorage(StorageTextureCache& cache, std::li
     auto texture = it->texture;
     it->texture->SetCached(false);
     noteUncached(it->texture);
-    it->texture->Flush();
+    TableWaits::Timed(TableWaits::TextureFlush, [&] { it->texture->Flush(); });
     cache.bytes -= it->accounted;
     cache.index.erase(it->key);
     cache.byImage.erase(it->texture.get());
@@ -1295,7 +1306,7 @@ GuestTextureResource StorageSurface(const Context& context, const GuestTextureRe
     auto surface = viewed;
     surface.mipCount = AllocatedLevels(viewed);
     const auto identity = SurfaceKey(context, surface);
-    std::lock_guard lock(surfaces.mutex);
+    std::lock_guard lock(TableWaits::Acquire(TableWaits::SurfacesMutex, surfaces.mutex), std::adopt_lock);
     if (extended) {
         auto& levels = surfaces.levels[identity];
         levels = std::max(levels, viewed.mipCount);
@@ -1352,7 +1363,7 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
         }
     }
     static const bool disabled = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
-    if ((DepthPlanesStale() || written) && (written || !layers || disabled)) static_cast<void>(FlushDepthPlanes(viewed.baseAddress, static_cast<std::size_t>(viewedBytes), written ? DepthPlaneScope::Whole : DepthPlaneScope::Overlapped));
+    if ((DepthPlanesStale() || written) && (written || !layers || disabled)) static_cast<void>(TableWaits::Timed(TableWaits::FlushDepthPlanes, [&] { return FlushDepthPlanes(viewed.baseAddress, static_cast<std::size_t>(viewedBytes), written ? DepthPlaneScope::Whole : DepthPlaneScope::Overlapped); }));
     if (written && DepthSurfaceOverlaps(context.device, viewed.baseAddress, viewedBytes)) {
         const auto storage = WrittenStorageBytes(viewed, mip);
         RetireCoveredDepthSurfaces(context.device, storage.bytes, storage.extents);
@@ -1369,7 +1380,7 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
     std::vector<std::shared_ptr<StorageTexture>> evicted;
     std::shared_ptr<StorageTexture> texture;
     {
-        std::lock_guard lock(cache.mutex);
+        std::lock_guard lock(TableWaits::Acquire(TableWaits::StorageCacheMutex, cache.mutex), std::adopt_lock);
         const CacheHold held(storageCacheHeld);
         if (resource.mipCount > AllocatedLevels(resource)) {
             auto allocated = resource;
@@ -1390,7 +1401,7 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
             if (profile) LookupOutcomes::Add(LookupOutcomes::StorageHit, start);
         } else {
             if (guestBytes == 0) guestBytes = DescribeSurface(resource).guestBytes;
-            if (StorageTexture::FlushPending(resource.baseAddress, static_cast<std::size_t>(guestBytes), nullptr, "storage image creation", PublishScope::None) && profile) start = LookupOutcomes::Add(LookupOutcomes::PendingFlush, start);
+            if (TableWaits::Timed(TableWaits::StorageFlushPending, [&] { return StorageTexture::FlushPending(resource.baseAddress, static_cast<std::size_t>(guestBytes), nullptr, "storage image creation", PublishScope::None); }) && profile) start = LookupOutcomes::Add(LookupOutcomes::PendingFlush, start);
             std::shared_ptr<StorageTexture> created;
             {
                 const CacheHold reclaimable(storageCacheReclaimable);
@@ -1425,7 +1436,7 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
     }
     if (!evicted.empty()) {
         auto& sampled = Textures();
-        std::lock_guard lock(sampled.mutex);
+        std::lock_guard lock(TableWaits::Acquire(TableWaits::SampledCacheMutex, sampled.mutex), std::adopt_lock);
         dropUncachedViews(sampled);
     }
     return texture;
@@ -1678,7 +1689,7 @@ std::uint64_t ReleaseTextureCaches(std::uint64_t bytes, bool newImage) {
 
 bool StorageImageCached(const Context& context, const StorageTexture* image) {
     auto& cache = StorageTextures();
-    std::lock_guard lock(cache.mutex);
+    std::lock_guard lock(TableWaits::Acquire(TableWaits::StorageCachedQueryMutex, cache.mutex), std::adopt_lock);
     const auto it = findStorageByImage(cache, context.device, image);
     if (it == cache.entries.end()) return false;
     cache.entries.splice(cache.entries.begin(), cache.entries, it);
@@ -1691,7 +1702,7 @@ namespace {
 bool StorageImagesCached(const Context& context, std::span<const StorageTexture* const> images) {
     if (images.empty()) return true;
     auto& cache = StorageTextures();
-    std::lock_guard lock(cache.mutex);
+    std::lock_guard lock(TableWaits::Acquire(TableWaits::StorageCachedQueryMutex, cache.mutex), std::adopt_lock);
     for (const auto* image : images) {
         const auto it = findStorageByImage(cache, context.device, image);
         if (it == cache.entries.end()) return false;
@@ -1724,13 +1735,13 @@ std::shared_ptr<StorageTexture> RepeatStorageSurface(const Context& context, con
     const auto viewedBytes = DescribeSurface(viewed).guestBytes;
     RequireNoMultisampleTarget(viewed.baseAddress, static_cast<std::size_t>(viewedBytes), "a storage image access");
     if (DepthSurfaceStorage(context, {}, viewed, 0) != nullptr) return nullptr;
-    if (DepthPlanesStale()) static_cast<void>(FlushDepthPlanes(viewed.baseAddress, static_cast<std::size_t>(viewedBytes), DepthPlaneScope::Overlapped));
+    if (DepthPlanesStale()) static_cast<void>(TableWaits::Timed(TableWaits::FlushDepthPlanes, [&] { return FlushDepthPlanes(viewed.baseAddress, static_cast<std::size_t>(viewedBytes), DepthPlaneScope::Overlapped); }));
     if (auto* recorder = Recorder::Active(); recorder != nullptr) recorder->BoundKeptBytes();
     const bool profile = LookupOutcomes::Profiled();
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto resource = StorageSurface(context, viewed);
     auto& cache = StorageTextures();
-    std::lock_guard lock(cache.mutex);
+    std::lock_guard lock(TableWaits::Acquire(TableWaits::StorageCacheMutex, cache.mutex), std::adopt_lock);
     const CacheHold held(storageCacheHeld);
     if (resource.mipCount > AllocatedLevels(resource)) return nullptr;
     const auto it = findStorageByImage(cache, context.device, stored.get());
@@ -2120,7 +2131,7 @@ bool TableCurrent(ReusedTable& table) {
 
 bool CachedTableTextures(const ReusedTable& table, std::vector<std::shared_ptr<Texture>>& cached) {
     auto& cache = Textures();
-    std::lock_guard lock(cache.mutex);
+    std::lock_guard lock(TableWaits::Acquire(TableWaits::TableTexturesMutex, cache.mutex), std::adopt_lock);
     expireOverflow(cache);
     std::vector<CacheRef> entries;
     entries.reserve(table.queries.size());
@@ -3734,7 +3745,7 @@ bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std
     };
     if ((context.copiedWriters != nullptr && overlaps(*context.copiedWriters)) || overlaps(*drawWriters) || (labels && recorder->CompletionLabelIn(address, bytes))) {
         Recorder::CountSync(4);
-        recorder->SyncThrough(address, bytes);
+        TableWaits::Timed(TableWaits::CompletePendingSync, [&] { recorder->SyncThrough(address, bytes); });
         return true;
     }
     return false;
@@ -5467,6 +5478,7 @@ void ShaderResources::addSamplerTable(const ShaderRecompiler::DescriptorBinding&
 void ShaderResources::resolveImageTables() {
     const auto none = [](const std::array<std::size_t, 2>& set) { return set[0] == std::numeric_limits<std::size_t>::max() && set[1] == std::numeric_limits<std::size_t>::max(); };
     if (none(tableBindings) && none(storageTableBindings)) return;
+    const TableWaits::Scope tableWaitScope;
     auto& counters = TextureCounts();
     for (std::size_t set = 0; set < tableBindings.size(); ++set) {
         if (storageTableBindings[set] != std::numeric_limits<std::size_t>::max()) bindings[storageTableBindings[set]].imageAllocations.assign(std::min(tableElements[set], StorageTableCapacity(context)), std::numeric_limits<std::size_t>::max());

@@ -7,6 +7,8 @@
 #include <immintrin.h>
 #endif
 
+#include "prx/libSceAgcDriver/Execution/include/TableWaits.hpp"
+
 namespace AgcDriver::Graphics {
 
 class SlimMutex {
@@ -16,8 +18,9 @@ public:
     SlimMutex& operator=(const SlimMutex&) = delete;
 
     void lock() {
+        if (!locked.exchange(true, std::memory_order_acquire)) return;
+        TableWaits::Timer wait(TableWaits::SlimMutexContended);
         for (unsigned spins = 0;;) {
-            if (!locked.exchange(true, std::memory_order_acquire)) return;
             while (locked.load(std::memory_order_relaxed)) {
                 if (spins < 128) {
                     ++spins;
@@ -28,6 +31,7 @@ public:
                     std::this_thread::yield();
                 }
             }
+            if (!locked.exchange(true, std::memory_order_acquire)) return;
         }
     }
     bool try_lock() { return !locked.load(std::memory_order_relaxed) && !locked.exchange(true, std::memory_order_acquire); }

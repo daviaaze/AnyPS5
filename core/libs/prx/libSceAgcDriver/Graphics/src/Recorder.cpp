@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/TableWaits.hpp"
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -4401,7 +4402,10 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
         // Registered before the release: a teardown can only start once the mutex is free.
         const UnlockedWaiter waiter{myId};
         mutex.unlock();
-        result = WaitTimeline(device, semaphore, waitSemaphores, targetSerial);
+        {
+            TableWaits::Timer tableWait(TableWaits::RecorderTimelineWait);
+            result = WaitTimeline(device, semaphore, waitSemaphores, targetSerial);
+        }
         // Read before the relock: the GPU wait, not the wait for the mutex behind it.
         if (profile || trace) waited = std::chrono::steady_clock::now();
     }
@@ -4572,11 +4576,15 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             }
         } report{profile, source, waitStart, *this, signaledAtStart};
         const auto waitFences = function(waitForFences, "vkWaitForFences");
-        auto result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
-        for (int waited = 5; result == VK_TIMEOUT; waited += 5) {
-            // A batch still running after 5 s is reported (every 5 s) so a GPU-side hang is visible.
-            std::fprintf(stderr, "[gpu] recorded batch still running on the GPU after %d s\n", waited);
+        VkResult result;
+        {
+            TableWaits::Timer tableWait(TableWaits::RecorderFenceWait);
             result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
+            for (int waited = 5; result == VK_TIMEOUT; waited += 5) {
+                // A batch still running after 5 s is reported (every 5 s) so a GPU-side hang is visible.
+                std::fprintf(stderr, "[gpu] recorded batch still running on the GPU after %d s\n", waited);
+                result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
+            }
         }
         if (result != VK_SUCCESS && result != VK_ERROR_DEVICE_LOST) {
             const auto idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);

@@ -4,6 +4,8 @@
 #include <atomic>
 #include <cstdint>
 
+#include "prx/libSceAgcDriver/Execution/include/TableWaits.hpp"
+
 namespace AgcDriver {
 
 inline void WaitWhile(const std::atomic<std::uint32_t>& word, std::uint32_t value) noexcept {
@@ -43,6 +45,7 @@ private:
     static constexpr std::uint32_t Contended = 2;
 
     [[gnu::noinline]] void lockContended() noexcept {
+        TableWaits::Timer wait(TableWaits::MutexContended);
         while (state.exchange(Contended, std::memory_order_acquire) != Unlocked) WaitWhile(state, Contended);
     }
 

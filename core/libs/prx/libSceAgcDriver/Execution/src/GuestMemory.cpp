@@ -2486,6 +2486,7 @@ void AssertGpuLockHeld(const char* where) {
 }
 
 void GpuMutexType::lock() {
+    TableWaits::Timer tableWait(TableWaits::GpuMutexLock, true);
     if (!GpuLockProfiled()) {
         auto* trace = PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr;
         if (trace == nullptr) {
