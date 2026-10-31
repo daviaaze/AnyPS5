@@ -5052,13 +5052,6 @@ bool ShaderResources::precollectImages() {
                     std::copy(words.begin(), words.end(), record.words.begin());
                     record.components = memo->components;
                     record.keys = TextureClearKeys(record.resource, record.guestBytes);
-                    const auto stagingResource = ArrayLayerWindow(record.resource, context.limits.maxImageArrayLayers);
-                    const bool sameSurface = stagingResource.baseAddress == record.resource.baseAddress;
-                    const auto stagingGuestBytes = sameSurface ? record.guestBytes : DescribeSurface(stagingResource).guestBytes;
-                    const auto stagingKeys = stagingResource.dccAddress == 0 ? DccKeys::Uncompressed :
-                            sameSurface ? record.keys : TextureClearKeys(stagingResource, stagingGuestBytes);
-                    const auto stagingView = viewedSampledWindow(stagingResource, stagingGuestBytes, stagingKeys);
-                    const auto stagingBytes = DescribeSurface(stagingView).guestBytes;
                     bool predictsMiss = false;
                     {
                         auto& cache = Textures();
@@ -5075,9 +5068,20 @@ bool ShaderResources::precollectImages() {
                     static const bool noPreparedStaging = std::getenv("APS5_NO_PREPARED_SNAPSHOT_STAGING") != nullptr;
                     constexpr std::size_t SnapshotCompareBytes = 256u << 10u;
                     if (!noPreparedStaging && predictsMiss && record.generation != 0 &&
-                            stagingKeys == DccKeys::Uncompressed && stagingBytes > SnapshotCompareBytes) {
-                        record.preparedStaging = std::make_shared<Buffer>(context, static_cast<std::size_t>(stagingBytes), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-                        preparedSnapshotStagingCount.fetch_add(1, std::memory_order_relaxed);
+                            record.keys == DccKeys::Uncompressed && record.guestBytes > SnapshotCompareBytes) {
+                        const auto stagingResource = ArrayLayerWindow(record.resource, context.limits.maxImageArrayLayers);
+                        const bool sameSurface = stagingResource.baseAddress == record.resource.baseAddress;
+                        const auto stagingGuestBytes = sameSurface ? record.guestBytes : DescribeSurface(stagingResource).guestBytes;
+                        const auto stagingKeys = stagingResource.dccAddress == 0 ? DccKeys::Uncompressed :
+                                sameSurface ? record.keys : TextureClearKeys(stagingResource, stagingGuestBytes);
+                        if (stagingKeys == DccKeys::Uncompressed) {
+                            const auto stagingView = viewedSampledWindow(stagingResource, stagingGuestBytes, stagingKeys);
+                            const auto stagingBytes = stagingView.baseAddress == stagingResource.baseAddress ? stagingGuestBytes : DescribeSurface(stagingView).guestBytes;
+                            if (stagingBytes > SnapshotCompareBytes) {
+                                record.preparedStaging = std::make_shared<Buffer>(context, static_cast<std::size_t>(stagingBytes), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+                                preparedSnapshotStagingCount.fetch_add(1, std::memory_order_relaxed);
+                            }
+                        }
                     }
                 }
             }
