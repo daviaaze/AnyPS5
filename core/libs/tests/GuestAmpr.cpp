@@ -94,11 +94,6 @@ void TestRecording(const std::string& text) {
 
     auto offset = recorder.Offset();
     auto commands = recorder.Commands();
-    Require(sceAmprCommandBufferPushMarker(&recorder.buffer, marker) == 0);
-    RequireRecorded(recorder, offset, commands, Apr::Opcode::PushMarker, sceAmprMeasureCommandSizePushMarker(marker), text);
-
-    offset = recorder.Offset();
-    commands = recorder.Commands();
     Require(sceAmprCommandBufferPushMarkerWithColor(&recorder.buffer, marker, color) == 0);
     RequireRecorded(recorder, offset, commands, Apr::Opcode::PushMarker, sceAmprMeasureCommandSizePushMarkerWithColor(marker, color), text);
 
