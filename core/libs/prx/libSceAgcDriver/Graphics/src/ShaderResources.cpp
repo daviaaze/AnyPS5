@@ -473,6 +473,7 @@ struct TextureCounters {
     std::atomic<std::uint64_t> tablesResolved{0};
     std::array<std::atomic<std::uint64_t>, 14> tableDenied{};
     std::array<std::atomic<std::uint64_t>, 8> tableMiss{};
+    std::array<std::atomic<std::uint64_t>, 4> tableStale{};
     std::atomic<std::uint64_t> tableWritesKept{0};
     std::atomic<std::uint64_t> tableWritesMade{0};
     // Snapshot hits over memory outside the write watch: kept by an unchanged UntrackedHint key, or
@@ -501,7 +502,7 @@ void reportTextureCounters() {
     if (nowMs - last < 10000 || !counters.lastReport.compare_exchange_strong(last, nowMs)) return;
     const auto count = [](const std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.load(std::memory_order_relaxed)); };
     AgcDriver::ProfilePrint_nid_no_patch("[textures] sampled created: %llu from storage images, %llu snapshots (%llu snapshot reads over recorded writes inside cachedTexture, %llu storage-path fallbacks); stage-A records %llu: %llu fast hits, %llu full lookups; storage images %llu hits, %llu created, %llu own-object refreshes; image tables %llu reused, %llu resolved; untracked snapshots %llu kept by the write-watch hint, %llu compared\n", count(counters.fromStorage), count(counters.snapshots), count(counters.pendingReads), count(counters.storageFallbacks), count(counters.records), count(counters.fastHits), count(counters.fastMisses), count(counters.storageHits), count(counters.storageCreated), count(counters.ownRefreshes), count(counters.tablesReused), count(counters.tablesResolved), count(counters.untrackedKept), count(counters.untrackedCompared));
-    AgcDriver::ProfilePrint_nid_no_patch("[table-reuse-denied] first reason per resolved image table: epoch0 %llu, capacity %llu, written image %llu, no sampled binding %llu, no lookup record %llu, lookup returned another object %llu, dcc address with uncompressed keys %llu, snapshot generation or storage proof %llu, table state changed %llu, keys not uncompressed %llu, table no longer current %llu, storage pending serial changed %llu, state changed at the end %llu; lookups that did not reuse: written table %llu, no sampled binding %llu, no remembered table %llu, remembered table no longer current %llu, texture left the cache %llu, pending serial changed %llu\n", count(counters.tableDenied[1]), count(counters.tableDenied[2]), count(counters.tableDenied[3]), count(counters.tableDenied[4]), count(counters.tableDenied[5]), count(counters.tableDenied[6]), count(counters.tableDenied[7]), count(counters.tableDenied[8]), count(counters.tableDenied[9]), count(counters.tableDenied[10]), count(counters.tableDenied[11]), count(counters.tableDenied[12]), count(counters.tableDenied[13]), count(counters.tableMiss[1]), count(counters.tableMiss[2]), count(counters.tableMiss[3]), count(counters.tableMiss[4]), count(counters.tableMiss[5]), count(counters.tableMiss[6]));
+    AgcDriver::ProfilePrint_nid_no_patch("[table-reuse-denied] first reason per resolved image table: epoch0 %llu, capacity %llu, written image %llu, no sampled binding %llu, no lookup record %llu, lookup returned another object %llu, dcc address with uncompressed keys %llu, snapshot generation or storage proof %llu, table state changed %llu, keys not uncompressed %llu, table no longer current %llu, storage pending serial changed %llu, state changed at the end %llu; lookups that did not reuse: written table %llu, no sampled binding %llu, no remembered table %llu, remembered table no longer current %llu, texture left the cache %llu, pending serial changed %llu; same table remembered but state differs: epoch %llu, unwatch serial %llu, allocations %llu, depth surfaces %llu\n", count(counters.tableDenied[1]), count(counters.tableDenied[2]), count(counters.tableDenied[3]), count(counters.tableDenied[4]), count(counters.tableDenied[5]), count(counters.tableDenied[6]), count(counters.tableDenied[7]), count(counters.tableDenied[8]), count(counters.tableDenied[9]), count(counters.tableDenied[10]), count(counters.tableDenied[11]), count(counters.tableDenied[12]), count(counters.tableDenied[13]), count(counters.tableMiss[1]), count(counters.tableMiss[2]), count(counters.tableMiss[3]), count(counters.tableMiss[4]), count(counters.tableMiss[5]), count(counters.tableMiss[6]), count(counters.tableStale[0]), count(counters.tableStale[1]), count(counters.tableStale[2]), count(counters.tableStale[3]));
 }
 
 // What the sampled-texture lookups on this thread proved their returned objects current against,
@@ -2047,6 +2048,12 @@ bool SameTable(const ReusedTable& table, VkDevice device, const ShaderRecompiler
 ReusedTable* FindReusedTable(VkDevice device, const ShaderRecompiler::DescriptorBinding& binding, const TableState& state) {
     if (state.epoch == 0) return nullptr;
     auto& tables = ReusedTables();
+    for (const auto& table : tables) {
+        if (table.state == state || !SameTable(table, device, binding)) continue;
+        const auto field = table.state.epoch != state.epoch ? 0u : table.state.unwatched != state.unwatched ? 1u : table.state.allocations != state.allocations ? 2u : 3u;
+        TextureCounts().tableStale[field].fetch_add(1, std::memory_order_relaxed);
+        break;
+    }
     std::erase_if(tables, [&](const ReusedTable& table) { return table.state != state; });
     for (auto& table : tables) {
         if (SameTable(table, device, binding)) return &table;
