@@ -474,6 +474,11 @@ struct TextureCounters {
     std::array<std::atomic<std::uint64_t>, 14> tableDenied{};
     std::array<std::atomic<std::uint64_t>, 8> tableMiss{};
     std::array<std::atomic<std::uint64_t>, 4> tableStale{};
+    std::atomic<std::uint64_t> tableCpwNs{0};
+    std::atomic<std::uint64_t> tableLookupNs{0};
+    std::atomic<std::uint64_t> tableSlowCount{0};
+    std::atomic<std::uint64_t> tableSlowNs{0};
+    std::atomic<std::uint64_t> tableMaxNs{0};
     std::atomic<std::uint64_t> tableWritesKept{0};
     std::atomic<std::uint64_t> tableWritesMade{0};
     // Snapshot hits over memory outside the write watch: kept by an unchanged UntrackedHint key, or
@@ -493,6 +498,20 @@ std::atomic<std::uint64_t> preparedSnapshotStagingCount{0};
 std::atomic<std::uint64_t> usedSnapshotStagingCount{0};
 std::atomic<std::uint64_t>& PreparedStagingUsed() { return usedSnapshotStagingCount; }
 
+void NoteTableElement(std::chrono::steady_clock::time_point begin, std::chrono::steady_clock::time_point middle, std::chrono::steady_clock::time_point end) {
+    auto& counters = TextureCounts();
+    const auto pending = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(middle - begin).count());
+    const auto lookup = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(end - middle).count());
+    counters.tableCpwNs.fetch_add(pending, std::memory_order_relaxed);
+    counters.tableLookupNs.fetch_add(lookup, std::memory_order_relaxed);
+    if (pending + lookup >= 20'000'000u) {
+        counters.tableSlowCount.fetch_add(1, std::memory_order_relaxed);
+        counters.tableSlowNs.fetch_add(pending + lookup, std::memory_order_relaxed);
+    }
+    auto largest = counters.tableMaxNs.load(std::memory_order_relaxed);
+    while (pending + lookup > largest && !counters.tableMaxNs.compare_exchange_weak(largest, pending + lookup, std::memory_order_relaxed)) {}
+}
+
 void reportTextureCounters() {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (!profile) return;
@@ -503,6 +522,7 @@ void reportTextureCounters() {
     const auto count = [](const std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.load(std::memory_order_relaxed)); };
     AgcDriver::ProfilePrint_nid_no_patch("[textures] sampled created: %llu from storage images, %llu snapshots (%llu snapshot reads over recorded writes inside cachedTexture, %llu storage-path fallbacks); stage-A records %llu: %llu fast hits, %llu full lookups; storage images %llu hits, %llu created, %llu own-object refreshes; image tables %llu reused, %llu resolved; untracked snapshots %llu kept by the write-watch hint, %llu compared\n", count(counters.fromStorage), count(counters.snapshots), count(counters.pendingReads), count(counters.storageFallbacks), count(counters.records), count(counters.fastHits), count(counters.fastMisses), count(counters.storageHits), count(counters.storageCreated), count(counters.ownRefreshes), count(counters.tablesReused), count(counters.tablesResolved), count(counters.untrackedKept), count(counters.untrackedCompared));
     AgcDriver::ProfilePrint_nid_no_patch("[table-reuse-denied] first reason per resolved image table: epoch0 %llu, capacity %llu, written image %llu, no sampled binding %llu, no lookup record %llu, lookup returned another object %llu, dcc address with uncompressed keys %llu, snapshot generation or storage proof %llu, table state changed %llu, keys not uncompressed %llu, table no longer current %llu, storage pending serial changed %llu, state changed at the end %llu; lookups that did not reuse: written table %llu, no sampled binding %llu, no remembered table %llu, remembered table no longer current %llu, texture left the cache %llu, pending serial changed %llu; same table remembered but state differs: epoch %llu, unwatch serial %llu, allocations %llu, depth surfaces %llu\n", count(counters.tableDenied[1]), count(counters.tableDenied[2]), count(counters.tableDenied[3]), count(counters.tableDenied[4]), count(counters.tableDenied[5]), count(counters.tableDenied[6]), count(counters.tableDenied[7]), count(counters.tableDenied[8]), count(counters.tableDenied[9]), count(counters.tableDenied[10]), count(counters.tableDenied[11]), count(counters.tableDenied[12]), count(counters.tableDenied[13]), count(counters.tableMiss[1]), count(counters.tableMiss[2]), count(counters.tableMiss[3]), count(counters.tableMiss[4]), count(counters.tableMiss[5]), count(counters.tableMiss[6]), count(counters.tableStale[0]), count(counters.tableStale[1]), count(counters.tableStale[2]), count(counters.tableStale[3]));
+    AgcDriver::ProfilePrint_nid_no_patch("[table-element-time] sampled table elements (cumulative since start): pending-write completion %.1f ms, lookup %.1f ms; %llu elements over 20 ms took %.1f ms in total, slowest %.1f ms\n", counters.tableCpwNs.load(std::memory_order_relaxed) / 1e6, counters.tableLookupNs.load(std::memory_order_relaxed) / 1e6, count(counters.tableSlowCount), counters.tableSlowNs.load(std::memory_order_relaxed) / 1e6, counters.tableMaxNs.load(std::memory_order_relaxed) / 1e6);
 }
 
 // What the sampled-texture lookups on this thread proved their returned objects current against,
@@ -5616,14 +5636,18 @@ void ShaderResources::resolveImageTables() {
                 resource = DecodeTextureResource(sampledWords);
                 guestBytes = DescribeSurface(resource).guestBytes;
             }
+            static const bool timed = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+            const auto t0 = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             CompletePendingCpuWrites(context, resource.baseAddress, static_cast<std::size_t>(guestBytes));
             if (resource.dccAddress != 0) CompletePendingCpuWrites(context, resource.dccAddress, DccKeyBytes(guestBytes));
+            const auto t1 = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             std::shared_ptr<Texture> texture;
             const auto components = ViewComponents(resource);
             const bool depthCompare = binding.imageDepthCompare.at(element);
             const VkImageViewType multisampleViewType = shape == ShaderRecompiler::DescriptorImageShape::Image2DMultisampleArray ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
             try {
                 texture = cachedTexture(context, sampledWords, resource, components, guestBytes, depthCompare, multisampleViewType);
+                if (timed) NoteTableElement(t0, t1, std::chrono::steady_clock::now());
             } catch (const std::runtime_error& error) {
                 table.SetMapValue(faults + element, rejectTableElement(table, words, error.what()));
                 if (reusable) fresh.elements.push_back({{}, {}, {}, 0, false, true, error.what()});
