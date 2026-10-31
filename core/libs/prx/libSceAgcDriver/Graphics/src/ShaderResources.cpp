@@ -2595,6 +2595,7 @@ void ShaderResources::buildComplete() {
         previousSampled = {};
         deferredImages.clear();
         applyAnisoOverride();
+        frameTiming.Mark("deferred_images");
         // The records served their purpose: each holds the cache entry's objects as of stage A,
         // which would otherwise keep a replaced texture or an evicted storage image (and its device
         // memory) alive, outside the caches' budgets, for as long as this object is cached.
@@ -2602,8 +2603,9 @@ void ShaderResources::buildComplete() {
         imageRecords.shrink_to_fit();
         nextImageRecord = 0;
         Require(textures.size() == plannedSampledImages && storageTextures.size() == plannedStorageImages, "image lookups disagree with the descriptor plan");
+        frameTiming.Mark("image_record_release");
         resolveImageTables();
-        frameTiming.Mark("deferred_images_tables");
+        frameTiming.Mark("image_tables");
         timing.bindingsMs += phase(BuildPhase::Images);
         requireGuestBuffers();
         guestMemory.UploadFinish(usesBda);

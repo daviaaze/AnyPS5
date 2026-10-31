@@ -121,7 +121,11 @@ bool _resolve(const char* guestPath, std::uint32_t* id, std::uint64_t* size) {
     std::uint64_t bytes = 0;
     if (!_fileSize(hostPath, bytes)) return false;
     std::lock_guard lock(g_filesLock);
+#ifdef _WIN32
     const auto key = hostPath.string();
+#else
+    const auto& key = hostPath.native();
+#endif
     auto found = g_idsByPath.find(key);
     if (found == g_idsByPath.end()) {
         found = g_idsByPath.emplace(key, static_cast<std::uint32_t>(g_files.size())).first;
