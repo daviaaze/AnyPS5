@@ -734,6 +734,8 @@ private:
     bool unlockedPrepare = false;
     bool completed = false;
     std::chrono::steady_clock::time_point phaseStart;
+    // Appended to preserve offsets of preceding members for ABI-sensitive native tests.
+    mutable std::weak_ptr<DrawBindings> drawBindingsMemo;
 };
 
 // Built ShaderResources by the content the build consumed (see ShaderResources::ContentKey), so a

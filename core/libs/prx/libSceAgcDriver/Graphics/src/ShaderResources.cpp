@@ -2893,6 +2893,8 @@ bool ShaderResources::NeverReusable(std::span<const CompiledShader> shaders) {
     });
 }
 
+static std::atomic<std::uint64_t> DrawBindingMemoHits{0};
+static std::atomic<std::uint64_t> DrawBindingMemoMisses{0};
 // APS5_PROFILE_DRAW: the per-device descriptor caches' counters, every 10 s.
 void ShaderResources::reportDescriptorCaches() const {
     static AgcDriver::Mutex reportMutex;
@@ -2905,6 +2907,7 @@ void ShaderResources::reportDescriptorCaches() const {
     const auto samplerHits = context.samplerCache != nullptr ? context.samplerCache->Hits() : 0;
     const auto samplerMisses = context.samplerCache != nullptr ? context.samplerCache->Misses() : 0;
     AgcDriver::ProfilePrint_nid_no_patch("[descriptors] layouts %llu hits / %llu created, sets %llu from %llu pools and %llu dedicated pools, samplers %llu hits / %llu created\n", static_cast<unsigned long long>(descriptors.layoutHits), static_cast<unsigned long long>(descriptors.layoutMisses), static_cast<unsigned long long>(descriptors.sets), static_cast<unsigned long long>(descriptors.pools), static_cast<unsigned long long>(descriptors.dedicatedPools), static_cast<unsigned long long>(samplerHits), static_cast<unsigned long long>(samplerMisses));
+    AgcDriver::ProfilePrint_nid_no_patch("[draw-binding-reuse] exact hits %llu, misses %llu (cumulative)\n", static_cast<unsigned long long>(DrawBindingMemoHits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(DrawBindingMemoMisses.load(std::memory_order_relaxed)));
 }
 
 template<typename TVisitor>
@@ -6127,6 +6130,26 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
     if (selected.empty()) return {};
+    const auto pin = [&](const std::shared_ptr<DrawBindings>& bindings) {
+        recorder.Keep(bindings);
+        for (const auto& snapshot : bindings->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+    };
+    // Selection above must run even on a hit: it proves current guest freshness and
+    // pending-write safety. Buffer ownership, not contents or Vulkan handle reuse,
+    // identifies immutable snapshot storage (including cached moved-word buffers).
+    static const bool profileMemo = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (auto previous = drawBindingsMemo.lock(); previous != nullptr &&
+            std::ranges::equal(previous->snapshots, result->snapshots, [](const auto& a, const auto& b) {
+                return a.allocation == b.allocation && a.address == b.address &&
+                    a.buffer.get() == b.buffer.get() &&
+                    !a.buffer.owner_before(b.buffer) && !b.buffer.owner_before(a.buffer) &&
+                    a.offset == b.offset && a.bytes == b.bytes;
+            })) {
+        if (profileMemo) DrawBindingMemoHits.fetch_add(1, std::memory_order_relaxed);
+        pin(previous);
+        return previous;
+    }
+    if (profileMemo) DrawBindingMemoMisses.fetch_add(1, std::memory_order_relaxed);
     Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
     std::array<bool, 2> described{};
     thread_local std::array<std::vector<VkDescriptorPoolSize>, 2>* countsSlot = nullptr;
@@ -6185,8 +6208,8 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     }
     Require(nextWrite == writes.end(), "draw snapshot writes disagree with their descriptor bindings");
     context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
-    recorder.Keep(result);
-    for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+    pin(result);
+    drawBindingsMemo = result;
     return result;
 }
 

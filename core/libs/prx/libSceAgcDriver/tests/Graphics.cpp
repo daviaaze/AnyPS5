@@ -5319,6 +5319,7 @@ struct MockVulkan {
 };
 
 MockVulkan mock;
+std::uint64_t mockDescriptorAllocations = 0;
 std::mutex pipelineCreateMutex;
 std::condition_variable pipelineCreateCondition;
 bool blockLibraryCreate = false;
@@ -5447,6 +5448,7 @@ VKAPI_ATTR void VKAPI_CALL mockDestroyDescriptorPool(VkDevice, VkDescriptorPool 
 
 VKAPI_ATTR VkResult VKAPI_CALL mockAllocateDescriptorSets(VkDevice, const VkDescriptorSetAllocateInfo* info, VkDescriptorSet* sets) {
     Require(info->descriptorSetCount == 1, "exactly one descriptor set must be allocated");
+    ++mockDescriptorAllocations;
     auto& pool = mock.descriptorPools.at(info->descriptorPool);
     ++pool.attempts;
     if (pool.allocated == pool.maxSets) return VK_ERROR_OUT_OF_POOL_MEMORY;
@@ -6399,6 +6401,65 @@ void descriptorSnapshotTests() {
         }
         Require(mock.live == 0, "snapshot descriptor resources leaked Vulkan objects");
     }
+}
+
+void descriptorSnapshotReuseTests() {
+    using AgcDriver::Graphics::DescriptorCache;
+    using AgcDriver::Graphics::Recorder;
+    using AgcDriver::Graphics::ShaderResources;
+    mock = MockVulkan{};
+    mock.allowCopies = true;
+    mockDescriptorAllocations = 0;
+    auto context = mockContext();
+    {
+        DescriptorCache cache(context);
+        context.descriptorCache = &cache;
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        ShaderRecompiler::RecompileResult vertex, fragment;
+        vertex.bindings.push_back(makeBinding(Role::FlattenedSrt, 43, 1, std::vector<std::uint32_t>(8, 0u)));
+        const auto state = AgcDriver::Graphics::DecodeState(makeState());
+        ShaderResources resources(context, vertex, fragment, state.color, 0, 0);
+        const std::array<std::uint32_t, 8> first{1,2,3,4,5,6,7,8};
+        const std::array<std::uint32_t, 8> second{9,10,11,12,13,14,15,16};
+        const auto moved = [&](const auto& words) {
+            std::vector<std::uint32_t> copy(words.begin(), words.end());
+            ShaderRecompiler::SharedValues<std::uint32_t> shared(std::move(copy));
+            return ShaderResources::MovedBuffer{0, 0, sizeof(words), std::move(shared)};
+        };
+        const std::array firstMoved{moved(first)};
+        const std::array secondMoved{moved(second)};
+        {
+            Recorder recorder(context);
+            mock.writes.clear();
+        auto old = resources.PrepareDrawBindings(recorder, firstMoved, true);
+        Require(old && mock.writes.size() == 1, "first selected snapshot did not rewrite descriptors");
+        const auto oldSet = old->allocation.set;
+        const auto allocationsAfterFirst = mockDescriptorAllocations;
+        const auto writesAfterFirst = mock.writes.size();
+        auto exact = resources.PrepareDrawBindings(recorder, firstMoved, true);
+        Require(exact == old && exact->allocation.set == oldSet, "exact snapshot identity did not reuse the rewritten binding");
+        Require(mockDescriptorAllocations == allocationsAfterFirst && mock.writes.size() == writesAfterFirst, "exact reuse still allocated/updated a descriptor set");
+        Require(sameBytes(exact->snapshots[0].Bytes(), first.data(), sizeof(first)), "reused descriptor no longer consumes the exact old bytes");
+        auto changed = resources.PrepareDrawBindings(recorder, secondMoved, true);
+        Require(changed != old && mock.writes.size() == writesAfterFirst + 1, "changed moved snapshot reused stale descriptor state");
+        Require(sameBytes(changed->snapshots[0].Bytes(), second.data(), sizeof(second)), "changed descriptor did not consume the new guest words");
+        Require(sameBytes(old->snapshots[0].Bytes(), first.data(), sizeof(first)), "in-flight old descriptor bytes changed after a new snapshot");
+        ShaderResources other(context, vertex, fragment, state.color, 0, 0);
+        const auto foreignBefore = mock.writes.size();
+        auto distinct = other.PrepareDrawBindings(recorder, secondMoved, true);
+        Require(distinct && distinct != changed && mock.writes.size() == foreignBefore + 1, "distinct resource instance reused another instance's descriptor originals");
+        old.reset();
+        exact.reset();
+        changed.reset();
+        distinct.reset();
+        }
+        const auto writesBeforeExpiredMemo = mock.writes.size();
+        Recorder afterDrain(context);
+        auto weakProbe = resources.PrepareDrawBindings(afterDrain, secondMoved, true);
+        Require(weakProbe != nullptr && mock.writes.size() == writesBeforeExpiredMemo + 1,
+            "expired weak memo did not rebuild after Recorder destruction");
+    }
+    Require(mock.live == 0, "descriptor snapshot reuse leaked Vulkan objects");
 }
 
 void changedDrawWordsLifetimeTests() {
@@ -13183,6 +13244,7 @@ int main(int argc, char** argv) {
         oversizedDescriptorTests();
         guestBufferViewBytesTests();
         descriptorSnapshotTests();
+        descriptorSnapshotReuseTests();
         changedDrawWordsLifetimeTests();
         dispatchMoveTests();
         descriptorCacheTests();
