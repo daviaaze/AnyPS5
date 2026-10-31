@@ -39,6 +39,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <memory_resource>
 #include <mutex>
 #include <set>
 #include <unordered_map>
@@ -1898,12 +1899,28 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         Require(draw.firstVertex <= std::numeric_limits<std::uint32_t>::max() - inputs.maxIndex, "indexed draw vertex range overflow");
         inputs.maxIndex += draw.firstVertex;
     }
+    if (attributes.empty()) {
+        timer.phase(PhaseVertex);
+        return inputs;
+    }
     std::vector<VertexFetch> fetches;
     std::vector<std::size_t> fetchValid;
     fetches.reserve(attributes.size());
     fetchValid.reserve(attributes.size());
-    std::vector<std::size_t> fetchOf(attributes.size(), 0);
-    std::vector<std::shared_ptr<Buffer>> zeroed(attributes.size());
+    // Call-local inline storage: no buffer owner or scratch state survives this draw,
+    // including recursive calls and exception unwinding. Larger device-supported
+    // layouts spill to the ordinary allocator rather than imposing a count limit.
+    // Keep the two helper-facing vectors above: SoloZeroPaddedFetchIndices requires
+    // std::vector references, not spans.
+    constexpr std::size_t InlineAttributes = 32;
+    constexpr std::size_t ScratchElementBytes = sizeof(std::size_t) * 2 +
+        sizeof(std::shared_ptr<Buffer>) + sizeof(std::uint8_t) + sizeof(VertexFetch) +
+        sizeof(VkBuffer) * 2 + sizeof(VkDeviceSize);
+    alignas(std::max_align_t) std::array<std::byte,
+        InlineAttributes * ScratchElementBytes + 8 * alignof(std::max_align_t)> scratchBytes;
+    std::pmr::monotonic_buffer_resource scratch(scratchBytes.data(), scratchBytes.size());
+    std::pmr::vector<std::size_t> fetchOf(attributes.size(), 0, &scratch);
+    std::pmr::vector<std::shared_ptr<Buffer>> zeroed(attributes.size(), &scratch);
     const auto& layout = inputs.VertexLayout();
     for (std::size_t i = 0; i < attributes.size(); ++i) {
         const auto& attribute = attributes[i];
@@ -1928,19 +1945,19 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         fetchValid.push_back(args == nullptr && stride != 0 ? static_cast<std::size_t>(std::min(recordBytes, static_cast<std::uint64_t>(bytes))) : bytes);
     }
     const auto soloFetches = SoloZeroPaddedFetchIndices(fetches, fetchValid);
-    std::vector<bool> isSolo(fetches.size(), false);
+    std::pmr::vector<std::uint8_t> isSolo(fetches.size(), 0, &scratch);
     for (const auto f : soloFetches) isSolo[f] = true;
-    std::vector<VertexFetch> plannedFetches;
+    std::pmr::vector<VertexFetch> plannedFetches(&scratch);
     plannedFetches.reserve(fetches.size());
-    std::vector<std::size_t> plannedOf(fetches.size(), 0);
+    std::pmr::vector<std::size_t> plannedOf(fetches.size(), 0, &scratch);
     for (std::size_t f = 0; f < fetches.size(); ++f) {
         if (isSolo[f]) continue;
         plannedOf[f] = plannedFetches.size();
         plannedFetches.push_back(fetches[f]);
     }
     const auto plan = PlanVertexCopies(plannedFetches);
-    std::vector<VkBuffer> rangeHandles;
-    std::vector<VkDeviceSize> rangeOffsets;
+    std::pmr::vector<VkBuffer> rangeHandles(&scratch);
+    std::pmr::vector<VkDeviceSize> rangeOffsets(&scratch);
     rangeHandles.reserve(plan.copies.size());
     rangeOffsets.reserve(plan.copies.size());
     for (std::size_t range = 0; range < plan.copies.size(); ++range) {
@@ -1960,7 +1977,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         rangeOffsets.push_back(0);
         inputs.vertexBuffers.push_back(std::move(copy.buffer));
     }
-    std::vector<VkBuffer> soloHandles(fetches.size(), VK_NULL_HANDLE);
+    std::pmr::vector<VkBuffer> soloHandles(fetches.size(), VK_NULL_HANDLE, &scratch);
     for (const auto f : soloFetches) {
         const auto begin = fetches[f].begin;
         const auto bytes = static_cast<std::size_t>(fetches[f].end - begin);
