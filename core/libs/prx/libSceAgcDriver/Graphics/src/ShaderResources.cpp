@@ -471,7 +471,7 @@ struct TextureCounters {
     std::atomic<std::uint64_t> tablesReused{0};
     std::atomic<std::uint64_t> tablesReplayed{0};
     std::atomic<std::uint64_t> tablesResolved{0};
-    std::array<std::atomic<std::uint64_t>, 12> tableDenied{};
+    std::array<std::atomic<std::uint64_t>, 14> tableDenied{};
     std::atomic<std::uint64_t> tableWritesKept{0};
     std::atomic<std::uint64_t> tableWritesMade{0};
     // Snapshot hits over memory outside the write watch: kept by an unchanged UntrackedHint key, or
@@ -500,7 +500,7 @@ void reportTextureCounters() {
     if (nowMs - last < 10000 || !counters.lastReport.compare_exchange_strong(last, nowMs)) return;
     const auto count = [](const std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.load(std::memory_order_relaxed)); };
     AgcDriver::ProfilePrint_nid_no_patch("[textures] sampled created: %llu from storage images, %llu snapshots (%llu snapshot reads over recorded writes inside cachedTexture, %llu storage-path fallbacks); stage-A records %llu: %llu fast hits, %llu full lookups; storage images %llu hits, %llu created, %llu own-object refreshes; image tables %llu reused, %llu resolved; untracked snapshots %llu kept by the write-watch hint, %llu compared\n", count(counters.fromStorage), count(counters.snapshots), count(counters.pendingReads), count(counters.storageFallbacks), count(counters.records), count(counters.fastHits), count(counters.fastMisses), count(counters.storageHits), count(counters.storageCreated), count(counters.ownRefreshes), count(counters.tablesReused), count(counters.tablesResolved), count(counters.untrackedKept), count(counters.untrackedCompared));
-    AgcDriver::ProfilePrint_nid_no_patch("[table-reuse-denied] first reason per resolved image table: epoch0 %llu, capacity %llu, written image %llu, no sampled binding %llu, no lookup record %llu, lookup returned another object %llu, dcc or not uncompressed %llu, snapshot generation or storage proof %llu, final state or pending serial %llu\n", count(counters.tableDenied[1]), count(counters.tableDenied[2]), count(counters.tableDenied[3]), count(counters.tableDenied[4]), count(counters.tableDenied[5]), count(counters.tableDenied[6]), count(counters.tableDenied[7]), count(counters.tableDenied[8]), count(counters.tableDenied[9]));
+    AgcDriver::ProfilePrint_nid_no_patch("[table-reuse-denied] first reason per resolved image table: epoch0 %llu, capacity %llu, written image %llu, no sampled binding %llu, no lookup record %llu, lookup returned another object %llu, dcc address with uncompressed keys %llu, snapshot generation or storage proof %llu, table state changed %llu, keys not uncompressed %llu, table no longer current %llu, storage pending serial changed %llu, state changed at the end %llu\n", count(counters.tableDenied[1]), count(counters.tableDenied[2]), count(counters.tableDenied[3]), count(counters.tableDenied[4]), count(counters.tableDenied[5]), count(counters.tableDenied[6]), count(counters.tableDenied[7]), count(counters.tableDenied[8]), count(counters.tableDenied[9]), count(counters.tableDenied[10]), count(counters.tableDenied[11]), count(counters.tableDenied[12]), count(counters.tableDenied[13]));
 }
 
 // What the sampled-texture lookups on this thread proved their returned objects current against,
@@ -5625,7 +5625,7 @@ void ShaderResources::resolveImageTables() {
                 const bool snapshotCurrent = looked != nullptr && looked->source == nullptr && looked->generation != 0 &&
                         looked->keys == DccKeys::Uncompressed && resource.dccAddress == 0;
                 const bool storageCurrent = exactStorageView && looked != nullptr && looked->source == source.get() && resource.dccAddress == 0;
-                if (!(looked != nullptr && looked->object == texture.get() && (snapshotCurrent || storageCurrent))) deny(looked == nullptr ? 5u : looked->object != texture.get() ? 6u : (looked->keys != DccKeys::Uncompressed || resource.dccAddress != 0) ? 7u : 8u);
+                if (!(looked != nullptr && looked->object == texture.get() && (snapshotCurrent || storageCurrent))) deny(looked == nullptr ? 5u : looked->object != texture.get() ? 6u : looked->keys != DccKeys::Uncompressed ? 10u : resource.dccAddress != 0 ? 7u : 8u);
                 if (reusable) {
                     fresh.elements.push_back({MakeTextureKey(context.device, sampledWords, components, depthCompare), texture, resource, guestBytes, firstLayer, false, {}});
                     const auto generation = storageCurrent ? source->GenerationFor(resource.baseAddress, static_cast<std::size_t>(guestBytes)) : looked->generation;
@@ -5635,8 +5635,11 @@ void ShaderResources::resolveImageTables() {
             fresh.bound[element] = bind(element, sampledWords, std::move(texture), resource, guestBytes, firstLayer);
         }
         counters.tablesResolved.fetch_add(1, std::memory_order_relaxed);
-        const bool remembered = reusable && CurrentTableState() == state && TableCurrent(fresh) && StorageTexture::PendingSerial() == fresh.pendingSerial && CurrentTableState() == state;
-        if (!remembered) counters.tableDenied[reusable ? 9u : std::min<std::size_t>(denied, 11u)].fetch_add(1, std::memory_order_relaxed);
+        const bool stateSame = reusable && CurrentTableState() == state;
+        const bool tableCurrent = stateSame && TableCurrent(fresh);
+        const bool pendingSame = tableCurrent && StorageTexture::PendingSerial() == fresh.pendingSerial;
+        const bool remembered = pendingSame && CurrentTableState() == state;
+        if (!remembered) counters.tableDenied[!reusable ? std::min<std::size_t>(denied, 11u) : !stateSame ? 9u : !tableCurrent ? 11u : !pendingSame ? 12u : 13u].fetch_add(1, std::memory_order_relaxed);
         if (remembered) {
             fresh.device = context.device;
             fresh.state = state;
