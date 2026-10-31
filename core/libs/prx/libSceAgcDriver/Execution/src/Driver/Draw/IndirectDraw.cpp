@@ -15,6 +15,11 @@ std::uint32_t Driver::drawUserWord(const DrawProgram& program, std::int32_t sgpr
     return program.userData[index];
 }
 
+bool Driver::IndirectInputRoutes() {
+    static const bool enabled = std::getenv("APS5_NO_INDIRECT_INPUT_ROUTES") == nullptr;
+    return enabled;
+}
+
 
 void Driver::FoldDrawOffsets(const ShaderRecompiler::RecompileResult& result, const DrawProgram& program, Pm4::DrawParameters& parameters) {
     if (result.vertexOffsetSgpr >= 0) {
@@ -56,7 +61,7 @@ std::optional<Graphics::IndirectDrawPath> Driver::ClassifyIndirectDraw(const Sha
         else rule = Rule::InPlace;
     };
     dimension(result.vertexOffsetSgpr, indirect.baseVertexSgpr, result.vertexOffsetShared, result.vertexOffsetConflict, drawParameters.indexed ? 0u : indirect.indxOffset, indirect.vertexRule, indirect.vertexConstant);
-    if (indirect.vertexRule == Rule::Constant && indirect.vertexConstant == 0u && graphics.stages.path == Graphics::ShaderPath::Vertex &&
+    if (IndirectInputRoutes() && indirect.vertexRule == Rule::Constant && indirect.vertexConstant == 0u && graphics.stages.path == Graphics::ShaderPath::Vertex &&
         !graphics.rectList && !graphics.stages.mesh && !graphics.stages.tessellation && result.vertexAttributes.empty() && result.vertexInputs.empty() && result.vertexInputPatches.empty() &&
         !result.vertexOffsetShared && !result.vertexOffsetConflict) {
         const auto& capabilities = localDevice->Target().supportedCapabilities;

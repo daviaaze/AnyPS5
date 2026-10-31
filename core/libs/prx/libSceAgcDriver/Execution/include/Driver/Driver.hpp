@@ -102,6 +102,8 @@ public:
     [[nodiscard]] static DeferredAbiUseCounts DeferredAbiUses();
     [[nodiscard]] std::vector<std::array<std::uint64_t, 2>> PreparedEntryHashes(const Shader* shader);
     [[nodiscard]] std::array<std::uint64_t, 4> PrebuiltLibraries();
+    // False under APS5_NO_INDIRECT_INPUT_ROUTES: no BaseInstance/BaseVertex routing of indirect draw inputs.
+    static bool IndirectInputRoutes();
     static void FoldDrawOffsets(const ShaderRecompiler::RecompileResult& result, const DrawProgram& program, Pm4::DrawParameters& parameters);
     static std::optional<Graphics::IndirectDrawPath> ClassifyIndirectDraw(const ShaderRecompiler::RecompileResult& result, const Graphics::State& graphics, const DrawProgram& frontProgram, const std::shared_ptr<VulkanDevice>& localDevice, Pm4::DrawParameters& drawParameters, bool traceIndirect, std::int32_t instanceInputSgpr = -1);
     static void tagVariantRuns(DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, const ShaderRecompiler::SrtUserDataUse& use, bool eligible, std::uint32_t hiddenWords, std::span<const std::shared_ptr<const ShaderRecompiler::SrtGuestWords>> supplied = {});

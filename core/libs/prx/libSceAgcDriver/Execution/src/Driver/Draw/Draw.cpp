@@ -1165,7 +1165,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         }
         if (i == 0 && drawParameters.indirect) {
             indirectCpu = ClassifyIndirectDraw(result, graphics, programs.front(), localDevice, drawParameters, traceIndirect);
-            if (indirectCpu == Graphics::IndirectDrawPath::NotFolded && program.binary.stage == Stage::Vertex && program.firstUserSgpr == 8u && !graphics.rectList && !graphics.stages.mesh && !graphics.stages.tessellation) {
+            if (IndirectInputRoutes() && indirectCpu == Graphics::IndirectDrawPath::NotFolded && program.binary.stage == Stage::Vertex && program.firstUserSgpr == 8u && !graphics.rectList && !graphics.stages.mesh && !graphics.stages.tessellation) {
                 const auto& indirect = *drawParameters.indirect;
                 const auto words = UserDataWords(programs, roles, indirect.startInstanceLocation);
                 if (words.size() == 1u && words.front().first == 0u && words.front().second < 64u) {

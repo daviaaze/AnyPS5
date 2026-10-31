@@ -165,7 +165,9 @@ void Run() {
     std::copy(descriptor.begin(), descriptor.end(), Table.begin() + 4u);
     RecordDescriptor = {Low(Records), High(Records) & 0xffffu, AllocationBytes, 0x31016facu,
         Low(Records + 4u), High(Records + 4u) & 0xffffu, AllocationBytes - 16u, 0x31016facu};
-    const auto selected = std::getenv("APS5_NO_GPU_INDIRECT_DRAW") != nullptr ? AgcDriver::Graphics::IndirectDrawPath::Disabled : AgcDriver::Graphics::IndirectDrawPath::Gpu;
+    const auto selected = std::getenv("APS5_NO_GPU_INDIRECT_DRAW") != nullptr ? AgcDriver::Graphics::IndirectDrawPath::Disabled
+        : std::getenv("APS5_NO_INDIRECT_INPUT_ROUTES") != nullptr ? AgcDriver::Graphics::IndirectDrawPath::NotFolded
+        : AgcDriver::Graphics::IndirectDrawPath::Gpu;
     constexpr std::array<std::uint32_t, 7> bases{0u, 65535u, 65536u, 65537u, 917966u, 0x80000000u, 0xffffffffu};
     for (const auto wave : {32u, 64u}) {
         for (const auto base : bases) {
@@ -265,7 +267,7 @@ void Cleanup() {
 
 int main(int argc, char** argv) {
     try {
-        if (argc == 2 && (std::string(argv[1]) == "--late-fallback" || std::string(argv[1]) == "--vertex-base-fallback")) {
+        if (argc == 2 && std::string(argv[1]) == "--late-fallback") {
 #ifdef _WIN32
             _putenv_s("APS5_NO_GPU_INDIRECT_DRAW", "1");
 #else
@@ -287,6 +289,7 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string(argv[1]) == "--fallback-key") enable("APS5_NO_DRAW_KEY");
         if (argc == 2 && std::string(argv[1]) == "--uncached") enable("APS5_NO_DRAW_SRT_ENTRIES");
+        if (argc == 2 && std::string(argv[1]) == "--no-input-routes") enable("APS5_NO_INDIRECT_INPUT_ROUTES");
         {
             const auto device = OpenVulkanTestDevice();
             if (!device) return VulkanTestSkipped;
