@@ -791,6 +791,15 @@ PendingLookup pendingLookupSource(const Context& context, const GuestTextureReso
     return lookup;
 }
 
+GuestTextureResource viewedSampledWindow(const GuestTextureResource& resource, std::uint64_t guestBytes, std::optional<DccKeys> knownKeys = std::nullopt) {
+    const auto window = ViewedArrayWindow(resource, false);
+    if (window.baseAddress != resource.baseAddress || resource.dccAddress == 0) return window;
+    if (ViewedArrayWindow(resource, true).baseAddress == resource.baseAddress) return window;
+    const auto bytes = guestBytes != 0 ? guestBytes : DescribeSurface(resource).guestBytes;
+    const auto keys = knownKeys ? *knownKeys : TextureClearKeys(resource, bytes);
+    return keys == DccKeys::Uncompressed ? ViewedArrayWindow(resource, true) : window;
+}
+
 // `guestBytes` is the surface size when the caller described the surface already (0: described here).
 std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& requested, VkComponentMapping components, std::uint64_t guestBytes = 0, bool depthCompare = false, VkImageViewType multisampleViewType = VK_IMAGE_VIEW_TYPE_2D, std::shared_ptr<Buffer> preparedStaging = {}) {
     const auto resource = ArrayLayerWindow(requested, context.limits.maxImageArrayLayers);
@@ -825,28 +834,20 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     if (depthBitsWidth == 32u && resource.format != float32) {
         auto bits = resource;
         bits.format = float32;
-        return cachedTexture(context, words, bits, components, guestBytes, depthCompare);
+        return cachedTexture(context, words, bits, components, guestBytes, depthCompare, multisampleViewType, std::move(preparedStaging));
     }
     constexpr auto unorm16 = static_cast<std::uint32_t>(ShaderRecompiler::IrBufferFormat::Format16UNorm);
     if (depthBitsWidth == 16u && resource.format != unorm16) {
         auto normalized = resource;
         normalized.format = unorm16;
-        return cachedTexture(context, words, normalized, components, guestBytes, depthCompare);
+        return cachedTexture(context, words, normalized, components, guestBytes, depthCompare, multisampleViewType, std::move(preparedStaging));
     }
-    // A view with DCC metadata is cut to its slices only when its whole-surface keys resolve to
-    // Uncompressed: the uncut path would then read the same slices' texels as stored.
-    const auto viewedWindow = [&] {
-        const auto window = ViewedArrayWindow(resource, false);
-        if (window.baseAddress != resource.baseAddress || resource.dccAddress == 0) return window;
-        if (ViewedArrayWindow(resource, true).baseAddress == resource.baseAddress) return window;
-        if (TextureClearKeys(resource, guestBytes != 0 ? guestBytes : DescribeSurface(resource).guestBytes) != DccKeys::Uncompressed) return window;
-        return ViewedArrayWindow(resource, true);
-    };
-    if (const auto window = viewedWindow(); window.baseAddress != resource.baseAddress) {
+    const auto window = viewedSampledWindow(resource, guestBytes);
+    if (window.baseAddress != resource.baseAddress) {
         static std::atomic<std::uint64_t> windows{0};
         const auto count = windows.fetch_add(1) + 1;
         if (count <= 5 || (count & (count - 1)) == 0) std::fprintf(stderr, "[gpu] sampled array view 0x%llx (%ux%u format %u, dimension %d, slices %u..%u) served from its viewed slices at 0x%llx; %llu such views\n", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, static_cast<int>(resource.dimension), resource.baseArray, resource.depthOrLastArray, static_cast<unsigned long long>(window.baseAddress), static_cast<unsigned long long>(count));
-        return cachedTexture(context, words, window, components, 0, depthCompare);
+        return cachedTexture(context, words, window, components, 0, depthCompare, multisampleViewType, std::move(preparedStaging));
     }
     if (guestBytes == 0) guestBytes = DescribeSurface(resource).guestBytes;
     if (guestBytes >= (1ull << 30u)) {
@@ -5051,21 +5052,31 @@ bool ShaderResources::precollectImages() {
                     std::copy(words.begin(), words.end(), record.words.begin());
                     record.components = memo->components;
                     record.keys = TextureClearKeys(record.resource, record.guestBytes);
-                    auto& cache = Textures();
-                    std::lock_guard lock(cache.mutex);
-                    if (const auto it = findSampledEntry(cache, context.device, record.words, record.components); it != cache.entries.end()) {
-                        record.texture = it->texture;
-                        record.source = it->source;
-                        record.entryKeys = it->keys;
-                        record.entryGeneration = it->generation;
-                        counters.records.fetch_add(1, std::memory_order_relaxed);
+                    const auto stagingResource = ArrayLayerWindow(record.resource, context.limits.maxImageArrayLayers);
+                    const bool sameSurface = stagingResource.baseAddress == record.resource.baseAddress;
+                    const auto stagingGuestBytes = sameSurface ? record.guestBytes : DescribeSurface(stagingResource).guestBytes;
+                    const auto stagingKeys = stagingResource.dccAddress == 0 ? DccKeys::Uncompressed :
+                            sameSurface ? record.keys : TextureClearKeys(stagingResource, stagingGuestBytes);
+                    const auto stagingView = viewedSampledWindow(stagingResource, stagingGuestBytes, stagingKeys);
+                    const auto stagingBytes = DescribeSurface(stagingView).guestBytes;
+                    bool predictsMiss = false;
+                    {
+                        auto& cache = Textures();
+                        std::lock_guard lock(cache.mutex);
+                        if (const auto it = findSampledEntry(cache, context.device, record.words, record.components); it != cache.entries.end()) {
+                            record.texture = it->texture;
+                            record.source = it->source;
+                            record.entryKeys = it->keys;
+                            record.entryGeneration = it->generation;
+                            counters.records.fetch_add(1, std::memory_order_relaxed);
+                        }
+                        predictsMiss = record.texture == nullptr || record.generation != record.entryGeneration || record.keys != record.entryKeys;
                     }
                     static const bool noPreparedStaging = std::getenv("APS5_NO_PREPARED_SNAPSHOT_STAGING") != nullptr;
                     constexpr std::size_t SnapshotCompareBytes = 256u << 10u;
-                    const bool predictsMiss = record.texture == nullptr || record.generation != record.entryGeneration || record.keys != record.entryKeys;
                     if (!noPreparedStaging && predictsMiss && record.generation != 0 &&
-                            record.keys == DccKeys::Uncompressed && record.guestBytes > SnapshotCompareBytes) {
-                        record.preparedStaging = std::make_shared<Buffer>(context, static_cast<std::size_t>(record.guestBytes), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+                            stagingKeys == DccKeys::Uncompressed && stagingBytes > SnapshotCompareBytes) {
+                        record.preparedStaging = std::make_shared<Buffer>(context, static_cast<std::size_t>(stagingBytes), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
                         preparedSnapshotStagingCount.fetch_add(1, std::memory_order_relaxed);
                     }
                 }

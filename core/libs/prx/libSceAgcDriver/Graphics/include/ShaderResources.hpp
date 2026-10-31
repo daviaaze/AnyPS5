@@ -519,10 +519,10 @@ private:
         DccKeys entryKeys = DccKeys::Uncompressed;
         std::uint64_t entryGeneration = 0;
         // A sampled element stage A predicts will miss into a large uncompressed snapshot: its
-        // exact-size TRANSFER_SRC staging Buffer, made here outside the device lock. Stage B hands it
-        // to cachedTexture, which uses it only when the lookup still misses into a staged snapshot of
-        // the same size; otherwise it is released (back to the pool). APS5_NO_PREPARED_SNAPSHOT_STAGING
-        // disables it.
+        // exact effective-view-size TRANSFER_SRC staging Buffer, allocated after releasing the
+        // texture-cache mutex and outside the device lock. Stage B hands it to cachedTexture, which
+        // uses it only when the lookup still misses into a staged snapshot of the same size;
+        // otherwise it is released (back to the pool). APS5_NO_PREPARED_SNAPSHOT_STAGING disables it.
         std::shared_ptr<Buffer> preparedStaging;
     };
     std::vector<ImageRecord> imageRecords;
