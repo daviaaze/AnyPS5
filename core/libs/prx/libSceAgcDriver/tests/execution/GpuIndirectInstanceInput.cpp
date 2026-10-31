@@ -150,9 +150,9 @@ void Check(std::uint32_t base, std::uint32_t instances, std::uint32_t secondBase
 
 using Counts = decltype(AgcDriver::Graphics::IndirectDrawCounts());
 
-void CheckPath(const Counts& before, AgcDriver::Graphics::IndirectDrawPath expected) {
+void CheckPath(const Counts& before, AgcDriver::Graphics::IndirectDrawPath expected, std::uint64_t count = 1u) {
     const auto after = AgcDriver::Graphics::IndirectDrawCounts();
-    for (std::size_t path = 0; path < after.size(); ++path) Require(after[path] == before[path] + (path == static_cast<std::size_t>(expected) ? 1u : 0u),
+    for (std::size_t path = 0; path < after.size(); ++path) Require(after[path] == before[path] + (path == static_cast<std::size_t>(expected) ? count : 0u),
         "unexpected indirect draw count for " + std::string(AgcDriver::Graphics::IndirectDrawPathName(static_cast<AgcDriver::Graphics::IndirectDrawPath>(path))) + ": " + std::to_string(after[path] - before[path]));
 }
 
@@ -222,7 +222,17 @@ void Run() {
     Check(65536u, 2u, 917966u, 2u);
     CheckPath(before, selected);
     Output.fill(Sentinel);
-    const std::array<std::uint32_t, 5> indexedRecord{3u, 3u, 0u, 0u, 917966u};
+    const std::array<std::uint32_t, 4> nonIndexedRecord{3u, 3u, 917966u, 917966u};
+    std::copy(nonIndexedRecord.begin(), nonIndexedRecord.end(), Records);
+    commands.clear();
+    State(commands, 64u, 0xbadc0ffeu);
+    Append(commands, 0x11, {1, Low(Records), High(Records)});
+    Append(commands, 0x24, {0, 0x280, 0x8e, 2});
+    const auto nonIndexedBefore = AgcDriver::Graphics::IndirectDrawCounts();
+    Submit(commands);
+    Check(917966u, 3u);
+    CheckPath(nonIndexedBefore, selected);
+    const std::array<std::uint32_t, 5> indexedRecord{3u, 3u, 0u, 917966u, 917966u};
     std::copy(indexedRecord.begin(), indexedRecord.end(), Records);
     commands.clear();
     State(commands, 64u, 0xbadc0ffeu);
@@ -235,7 +245,7 @@ void Run() {
     Submit(commands);
     Check(917966u, 3u);
     CheckPath(indexedBefore, selected);
-    std::puts("GPU-written single/multi-record and indexed draws retained masked arithmetic across direct/indirect and SGPR-route alternation; resource-pointer patches retained CPU fallback");
+    std::puts("GPU indexed and non-indexed indirect draws with a record vertex base matched the rewrite output");
 }
 
 void Cleanup() {
@@ -255,7 +265,7 @@ void Cleanup() {
 
 int main(int argc, char** argv) {
     try {
-        if (argc == 2 && std::string(argv[1]) == "--late-fallback") {
+        if (argc == 2 && (std::string(argv[1]) == "--late-fallback" || std::string(argv[1]) == "--vertex-base-fallback")) {
 #ifdef _WIN32
             _putenv_s("APS5_NO_GPU_INDIRECT_DRAW", "1");
 #else

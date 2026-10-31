@@ -2690,6 +2690,19 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     // a device write to it earlier in the pass breaks it ('read after write'), and writes before the
     // pass are covered by the pass-begin barrier below. Only a rewrite (scratch copy) needs a break.
     const bool indirectRewrite = gpuIndirect && indirectRewrites(*args);
+    {
+        static const bool profileForced = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+        if (profileForced) {
+            static std::array<std::atomic<std::uint64_t>, 8> forcedBy{};
+            static std::atomic<std::int64_t> forcedReport{0};
+            const bool lds = PixelFunctionLdsSubgroup(shaders) != 0u;
+            const std::array<bool, 8> flags{capture, payload, readsTarget, indirectRewrite, meshIndirect, captured, lds, gpuIndirect};
+            for (std::size_t i = 0; i < flags.size(); ++i) if (flags[i]) forcedBy[i].fetch_add(1, std::memory_order_relaxed);
+            const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+            if (forcedReport.exchange(tenSeconds, std::memory_order_relaxed) != tenSeconds)
+                std::fprintf(stderr, "[forced-pass] draws by flag (cumulative): capture %llu, payload %llu, readsTarget %llu, indirect rewrite %llu, mesh indirect %llu, captured %llu, lds subgroup %llu; gpu indirect (any) %llu\n", static_cast<unsigned long long>(forcedBy[0].load()), static_cast<unsigned long long>(forcedBy[1].load()), static_cast<unsigned long long>(forcedBy[2].load()), static_cast<unsigned long long>(forcedBy[3].load()), static_cast<unsigned long long>(forcedBy[4].load()), static_cast<unsigned long long>(forcedBy[5].load()), static_cast<unsigned long long>(forcedBy[6].load()), static_cast<unsigned long long>(forcedBy[7].load()));
+        }
+    }
     const auto start = recorder->StartDrawPass(passKey, capture || payload || readsTarget || indirectRewrite || meshIndirect || captured || PixelFunctionLdsSubgroup(shaders) != 0u, fenced, passAccess);
     for (const auto& target : record.multisampleTargets) KeepMultisampleTarget_nid_no_patch(target);
     const bool continued = start.continued;

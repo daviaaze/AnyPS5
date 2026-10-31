@@ -52,6 +52,9 @@ void validateTranslateOptions(const TranslateOptions& options) {
             throw std::runtime_error("dynamic instance input cannot also fold an instance fetch offset");
         }
     }
+    if (options.routedVertexBase && (options.stage != ShaderStageKind::Vertex || options.gcnLegacyVertexInputs)) {
+        throw std::runtime_error("routed vertex base requires a non-legacy vertex shader");
+    }
     if (options.waveSize != 32u && options.waveSize != 64u) {
         throw std::runtime_error("shader translation requires wave32 or wave64, got " + std::to_string(options.waveSize));
     }
@@ -194,6 +197,7 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
         const std::int32_t folded = fetch == nullptr ? -1 : kind == StageInputKind::VertexIndex ? fetch->vertexOffsetSgpr : fetch->instanceOffsetSgpr;
         IrValue& index = builtin(kind);
         if (kind == StageInputKind::InstanceIndex && options.instanceInputSgpr >= 0) return entryIr.ISub(index, builtin(StageInputKind::BaseInstance));
+        if (kind == StageInputKind::VertexIndex && options.routedVertexBase) return entryIr.ISub(index, builtin(StageInputKind::BaseVertex));
         return folded < 0 ? index : entryIr.ISub(index, entryIr.GetUserData(static_cast<ScalarReg>(folded)));
     };
     const auto tessellationBase = [&entryIr](TessellationBaseKind kind) -> IrValue& {

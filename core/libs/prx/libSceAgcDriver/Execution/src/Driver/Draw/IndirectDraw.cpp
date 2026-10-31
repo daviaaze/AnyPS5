@@ -15,6 +15,7 @@ std::uint32_t Driver::drawUserWord(const DrawProgram& program, std::int32_t sgpr
     return program.userData[index];
 }
 
+
 void Driver::FoldDrawOffsets(const ShaderRecompiler::RecompileResult& result, const DrawProgram& program, Pm4::DrawParameters& parameters) {
     if (result.vertexOffsetSgpr >= 0) {
         const auto offset = drawUserWord(program, result.vertexOffsetSgpr);
@@ -27,6 +28,7 @@ void Driver::FoldDrawOffsets(const ShaderRecompiler::RecompileResult& result, co
 std::optional<Graphics::IndirectDrawPath> Driver::ClassifyIndirectDraw(const ShaderRecompiler::RecompileResult& result, const Graphics::State& graphics, const DrawProgram& frontProgram, const std::shared_ptr<VulkanDevice>& localDevice, Pm4::DrawParameters& drawParameters, bool traceIndirect, std::int32_t instanceInputSgpr) {
     std::optional<Graphics::IndirectDrawPath> indirectCpu;
     auto& indirect = *drawParameters.indirect;
+    indirect.routedVertexBase = false;
     using Rule = Pm4::DrawParameters::IndirectDraw::Rule;
     using Path = Graphics::IndirectDrawPath;
     const auto support = localDevice->DrawIndirectSupport();
@@ -54,6 +56,15 @@ std::optional<Graphics::IndirectDrawPath> Driver::ClassifyIndirectDraw(const Sha
         else rule = Rule::InPlace;
     };
     dimension(result.vertexOffsetSgpr, indirect.baseVertexSgpr, result.vertexOffsetShared, result.vertexOffsetConflict, drawParameters.indexed ? 0u : indirect.indxOffset, indirect.vertexRule, indirect.vertexConstant);
+    if (indirect.vertexRule == Rule::Constant && indirect.vertexConstant == 0u && graphics.stages.path == Graphics::ShaderPath::Vertex &&
+        !graphics.rectList && !graphics.stages.mesh && !graphics.stages.tessellation && result.vertexAttributes.empty() && result.vertexInputs.empty() && result.vertexInputPatches.empty() &&
+        !result.vertexOffsetShared && !result.vertexOffsetConflict) {
+        const auto& capabilities = localDevice->Target().supportedCapabilities;
+        if (std::ranges::find(capabilities, static_cast<std::uint32_t>(spv::CapabilityDrawParameters)) != capabilities.end()) {
+            indirect.vertexRule = Rule::InPlace;
+            indirect.routedVertexBase = true;
+        }
+    }
     if (instanceInputSgpr >= 0) {
         if (instanceInputSgpr != indirect.startInstanceSgpr || instanceInputSgpr == indirect.baseVertexSgpr || result.instanceOffsetSgpr >= 0 ||
             graphics.stages.path != Graphics::ShaderPath::Vertex || graphics.rectList || graphics.stages.mesh || graphics.stages.tessellation ||

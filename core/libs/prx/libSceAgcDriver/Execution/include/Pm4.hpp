@@ -55,6 +55,7 @@ struct DrawParameters {
         std::int32_t baseVertexSgpr = -1;
         std::int32_t startInstanceSgpr = -1;
         std::int32_t drawIndexSgpr = -1;
+        bool routedVertexBase = false;
         // Bytes of the record range: (count - 1) * stride + recordBytes, or 0 for no records.
         std::uint64_t RangeBytes() const { return count == 0 ? 0 : static_cast<std::uint64_t>(count - 1) * stride + recordBytes; }
         std::uint32_t VertexDwordOffset() const { return recordBytes == 20 ? 12u : 8u; }

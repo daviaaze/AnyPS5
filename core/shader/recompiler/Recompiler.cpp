@@ -261,6 +261,11 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
     translateOptions.nativeFloat16 = supports(spv::CapabilityFloat16) && supports(spv::CapabilityRoundingModeRTE) && supports(spv::CapabilityDenormPreserve);
     translateOptions.interpolationFunctions = supports(spv::CapabilityInterpolationFunction);
     translateOptions.instanceInputSgpr = request.graphics ? request.graphics->instanceInputSgpr : -1;
+    translateOptions.routedVertexBase = request.graphics && request.graphics->routedVertexBase;
+    if (translateOptions.routedVertexBase && (request.shader.stage != ShaderStage::Vertex || request.graphics->mesh || request.graphics->tessellation ||
+        std::ranges::find(request.target.supportedCapabilities, static_cast<std::uint32_t>(spv::CapabilityDrawParameters)) == request.target.supportedCapabilities.end())) {
+        throw std::runtime_error("routed vertex base requires a vertex draw with shader draw parameters");
+    }
     if (translateOptions.instanceInputSgpr != -1 && (request.shader.stage != ShaderStage::Vertex || request.graphics->mesh || request.graphics->tessellation || !supports(spv::CapabilityDrawParameters))) {
         throw std::runtime_error("dynamic instance input requires a vertex draw with shader draw parameters");
     }

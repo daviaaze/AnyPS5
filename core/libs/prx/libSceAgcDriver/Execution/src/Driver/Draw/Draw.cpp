@@ -1038,6 +1038,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     std::optional<Graphics::IndirectDrawPath> indirectCpu;
     std::size_t completedSubdraws = 0;
     std::int32_t instanceInputSgpr = -1;
+    bool routedVertexBase = false;
     std::vector<std::uint32_t> pushOffsets(programs.size(), 0);
     std::optional<ShaderRecompiler::MeshBarycentricLayout> meshBarycentrics;
     std::vector<std::size_t> resultIndex(programs.size(), 0);
@@ -1184,6 +1185,8 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                     }
                 }
             }
+            routedVertexBase = drawParameters.indirect->routedVertexBase && !indirectCpu.has_value();
+            if (routedVertexBase) indirectCpu.reset();
             if (EmptyIndirectSkip()) CpuIndirectPrograms()[programs.front().binary.codeAddress] = indirectCpu.has_value();
         } else if (i == 0) {
             fold(result, drawParameters);
@@ -1319,18 +1322,23 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         snapshots.reserve(memory.size());
         for (const auto& region : memory) snapshots.push_back({region.guestAddress, region.bytes});
     };
-    if (instanceInputSgpr >= 0) {
+    if (instanceInputSgpr >= 0 || routedVertexBase) {
         auto dynamicCaptures = stageCaptures;
         auto dynamicRecompiled = recompiled;
         try {
-            const auto compiled = materializeDrawStage(0, pushOffsets[0], queue, submission, packetOffset, trace.token, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, *shaderMemory, dynamicCaptures, dynamicRecompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected, meshBarycentrics, instanceInputSgpr);
-            require(compiled->pushConstants.size() <= programResults[0]->pushConstants.size() && compiled->parameterExports == programResults[0]->parameterExports, "dynamic instance input changed the linked stage interface");
+            const auto compiled = materializeDrawStage(0, pushOffsets[0], queue, submission, packetOffset, trace.token, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, *shaderMemory, dynamicCaptures, dynamicRecompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected, meshBarycentrics, instanceInputSgpr, routedVertexBase);
+            require(compiled->pushConstants.size() <= programResults[0]->pushConstants.size() && compiled->parameterExports == programResults[0]->parameterExports, "routed draw inputs changed the linked stage interface");
             compiledStages.push_back(compiled);
             programResults[0] = compiled.get();
             stages[0].program = compiled.get();
         } catch (const std::bad_alloc&) {
             throw;
         } catch (const std::exception&) {
+            if (routedVertexBase) {
+                routedVertexBase = false;
+                drawParameters.indirect->routedVertexBase = false;
+                drawParameters.indirect->vertexRule = Pm4::DrawParameters::IndirectDraw::Rule::Constant;
+            }
             indirectCpu = Graphics::IndirectDrawPath::NotFolded;
         }
     }

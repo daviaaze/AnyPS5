@@ -470,6 +470,8 @@ struct GraphicsCompileContext {
     GraphicsDrawParameters draw;
     std::optional<MeshBarycentricLayout> meshBarycentrics;
     std::int32_t instanceInputSgpr = -1;
+    // When enabled, VertexIndex is rebased by BaseVertex for an in-place indirect route.
+    bool routedVertexBase = false;
 };
 
 struct RecompileRequest {

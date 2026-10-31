@@ -668,6 +668,14 @@ int main() {
                 expectRejected(trailing, "RequestSerializer: unexpected trailing data");
             }
             dynamic.graphics->instanceInputSgpr = -1;
+            dynamic.graphics->routedVertexBase = true;
+            const auto routedVertex = serializer.Serialize(dynamic);
+            const auto routedVertexBytes = DecodeBase64(routedVertex);
+            Require(routedVertexBytes[4] == 51u);
+            const auto replayVertex = serializer.Deserialize(routedVertex);
+            Require(replayVertex.request.graphics->routedVertexBase && replayVertex.request.graphics->instanceInputSgpr == -1);
+            Require(serializer.Serialize(replayVertex.request) == routedVertex);
+            dynamic.graphics->routedVertexBase = false;
             Require(serializer.Serialize(dynamic) == ordinary);
             legacy47.insert(legacy47.end(), {8u, 0u, 0u, 0u});
             expectRejected(legacy47, "RequestSerializer: unexpected trailing data");
