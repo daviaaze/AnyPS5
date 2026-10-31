@@ -184,6 +184,8 @@ private:
     static bool verifyDrawRecipe();
     static std::size_t drawCacheEntries();
     static bool drawCacheIndirect();
+    static bool drawCachePushWord();
+    static bool verifyDrawPushWord();
     void accountDrawVariant(const DispatchVariant& variant, bool added);
     void insertDrawEntry(std::uint64_t key, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::shared_ptr<const DrawDecode> decode, std::uint64_t shape = 0, bool replaceShape = false);
     bool admitDrawKey(std::uint64_t key, std::uint64_t shape);
@@ -201,6 +203,7 @@ private:
     static bool drawRelocationEnabled();
     static std::uint64_t relocatedContentKey(const RelocatableUserWord& word, std::uint32_t value, bool& readable);
     static void applyShaderDataPatches(DispatchVariant& variant);
+    static void patchForwardedWords(ShaderRecompiler::RecompileResult& result, std::span<const std::pair<std::uint32_t, std::uint32_t>> patches);
     void learnPendingRelocation();
     void relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std::shared_ptr<DrawEntry>& entry, std::shared_ptr<const DrawDecode>& decode, std::vector<DrawUserPatch>& patches);
     void reportDrawRelocation();
