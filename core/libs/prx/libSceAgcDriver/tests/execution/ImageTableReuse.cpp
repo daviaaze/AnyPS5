@@ -340,7 +340,9 @@ void RunTests(AgcDriver::VulkanDevice& device, const GuestBlock& block, const Gu
     Require(Dispatch(device, result, 19) == Row(block.Texels(19)), "image table reuse: the original table sampled the moved record");
     Require(Dispatch(device, moved, 19) == Row(block.Texels(Moved)), "image table reuse: the moved table sampled the wrong entry when reused");
     Require(Dispatch(device, result, 21) == Row(block.Texels(21)), "image table reuse: the original table sampled the wrong entry when reused");
-    Expect(before, 2, 2, "two tables that differ in one record");
+    // The original table, remembered in the previous epoch, is reused after its ranges are
+    // collected and proved unchanged; only the moved table resolves.
+    Expect(before, 3, 1, "two tables that differ in one record");
     ExpectWrites(before, 0, 4, "two tables that differ in one record, alternating");
 
     SetOutput(block.Texels(13));

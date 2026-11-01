@@ -489,6 +489,11 @@ struct TextureCounters {
     std::array<std::atomic<std::uint64_t>, 14> tableDenied{};
     std::array<std::atomic<std::uint64_t>, 8> tableMiss{};
     std::array<std::atomic<std::uint64_t>, 4> tableStale{};
+    // Diagnostic split of TableCurrent failures right after resolution (tableDenied[11]):
+    // 0 expired texture, 1 zero guest bytes, 2 storage source uncached, 3 pending scan unstable,
+    // 4 pending GPU write overlaps (storage view), 5 overlaps (snapshot), 6 guest bytes changed
+    // with a zero query generation, 7 guest bytes changed with nonzero generations.
+    std::array<std::atomic<std::uint64_t>, 8> tableCurrentFail{};
     std::atomic<std::uint64_t> tableCpwNs{0};
     std::atomic<std::uint64_t> tableLookupNs{0};
     std::atomic<std::uint64_t> tableSlowCount{0};
@@ -537,6 +542,7 @@ void reportTextureCounters() {
     const auto count = [](const std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.load(std::memory_order_relaxed)); };
     AgcDriver::ProfilePrint_nid_no_patch("[textures] sampled created: %llu from storage images, %llu snapshots (%llu snapshot reads over recorded writes inside cachedTexture, %llu storage-path fallbacks); stage-A records %llu: %llu fast hits, %llu full lookups; storage images %llu hits, %llu created, %llu own-object refreshes; image tables %llu reused, %llu resolved; untracked snapshots %llu kept by the write-watch hint, %llu compared\n", count(counters.fromStorage), count(counters.snapshots), count(counters.pendingReads), count(counters.storageFallbacks), count(counters.records), count(counters.fastHits), count(counters.fastMisses), count(counters.storageHits), count(counters.storageCreated), count(counters.ownRefreshes), count(counters.tablesReused), count(counters.tablesResolved), count(counters.untrackedKept), count(counters.untrackedCompared));
     AgcDriver::ProfilePrint_nid_no_patch("[table-reuse-denied] first reason per resolved image table: epoch0 %llu, capacity %llu, written image %llu, no sampled binding %llu, no lookup record %llu, lookup returned another object %llu, dcc address with uncompressed keys %llu, snapshot generation or storage proof %llu, table state changed %llu, keys not uncompressed %llu, table no longer current %llu, storage pending serial changed %llu, state changed at the end %llu; lookups that did not reuse: written table %llu, no sampled binding %llu, no remembered table %llu, remembered table no longer current %llu, texture left the cache %llu, pending serial changed %llu; same table remembered but state differs: epoch %llu, unwatch serial %llu, allocations %llu, depth surfaces %llu\n", count(counters.tableDenied[1]), count(counters.tableDenied[2]), count(counters.tableDenied[3]), count(counters.tableDenied[4]), count(counters.tableDenied[5]), count(counters.tableDenied[6]), count(counters.tableDenied[7]), count(counters.tableDenied[8]), count(counters.tableDenied[9]), count(counters.tableDenied[10]), count(counters.tableDenied[11]), count(counters.tableDenied[12]), count(counters.tableDenied[13]), count(counters.tableMiss[1]), count(counters.tableMiss[2]), count(counters.tableMiss[3]), count(counters.tableMiss[4]), count(counters.tableMiss[5]), count(counters.tableMiss[6]), count(counters.tableStale[0]), count(counters.tableStale[1]), count(counters.tableStale[2]), count(counters.tableStale[3]));
+    AgcDriver::ProfilePrint_nid_no_patch("[table-current-fail] after resolution: expired %llu, zero bytes %llu, storage uncached %llu, pending scan unstable %llu, pending overlap storage %llu, pending overlap snapshot %llu, changed zero-generation %llu, changed %llu\n", count(counters.tableCurrentFail[0]), count(counters.tableCurrentFail[1]), count(counters.tableCurrentFail[2]), count(counters.tableCurrentFail[3]), count(counters.tableCurrentFail[4]), count(counters.tableCurrentFail[5]), count(counters.tableCurrentFail[6]), count(counters.tableCurrentFail[7]));
     AgcDriver::ProfilePrint_nid_no_patch("[table-element-time] sampled table elements (cumulative since start): pending-write completion %.1f ms, lookup %.1f ms; %llu elements over 20 ms took %.1f ms in total, slowest %.1f ms\n", counters.tableCpwNs.load(std::memory_order_relaxed) / 1e6, counters.tableLookupNs.load(std::memory_order_relaxed) / 1e6, count(counters.tableSlowCount), counters.tableSlowNs.load(std::memory_order_relaxed) / 1e6, counters.tableMaxNs.load(std::memory_order_relaxed) / 1e6);
     auto& waits = TableWaits::Get();
     std::string sites;
@@ -2055,6 +2061,11 @@ struct TableState {
     std::uint64_t allocations = 0;
     std::uint64_t depthSurfaces = 0;
     bool operator==(const TableState&) const = default;
+    // Everything but the collect epoch: a table from an earlier epoch stays a candidate, and
+    // TableCurrent collects its ranges' writes before the generation proof (the fast path's rule).
+    bool SameExceptEpoch(const TableState& other) const {
+        return unwatched == other.unwatched && allocations == other.allocations && depthSurfaces == other.depthSurfaces;
+    }
 };
 
 TableState CurrentTableState() {
@@ -2108,12 +2119,14 @@ ReusedTable* FindReusedTable(VkDevice device, const ShaderRecompiler::Descriptor
         TextureCounts().tableStale[field].fetch_add(1, std::memory_order_relaxed);
         break;
     }
-    std::erase_if(tables, [&](const ReusedTable& table) { return table.state != state; });
+    std::erase_if(tables, [&](const ReusedTable& table) { return !table.state.SameExceptEpoch(state); });
     for (auto& table : tables) {
         if (SameTable(table, device, binding)) return &table;
     }
     return nullptr;
 }
+
+thread_local std::size_t tableCurrentReason = 0;
 
 bool TableCurrent(ReusedTable& table) {
     auto& checks = table.pendingChecks;
@@ -2124,19 +2137,25 @@ bool TableCurrent(ReusedTable& table) {
         const auto texture = element.texture.lock();
         if (texture == nullptr) {
             checks.clear();
+            tableCurrentReason = 0;
             return false;
         }
         const auto& source = texture->SharedStorageSource();
         if (source != nullptr && texture->ViewsStorageImage()) {
             if (!source->Cached() || source->GuestBytes() == 0) {
                 checks.clear();
+                tableCurrentReason = 2;
                 return false;
             }
             const auto begin = source->Descriptor().baseAddress;
-            checks.push_back({begin, begin + source->GuestBytes(), source.get(), source.get(), false, nullptr});
+            // As the fast path's storage queries: the viewed image itself is exempt from the
+            // overlap scan whether or not it is pending; its guest generation (table.queries)
+            // proves the contents. Requiring it to be pending rejected every clean source.
+            checks.push_back({begin, begin + source->GuestBytes(), source.get(), nullptr, false, nullptr});
         } else {
             if (element.guestBytes == 0) {
                 checks.clear();
+                tableCurrentReason = 1;
                 return false;
             }
             checks.push_back({element.resource.baseAddress, element.resource.baseAddress + element.guestBytes, nullptr, nullptr, false, nullptr});
@@ -2145,9 +2164,27 @@ bool TableCurrent(ReusedTable& table) {
     const auto serial = StorageTexture::PendingSerial();
     const bool identities = StorageTexture::ScanPending(checks);
     const bool stable = identities && StorageTexture::PendingSerial() == serial;
-    const bool overlaps = std::any_of(checks.begin(), checks.end(), [](const auto& query) { return query.overlaps; });
+    const auto overlapping = std::find_if(checks.begin(), checks.end(), [](const auto& query) { return query.overlaps; });
+    const bool overlaps = overlapping != checks.end();
+    const bool storageOverlap = overlaps && overlapping->except != nullptr;
     checks.clear();
-    if (!stable || overlaps || !GuestMemory::UnchangedSinceAll(table.queries)) return false;
+    if (!stable) { tableCurrentReason = 3; return false; }
+    if (overlaps) { tableCurrentReason = storageOverlap ? 4 : 5; return false; }
+    // A table remembered in an earlier collect epoch has not seen this epoch's CPU writes to its
+    // ranges: collect them first, as the fast path does before its generation query. A fresh
+    // table (no remembered state yet) was just resolved through lookups that collected them.
+    const auto epoch = GuestMemory::ThreadCollectEpoch();
+    const bool earlier = table.state.epoch != 0 && table.state.epoch != epoch;
+    if (earlier) {
+        for (const auto& query : table.queries) {
+            if (GuestMemory::CollectWrites(query.address, query.bytes) == 0) { tableCurrentReason = 7; return false; }
+        }
+    }
+    if (!GuestMemory::UnchangedSinceAll(table.queries)) {
+        tableCurrentReason = std::any_of(table.queries.begin(), table.queries.end(), [](const auto& query) { return query.generation == 0; }) ? 6 : 7;
+        return false;
+    }
+    if (earlier) table.state.epoch = epoch;
     table.pendingSerial = serial;
     return true;
 }
@@ -5728,6 +5765,7 @@ void ShaderResources::resolveImageTables() {
         const bool pendingSame = tableCurrent && StorageTexture::PendingSerial() == fresh.pendingSerial;
         const bool remembered = pendingSame && CurrentTableState() == state;
         if (!remembered) counters.tableDenied[!reusable ? std::min<std::size_t>(denied, 11u) : !stateSame ? 9u : !tableCurrent ? 11u : !pendingSame ? 12u : 13u].fetch_add(1, std::memory_order_relaxed);
+        if (reusable && stateSame && !tableCurrent) counters.tableCurrentFail[tableCurrentReason].fetch_add(1, std::memory_order_relaxed);
         if (remembered) {
             fresh.device = context.device;
             fresh.state = state;
