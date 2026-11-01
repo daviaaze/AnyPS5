@@ -9655,7 +9655,31 @@ void verifyDecodeMemoAddressCanonicalization() {
         for (std::uint32_t index = 0; index < codes.size(); ++index) codes[index] = index;
         column.codes = SharedValues<std::uint32_t>(std::move(codes));
         column.words = SharedValues<DescriptorValue>(std::move(words));
-        return ResourceMaterializer::ResolveImageTables(info, snapshot, key);
+        const auto uncached = ResourceMaterializer::ResolveImageTables(info, snapshot, 0u);
+        auto cached = ResourceMaterializer::ResolveImageTables(info, snapshot, key);
+        require(cached.map == uncached.map && cached.faults == uncached.faults &&
+                cached.elements.size() == uncached.elements.size() && cached.samplers.size() == uncached.samplers.size() &&
+                cached.poison.size() == uncached.poison.size(), "memoized image mode: cached table structure differs from bypass");
+        for (std::size_t i = 0; i < cached.elements.size(); ++i) {
+            const auto& a = cached.elements[i];
+            const auto& b = uncached.elements[i];
+            require(std::tie(a.words, a.dimension, a.depthCompare, a.kind, a.samplers, a.atomic, a.atomic64) ==
+                    std::tie(b.words, b.dimension, b.depthCompare, b.kind, b.samplers, b.atomic, b.atomic64),
+                    "memoized image mode: cached element differs from bypass");
+        }
+        for (std::size_t i = 0; i < cached.samplers.size(); ++i) {
+            const auto& a = cached.samplers[i];
+            const auto& b = uncached.samplers[i];
+            require(std::tie(a.words, a.compare, a.point) == std::tie(b.words, b.compare, b.point),
+                    "memoized image mode: cached sampler differs from bypass");
+        }
+        for (std::size_t i = 0; i < cached.poison.size(); ++i) {
+            const auto& a = cached.poison[i];
+            const auto& b = uncached.poison[i];
+            require(std::tie(a.words, a.dwordCount, a.resource, a.reason) == std::tie(b.words, b.dwordCount, b.resource, b.reason),
+                    "memoized image mode: cached poison differs from bypass");
+        }
+        return cached;
     };
     const auto recordFlags = [](const ResolvedImageTables& result, std::uint32_t key) {
         const auto start = result.map.at(Abi::TableHeader(0u) + Abi::TableMapStart);
@@ -9679,6 +9703,22 @@ void verifyDecodeMemoAddressCanonicalization() {
     require(firstResult.elements.size() == 1u && secondResult.elements.size() == 1u && highResult.elements.size() == 1u &&
             firstResult.elements[0].words == first.dwords && secondResult.elements[0].words == second.dwords && highResult.elements[0].words == highAddress.dwords,
             "memoized image mode: address canonicalization changed emitted descriptor words");
+
+    // Reuse the artifact identity while changing only descriptor extent word 2.
+    for (std::uint32_t shape = 1u; shape <= 1024u; ++shape) {
+        auto extent = first;
+        extent.dwords[2] = shape | ((1023u - shape) << 14u) | ((shape & 0xfu) << 28u);
+        const auto fresh = resolve({first, extent, extent}, 0xdec0deu);
+        const auto start = fresh.map.at(Abi::TableHeader(0u) + Abi::TableMapStart);
+        for (std::uint32_t index = 0u; index < 3u; ++index) {
+            const auto record = fresh.map.at(start + index);
+            require(record != Abi::NullCode && recordFlags(fresh, index) == recordFlags(firstResult, 0u),
+                    "memoized image mode: extent map selected a null, poisoned, or different mode");
+            const auto element = fresh.map.at(record + Abi::ImageRecordElement);
+            require(fresh.elements.at(element).words == (index == 0u ? first.dwords : extent.dwords),
+                    "memoized image mode: extent map selected the wrong descriptor geometry");
+        }
+    }
 
     auto nullLow = descriptor(0u);
     nullLow.dwords[1] |= 1u;
@@ -9705,10 +9745,25 @@ void verifyDecodeMemoAddressCanonicalization() {
         const auto dimension = index == 2u ? RdnaImageDimension::Dim3D : RdnaImageDimension::Dim2D;
         require(mode.dimension == dimension && mode.numericClass == numeric, "memoized image mode: format, type, mip, or swizzle variant selected the wrong runtime mode");
     }
+    require(recordFlags(variants, 0u) != recordFlags(variants, 1u) &&
+            recordFlags(variants, 0u) != recordFlags(variants, 2u),
+            "memoized image mode: format and type controls did not cross mode boundaries");
     const auto invalidFlags = recordFlags(variants, 5u);
     require((invalidFlags & Abi::PoisonFlag) != 0u, "memoized image mode: an invalid volume mip range reused a valid mode");
     const auto& fault = variants.poison.at(invalidFlags & ~Abi::PoisonFlag);
     require(fault.reason == Abi::PoisonReason::Dimension && fault.words == invalidVolume.dwords, "memoized image mode: an invalid volume lost its Dimension poison or descriptor");
+    auto invalidExtent = invalidVolume;
+    invalidExtent.dwords[2] = 0xffffffffu;
+    const auto freshPoison = resolve({invalidVolume, invalidExtent}, 0xdec0deu);
+    require(freshPoison.faults == 2u, "memoized image mode: invalid extent variants did not each fault");
+    for (std::uint32_t index = 0u; index < 2u; ++index) {
+        const auto flags = recordFlags(freshPoison, index);
+        require((flags & Abi::PoisonFlag) != 0u, "memoized image mode: invalid extent reused a valid mode");
+        const auto& poison = freshPoison.poison.at(flags & ~Abi::PoisonFlag);
+        require(poison.reason == Abi::PoisonReason::Dimension &&
+                poison.words == (index == 0u ? invalidVolume.dwords : invalidExtent.dwords),
+                "memoized image mode: shared invalid mode decision lost fresh poison descriptor geometry");
+    }
 
 
 }

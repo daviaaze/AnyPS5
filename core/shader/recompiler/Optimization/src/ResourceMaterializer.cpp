@@ -1897,6 +1897,9 @@ std::uint32_t decodeTableEntry(const ImageResource& image, std::span<const Image
     // Runtime mode selection observes the address only through raw nullness.
     key.words[0] = nullImageDescriptor(words) ? 0u : 1u;
     key.words[1] &= ~0xffu;
+    // Extent/pitch word 2 does not participate in runtime mode or poison selection.
+    // Keep the original descriptor untouched for emitted records and element identity.
+    key.words[2] = 0u;
     HotDecodeMemo* hot = nullptr;
     std::size_t hash = 0;
     bool probeHot = false;
