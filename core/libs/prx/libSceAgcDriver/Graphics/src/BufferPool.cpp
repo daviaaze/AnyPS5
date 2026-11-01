@@ -792,12 +792,15 @@ void BufferPool::Put(const BufferAllocation& allocation) noexcept {
     try {
         std::unique_lock lock(mutex);
         auto& tier = tierFor(allocation.bytes, allocation.properties);
-        const bool hostGiant = &tier == &largeTier && (allocation.properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0 && allocation.allocationBytes > hostGiantLimit;
+        const bool unsupportedHostGiant = &tier == &largeTier &&
+            (allocation.properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0 &&
+            allocation.allocationBytes > hostGiantLimit &&
+            allocation.usage != VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
         const auto exceedsBudget = [&] {
             const auto reserved = &tier == &largeTier ? mediumSlabBytes : VkDeviceSize{0};
             return tier.retainedBytes + retainedCharge(allocation) + reserved > tier.budget;
         };
-        if (retainedCharge(allocation) > tier.budget || hostGiant) {
+        if (retainedCharge(allocation) > tier.budget || unsupportedHostGiant) {
             evicted.push_back(allocation);
         } else {
             while (tier.slots != 0 && (exceedsBudget() || tier.slots >= maxSlots)) {

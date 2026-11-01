@@ -202,7 +202,8 @@ private:
     // The small tier's own budget (slots of at most half a MiB each): pinned host memory the large
     // tier's budget does not count.
     static constexpr VkDeviceSize smallBudget = 64ull * 1024 * 1024;
-    // Rare host giants must not displace the texture staging working set.
+    // Above this size, only exact TRANSFER_SRC host buffers may be retained. They share the large
+    // tier budget and LRU with other allocations; near-size host-transfer lookup remains capped here.
     static constexpr VkDeviceSize hostGiantLimit = budget / 4u;
     // Requests of this size and more keep their exact size.
     static constexpr std::size_t classLimit = std::size_t{1} << 20u;

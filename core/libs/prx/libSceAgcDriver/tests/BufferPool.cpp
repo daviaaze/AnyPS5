@@ -399,27 +399,35 @@ void AddressablePoolSeparation() {
     Expect(MemoryOf(addressed.Handle()) != scratch && addressed.DeviceAddress() != 0, "an addressable device-local buffer took a scratch buffer without a device address");
 }
 
-void HostGiantKeepsWorkingSet() {
+
+void HostTransferGiantReuse() {
     mock = MockDevice{};
     auto context = mockContext();
-    constexpr auto usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-    VkDeviceMemory staging = VK_NULL_HANDLE;
+    constexpr auto bytes = 129 * MiB;
+    constexpr auto transfer = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    VkDeviceMemory retained = VK_NULL_HANDLE;
     {
-        Buffer texture(context, 2818048, usage, HostVisible);
-        staging = MemoryOf(texture.Handle());
+        Buffer first(context, bytes, transfer, HostVisible);
+        retained = MemoryOf(first.Handle());
+    }
+    const auto allocations = mock.allocations;
+    {
+        Buffer again(context, bytes, transfer, HostVisible);
+        Expect(MemoryOf(again.Handle()) == retained && mock.allocations == allocations,
+            "an exact host-visible transfer-source giant was not reused");
     }
     {
-        Buffer first(context, 120 * MiB, usage, HostVisible);
-        Buffer second(context, 120 * MiB + 4096, usage, HostVisible);
+        Buffer otherUsage(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, HostVisible);
     }
+    const auto otherUsageAllocations = mock.allocations;
     {
-        Buffer giant(context, 335544320, usage, HostVisible);
+        Buffer otherUsage(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, HostVisible);
+        Expect(mock.allocations == otherUsageAllocations + 1,
+            "a host-visible giant with non-exact transfer-source usage was retained");
     }
-    const auto made = mock.allocations;
-    Buffer again(context, 2818048, usage, HostVisible);
-    Expect(MemoryOf(again.Handle()) == staging && mock.allocations == made, "a host staging buffer over a quarter of the pool budget evicted the retained texture staging buffer");
-    Buffer giantAgain(context, 335544320, usage, HostVisible);
-    Expect(mock.allocations == made + 1, "a host staging buffer over a quarter of the pool budget was retained");
+    context.bufferPool.reset();
+    Expect(mock.liveBytes == 0 && mock.liveBuffers.empty() && mock.allocations == mock.frees,
+        "host transfer giant reuse test leaked resources");
 }
 
 void ColdHostEntriesYieldToLargeWorkingSet() {
@@ -1477,7 +1485,7 @@ int main(int argc, char** argv) {
             NearSizeHostCompatibility();
             NearSizeHostAlignedReuse();
             ColdHostEntriesYieldToLargeWorkingSet();
-            HostGiantKeepsWorkingSet();
+            HostTransferGiantReuse();
             return failures == 0 ? 0 : 1;
         }
         if (argc == 2) {
@@ -1495,11 +1503,11 @@ int main(int argc, char** argv) {
         SmallDeviceRetention();
         Budget();
         AddressablePoolSeparation();
-        HostGiantKeepsWorkingSet();
         ColdHostEntriesYieldToLargeWorkingSet();
         NearSizeHostStaging();
         NearSizeHostCompatibility();
         NearSizeHostAlignedReuse();
+        HostTransferGiantReuse();
         SmallDeviceClasses();
         SlabMetadataFailure();
         SlabMapFailure();
