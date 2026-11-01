@@ -1958,7 +1958,7 @@ struct ResolutionMemoEntry {
 
 struct ResolutionMemo {
     std::mutex mutex;
-    std::vector<ResolutionMemoEntry> entries;
+    std::vector<std::shared_ptr<const ResolutionMemoEntry>> entries;
 };
 
 ResolutionMemo& resolutionMemo() {
@@ -1970,12 +1970,16 @@ constexpr std::size_t ResolutionMemoEntries = 256;
 constexpr std::size_t ResolutionMemoVariantEntries = 4;
 constexpr std::size_t ResolutionMemoWords = std::size_t{1} << 23u;
 
-bool sameColumns(const std::vector<ImageTableColumnSnapshot>& left, const std::vector<ImageTableColumnSnapshot>& right) {
+bool sameColumns(const std::vector<ImageTableColumnSnapshot>& left, const std::vector<ImageTableColumnSnapshot>& right, bool compareContents) {
     if (left.size() != right.size()) return false;
     for (std::size_t index = 0; index < left.size(); index++) {
         const auto& a = left[index];
         const auto& b = right[index];
-        if (a.base != b.base || a.size != b.size || a.records != b.records || a.keys != b.keys || a.fault != b.fault || a.outside != b.outside || !a.codes.Shares(b.codes) || !a.words.Shares(b.words)) return false;
+        if (a.base != b.base || a.size != b.size || a.records != b.records || a.keys != b.keys || a.fault != b.fault || a.outside != b.outside) return false;
+        // Recapturing unchanged data may seal a fresh immutable backing.
+        // Full value equality is only attempted outside the memo mutex.
+        if (!a.codes.Shares(b.codes) && (!compareContents || a.codes != b.codes)) return false;
+        if (!a.words.Shares(b.words) && (!compareContents || a.words != b.words)) return false;
     }
     return true;
 }
@@ -2191,31 +2195,53 @@ std::shared_ptr<const ResolvedImageTables> ResourceMaterializer::ResolveImageTab
     auto reducing = reducingSamplers(info, snapshot);
     auto& memo = resolutionMemo();
     auto& totals = tableReuseTotals();
-    {
-        std::lock_guard lock(memo.mutex);
-        const auto found = std::find_if(memo.entries.begin(), memo.entries.end(), [&](const ResolutionMemoEntry& entry) { return entry.memoKey == memoKey && entry.reducing == reducing && sameColumns(entry.tables, snapshot.tables.tables); });
-        if (found != memo.entries.end()) {
-            std::rotate(memo.entries.begin(), found, found + 1);
-            totals.resolutionsShared.fetch_add(1, std::memory_order_relaxed);
-            return memo.entries.front().resolved;
+    std::unique_lock lookupLock(memo.mutex);
+    const auto found = std::find_if(memo.entries.begin(), memo.entries.end(), [&](const auto& entry) { return entry->memoKey == memoKey && entry->reducing == reducing && sameColumns(entry->tables, snapshot.tables.tables, false); });
+    if (found != memo.entries.end()) {
+        std::rotate(memo.entries.begin(), found, found + 1);
+        totals.resolutionsShared.fetch_add(1, std::memory_order_relaxed);
+        return memo.entries.front()->resolved;
+    }
+    std::array<std::shared_ptr<const ResolutionMemoEntry>, ResolutionMemoVariantEntries> candidates;
+    std::size_t candidateCount = 0;
+    for (const auto& entry : memo.entries) {
+        if (entry->memoKey != memoKey || entry->reducing != reducing) continue;
+        candidates[candidateCount++] = entry;
+        if (candidateCount == candidates.size()) break;
+    }
+    lookupLock.unlock();
+    // Retain only the bounded variant candidates, then compare immutable values
+    // without serializing other queues behind full equality.
+    for (std::size_t index = 0; index < candidateCount; ++index) {
+        const auto& candidate = candidates[index];
+        if (!sameColumns(candidate->tables, snapshot.tables.tables, true)) continue;
+        {
+            std::lock_guard lock(memo.mutex);
+            const auto found = std::find(memo.entries.begin(), memo.entries.end(), candidate);
+            if (found != memo.entries.end()) std::rotate(memo.entries.begin(), found, found + 1);
         }
+        totals.resolutionsShared.fetch_add(1, std::memory_order_relaxed);
+        return candidate->resolved;
     }
     auto resolved = std::make_shared<const ResolvedImageTables>(ResolveImageTables(info, snapshot, memoKey));
     totals.resolutions.fetch_add(1, std::memory_order_relaxed);
     const auto footprint = resolutionFootprint(*resolved, snapshot.tables.tables);
     if (footprint > ResolutionMemoWords) return resolved;
+    // Keep result ownership separate: callers do not retain snapshot columns
+    // after their memo entry has been evicted.
+    auto entry = std::make_shared<const ResolutionMemoEntry>(memoKey, snapshot.tables.tables, std::move(reducing), resolved, footprint);
     std::lock_guard lock(memo.mutex);
-    memo.entries.insert(memo.entries.begin(), ResolutionMemoEntry{memoKey, snapshot.tables.tables, std::move(reducing), resolved, footprint});
+    memo.entries.insert(memo.entries.begin(), std::move(entry));
     std::size_t kept = 0;
     std::size_t variantEntries = 0;
     std::size_t total = 0;
     for (std::size_t index = 0; index < memo.entries.size(); index++) {
-        auto& entry = memo.entries[index];
+        const auto& entry = *memo.entries[index];
         const bool sameVariant = entry.memoKey == memoKey;
         if ((sameVariant && variantEntries == ResolutionMemoVariantEntries) || kept == ResolutionMemoEntries || total + entry.footprint > ResolutionMemoWords) continue;
         if (sameVariant) variantEntries++;
         total += entry.footprint;
-        if (kept != index) memo.entries[kept] = std::move(entry);
+        if (kept != index) memo.entries[kept] = std::move(memo.entries[index]);
         kept++;
     }
     memo.entries.resize(kept);
