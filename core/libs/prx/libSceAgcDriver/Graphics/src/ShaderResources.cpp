@@ -350,8 +350,10 @@ std::vector<std::byte> spareSnapshot(TextureCache& cache, std::size_t bytes) {
     return {};
 }
 
-bool admitTexture(TextureCache& cache, const TextureKey& key, std::uint64_t incoming, std::uint64_t budget) {
-    const auto ceiling = budget + budget / 4u;
+std::uint64_t sampledBudget(const Context& context, TextureCache& cache, std::uint64_t required);
+
+bool admitTexture(const Context& context, TextureCache& cache, const TextureKey& key, std::uint64_t incoming, std::uint64_t& budget) {
+    auto ceiling = budget + budget / 4u;
     const auto fits = [&](std::uint64_t limit) { return cache.bytes <= limit && incoming <= limit - cache.bytes; };
     const auto fitsCombined = [&](std::uint64_t limit) {
         if (cache.bytes > limit || incoming > limit - cache.bytes) return false;
@@ -370,6 +372,7 @@ bool admitTexture(TextureCache& cache, const TextureKey& key, std::uint64_t inco
     }
     const bool scan = incoming != 0 && present != 0;
     const bool firstUse = scan && !cache.firstUses.contains(key);
+    bool triedColdReclaim = false;
     while (!cache.entries.empty() && !fits(budget)) {
         const auto back = std::prev(cache.entries.end());
         const bool over = !fits(ceiling);
@@ -385,6 +388,17 @@ bool admitTexture(TextureCache& cache, const TextureKey& key, std::uint64_t inco
         } else if (keep && !over) {
             break;
         } else {
+            if (!triedColdReclaim) {
+                triedColdReclaim = true;
+                const auto required = cache.bytes + std::min(incoming, std::numeric_limits<std::uint64_t>::max() - cache.bytes);
+                const auto reclaimedBudget = sampledBudget(context, cache, required);
+                if (reclaimedBudget != budget) {
+                    budget = reclaimedBudget;
+                    ceiling = budget + budget / 4u;
+                    if (incoming > ceiling) return false;
+                    continue;
+                }
+            }
             eraseTexture(cache, back);
             ++cache.counts.evicted;
         }
@@ -1175,9 +1189,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         counters.snapshots.fetch_add(1, std::memory_order_relaxed);
     }
     auto texture = entry.texture;
-    const auto required = cache.bytes + std::min(entry.accounted, std::numeric_limits<std::uint64_t>::max() - cache.bytes);
-    budget = sampledBudget(context, cache, required);
-    const bool admitted = admitTexture(cache, key, entry.accounted, budget);
+    const bool admitted = admitTexture(context, cache, key, entry.accounted, budget);
     const auto ceiling = budget + budget / 4u;
     if (!admitted) {
         if (entry.accounted == 0 || entry.accounted > ceiling || cache.overflowIndex.contains(key) || cache.bytes > ceiling - entry.accounted || cache.overflowBytes > ceiling - entry.accounted - cache.bytes) {
