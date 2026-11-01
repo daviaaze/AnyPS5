@@ -17,6 +17,9 @@ public:
     // Host-visible buffers only: a device-local one (properties without HOST_VISIBLE, the staging
     // shadows of GuestBufferMemory) has no mapping and its bytes move by GPU copies alone.
     std::span<std::byte> Bytes();
+    std::span<const std::byte> Bytes() const;
+    std::size_t Size() const { return size; }
+    void ReadCommitted(std::uint64_t address);
     bool Mapped() const { return mapping != nullptr; }
     void Invalidate();
 
@@ -39,6 +42,9 @@ private:
     VkBufferUsageFlags usage;
     VkMemoryPropertyFlags properties;
     std::uint32_t memoryType = 0;
+    std::size_t zeroBegin = 0, zeroEnd = 0;
+    bool zeroTracking = false;
+    bool mutableExposure = false;
     std::shared_ptr<BufferPool> cache;
 };
 

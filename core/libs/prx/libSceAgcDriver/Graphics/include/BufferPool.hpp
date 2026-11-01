@@ -33,6 +33,8 @@ struct BufferAllocation {
     bool slab = false;
     std::size_t bufferBytes = 0;
     std::uint32_t memoryType = 0;
+    std::size_t zeroBegin = 0;
+    std::size_t zeroEnd = 0;
 };
 
 struct SlabSlot {

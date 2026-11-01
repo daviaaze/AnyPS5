@@ -779,6 +779,14 @@ void ReadTextureSurface(const GuestTextureResource& resource, DccKeys keys, std:
     else FillDccClear(DccClearTextureFormat(resource.format), keys, resource.dccAlphaOnMsb, bytes);
     if (keys == DccKeys::ClearSingle) ExpandSingleBlocks(bytes, BytesPerElement(resource.format));
 }
+void ReadTextureSurface(const GuestTextureResource& resource, DccKeys keys, Buffer& buffer) {
+    if (keys != DccKeys::Uncompressed) {
+        ReadTextureSurface(resource, keys, buffer.Bytes());
+        return;
+    }
+    const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureRead);
+    buffer.ReadCommitted(resource.baseAddress);
+}
 
 bool SingleKeysReadable(const GuestTextureResource& resource) {
     return KeyBytes % BytesPerElement(resource.format) == 0;

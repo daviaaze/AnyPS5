@@ -2753,21 +2753,38 @@ bool equalsCommittedBytes(std::uint64_t address, const std::byte* expected, std:
 #endif
 }
 
-void copyCommitted(std::uint64_t address, std::span<std::byte> destination) {
+
+ZeroRange copyCommitted(std::uint64_t address, std::span<std::byte> destination, ZeroRange knownZeros = {}) {
+    if (knownZeros.begin >= knownZeros.end || knownZeros.begin >= destination.size()) knownZeros = {};
+    else knownZeros.end = std::min(knownZeros.end, destination.size());
+    const auto zero = [&](std::size_t begin, std::size_t end) {
+        const auto skipBegin = std::max(begin, knownZeros.begin), skipEnd = std::min(end, knownZeros.end);
+        if (skipBegin >= skipEnd) {
+            if (begin < end) std::memset(destination.data() + begin, 0, end - begin);
+        } else {
+            if (begin < skipBegin) std::memset(destination.data() + begin, 0, skipBegin - begin);
+            if (skipEnd < end) std::memset(destination.data() + skipEnd, 0, end - skipEnd);
+        }
+    };
     if (Accessible(reinterpret_cast<const void*>(address), destination.size())) {
         copyCommittedBytes(destination.data(), address, destination.size());
-        return;
+        return {};
     }
     std::size_t copied = 0;
     for (const auto& [begin, end] : CommittedRanges(address, destination.size())) {
         const auto offset = static_cast<std::size_t>(begin - address);
-        if (offset > copied) std::memset(destination.data() + copied, 0, offset - copied);
+        if (offset > copied) zero(copied, offset);
         const auto bytes = static_cast<std::size_t>(end - begin);
-        // The copy also initializes chunks that become unreadable on Windows.
+        // A Windows read can partially overwrite a range before failing; those chunks must
+        // always be zeroed by the ordinary guarded copy, regardless of prior destination bytes.
         copyCommittedBytes(destination.data() + offset, begin, bytes);
         copied = offset + bytes;
     }
-    if (copied < destination.size()) std::memset(destination.data() + copied, 0, destination.size() - copied);
+    if (copied < destination.size()) {
+        zero(copied, destination.size());
+        return {copied, destination.size()};
+    }
+    return {};
 }
 
 }
@@ -2779,6 +2796,15 @@ void ReadCommitted(std::uint64_t address, std::span<std::byte> destination) {
     const TimedAccess timed(CounterRead, destination.size());
     CountReadCaller(__builtin_return_address(0));
     copyCommitted(address, destination);
+}
+
+ZeroRange ReadCommittedWithKnownZeros(std::uint64_t address, std::span<std::byte> destination, ZeroRange knownZeros) {
+    if (destination.empty()) return {};
+    GuardRead(address, destination.size());
+    FlushGpuWrites(address, destination.size());
+    const TimedAccess timed(CounterRead, destination.size());
+    CountReadCaller(__builtin_return_address(0));
+    return copyCommitted(address, destination, knownZeros);
 }
 
 void ReadCommittedUnsynced(std::uint64_t address, std::span<std::byte> destination) {

@@ -1139,7 +1139,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         if (dropped) {
             parkSnapshot(cache, recycled);
             expireSpareSnapshots(cache, present);
-            if (preparedStaging != nullptr && preparedStaging->Bytes().size() == bytes) {
+            if (preparedStaging != nullptr && preparedStaging->Size() == bytes) {
                 staging = std::move(preparedStaging);
                 PreparedStagingUsed().fetch_add(1, std::memory_order_relaxed);
             } else {
@@ -1149,8 +1149,9 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             if (recycled.empty()) recycled = spareSnapshot(cache, bytes);
             entry.bytes = recycled.empty() ? std::vector<std::byte>(bytes) : std::move(recycled);
         }
-        const auto read = staging != nullptr ? staging->Bytes() : std::span<std::byte>(entry.bytes);
-        ReadTextureSurface(resource, *keys, read);
+        if (staging != nullptr) ReadTextureSurface(resource, *keys, *staging);
+        else ReadTextureSurface(resource, *keys, std::span<std::byte>(entry.bytes));
+        const auto read = staging != nullptr ? std::as_const(*staging).Bytes() : std::span<const std::byte>(entry.bytes);
         const auto readMs = profile ? std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - readStarted).count() : 0.0;
         if (!pending) entry.untracked = untracked;
         static const bool traceTextures = std::getenv("APS5_TRACE_TEXTURES") != nullptr;

@@ -96,6 +96,8 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
     const bool addressable = (usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0;
     Require(!addressable || context.bufferDeviceAddress, "buffer device address is not enabled");
     cache = GetBufferPool(context);
+    zeroTracking = this->usage == VK_BUFFER_USAGE_TRANSFER_SRC_BIT &&
+        (properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
     const auto allocation = cache->Take(size, this->usage, properties);
     timing.lap(timing.poolMs);
     if (allocation) {
@@ -111,6 +113,8 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
         offset = allocation->offset;
         slab = allocation->slab;
         timing.slab = slab;
+        zeroBegin = std::min(allocation->zeroBegin, size);
+        zeroEnd = std::min(allocation->zeroEnd, size);
 #ifdef __APPLE__
         ClearPooledTail(mapping, size, std::min<VkDeviceSize>(capacity, allocationBytes), properties);
 #endif
@@ -178,6 +182,8 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
                 memory = hostTransfer->memory;
                 mapping = hostTransfer->mapping;
                 allocationBytes = hostTransfer->allocationBytes;
+                zeroBegin = std::min(hostTransfer->zeroBegin, size);
+                zeroEnd = std::min(hostTransfer->zeroEnd, size);
 #ifdef __APPLE__
                 ClearPooledTail(mapping, size, allocationBytes, properties);
 #endif
@@ -254,9 +260,11 @@ Buffer::~Buffer() {
     release();
 }
 
+
 void Buffer::release() noexcept {
     if (ready && cache) {
-        cache->Put({buffer, memory, mapping, deviceAddress, allocationBytes, capacity, usage, properties, offset, slab, size, memoryType});
+        cache->Put({buffer, memory, mapping, deviceAddress, allocationBytes, capacity, usage, properties, offset, slab, size, memoryType,
+                    !mutableExposure && zeroTracking ? zeroBegin : 0, !mutableExposure && zeroTracking ? zeroEnd : 0});
         return;
     }
     if (slab) {
@@ -274,11 +282,30 @@ VkBuffer Buffer::Handle() const {
 }
 
 std::span<std::byte> Buffer::Bytes() {
+    mutableExposure = true;
+    zeroBegin = zeroEnd = 0;
+    zeroTracking = false;
     Require(mapping != nullptr, "device-local buffer has no host mapping");
     return {static_cast<std::byte*>(mapping), size};
 }
+std::span<const std::byte> Buffer::Bytes() const {
+    Require(mapping != nullptr, "device-local buffer has no host mapping");
+    return {static_cast<const std::byte*>(mapping), size};
+}
+void Buffer::ReadCommitted(std::uint64_t address) {
+    const auto previous = zeroTracking && !mutableExposure ? GuestMemory::ZeroRange{zeroBegin, zeroEnd} : GuestMemory::ZeroRange{};
+    zeroBegin = zeroEnd = 0;
+    Require(mapping != nullptr, "device-local buffer has no host mapping");
+    const auto zeros = GuestMemory::ReadCommittedWithKnownZeros(address, {static_cast<std::byte*>(mapping), size}, previous);
+    if (!mutableExposure && zeroTracking) {
+        zeroBegin = zeros.begin;
+        zeroEnd = zeros.end;
+    }
+}
 
 void Buffer::Invalidate() {
+    zeroBegin = zeroEnd = 0;
+    zeroTracking = false;
     Require(mapping != nullptr, "cannot invalidate an unmapped GPU buffer");
     VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
     range.memory = memory;
