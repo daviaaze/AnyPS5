@@ -492,8 +492,10 @@ struct TextureCounters {
     // Diagnostic split of TableCurrent failures right after resolution (tableDenied[11]):
     // 0 expired texture, 1 zero guest bytes, 2 storage source uncached, 3 pending scan unstable,
     // 4 pending GPU write overlaps (storage view), 5 overlaps (snapshot), 6 guest bytes changed
-    // with a zero query generation, 7 guest bytes changed with nonzero generations.
-    std::array<std::atomic<std::uint64_t>, 8> tableCurrentFail{};
+    // with a zero query generation, 7 guest bytes changed with nonzero generations, 8 DCC keys no
+    // longer prove uncompressed.
+    std::array<std::atomic<std::uint64_t>, 9> tableCurrentFail{};
+    std::array<std::atomic<std::uint64_t>, 7> tableProofFail{};
     std::atomic<std::uint64_t> tableCpwNs{0};
     std::atomic<std::uint64_t> tableLookupNs{0};
     std::atomic<std::uint64_t> tableSlowCount{0};
@@ -542,7 +544,8 @@ void reportTextureCounters() {
     const auto count = [](const std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.load(std::memory_order_relaxed)); };
     AgcDriver::ProfilePrint_nid_no_patch("[textures] sampled created: %llu from storage images, %llu snapshots (%llu snapshot reads over recorded writes inside cachedTexture, %llu storage-path fallbacks); stage-A records %llu: %llu fast hits, %llu full lookups; storage images %llu hits, %llu created, %llu own-object refreshes; image tables %llu reused, %llu resolved; untracked snapshots %llu kept by the write-watch hint, %llu compared\n", count(counters.fromStorage), count(counters.snapshots), count(counters.pendingReads), count(counters.storageFallbacks), count(counters.records), count(counters.fastHits), count(counters.fastMisses), count(counters.storageHits), count(counters.storageCreated), count(counters.ownRefreshes), count(counters.tablesReused), count(counters.tablesResolved), count(counters.untrackedKept), count(counters.untrackedCompared));
     AgcDriver::ProfilePrint_nid_no_patch("[table-reuse-denied] first reason per resolved image table: epoch0 %llu, capacity %llu, written image %llu, no sampled binding %llu, no lookup record %llu, lookup returned another object %llu, dcc address with uncompressed keys %llu, snapshot generation or storage proof %llu, table state changed %llu, keys not uncompressed %llu, table no longer current %llu, storage pending serial changed %llu, state changed at the end %llu; lookups that did not reuse: written table %llu, no sampled binding %llu, no remembered table %llu, remembered table no longer current %llu, texture left the cache %llu, pending serial changed %llu; same table remembered but state differs: epoch %llu, unwatch serial %llu, allocations %llu, depth surfaces %llu\n", count(counters.tableDenied[1]), count(counters.tableDenied[2]), count(counters.tableDenied[3]), count(counters.tableDenied[4]), count(counters.tableDenied[5]), count(counters.tableDenied[6]), count(counters.tableDenied[7]), count(counters.tableDenied[8]), count(counters.tableDenied[9]), count(counters.tableDenied[10]), count(counters.tableDenied[11]), count(counters.tableDenied[12]), count(counters.tableDenied[13]), count(counters.tableMiss[1]), count(counters.tableMiss[2]), count(counters.tableMiss[3]), count(counters.tableMiss[4]), count(counters.tableMiss[5]), count(counters.tableMiss[6]), count(counters.tableStale[0]), count(counters.tableStale[1]), count(counters.tableStale[2]), count(counters.tableStale[3]));
-    AgcDriver::ProfilePrint_nid_no_patch("[table-current-fail] after resolution: expired %llu, zero bytes %llu, storage uncached %llu, pending scan unstable %llu, pending overlap storage %llu, pending overlap snapshot %llu, changed zero-generation %llu, changed %llu\n", count(counters.tableCurrentFail[0]), count(counters.tableCurrentFail[1]), count(counters.tableCurrentFail[2]), count(counters.tableCurrentFail[3]), count(counters.tableCurrentFail[4]), count(counters.tableCurrentFail[5]), count(counters.tableCurrentFail[6]), count(counters.tableCurrentFail[7]));
+    AgcDriver::ProfilePrint_nid_no_patch("[table-current-fail] after resolution: expired %llu, zero bytes %llu, storage uncached %llu, pending scan unstable %llu, pending overlap storage %llu, pending overlap snapshot %llu, changed zero-generation %llu, changed %llu, dcc keys %llu\n", count(counters.tableCurrentFail[0]), count(counters.tableCurrentFail[1]), count(counters.tableCurrentFail[2]), count(counters.tableCurrentFail[3]), count(counters.tableCurrentFail[4]), count(counters.tableCurrentFail[5]), count(counters.tableCurrentFail[6]), count(counters.tableCurrentFail[7]), count(counters.tableCurrentFail[8]));
+    AgcDriver::ProfilePrint_nid_no_patch("[table-proof-fail] snapshot generation 0 %llu, storage view other base %llu, storage view smaller %llu, source uncached %llu, keys not served %llu, lookup other source %llu, view of non-storage %llu\n", count(counters.tableProofFail[0]), count(counters.tableProofFail[1]), count(counters.tableProofFail[2]), count(counters.tableProofFail[3]), count(counters.tableProofFail[4]), count(counters.tableProofFail[5]), count(counters.tableProofFail[6]));
     AgcDriver::ProfilePrint_nid_no_patch("[table-element-time] sampled table elements (cumulative since start): pending-write completion %.1f ms, lookup %.1f ms; %llu elements over 20 ms took %.1f ms in total, slowest %.1f ms\n", counters.tableCpwNs.load(std::memory_order_relaxed) / 1e6, counters.tableLookupNs.load(std::memory_order_relaxed) / 1e6, count(counters.tableSlowCount), counters.tableSlowNs.load(std::memory_order_relaxed) / 1e6, counters.tableMaxNs.load(std::memory_order_relaxed) / 1e6);
     auto& waits = TableWaits::Get();
     std::string sites;
@@ -2126,6 +2129,20 @@ ReusedTable* FindReusedTable(VkDevice device, const ShaderRecompiler::Descriptor
     return nullptr;
 }
 
+bool SameKeySurface(const StorageTexture* source, const GuestTextureResource& resource, std::uint64_t guestBytes);
+
+// A table element with DCC metadata stays usable only while its keys still prove uncompressed,
+// through the same proofs the fast path asks (its texture's, or its storage source's).
+bool TableElementKeysUncompressed(const ReusedTableElement& element, const Texture& texture, const StorageTexture* source) {
+    if (element.resource.dccAddress == 0) return true;
+    if (source != nullptr) {
+        if (source->ProvedKeys() != source->UploadedKeys() || !StorageImageServesKeys(*source, element.resource.dccAddress)) return false;
+        const auto keys = SameKeySurface(source, element.resource, element.guestBytes) ? source->ProvedKeys() : ProvedClearKeys(element.resource, element.guestBytes, texture.KeyProof());
+        return keys == DccKeys::Uncompressed;
+    }
+    return ProvedClearKeys(element.resource, element.guestBytes, texture.KeyProof()) == DccKeys::Uncompressed;
+}
+
 thread_local std::size_t tableCurrentReason = 0;
 
 bool TableCurrent(ReusedTable& table) {
@@ -2159,6 +2176,11 @@ bool TableCurrent(ReusedTable& table) {
                 return false;
             }
             checks.push_back({element.resource.baseAddress, element.resource.baseAddress + element.guestBytes, nullptr, nullptr, false, nullptr});
+        }
+        if (!TableElementKeysUncompressed(element, *texture, source != nullptr && texture->ViewsStorageImage() ? source.get() : nullptr)) {
+            checks.clear();
+            tableCurrentReason = 8;
+            return false;
         }
     }
     const auto serial = StorageTexture::PendingSerial();
@@ -5747,10 +5769,21 @@ void ShaderResources::resolveImageTables() {
                 const bool exactStorageView = source != nullptr && texture->ViewsStorageImage() && source->Cached() &&
                         source->Descriptor().baseAddress == resource.baseAddress && source->GuestBytes() >= guestBytes &&
                         StorageImageServesKeys(*source, resource.dccAddress);
+                // DCC metadata is no bar while the lookup proved the keys uncompressed: TableCurrent
+                // re-proves them (TableElementKeysUncompressed) before every reuse.
                 const bool snapshotCurrent = looked != nullptr && looked->source == nullptr && looked->generation != 0 &&
-                        looked->keys == DccKeys::Uncompressed && resource.dccAddress == 0;
-                const bool storageCurrent = exactStorageView && looked != nullptr && looked->source == source.get() && resource.dccAddress == 0;
+                        looked->keys == DccKeys::Uncompressed;
+                const bool storageCurrent = exactStorageView && looked != nullptr && looked->source == source.get();
                 if (!(looked != nullptr && looked->object == texture.get() && (snapshotCurrent || storageCurrent))) deny(looked == nullptr ? 5u : looked->object != texture.get() ? 6u : looked->keys != DccKeys::Uncompressed ? 10u : resource.dccAddress != 0 ? 7u : 8u);
+                if (looked != nullptr && looked->object == texture.get() && !snapshotCurrent && !storageCurrent && looked->keys == DccKeys::Uncompressed) {
+                    // Diagnostic split of deny 8: 0 snapshot with generation 0, 1 storage view of
+                    // another base, 2 storage view smaller than the surface, 3 source uncached,
+                    // 4 keys not served, 5 lookup named another source, 6 view not of a storage image.
+                    const std::size_t why = source == nullptr ? 0u : !texture->ViewsStorageImage() ? 6u : !source->Cached() ? 3u :
+                            source->Descriptor().baseAddress != resource.baseAddress ? 1u : source->GuestBytes() < guestBytes ? 2u :
+                            !StorageImageServesKeys(*source, resource.dccAddress) ? 4u : 5u;
+                    counters.tableProofFail[why].fetch_add(1, std::memory_order_relaxed);
+                }
                 if (reusable) {
                     fresh.elements.push_back({MakeTextureKey(context.device, sampledWords, components, depthCompare), texture, resource, guestBytes, firstLayer, false, {}});
                     const auto generation = storageCurrent ? source->GenerationFor(resource.baseAddress, static_cast<std::size_t>(guestBytes)) : looked->generation;
