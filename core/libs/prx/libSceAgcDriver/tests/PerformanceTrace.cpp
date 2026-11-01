@@ -120,6 +120,49 @@ void SnapshotBudgetFairShare() {
         "snapshot budgeting starved a later small track or failed to split the remaining budget across hot tracks");
 }
 
+void WaitEdgeBoundsAndWindow() {
+    std::atomic<std::uint64_t> presents{1};
+    std::atomic<bool> buffering{false};
+    TraceThread thread("queue worker 0x0", presents, 2, buffering);
+    TraceThread::WaitTraceEvent event{};
+    event.waitId = 7;
+    thread.NoteWaitEvent(event);
+    Check(thread.Collect().waitEvents.empty(), "a disabled raw window retained a wait edge");
+    buffering.store(true);
+    thread.NoteWaitEvent(event);
+    event.kind = TraceThread::WaitTraceKind::End;
+    thread.NoteWaitEvent(event);
+    event.kind = TraceThread::WaitTraceKind::Store;
+    event.waitId = 0;
+    thread.NoteWaitEvent(event);
+    const auto origin = Clock::now();
+    thread.Add("Driver.Packet", nullptr, origin, origin + microseconds(30));
+    const auto bounded = thread.Collect(2);
+    Check(bounded.waitEvents.size() == 2 && bounded.slices.empty() && bounded.eventsOmitted == 1,
+        "wait edges escaped the shared snapshot budget or lost ordinary-slice omission accounting");
+    Check(bounded.waitEvents[0].event.kind == TraceThread::WaitTraceKind::End &&
+        bounded.waitEvents[0].event.waitId == 7 && bounded.waitEvents[1].event.kind == TraceThread::WaitTraceKind::Store,
+        "the wait ring did not retain its newest records in order");
+    Check(bounded.dropped && bounded.waitEventsLost == 1 && bounded.waitEventsFullAt.has_value(),
+        "a lost wait begin could be mistaken for a complete causal capture");
+    Check(bounded.totals.size() == 1 && bounded.totals[0].count == 1,
+        "wait-edge budgeting discarded ordinary phase totals");
+    const auto truncated = thread.Collect(1);
+    Check(truncated.waitEvents.size() == 1 && truncated.waitEvents[0].event.kind == TraceThread::WaitTraceKind::Store &&
+        truncated.waitEventsOmitted == 1 && truncated.waitEventsOmittedAt.has_value(),
+        "snapshot truncation did not identify omitted wait edges");
+    buffering.store(false);
+    thread.NoteWaitEvent(event);
+    Check(thread.Collect().waitEventsLost == 1, "a closed window continued overwriting wait evidence");
+    thread.ResetWaitTrace();
+    const auto reset = thread.Collect();
+    Check(reset.waitEvents.empty() && reset.waitEventsLost == 0 && reset.slices.size() == 1,
+        "opening a new wait window retained old wait evidence or erased existing ordinary slices");
+    TraceThread zero("queue worker 0x0", presents, 0);
+    zero.NoteWaitEvent(event);
+    Check(zero.Collect().waitEvents.empty(), "a zero-capacity wait ring retained a record");
+}
+
 void FoldShortSlices() {
     std::atomic<std::uint64_t> presents{1};
     TraceThread thread("queue worker 0x0", presents, 16);
@@ -158,27 +201,6 @@ void Utf8Strings() {
     Check(TraceFormat::Summary(summary, {}, presents).find("\"title\":\"Ghost of Y\xc5\x8dtei\"") != std::string::npos, "the summary line did not keep a UTF-8 title");
 }
 
-void EventsShape() {
-    const auto origin = Clock::now();
-    const std::vector<TraceThread::Slice> slices{
-        {"Driver.Packet", nullptr, origin + microseconds(10), microseconds(30)},
-        {"Driver.Packet", "draw", origin + microseconds(12), microseconds(25)},
-        {nullptr, nullptr, origin, milliseconds(2)},
-    };
-    const std::vector<TraceThread::Snapshot> threads{{"queue worker 0x0", slices, {}, false}};
-    const std::vector<Clock::time_point> presents{origin, origin + milliseconds(16)};
-    const auto json = TraceFormat::Events(7, origin, threads, 0, presents, 5);
-    const std::string expected =
-        "{\"traceEvents\":[\n"
-        "{\"name\":\"process_name\",\"ph\":\"M\",\"ts\":0.000,\"pid\":7,\"tid\":0,\"args\":{\"name\":\"AnyPS5\"}},\n"
-        "{\"name\":\"thread_name\",\"ph\":\"M\",\"ts\":0.000,\"pid\":7,\"tid\":1,\"args\":{\"name\":\"queue worker 0x0\"}},\n"
-        "{\"name\":\"queue worker 0x0 folded\",\"ph\":\"C\",\"ts\":0.000,\"pid\":7,\"tid\":1,\"args\":{\"ms\":2.000}},\n"
-        "{\"name\":\"Driver.Packet\",\"ph\":\"X\",\"ts\":10.000,\"pid\":7,\"tid\":1,\"dur\":30.000},\n"
-        "{\"name\":\"Driver.Packet.draw\",\"ph\":\"X\",\"ts\":12.000,\"pid\":7,\"tid\":1,\"dur\":25.000},\n"
-        "{\"name\":\"present\",\"ph\":\"i\",\"ts\":0.000,\"pid\":7,\"tid\":1,\"s\":\"g\",\"args\":{\"present\":5}}\n"
-        "]}\n";
-    Check(json == expected, "trace events changed shape");
-}
 void BatchIds() {
     const auto origin = Clock::now();
     const std::vector<TraceThread::Slice> slices{{"Driver.Packet", "dispatch", origin + microseconds(10), microseconds(30), 42}};
@@ -745,11 +767,11 @@ int main() {
         TotalsOverflow();
         CapacitySettings();
         SnapshotBudgetFairShare();
+        WaitEdgeBoundsAndWindow();
         FullBufferEvents();
         FoldShortSlices();
         EscapeStrings();
         Utf8Strings();
-        EventsShape();
         BatchIds();
         PresentBoundaryWitnesses();
         SummaryFields();

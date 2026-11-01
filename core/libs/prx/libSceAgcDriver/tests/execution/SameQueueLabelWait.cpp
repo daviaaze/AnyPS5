@@ -1,7 +1,9 @@
 #include "VulkanTestDevice.hpp"
-#include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
+#include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -19,6 +21,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -38,6 +41,7 @@ struct Slot {
     alignas(256) std::array<std::uint32_t, 4> spinOutput{};
     alignas(256) std::array<std::uint32_t, 4> spinDescriptor{};
     alignas(256) volatile std::uint32_t label = 0;
+    alignas(8) volatile std::uint64_t wideLabel = 0;
     alignas(256) volatile std::uint32_t done = 0;
     alignas(256) volatile std::uint32_t gate = 0;
 };
@@ -109,6 +113,12 @@ void WaitEqual(std::vector<std::uint32_t>& words, volatile std::uint32_t* target
     words.insert(words.end(), {0xc0053c00u, 0x13u, Low(target), High(target), value, 0xffffffffu, 0x19u});
 }
 
+void WaitEqual64(std::vector<std::uint32_t>& words, volatile std::uint64_t* target, std::uint64_t value) {
+    const auto address = reinterpret_cast<std::uintptr_t>(target);
+    words.insert(words.end(), {0xc0079300u, 0x13u, static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u),
+        static_cast<std::uint32_t>(value), static_cast<std::uint32_t>(value >> 32u), 0xffffffffu, 0xffffffffu, 0x19u});
+}
+
 std::uint64_t Run(Slot& slot, std::uint32_t value, bool wait) {
     slot.spinDescriptor = {Low(slot.spinOutput.data()), High(slot.spinOutput.data()) & 0xffffu, sizeof(slot.spinOutput), 0x31016facu};
     slot.done = 0;
@@ -161,15 +171,81 @@ std::uint64_t RunLanded(Slot& slot, std::uint32_t value, bool wait) {
     return AgcDriver::GuestMemory::CollectEpochBumps() - before;
 }
 
+void SubmitWords(std::vector<std::uint32_t>& words, std::uint32_t queue) {
+    Packet packet{words.data(), static_cast<std::uint32_t>(words.size()), 0, {}};
+    Require((queue == 0 ? sceAgcDriverSubmitDcb(&packet) : sceAgcDriverSubmitAcb(queue, &packet)) == 0, "wait-edge fixture submit failed");
 }
 
-int main() {
+void WaitFor(volatile std::uint32_t& value, std::uint32_t expected, const char* message) {
+    const auto start = std::chrono::steady_clock::now();
+    while (value != expected) {
+        Require(std::chrono::steady_clock::now() - start < std::chrono::seconds(10), message);
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+}
+
+void RunWaitEdgeTrace(Slot& slot, const AgcDriver::VulkanDevice* traceDevice) {
+    constexpr std::uint32_t expected = 0x12345678u;
+    slot.spinDescriptor = {Low(slot.spinOutput.data()), High(slot.spinOutput.data()) & 0xffffu, sizeof(slot.spinOutput), 0x31016facu};
+    slot.label = 0;
+    slot.done = 0;
+    slot.gate = 0;
+    AgcDriverWaitIdle_nid_postfix();
+    AgcDriver::PerformanceTrace::Present(1, 1, traceDevice);
+
+    std::vector<std::uint32_t> waitWords;
+    WriteData(waitWords, &slot.done, 1);
+    WaitEqual(waitWords, &slot.label, expected);
+    WriteData(waitWords, &slot.done, 2);
+    SubmitWords(waitWords, 0);
+    WaitFor(slot.done, 1, "queue 0 did not reach the pre-wait marker");
+
+    std::vector<std::uint32_t> wrongWords;
+    WriteData(wrongWords, &slot.gate, expected);
+    WriteData(wrongWords, &slot.label, expected - 1);
+    WriteData(wrongWords, &slot.gate, 0x87654321u);
+    WriteData(wrongWords, &slot.gate, 1);
+    SubmitWords(wrongWords, 0x20);
+    WaitFor(slot.gate, 1, "the wrong-value writer did not complete");
+    Require(slot.done == 1, "a wrong-address or wrong-value write satisfied the wait");
+
+    std::vector<std::uint32_t> matchingWords;
+    Dispatch(matchingWords, SpinCode.data(), {Low(slot.spinDescriptor.data()), High(slot.spinDescriptor.data()), SpinIterations});
+    ReleaseLabel(matchingWords, &slot.label, expected);
+    SubmitWords(matchingWords, 0x20);
+    WaitFor(slot.done, 2, "the matching writer did not release the blocked wait");
+    AgcDriverWaitIdle_nid_postfix();
+    Require(slot.label == expected, "matching writer value was not stored");
+    constexpr std::uint64_t wideExpected = 0x1122334455667788ull;
+    slot.wideLabel = wideExpected;
+    slot.done = 0;
+    std::vector<std::uint32_t> entrySatisfiedWords;
+    WaitEqual64(entrySatisfiedWords, &slot.wideLabel, wideExpected);
+    WriteData(entrySatisfiedWords, &slot.done, 3);
+    SubmitWords(entrySatisfiedWords, 0);
+    WaitFor(slot.done, 3, "the already-satisfied 64-bit wait did not complete");
+    AgcDriverWaitIdle_nid_postfix();
+    Require(slot.wideLabel == wideExpected, "the 64-bit entry value changed");
+    AgcDriver::PerformanceTrace::Present(1, 1, traceDevice);
+    AgcDriver::PerformanceTrace::StopOutput();
+    std::cout << "wait-edge blocked transition passed: wrong-address/value held; matching queue 0x20 store released queue 0x0 wait; expected 0x"
+              << std::hex << expected << std::dec << '\n';
+}
+
+}
+
+int main(int argc, char** argv) {
     try {
         auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
-        device.reset();
         GuestBlock block;
         auto& slot = block.Data();
+        if (argc == 2 && std::string_view(argv[1]) == "wait-edge-trace") {
+            RunWaitEdgeTrace(slot, device.get());
+            AgcDriverShutdown_nid_postfix();
+            return 0;
+        }
+        device.reset();
         Run(slot, 1, false);
         std::uint64_t extra = ~std::uint64_t{0};
         for (std::uint32_t attempt = 0; attempt < 3; ++attempt) {

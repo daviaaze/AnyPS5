@@ -15,8 +15,9 @@
 #include "prx/libSceAgcDriver/Graphics/shaders/SampleCounter_spv.h"
 #include "prx/libSceAgcDriver/Graphics/shaders/SampleDumps_spv.h"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
-#include "prx/libSceAgcDriver/Execution/include/PerformanceOverlay.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PerformanceOverlay.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4Opcodes.hpp"
 #include "prx/libc/include/CpuTopology.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -1743,6 +1744,32 @@ void Recorder::ensureOpen() {
 void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const std::byte> bytes, std::uint64_t address) {
     if (bytes.empty()) return;
     ensureOpen();
+    struct StoreTrace {
+        Recorder& recorder;
+        std::span<const std::byte> bytes;
+        std::uint64_t address;
+        int exceptions = std::uncaught_exceptions();
+        ~StoreTrace() {
+            if (std::uncaught_exceptions() != exceptions) return;
+            if (auto* thread = PerformanceTrace::Thread(); thread != nullptr) {
+                TraceThread::WaitTraceEvent event{};
+                event.kind = TraceThread::WaitTraceKind::Store;
+                event.address = address;
+                event.width = static_cast<std::uint32_t>(bytes.size());
+                event.queue = GuestMemory::GpuLockThreadTag();
+                if (event.queue != std::numeric_limits<std::uint32_t>::max()) event.producerQueue = event.queue;
+                event.contextBatch = TraceBatchTag;
+                event.gpuBatch = recorder.open->traceId;
+                if (bytes.size() <= sizeof(event.value)) {
+                    std::memcpy(&event.value, bytes.data(), bytes.size());
+                    event.valueKnown = true;
+                }
+                thread->NoteWaitEvent(event);
+            }
+        }
+    };
+    std::optional<StoreTrace> storeTrace;
+    if (PerformanceTrace::CapturingRawWindow()) storeTrace.emplace(*this, bytes, address);
     auto& run = open->run;
     const VkDeviceSize end = offset + bytes.size();
     storeCount.fetch_add(1, std::memory_order_relaxed);

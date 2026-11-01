@@ -6,8 +6,11 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <cstdlib>
+#include <exception>
+#include <optional>
 #include <mutex>
 #include <set>
 #ifdef _WIN32
@@ -107,6 +110,7 @@ void Driver::landPendingWaits(std::uint32_t queue) {
 
 void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t queue, const PacketHistory& context, std::uint64_t received, bool heldAtSubmit, bool requireMemory) {
 
+
     auto start = std::chrono::steady_clock::now();
     auto lastDone = packetsDone.load();
 
@@ -116,6 +120,49 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     const std::size_t awaitedBytes = Pm4::WaitAwaitedBytes(packet);
     const auto alignMask = awaitedBytes == 8 ? ~7ull : ~3ull;
     const std::uint64_t awaited = (packet[2] & static_cast<std::uint32_t>(alignMask)) | (static_cast<std::uint64_t>(packet[3]) << 32u);
+    using TraceOutcome = TraceThread::WaitTraceOutcome;
+    struct WaitScope {
+        TraceThread& thread;
+        TraceThread::WaitTraceEvent event{};
+        int exceptions = std::uncaught_exceptions();
+        explicit WaitScope(TraceThread& thread) : thread(thread) {}
+        ~WaitScope() {
+            event.kind = TraceThread::WaitTraceKind::End;
+            if (std::uncaught_exceptions() > exceptions) event.outcome = TraceOutcome::Exception;
+            thread.NoteWaitEvent(event);
+        }
+    };
+    std::optional<WaitScope> waitScope;
+    if (PerformanceTrace::CapturingRawWindow()) {
+        if (auto* thread = PerformanceTrace::Thread(); thread != nullptr) {
+            waitScope.emplace(*thread);
+            auto& event = waitScope->event;
+            event.waitId = thread->NextWaitId();
+            event.contextBatch = TraceBatchTag;
+            event.address = awaited;
+            event.queue = queue;
+            event.width = static_cast<std::uint32_t>(awaitedBytes);
+            event.function = packet[1] & 7u;
+            event.reference = wide ? packet[4] | (static_cast<std::uint64_t>(packet[5]) << 32u) : packet[4];
+            event.mask = wide ? packet[6] | (static_cast<std::uint64_t>(packet[7]) << 32u) : packet[5];
+            thread->NoteWaitEvent(event);
+        }
+    }
+    const auto traceOutcome = [&](TraceOutcome outcome, bool observedMemory = false) {
+        if (!waitScope) return;
+        waitScope->event.outcome = outcome;
+        if (!observedMemory) waitScope->event.valueKnown = false;
+    };
+    const auto waitSatisfied = [&] {
+        if (!waitScope) return Pm4::WaitSatisfiedUnchecked(packet);
+        // Replace the existing comparison's one volatile read; tracing adds no guest read.
+        const std::uint64_t value = awaitedBytes == 8
+            ? *reinterpret_cast<const volatile std::uint64_t*>(awaited)
+            : *reinterpret_cast<const volatile std::uint32_t*>(awaited);
+        waitScope->event.value = value;
+        waitScope->event.valueKnown = true;
+        return Pm4::WaitComparesValue(packet, value);
+    };
     static const bool traceGpu = std::getenv("APS5_TRACE_GPU") != nullptr;
     if (traceGpu) std::fprintf(stderr, "[gpu] %.1f queue 0x%x waits 0x%llx == 0x%x (now 0x%x)\n", TraceMs(), queue, static_cast<unsigned long long>(awaited), packet[4],
                                *reinterpret_cast<const volatile std::uint32_t*>(awaited));
@@ -140,16 +187,20 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         return !requireMemory && storedSince(packet, awaited, awaitedBytes, received, queue, &writer) && writer == queue;
     };
     GuestMemory::CheckRange(reinterpret_cast<const void*>(awaited), awaitedBytes, awaitedBytes);
-    if (Pm4::WaitSatisfiedUnchecked(packet)) {
+    if (waitSatisfied()) {
+        traceOutcome(TraceOutcome::EntrySatisfied, true);
         ++outcomes.atEntry;
         if (storedByOwnLabel()) epochPoint.bump = false;
         return;
     }
     if (heldAtSubmit) {
+        traceOutcome(TraceOutcome::HeldAtSubmit);
         ++outcomes.heldAtSubmit;
         return;
     }
     if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, queue, &writer)) {
+        traceOutcome(TraceOutcome::TrackedWrite);
+        if (waitScope) waitScope->event.producerQueue = writer;
         ++outcomes.trackedWrite;
         if (writer != queue) notePendingWait(packet, queue, received);
         else epochPoint.bump = false;
@@ -188,6 +239,12 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             }
             ++outcomes.fromRecorderLate;
             if (trace) traceLate("trusted", hit, refusal);
+        }
+        traceOutcome(TraceOutcome::LabelShortcut);
+        if (waitScope) {
+            waitScope->event.producerQueue = hit->queue;
+            waitScope->event.labelStamp = hit->stamp;
+            waitScope->event.labelGeneration = hit->generation;
         }
         ++(polling ? outcomes.fromRecorderPolling : outcomes.fromRecorder);
         ++outcomes.labelFlushes;
@@ -357,8 +414,10 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     bool spinning = pauseSpin;
     std::uint32_t polls = 0;
     StallWatch stall(queue);
-    while (!Pm4::WaitSatisfiedUnchecked(packet)) {
+    while (!waitSatisfied()) {
         if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, queue, &writer)) {
+            traceOutcome(TraceOutcome::TrackedWrite);
+            if (waitScope) waitScope->event.producerQueue = writer;
             ++outcomes.trackedWrite;
             if (writer != queue) notePendingWait(packet, queue, received);
             else epochPoint.bump = false;
@@ -381,7 +440,10 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         if (requireMemory && (polls & 15u) == 0) {
             std::unique_lock settleLock(GuestMemory::GpuMutex(), std::try_to_lock);
             if (settleLock.owns_lock()) {
-                if (const auto localDevice = device.Load(); localDevice != nullptr && localDevice->RecordedWritesSettled(awaited, awaitedBytes)) return;
+                if (const auto localDevice = device.Load(); localDevice != nullptr && localDevice->RecordedWritesSettled(awaited, awaitedBytes)) {
+                    traceOutcome(TraceOutcome::Landed);
+                    return;
+                }
             }
         }
         if (const auto done = packetsDone.load(); done != lastDone || (!requireMemory && packetsInFlight.load() != 0)) {
@@ -427,6 +489,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             context.Print(stderr, "[gpu]   preceding packet %s\n");
         }
     }
+    traceOutcome(requireMemory ? TraceOutcome::Landed : TraceOutcome::PollingSatisfied, true);
     ++outcomes.polled;
     if (storedByOwnLabel()) epochPoint.bump = false;
 }

@@ -546,6 +546,7 @@ void PerformanceTrace::Present(std::uint32_t width, std::uint32_t height, const 
             state.latestGpuClock.reset();
         }
         PerformanceTrace::ResetGpuRanges(TraceThread::ParseCapacity(std::getenv("APS5_TRACE_EVENTS")));
+        for (const auto& thread : state.threads) thread->ResetWaitTrace();
         state.presents.push_back(now);
         presentCount.fetch_add(1, std::memory_order_relaxed);
         buffering.store(true, std::memory_order_relaxed);

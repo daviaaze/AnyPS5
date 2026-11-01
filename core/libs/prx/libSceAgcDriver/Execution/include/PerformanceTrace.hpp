@@ -174,6 +174,31 @@ public:
         std::uint64_t count;
     };
 
+    enum class WaitTraceKind : std::uint8_t { Begin, End, Store, AcceptedStore };
+    enum class WaitTraceOutcome : std::uint8_t { Pending, EntrySatisfied, HeldAtSubmit, TrackedWrite, LabelShortcut, PollingSatisfied, Landed, Exception };
+    struct WaitTraceEvent {
+        WaitTraceKind kind = WaitTraceKind::Begin;
+        WaitTraceOutcome outcome = WaitTraceOutcome::Pending;
+        std::uint64_t waitId = 0;
+        std::uint64_t contextBatch = 0;
+        std::uint64_t address = 0;
+        std::uint64_t reference = 0;
+        std::uint64_t mask = 0;
+        std::uint64_t value = 0;
+        std::uint64_t producerQueue = std::numeric_limits<std::uint64_t>::max();
+        std::uint64_t labelStamp = 0;
+        std::uint64_t labelGeneration = 0;
+        std::uint64_t gpuBatch = 0;
+        std::uint32_t width = 0;
+        std::uint32_t function = 0;
+        std::uint32_t queue = std::numeric_limits<std::uint32_t>::max();
+        bool valueKnown = false;
+    };
+    struct WaitTraceRecord {
+        WaitTraceEvent event;
+        Clock::time_point at{};
+    };
+
     struct Snapshot {
         std::string name;
         std::vector<Slice> slices;
@@ -187,12 +212,56 @@ public:
         std::uint64_t eventsOmitted = 0;
         std::optional<Clock::time_point> eventsOmittedAt;
         std::optional<Clock::time_point> retainedThrough;
+        std::vector<WaitTraceRecord> waitEvents;
+        std::uint64_t waitEventsLost = 0;
+        std::optional<Clock::time_point> waitEventsFullAt;
+        std::uint64_t waitEventsOmitted = 0;
+        std::optional<Clock::time_point> waitEventsOmittedAt;
     };
+    void ResetWaitTrace() {
+        std::lock_guard lock(eventMutex);
+        waitUsed = 0;
+        waitTotal = 0;
+        waitLost = 0;
+        waitFirstLost = {};
+        nextWaitId = 0;
+    }
+    static constexpr std::size_t WaitEventCapacity = 4096;
+
+
+    void NoteWaitEvent(const WaitTraceEvent& event) {
+        if (!buffering.load(std::memory_order_relaxed)) return;
+        const auto at = Clock::now();
+        std::lock_guard lock(eventMutex);
+        if (!buffering.load(std::memory_order_relaxed)) return;
+        const auto limit = std::min(capacity, WaitEventCapacity);
+        if (limit == 0) return;
+        if (waitUsed < limit) {
+            waitEvents[waitUsed++] = {event, at};
+            ++waitTotal;
+            return;
+        }
+        if (waitLost == 0) waitFirstLost = at;
+        waitEvents[static_cast<std::size_t>(waitLost % limit)] = {event, at};
+        ++waitLost;
+        ++waitTotal;
+    }
+
+    std::size_t BufferedEventCount() const {
+        std::lock_guard lock(eventMutex);
+        const auto sliceUsed = used.load(std::memory_order_relaxed);
+        const auto waitLimit = std::min(capacity, WaitEventCapacity);
+        return sliceUsed + std::min(waitTotal, waitLimit);
+    }
+    std::uint64_t NextWaitId() {
+        std::lock_guard lock(eventMutex);
+        return ++nextWaitId;
+    }
 
     inline static const std::atomic<bool> AlwaysBuffering{true};
 
     TraceThread(std::string name, const std::atomic<std::uint64_t>& presents, std::size_t capacity = DefaultCapacity, const std::atomic<bool>& buffering = AlwaysBuffering, std::uint64_t nativeTid = 0)
-        : name(std::move(name)), nativeTid(nativeTid), presents(presents), buffering(buffering), slices(std::make_unique<Slice[]>(capacity)), capacity(capacity) {}
+        : name(std::move(name)), nativeTid(nativeTid), presents(presents), buffering(buffering), slices(std::make_unique<Slice[]>(capacity)), capacity(capacity), waitEvents(std::make_unique<WaitTraceRecord[]>(std::min(capacity, WaitEventCapacity))) {}
 
     TraceThread(const TraceThread&) = delete;
     TraceThread& operator=(const TraceThread&) = delete;
@@ -212,10 +281,6 @@ public:
         }
         if (length < MinimumSlice) folded += length;
         else append({scope, stage, begin, length, TraceBatchTag});
-    }
-    std::size_t BufferedEventCount() const {
-        std::lock_guard lock(eventMutex);
-        return used.load(std::memory_order_relaxed);
     }
 
 
@@ -244,33 +309,43 @@ public:
         snapshot.nativeTid = nativeTid;
         {
             std::lock_guard lock(eventMutex);
-            const auto count = used.load(std::memory_order_relaxed);
-            const auto keep = std::min(count, maximumEvents);
-            snapshot.slices.reserve(keep);
+            const auto sliceCount = used.load(std::memory_order_relaxed);
+            const auto waitLimit = std::min(capacity, WaitEventCapacity);
+            const auto waitCount = std::min(waitTotal, waitLimit);
+            const auto waitOldest = waitLimit == 0 ? 0 : static_cast<std::size_t>(waitLost % waitLimit);
+            const auto totalAvailable = sliceCount + waitCount;
+            const auto totalKeep = std::min(maximumEvents, totalAvailable);
+            const auto waitKeep = std::min(waitCount, totalKeep);
+            const auto sliceKeep = std::min(sliceCount, totalKeep - waitKeep);
             const auto overwritten = lost.load(std::memory_order_relaxed);
             const auto oldest = capacity == 0 ? 0 : static_cast<std::size_t>(overwritten % capacity);
-            snapshot.eventsOmitted = count - keep;
-            if (snapshot.eventsOmitted != 0 && count != 0)
-                snapshot.eventsOmittedAt = slices[oldest].begin;
-            const auto first = capacity == 0 ? 0 : (oldest + count - keep) % capacity;
-            for (std::size_t index = 0; index < keep; ++index)
-                snapshot.slices.push_back(slices[(first + index) % capacity]);
+            const auto first = capacity == 0 ? 0 : (oldest + sliceCount - sliceKeep) % capacity;
+            snapshot.slices.reserve(sliceKeep);
+            for (std::size_t index = 0; index < sliceKeep; ++index) snapshot.slices.push_back(slices[(first + index) % capacity]);
             snapshot.eventsLost = overwritten;
-            if (snapshot.eventsLost != 0)
-                snapshot.eventsFullAt = Clock::time_point(Clock::duration(firstLost.load(std::memory_order_relaxed)));
-            if (!snapshot.slices.empty()) {
-                snapshot.retainedFrom = snapshot.slices.front().begin;
-                snapshot.retainedThrough = snapshot.slices.front().begin;
-                for (const auto& slice : snapshot.slices) {
-                    if (slice.begin < *snapshot.retainedFrom) snapshot.retainedFrom = slice.begin;
-                    const auto through = slice.scope == nullptr ? slice.begin : slice.begin + slice.length;
-                    if (through > *snapshot.retainedThrough) snapshot.retainedThrough = through;
-                }
-            }
+            if (overwritten != 0) snapshot.eventsFullAt = Clock::time_point(Clock::duration(firstLost.load(std::memory_order_relaxed)));
+            snapshot.eventsOmitted = sliceCount - sliceKeep;
+            if (snapshot.eventsOmitted != 0 && sliceCount != 0) snapshot.eventsOmittedAt = slices[oldest].begin;
+            const auto waitFirst = waitLimit == 0 ? 0 : (waitOldest + waitCount - waitKeep) % waitLimit;
+            snapshot.waitEvents.reserve(waitKeep);
+            for (std::size_t index = 0; index < waitKeep; ++index)
+                snapshot.waitEvents.push_back(waitEvents[(waitFirst + index) % waitLimit]);
+            snapshot.waitEventsLost = waitLost;
+            if (waitLost != 0) snapshot.waitEventsFullAt = waitFirstLost;
+            snapshot.waitEventsOmitted = waitCount - waitKeep;
+            if (snapshot.waitEventsOmitted != 0 && waitCount != 0)
+                snapshot.waitEventsOmittedAt = waitEvents[waitOldest].at;
+            const auto retain = [&](Clock::time_point begin, Clock::time_point through) {
+                if (!snapshot.retainedFrom || begin < *snapshot.retainedFrom) snapshot.retainedFrom = begin;
+                if (!snapshot.retainedThrough || through > *snapshot.retainedThrough) snapshot.retainedThrough = through;
+            };
+            for (const auto& slice : snapshot.slices)
+                retain(slice.begin, slice.scope == nullptr ? slice.begin : slice.begin + slice.length);
+            for (const auto& record : snapshot.waitEvents) retain(record.at, record.at);
         }
         snapshot.totals = CollectTotals();
         snapshot.totalsFull = totalsFull.load(std::memory_order_relaxed);
-        snapshot.dropped = snapshot.eventsLost != 0 || snapshot.eventsOmitted != 0 || snapshot.totalsFull;
+        snapshot.dropped = snapshot.eventsLost != 0 || snapshot.eventsOmitted != 0 || snapshot.waitEventsLost != 0 || snapshot.waitEventsOmitted != 0 || snapshot.totalsFull;
         return snapshot;
     }
 
@@ -322,6 +397,12 @@ private:
     const std::atomic<bool>& buffering;
     const std::unique_ptr<Slice[]> slices;
     const std::size_t capacity;
+    const std::unique_ptr<WaitTraceRecord[]> waitEvents;
+    std::size_t waitUsed = 0;
+    std::uint64_t waitLost = 0;
+    Clock::time_point waitFirstLost{};
+    std::uint64_t nextWaitId = 0;
+    std::uint64_t waitTotal = 0;
     mutable std::mutex eventMutex;
     std::atomic<std::size_t> used{0};
     std::atomic<std::uint64_t> lost{0};
@@ -629,10 +710,12 @@ public:
             if (thread.retainedFrom && thread.retainedThrough) {
                 output += ",\"retained_from_s\":" + number(std::chrono::duration<double>(*thread.retainedFrom - origin).count());
                 output += ",\"retained_through_s\":" + number(std::chrono::duration<double>(*thread.retainedThrough - origin).count());
-                output += ",\"retained_event_count\":" + std::to_string(thread.slices.size());
+                output += ",\"retained_event_count\":" + std::to_string(thread.slices.size() + thread.waitEvents.size());
             }
             output += ",\"events_omitted_in_snapshot\":" + std::to_string(thread.eventsOmitted);
             output += ",\"events_overwritten\":" + std::to_string(thread.eventsLost);
+            output += ",\"wait_events_omitted_in_snapshot\":" + std::to_string(thread.waitEventsOmitted);
+            output += ",\"wait_events_overwritten\":" + std::to_string(thread.waitEventsLost);
             output += "}}";
             std::vector<TraceThread::Slice> slices(thread.slices.begin(), thread.slices.end());
             std::stable_sort(slices.begin(), slices.end(), [](const auto& a, const auto& b) { return a.begin != b.begin ? a.begin < b.begin : a.length > b.length; });
@@ -656,6 +739,41 @@ public:
             if (thread.eventsOmittedAt) {
                 event("trace snapshot events omitted", "i", *thread.eventsOmittedAt, tid);
                 output += ",\"s\":\"t\",\"args\":{\"events_omitted_in_snapshot\":" + std::to_string(thread.eventsOmitted) + "}}";
+            }
+            for (const auto& record : thread.waitEvents) {
+                const auto& item = record.event;
+                const bool store = item.kind == TraceThread::WaitTraceKind::Store || item.kind == TraceThread::WaitTraceKind::AcceptedStore;
+                event(store ? "label-store" : item.kind == TraceThread::WaitTraceKind::Begin ? "wait-begin" : "wait-end", "i", record.at, tid);
+                const auto hex = [](std::uint64_t value) {
+                    constexpr char digits[] = "0123456789abcdef";
+                    std::string text(16, '0');
+                    for (std::size_t digit = 0; digit < 16; ++digit) text[15 - digit] = digits[(value >> (digit * 4)) & 0xf];
+                    return text;
+                };
+                output += ",\"s\":\"t\",\"args\":{\"wait_id\":" + std::to_string(item.waitId)
+                    + ",\"context_batch\":" + std::to_string(item.contextBatch)
+                    + ",\"address\":\"0x" + hex(item.address)
+                    + "\",\"reference\":\"0x" + hex(item.reference)
+                    + "\",\"mask\":\"0x" + hex(item.mask)
+                    + "\",\"value\":\"0x" + hex(item.value)
+                    + "\",\"value_known\":" + std::string(item.valueKnown ? "true" : "false")
+                    + ",\"store_path\":" + (store ? std::string(item.kind == TraceThread::WaitTraceKind::AcceptedStore ? "\"driver-accepted\"" : "\"recorded-gpu\"") : std::string("null"))
+                    + ",\"queue\":" + (item.queue == std::numeric_limits<std::uint32_t>::max() ? std::string("null") : std::to_string(item.queue))
+                    + ",\"producer_queue\":" + (item.producerQueue == std::numeric_limits<std::uint64_t>::max() ? std::string("null") : std::to_string(item.producerQueue))
+                    + ",\"label_stamp\":\"0x" + hex(item.labelStamp)
+                    + "\",\"label_generation\":\"0x" + hex(item.labelGeneration)
+                    + "\",\"gpu_batch\":" + std::to_string(item.gpuBatch)
+                    + ",\"width\":" + std::to_string(item.width)
+                    + ",\"function\":" + std::to_string(item.function)
+                    + ",\"outcome\":" + std::to_string(static_cast<unsigned>(item.outcome)) + "}}";
+            }
+            if (thread.waitEventsFullAt) {
+                event("wait trace buffer overwritten", "i", *thread.waitEventsFullAt, tid);
+                output += ",\"s\":\"t\",\"args\":{\"wait_events_overwritten\":" + std::to_string(thread.waitEventsLost) + "}}";
+            }
+            if (thread.waitEventsOmittedAt) {
+                event("wait trace snapshot events omitted", "i", *thread.waitEventsOmittedAt, tid);
+                output += ",\"s\":\"t\",\"args\":{\"wait_events_omitted_in_snapshot\":" + std::to_string(thread.waitEventsOmitted) + "}}";
             }
         }
         for (std::size_t index = 0; index < presents.size(); ++index) {
@@ -765,18 +883,26 @@ public:
             std::optional<Clock::time_point> eventsFullAt;
             std::uint64_t eventsOmitted = 0;
             std::optional<Clock::time_point> eventsOmittedAt;
+            std::uint64_t waitEventsLost = 0;
+            std::optional<Clock::time_point> waitEventsFullAt;
+            std::uint64_t waitEventsOmitted = 0;
+            std::optional<Clock::time_point> waitEventsOmittedAt;
             bool totalsFull = false;
         };
         std::vector<DroppedThread> droppedList;
         for (const auto& thread : threads) {
             dropped = dropped || thread.dropped;
-            if (thread.eventsLost != 0 || thread.eventsOmitted != 0 || thread.totalsFull) {
+            if (thread.eventsLost != 0 || thread.eventsOmitted != 0 || thread.waitEventsLost != 0 || thread.waitEventsOmitted != 0 || thread.totalsFull) {
                 auto entry = std::find_if(droppedList.begin(), droppedList.end(), [&](const DroppedThread& candidate) { return candidate.name == thread.name; });
                 if (entry == droppedList.end()) entry = droppedList.insert(droppedList.end(), DroppedThread{thread.name});
                 entry->eventsLost += thread.eventsLost;
                 entry->eventsOmitted += thread.eventsOmitted;
+                entry->waitEventsLost += thread.waitEventsLost;
+                entry->waitEventsOmitted += thread.waitEventsOmitted;
                 if (thread.eventsLost != 0 && thread.eventsFullAt && (!entry->eventsFullAt || *thread.eventsFullAt < *entry->eventsFullAt)) entry->eventsFullAt = thread.eventsFullAt;
                 if (thread.eventsOmitted != 0 && thread.eventsOmittedAt && (!entry->eventsOmittedAt || *thread.eventsOmittedAt < *entry->eventsOmittedAt)) entry->eventsOmittedAt = thread.eventsOmittedAt;
+                if (thread.waitEventsLost != 0 && thread.waitEventsFullAt && (!entry->waitEventsFullAt || *thread.waitEventsFullAt < *entry->waitEventsFullAt)) entry->waitEventsFullAt = thread.waitEventsFullAt;
+                if (thread.waitEventsOmitted != 0 && thread.waitEventsOmittedAt && (!entry->waitEventsOmittedAt || *thread.waitEventsOmittedAt < *entry->waitEventsOmittedAt)) entry->waitEventsOmittedAt = thread.waitEventsOmittedAt;
                 entry->totalsFull = entry->totalsFull || thread.totalsFull;
             }
             Clock::duration busy{};
@@ -817,6 +943,15 @@ public:
                     droppedThreads += "\"events_omitted_in_snapshot\":" + std::to_string(entry.eventsOmitted) + ",";
                     if (entry.eventsOmittedAt && !presents.empty() && *entry.eventsOmittedAt >= presents.front() && *entry.eventsOmittedAt <= presents.back())
                         droppedThreads += "\"snapshot_omitted_after_s\":" + number(std::chrono::duration<double>(*entry.eventsOmittedAt - presents.front()).count()) + ",";
+                }
+                if (entry.waitEventsLost != 0) {
+                    if (entry.waitEventsFullAt && !presents.empty() && *entry.waitEventsFullAt >= presents.front() && *entry.waitEventsFullAt <= presents.back()) droppedThreads += "\"wait_events_overwrite_started_after_s\":" + number(std::chrono::duration<double>(*entry.waitEventsFullAt - presents.front()).count()) + ",";
+                    droppedThreads += "\"wait_events_overwritten\":" + std::to_string(entry.waitEventsLost) + ",";
+                }
+                if (entry.waitEventsOmitted != 0) {
+                    droppedThreads += "\"wait_events_omitted_in_snapshot\":" + std::to_string(entry.waitEventsOmitted) + ",";
+                    if (entry.waitEventsOmittedAt && !presents.empty() && *entry.waitEventsOmittedAt >= presents.front() && *entry.waitEventsOmittedAt <= presents.back())
+                        droppedThreads += "\"wait_snapshot_omitted_after_s\":" + number(std::chrono::duration<double>(*entry.waitEventsOmittedAt - presents.front()).count()) + ",";
                 }
                 droppedThreads += std::string("\"totals_full\":") + (entry.totalsFull ? "true" : "false") + "}";
             }

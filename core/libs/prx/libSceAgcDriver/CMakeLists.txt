@@ -3112,6 +3112,14 @@ if(BUILD_TESTING)
             set_tests_properties(${agcTestName}_draw_pipeline PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()
     endforeach()
+    add_test(NAME agc_driver_same_queue_label_wait_trace COMMAND agc_driver_same_queue_label_wait_tests wait-edge-trace)
+    set_tests_properties(agc_driver_same_queue_label_wait_trace PROPERTIES
+        ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_TRACE_FRAMES=0:1;APS5_TRACE_DIR=${CMAKE_CURRENT_BINARY_DIR}/wait-edge-trace"
+        SKIP_RETURN_CODE 77 TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    if(WIN32)
+        set_tests_properties(agc_driver_same_queue_label_wait_trace PROPERTIES
+            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_driver_image_table_reuse_overflow COMMAND agc_driver_image_table_reuse_tests overflow)
     set_tests_properties(agc_driver_image_table_reuse_overflow PROPERTIES
         ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_SAMPLED_FROM_STORAGE=1"

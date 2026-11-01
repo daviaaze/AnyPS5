@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -9,6 +10,23 @@
 namespace AgcDriver::DriverDetail {
 
 void Driver::noteLabelStore(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue) {
+    if (PerformanceTrace::CapturingRawWindow()) {
+        if (auto* thread = PerformanceTrace::Thread(); thread != nullptr) {
+            TraceThread::WaitTraceEvent event{};
+            event.kind = TraceThread::WaitTraceKind::AcceptedStore;
+            event.contextBatch = TraceBatchTag;
+            event.address = address;
+            event.queue = queue;
+            event.producerQueue = queue;
+            event.labelStamp = stamp;
+            event.width = static_cast<std::uint32_t>(bytes.size());
+            if (bytes.size() <= sizeof(event.value)) {
+                std::memcpy(&event.value, bytes.data(), bytes.size());
+                event.valueKnown = true;
+            }
+            thread->NoteWaitEvent(event);
+        }
+    }
     if (!KeepsLabelStore(address, bytes.size())) return;
     std::lock_guard lock(labelStoresMutex);
     for (std::size_t offset = 0; offset < bytes.size(); offset += 4) {
