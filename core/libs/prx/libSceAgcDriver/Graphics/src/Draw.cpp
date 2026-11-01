@@ -2399,8 +2399,8 @@ void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>
 
 // What recordDraw records from: the recorder, the resources, the pipeline and framebuffer, the
 // resident targets with their views, the indirect records (null for a direct draw), how the
-// completion work is handled (`listed`, `completion`, `waited`: see Draw) and, from a recipe, the
-// push constant block (else assembled from the stages).
+// completion work is handled (`listed`, `completion`, `waited`: see Draw). Push constants
+// always come from the current stages and the current resource patches, including recipe hits.
 struct RecordedDraw {
     Recorder* recorder = nullptr;
     std::shared_ptr<ShaderResources> resources;
@@ -2417,8 +2417,6 @@ struct RecordedDraw {
     bool listed = false;
     bool completion = false;
     bool waited = false;
-    const std::array<std::byte, PipelinePushConstantBytes>* pushBytes = nullptr;
-    VkShaderStageFlags pushStages = 0;
     std::vector<std::pair<std::uint32_t, std::shared_ptr<Pipeline>>> stencilReplay;
     std::vector<SampleOrderTarget> reordered;
     SampleOrderPass reorderPass;
@@ -2434,13 +2432,11 @@ void patchDepthRemapPush(std::array<std::byte, PipelinePushConstantBytes>& block
     std::memcpy(block.data() + ShaderRecompiler::DepthRemapPushOffsetBytes, words.data(), sizeof(words));
 }
 
-void recordStencilReplay(const Context& context, VkCommandBuffer commands, const State& state, const Pm4::DrawParameters& draw, const DrawInputs& inputs, std::span<const std::pair<std::uint32_t, std::shared_ptr<Pipeline>>> replay, std::span<const CompiledShader> shaders, const ShaderResources& resources, const std::array<std::byte, PipelinePushConstantBytes>* bytes = nullptr, VkShaderStageFlags stages = 0) {
+void recordStencilReplay(const Context& context, VkCommandBuffer commands, const State& state, const Pm4::DrawParameters& draw, const DrawInputs& inputs, std::span<const std::pair<std::uint32_t, std::shared_ptr<Pipeline>>> replay, std::span<const CompiledShader> shaders, const ShaderResources& resources) {
     State selected = state;
-    auto block = bytes != nullptr ? *bytes : AssemblePushConstants(shaders);
-    if (bytes == nullptr) {
-        resources.PatchPushConstants(block);
-        stages = PushConstantStages(shaders);
-    }
+    auto block = AssemblePushConstants(shaders);
+    resources.PatchPushConstants(block);
+    const auto stages = PushConstantStages(shaders);
     patchDepthRemapPush(block, state);
     const auto fragment = std::ranges::find_if(shaders, [](const CompiledShader& shader) { return shader.stage == ShaderRecompiler::ShaderStage::Fragment && !shader.program->stencilReferences.empty(); });
     Require(fragment != shaders.end(), "stencil replay fragment stage is missing");
@@ -2475,12 +2471,9 @@ void recordStencilReplay(const Context& context, VkCommandBuffer commands, const
     }
 }
 
-void pushDrawConstants(const Pipeline& pipeline, VkCommandBuffer commands, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const ShaderResources& resources, const std::array<std::byte, PipelinePushConstantBytes>* bytes, VkShaderStageFlags stages, VkDeviceAddress meshArguments = 0, bool restartTable = false) {
-    auto block = bytes != nullptr ? *bytes : AssemblePushConstants(shaders);
-    if (bytes == nullptr) {
-        resources.PatchPushConstants(block);
-        stages = PushConstantStages(shaders);
-    }
+void pushDrawConstants(const Pipeline& pipeline, VkCommandBuffer commands, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const ShaderResources& resources, VkDeviceAddress meshArguments = 0, bool restartTable = false) {
+    auto block = AssemblePushConstants(shaders);
+    auto stages = PushConstantStages(shaders);
     patchDepthRemapPush(block, state);
     if (state.stages.tessellation) {
         for (const auto& shader : shaders) Require(shader.program->pushConstants.empty() || shader.pushConstantOffset >= PipelinePushSlotBytes || shader.pushConstantOffset + shader.program->pushConstants.size() <= ShaderRecompiler::TessellationLevelPushOffsetBytes, "a stage's push constants overlap the tessellation levels");
@@ -2935,7 +2928,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     if (std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->functionLdsBuffer; })) BindPixelFunctionLds(context, commands, record.pipeline->Layout());
     if (UsesMeshWindow(shaders)) BindMeshWindow(context, commands, record.pipeline->Layout());
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
-    pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty());
+    pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty());
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
     static const bool timeEachDraw = std::getenv("APS5_PROFILE_GPU_DRAWS") != nullptr;
     auto eachDrawTiming = Recorder::NoTiming;
@@ -2948,7 +2941,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     }
     if (record.stencilReplay.empty()) recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset, trace, subdraw);
     else {
-        recordStencilReplay(context, commands, state, draw, inputs, record.stencilReplay, shaders, resources, record.pushBytes, record.pushStages);
+        recordStencilReplay(context, commands, state, draw, inputs, record.stencilReplay, shaders, resources);
         for (const auto& [reference, pipeline] : record.stencilReplay) recorder->Keep(pipeline);
     }
     if (record.pipeline->SplitsFaces()) {
@@ -3777,11 +3770,8 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
             recipe->targetViews = targetViews;
             recipe->passKey = DrawRenderPassKey(context, state, targetViews);
             recipe->vertexInput = inputs.VertexLayout();
-            recipe->pushStages = PushConstantStages(shaders);
-            if (recipe->pushStages != 0) {
-                recipe->pushBytes = AssemblePushConstants(shaders);
-                resources->PatchPushConstants(recipe->pushBytes);
-            }
+            // Never retain the first draw's user data in a reusable recipe. Replay assembles the
+            // current compiled stages and applies this record's resource push patches.
             recipe->masked = masked;
             recipe->fragmentOutputs = inputs.fragmentOutputs;
             recipe->shaderStages = inputs.shaderStages;
@@ -3908,7 +3898,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
     if (pixelLdsSubgroup != 0u) BindPixelFunctionLds(context, commands, pipeline->Layout());
     if (UsesMeshWindow(shaders)) BindMeshWindow(context, commands, pipeline->Layout());
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
-    pushDrawConstants(*pipeline, commands, state, draw, shaders, *resources, nullptr, 0, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty());
+    pushDrawConstants(*pipeline, commands, state, draw, shaders, *resources, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty());
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
     std::uint32_t subdraw = 0;
     if (stencilReplay.empty()) recordDrawCommands(context, commands, state, draw, inputs, args != nullptr ? &indirect : nullptr, argumentBuffer, argumentOffset, prepared.trace, subdraw);
@@ -4211,9 +4201,8 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         if (recipe.targetViews.back() != depthView) return miss(DrawRecipeMiss::TargetGone);
     }
     timer.phase(PhasePrepare);
-    // The template's proof (rules R6/R7): ProveCurrent, T1 included, the alias checks the trimmed
-    // key leaves to a hit repeated; a failure removes the template from the cache (the batch keeps
-    // it) and the caller rebuilds.
+    // The template's proof (rules R6/R7): ProveCurrent, T1 included, then the same moved-buffer
+    // proof and alias checks as resolveDrawResources. Any failure rebuilds through Draw.
     auto resources = recipe.templateRef.lock();
     if (resources == nullptr) return miss(DrawRecipeMiss::TemplateGone);
     Require(resources->Reusable(), "draw recipe over a non-reusable template");
@@ -4225,6 +4214,11 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         countCache(&DrawProfile::cacheInvalidated);
         resources->KeepStorageImageBytes(*recorder);
         recorder->Keep(std::move(resources));
+        timer.phase(PhaseLookup);
+        return miss(DrawRecipeMiss::Proof);
+    }
+    auto moved = resources->MovedReadOnlyBuffers(shaders, *recorder, &state.color);
+    if (!moved.has_value()) {
         timer.phase(PhaseLookup);
         return miss(DrawRecipeMiss::Proof);
     }
@@ -4255,9 +4249,8 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     record.framebuffer = std::move(framebuffer);
     record.targetViews = recipe.targetViews;
     record.targets = std::move(targets);
+    record.moved = *moved;
     for (const auto& color : state.colors) record.targetSlices.emplace_back(color.arraySlice, color.arrayLastSlice != 0 ? color.layers : 1u);
-    record.pushBytes = &recipe.pushBytes;
-    record.pushStages = recipe.pushStages;
     record.depthLocations = passDepthLocations(context, state, *record.pipeline);
     recordDraw(context, state, draw, shaders, inputs, record, outcome, timer, ownWaitedMs, trace);
     if (profile) {

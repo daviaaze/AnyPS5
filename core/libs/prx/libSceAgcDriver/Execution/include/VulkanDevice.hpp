@@ -350,11 +350,13 @@ public:
     enum class RecipeKind : std::size_t { Dispatch, Indirect, Draw };
     static void NoteRecipe(RecipeEvent event, bool indirect);
     static void NoteRecipe(RecipeEvent event, RecipeKind kind);
+    // Successful dispatch/indirect/draw recipe replays, for native consumer regression evidence.
+    static std::uint64_t RecipeHits(RecipeKind kind);
     enum class DrawRecipePrecheck : std::size_t { NoRecipe, Device };
     static void NoteDrawRecipeMiss(DrawRecipePrecheck miss);
     using DrawTraceContext = Graphics::DrawTraceContext;
-    // `recipe`, when given, receives the DrawRecipe a recorded, cacheable, reusable, direct draw
-    // built for its draw-cache entry (design_cpu_final M8); null otherwise.
+    // `recipe`, when given, receives the DrawRecipe built for this recordable direct draw
+    // (including a CPU-resolved indirect record), null otherwise.
     void Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, const DrawTraceContext* trace = nullptr, std::uint64_t shape = 0);
     bool DrawInputsInPlace() const;
     std::optional<std::string> KnownDrawRejection(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders) const;

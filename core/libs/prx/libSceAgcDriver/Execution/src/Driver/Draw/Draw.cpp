@@ -1385,12 +1385,21 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         const auto baseVertexWords = UserDataWords(programs, roles, indirect.baseVertexLocation);
         const auto startInstanceWords = UserDataWords(programs, roles, indirect.startInstanceLocation);
         const auto drawIndexWords = indirect.drawIndexEnabled ? UserDataWords(programs, roles, indirect.drawIndexLocation) : std::vector<std::pair<std::size_t, std::size_t>>{};
+        const bool pushWord = drawCachePushWord();
+        // Stage-data hits patch copied descriptor words but preserve the matched stage ABI.
+        // DrawWithRecipe still proves this record's current descriptors and moved buffers.
+        const bool indirectRecipeMode = registerKey && drawHit && drawCacheIndirect() && pushWord && Graphics::DrawRecipes() && !graphics.rectList && !graphics.stages.tessellationGeometry;
+        std::vector<std::shared_ptr<DispatchVariant>> indirectRecipeStages;
+        if (indirectRecipeMode) {
+            indirectRecipeStages.reserve(programs.size());
+            for (std::size_t i = 0; i < programs.size(); ++i) indirectRecipeStages.push_back(matched[i]);
+            if (std::any_of(indirectRecipeStages.begin(), indirectRecipeStages.end(), [](const auto& variant) { return variant == nullptr; })) indirectRecipeStages.clear();
+        }
         const auto drawable = [&](const Pm4::DrawArguments& arguments) { return arguments.count != 0 && arguments.instances != 0 && (!drawParameters.indexed || !indirect.indexLimitKnown || arguments.firstVertexOrIndex < drawParameters.indexCount); };
         std::size_t lastDrawable = records.size();
         for (std::size_t record = 0; record < records.size(); ++record) {
             if (drawable(records[record])) lastDrawable = record;
         }
-        const bool pushWord = drawCachePushWord();
         const bool verifyPushWord = pushWord && verifyDrawPushWord();
         std::uint64_t wordsForwarded = 0, stagesRecompiled = 0, wordsRefused = 0, wordsVerified = 0;
         struct RecordWord {
@@ -1482,6 +1491,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                 setMeshIndexBuffer(direct);
                 patched.insert(0);
             }
+            bool recipeSafe = !indirectRecipeStages.empty();
             for (const auto programIndex : patched) {
                 auto& result = results[resultIndex[programIndex]];
                 const auto pushBytes = result.pushConstants.size();
@@ -1496,6 +1506,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                     continue;
                 }
                 if (pushWord) wordsRefused += static_cast<std::uint64_t>(std::count_if(recordWords.begin(), recordWords.end(), [&](const RecordWord& word) { return word.program == programIndex; }));
+                recipeSafe = false;
                 result = *materializeDrawStage(programIndex, pushOffsets[programIndex], queue, submission, packetOffset, trace.token, programs, graphics, pixel, vertexInfos, memory, linked, programs[programIndex].binary.stage == Stage::TessellationControl || programs[programIndex].binary.stage == Stage::TessellationEvaluation ? direct : drawParameters, localDevice, *shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected, meshBarycentrics);
                 if (!rejected.empty()) return DrawVerdict::Rejected;
                 require(result.pushConstants.size() == pushBytes, "patched program changed its push constant layout");
@@ -1512,19 +1523,22 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                 rejected = std::move(*known);
                 return DrawVerdict::Rejected;
             }
+            auto recordRecipe = recipeSafe ? findDrawRecipe(drawKey, indirectRecipeStages) : std::shared_ptr<const DrawRecipe>{};
+            if (recipeSafe && recordRecipe == nullptr) VulkanDevice::NoteDrawRecipeMiss(VulkanDevice::DrawRecipePrecheck::NoRecipe);
             if (pipelined && pipelinedIndirect && record == lastDrawable && !gpuLock.owns_lock() && deferredLabels().labels.empty()) {
                 phaseTiming.Phase(DrawRowVectors);
                 auto writes = drawWriteRanges(graphics, stages);
+                auto reads = QueuedDrawReadRanges(direct, stages);
                 const auto commitQueue = submission.queue;
                 const auto commitPacket = tail.packetOpcode;
                 const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
-                auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), direct, stages = std::move(stages), snapshots = std::move(snapshots), commitQueue, commitPacket, epoch, trace = trace, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData)] {
+                auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), direct, stages = std::move(stages), snapshots = std::move(snapshots), commitQueue, commitPacket, epoch, trace = trace, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData), recipe = std::move(recordRecipe), recipeStages = recipeSafe ? std::move(indirectRecipeStages) : std::vector<std::shared_ptr<DispatchVariant>>{}, drawKey, shape = tail.shapeKey] {
                     DrawPipeline::FollowEpoch(epoch);
                     GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
-                    commitDraw(localDevice, commitQueue, decode->state, direct, stages, snapshots, nullptr, {}, 0, trace);
+                    commitDraw(localDevice, commitQueue, decode->state, direct, stages, snapshots, recipe, recipeStages, drawKey, trace, shape);
                 };
                 auto held = std::make_shared<decltype(commit)>(std::move(commit));
-                DrawPipeline::Queue0().Enqueue([held] { (*held)(); }, std::move(writes));
+                DrawPipeline::Queue0().Enqueue([held] { (*held)(); }, std::move(writes), 0, {}, std::move(reads), true);
                 phaseTiming.Phase(DrawRowLockWait);
                 countRecordWords();
                 timing.Mark("draw_enqueued");
@@ -1534,7 +1548,14 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             lockForDraw();
             noteDrawWriters(stages, submission.queue);
             phaseTiming.Phase(DrawRowVectors);
-            localDevice->Draw(graphics, direct, stages, snapshots, nullptr, tracePtr);
+            if (recordRecipe != nullptr && localDevice->DrawFromRecipe(graphics, direct, stages, snapshots, recordRecipe, tracePtr) == RecipeOutcome::Recorded) {
+                phaseTiming.Phase(DrawRowGraphics);
+                continue;
+            }
+            if (recordRecipe != nullptr) VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
+            std::shared_ptr<const DrawRecipe> built;
+            localDevice->Draw(graphics, direct, stages, snapshots, recipeSafe ? &built : nullptr, tracePtr, tail.shapeKey);
+            if (built != nullptr) attachDrawRecipe(drawKey, indirectRecipeStages, std::move(built));
             phaseTiming.Phase(DrawRowGraphics);
         }
         countRecordWords();

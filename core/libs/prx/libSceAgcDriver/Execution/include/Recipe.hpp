@@ -65,10 +65,11 @@ enum class RecipeOutcome { Recorded, Rebuild };
 // framebuffer list; a recipe outlives a device replacement in the draw cache, so an owning
 // reference would destroy the objects against a dead VkDevice), the resident targets (weak: a hit
 // proves them on the stored objects while they are still Cached()) with their attachment views,
-// and the per-draw derivations of the compiled stages and the state: the vertex input layout, the
-// push constant block, the state with the unwritten outputs masked, the fragment outputs and the
-// pipeline stages. Built at the end of a recorded, cacheable, reusable, non-indirect draw and
-// attached to the draw entry's matched stage variants; immutable.
+// the per-draw derivations needed to prove pipeline compatibility: vertex input layout, masked
+// state, fragment outputs, pipeline stages and depth-target presence. Push bytes are not cached:
+// replay assembles them from current compiled stages and current resource patches. Recipes are
+// built for recordable direct draws, including CPU-resolved indirect records, and attached to
+// matched draw-stage variants; immutable.
 struct DrawRecipe {
     VkDevice device = VK_NULL_HANDLE;
     std::weak_ptr<Graphics::ShaderResources> templateRef;
@@ -79,8 +80,8 @@ struct DrawRecipe {
     std::vector<VkImageView> targetViews;
     std::uint64_t passKey = 0;
     Graphics::VertexInputLayout vertexInput;
-    std::array<std::byte, Graphics::PipelinePushConstantBytes> pushBytes{};
-    VkShaderStageFlags pushStages = 0;
+    // Stage identity proves the pipeline ABI, never the current push payload.
+    // Replay assembles push constants from the caller's current compiled stages.
     std::optional<Graphics::State> masked;
     std::uint32_t fragmentOutputs = 0;
     VkPipelineStageFlags shaderStages = 0;

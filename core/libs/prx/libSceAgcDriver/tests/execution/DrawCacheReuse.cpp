@@ -3,6 +3,22 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "VulkanTestDevice.hpp"
+#include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestWriteWatch.hpp"
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#endif
+#include <cstring>
+#include <memory>
+#include <span>
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -16,6 +32,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+
 
 namespace {
 
@@ -36,6 +53,68 @@ alignas(256) constexpr std::array<std::uint32_t, 8> PixelCode{0x7e000200u, 0x7e0
 alignas(256) constexpr std::array<std::uint32_t, 8> ConstantPixelCode{0xf4000080u, 0xfa000000u, 0xbf8cc07fu, 0x7e000202u, 0x7e020280u, 0xf800180fu, 0x00010100u, 0xbf810000u};
 alignas(256) std::array<std::byte, 1024> ColorMemory{};
 alignas(256) std::array<float, 4> PixelConstant{};
+std::byte* PixelConstantAddress = reinterpret_cast<std::byte*>(PixelConstant.data());
+std::byte* ColorTargetAddress = ColorMemory.data();
+
+class WatchedGuestBlock {
+public:
+    static constexpr std::size_t Bytes = 65536;
+
+    WatchedGuestBlock() {
+        Require(AgcDriver::GuestMemory::WriteWatched(), "the recipe target requires guest write watch");
+#ifdef _WIN32
+        data = static_cast<std::byte*>(GuestArena::GuestArenaAllocate_nid_postfix(Bytes, Bytes));
+        if (data != nullptr) GuestArena::GuestArenaCommit_nid_postfix(data, Bytes, PAGE_READWRITE, Bytes);
+#else
+        void* mapped = mmap(nullptr, Bytes * 2u, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        Require(mapped != MAP_FAILED, "cannot reserve watched guest color target memory");
+        const auto begin = reinterpret_cast<std::uintptr_t>(mapped);
+        const auto aligned = (begin + Bytes - 1u) & ~(static_cast<std::uintptr_t>(Bytes) - 1u);
+        if (aligned != begin) munmap(mapped, aligned - begin);
+        if (aligned + Bytes != begin + Bytes * 2u) munmap(reinterpret_cast<void*>(aligned + Bytes), begin + Bytes * 2u - aligned - Bytes);
+        data = reinterpret_cast<std::byte*>(aligned);
+#endif
+        Require(data != nullptr, "cannot allocate watched guest color target memory");
+        std::memset(data, 0, Bytes);
+#ifndef _WIN32
+        GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(data, Bytes);
+#endif
+        GuestAllocations::Mutation().Add(data, Bytes, true, true, true);
+        Require((reinterpret_cast<std::uintptr_t>(data) & (Bytes - 1u)) == 0 &&
+                    AgcDriver::GuestMemory::Watched(reinterpret_cast<std::uintptr_t>(data), Bytes),
+                "the resident recipe target is not a watched, aligned guest allocation");
+    }
+
+    ~WatchedGuestBlock() {
+        GuestAllocations::Mutation().Remove(data);
+#ifdef _WIN32
+        GuestArena::GuestArenaReset_nid_postfix(data, Bytes);
+        GuestArena::GuestArenaRelease_nid_postfix(data, Bytes);
+#else
+        munmap(data, Bytes);
+        GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(data, Bytes);
+#endif
+    }
+
+    WatchedGuestBlock(const WatchedGuestBlock&) = delete;
+    WatchedGuestBlock& operator=(const WatchedGuestBlock&) = delete;
+
+    std::byte* Data() const { return data; }
+
+private:
+    std::byte* data = nullptr;
+};
+bool ResidentRecipeTarget = false;
+alignas(256) std::array<std::byte, WatchedGuestBlock::Bytes> ResidentTargetZeros{};
+alignas(256) std::array<std::byte, WatchedGuestBlock::Bytes> ResidentTargetReadback{};
+
+void ClearColorMemory() {
+    if (ResidentRecipeTarget) {
+        AgcDriver::GuestMemory::Write(reinterpret_cast<std::uintptr_t>(ColorTargetAddress), std::span<const std::byte>(ResidentTargetZeros));
+    } else {
+        std::fill_n(ColorTargetAddress, ColorMemory.size(), std::byte{0});
+    }
+}
 
 struct Header {
     Shader shader{};
@@ -69,7 +148,7 @@ void Append(std::vector<std::uint32_t>& commands, std::uint32_t opcode, std::ini
 }
 
 std::vector<std::uint32_t> Draws(float scale, const std::uint32_t* vertexCode, std::uint32_t vertexUserSgprs, const std::uint32_t* pixelCode, std::uint32_t pixelUserSgprs, const std::vector<std::vector<std::uint32_t>>& pixelWords) {
-    const auto color = reinterpret_cast<std::uintptr_t>(ColorMemory.data());
+    const auto color = reinterpret_cast<std::uintptr_t>(ColorTargetAddress);
     const auto vertex = reinterpret_cast<std::uintptr_t>(vertexCode);
     const auto pixel = reinterpret_cast<std::uintptr_t>(pixelCode);
     const std::vector<std::pair<std::uint32_t, std::uint32_t>> context{
@@ -82,7 +161,7 @@ std::vector<std::uint32_t> Draws(float scale, const std::uint32_t* vertexCode, s
         {0x8e, 0xf}, {0x8f, 0xf}, {0x202, 0xcc0010},
         {0x1c4, 0}, {0x1c5, 9}, {0x1c3, 4}, {0x31c, 0x28028},
         {0x31b, 0}, {0x31d, 0}, {0x3b0, (63u << 14u) | 3u},
-        {0x3b8, 0x9000000}, {0x1e0, 0},
+        {0x3b8, ResidentRecipeTarget ? (0x09000000u | (9u << 14u)) : 0x09000000u}, {0x1e0, 0},
         {0xc, 0}, {0xd, 0x40040},
         {0x81, 0x80000000}, {0x82, 0x40040},
         {0x90, 0x80000000}, {0x91, 0x40040},
@@ -178,9 +257,26 @@ void CyclicWorkingSet(bool libraries) {
 }
 
 unsigned BrightestColorByte() {
-    AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(ColorMemory.data()), ColorMemory.size());
+    if (ResidentRecipeTarget) {
+        const auto address = reinterpret_cast<std::uintptr_t>(ColorTargetAddress);
+        AgcDriver::GuestMemory::ReadCommitted(address, ResidentTargetReadback);
+        const AgcDriver::Graphics::ColorTargetLayout layout(64, 4, AgcDriver::Graphics::ColorTileMode::Standard64KB, 4);
+        unsigned brightest = 0;
+        for (std::uint32_t y = 0; y < 4; ++y) {
+            for (std::uint32_t x = 0; x < 64; ++x) {
+                const auto offset = layout.Offset(x, y);
+                for (std::size_t channel = 0; channel < 4; ++channel) {
+                    brightest = std::max(brightest, static_cast<unsigned>(std::to_integer<std::uint8_t>(ResidentTargetReadback[offset + channel])));
+                }
+            }
+        }
+        return brightest;
+    }
+    AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(ColorTargetAddress), ColorMemory.size());
     unsigned brightest = 0;
-    for (const auto value : ColorMemory) brightest = std::max(brightest, static_cast<unsigned>(value));
+    for (std::size_t index = 0; index < ColorMemory.size(); ++index) {
+        brightest = std::max(brightest, static_cast<unsigned>(std::to_integer<std::uint8_t>(ColorTargetAddress[index])));
+    }
     return brightest;
 }
 
@@ -218,7 +314,7 @@ void StageDataHitsRefreshTheirWords(bool libraries) {
     const bool enabled = std::getenv("APS5_NO_DRAW_STAGE_DATA_HITS") == nullptr;
     Registered(TriangleVertexHeader, TriangleVertexCode.data(), sizeof(TriangleVertexCode), 2);
     Registered(ConstantPixelHeader, ConstantPixelCode.data(), sizeof(ConstantPixelCode), 1);
-    ColorMemory.fill(std::byte{0});
+    ClearColorMemory();
     PixelConstant[0] = 0.25f;
     const auto before = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
     const auto cached = SubmitConstantDraws(3);
@@ -243,7 +339,7 @@ void StageDataHitsRefreshTheirWords(bool libraries) {
 void RefreshedStageDataVerifies() {
     Registered(TriangleVertexHeader, TriangleVertexCode.data(), sizeof(TriangleVertexCode), 2);
     Registered(ConstantPixelHeader, ConstantPixelCode.data(), sizeof(ConstantPixelCode), 1);
-    ColorMemory.fill(std::byte{0});
+    ClearColorMemory();
     PixelConstant[0] = 0.25f;
     const auto cached = SubmitConstantDraws(3);
     Require(BrightestColorByte() == 64, "draw-entry verification: the initial constant did not render");
@@ -314,10 +410,12 @@ void CpuPathIndirectDrawsAreCachedWhenAsked(bool libraries) {
 
 void RecordsKeepThePacketsFragmentWord(bool libraries) {
     const auto mode = std::string(libraries ? "with" : "without") + " graphics pipeline libraries";
+    const auto recipeHitsBefore = AgcDriver::VulkanDevice::RecipeHits(AgcDriver::VulkanDevice::RecipeKind::Draw);
     const bool cached = std::getenv("APS5_DRAW_CACHE_INDIRECT") != nullptr;
     Registered(OffsetTriangleVertexHeader, OffsetTriangleVertexCode.data(), sizeof(OffsetTriangleVertexCode), 2);
+    Registered(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
     const auto submitRecords = [&](float fragmentWord) {
-        ColorMemory.fill(std::byte{0});
+        ClearColorMemory();
         auto commands = Draws(32.0f, OffsetTriangleVertexCode.data(), 1, PixelCode.data(), 1, {});
         Append(commands, 0x76, {0x00c, std::bit_cast<std::uint32_t>(fragmentWord)});
         Append(commands, 0x79, {0x24a, 0});
@@ -352,15 +450,23 @@ void RecordsKeepThePacketsFragmentWord(bool libraries) {
     } else {
         Require(after.inserts == before.inserts && after.hits == before.hits, mode + ": without APS5_DRAW_CACHE_INDIRECT, CPU-path indirect draws inserted " + std::to_string(after.inserts - before.inserts) + " draw entries and hit " + std::to_string(after.hits - before.hits) + " times, expected none");
     }
+    if (std::getenv("APS5_TEST_RECORD_RECIPE_REGRESSIONS") != nullptr) {
+        const auto recipeHitsAfter = AgcDriver::VulkanDevice::RecipeHits(AgcDriver::VulkanDevice::RecipeKind::Draw);
+        const bool disabled = std::getenv("APS5_NO_DRAW_RECIPE") != nullptr;
+        Require(disabled ? recipeHitsAfter == recipeHitsBefore : recipeHitsAfter > recipeHitsBefore,
+                mode + (disabled ? ": disabled draw recipes recorded a replay" : ": repeated CPU-resolved DIRECT records made no draw-recipe replay"));
+    }
 }
 
 void RecordWordsReachTheShader(bool libraries) {
     const auto mode = std::string(libraries ? "with" : "without") + " graphics pipeline libraries";
+    const auto recipeHitsBefore = AgcDriver::VulkanDevice::RecipeHits(AgcDriver::VulkanDevice::RecipeKind::Draw);
     const bool cached = std::getenv("APS5_DRAW_CACHE_INDIRECT") != nullptr;
     const bool forwarded = std::getenv("APS5_DRAW_CACHE_PUSH_WORD") != nullptr;
     const bool verify = forwarded && std::getenv("APS5_VERIFY_DRAW_PUSH_WORD") != nullptr;
     Registered(OffsetTriangleVertexHeader, OffsetTriangleVertexCode.data(), sizeof(OffsetTriangleVertexCode), 2);
-    ColorMemory.fill(std::byte{0});
+    Registered(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
+    ClearColorMemory();
     const auto submitRecord = [&](std::uint32_t firstVertex) {
         OffsetRecord[2] = firstVertex;
         auto commands = Draws(32.0f, OffsetTriangleVertexCode.data(), 1, PixelCode.data(), 1, {});
@@ -377,19 +483,91 @@ void RecordWordsReachTheShader(bool libraries) {
     submitRecord(4);
     const auto seen = submitRecord(4);
     Require(BrightestColorByte() == 0, mode + ": a repeated CPU-path indirect draw whose record moves the triangle off screen wrote " + std::to_string(BrightestColorByte()) + ", expected nothing: the record's word must reach the shader, not the packet's");
-    const auto after = submitRecord(0);
+    submitRecord(0);
     Require(BrightestColorByte() == 255, mode + ": a CPU-path indirect draw whose record puts the triangle on screen wrote " + std::to_string(BrightestColorByte()) + ", expected 255");
-    Require(after.lookups - before.lookups == 4, mode + ": four CPU-path indirect draws made " + std::to_string(after.lookups - before.lookups) + " draw-cache lookups, expected 4");
-    if (cached) Require(after.inserts - before.inserts == 1 && seen.hits - before.hits == 1 && after.hits - before.hits == 2, mode + ": with APS5_DRAW_CACHE_INDIRECT, four CPU-path indirect draws inserted " + std::to_string(after.inserts - before.inserts) + " entries and hit " + std::to_string(after.hits - before.hits) + " times, expected 1 and 2");
-    else Require(after.inserts == before.inserts && after.hits == before.hits, mode + ": without APS5_DRAW_CACHE_INDIRECT, CPU-path indirect draws were cached");
-    const auto wordsForwarded = after.recordWordsForwarded - before.recordWordsForwarded;
-    const auto stagesRecompiled = after.recordStagesRecompiled - before.recordStagesRecompiled;
-    const auto refused = after.recordWordsRefused - before.recordWordsRefused;
-    const auto verified = after.recordWordsVerified - before.recordWordsVerified;
-    if (forwarded) Require(wordsForwarded == 4 && stagesRecompiled == 0 && refused == 0, mode + ": with APS5_DRAW_CACHE_PUSH_WORD, four records forwarded " + std::to_string(wordsForwarded) + " patched words as push data, re-materialized " + std::to_string(stagesRecompiled) + " stages and refused " + std::to_string(refused) + " words, expected 4, 0 and 0");
-    else Require(wordsForwarded == 0 && stagesRecompiled == 4, mode + ": without APS5_DRAW_CACHE_PUSH_WORD, four records forwarded " + std::to_string(wordsForwarded) + " words and re-materialized " + std::to_string(stagesRecompiled) + " stages, expected 0 and 4");
-    Require(verified == (verify ? 4u : 0u), mode + ": " + std::to_string(verified) + " forwarded words were verified against a full build, expected " + std::to_string(verify ? 4 : 0));
+    const auto retained = submitRecord(4);
+    Require(BrightestColorByte() == 255, mode + ": a later CPU-path indirect record moving off screen changed the earlier GPU-written pixel output");
+    Require(retained.lookups - before.lookups == 5, mode + ": five CPU-path indirect draws made " + std::to_string(retained.lookups - before.lookups) + " draw-cache lookups, expected 5");
+    if (cached) Require(retained.inserts - before.inserts == 1 && seen.hits - before.hits == 1 && retained.hits - before.hits == 3, mode + ": with APS5_DRAW_CACHE_INDIRECT, five CPU-path indirect draws inserted " + std::to_string(retained.inserts - before.inserts) + " entries and hit " + std::to_string(retained.hits - before.hits) + " times, expected 1 and 3");
+    else Require(retained.inserts == before.inserts && retained.hits == before.hits, mode + ": without APS5_DRAW_CACHE_INDIRECT, CPU-path indirect draws were cached");
+    const auto wordsForwarded = retained.recordWordsForwarded - before.recordWordsForwarded;
+    const auto stagesRecompiled = retained.recordStagesRecompiled - before.recordStagesRecompiled;
+    const auto refused = retained.recordWordsRefused - before.recordWordsRefused;
+    const auto verified = retained.recordWordsVerified - before.recordWordsVerified;
+    if (forwarded) Require(wordsForwarded == 5 && stagesRecompiled == 0 && refused == 0, mode + ": with APS5_DRAW_CACHE_PUSH_WORD, five records forwarded " + std::to_string(wordsForwarded) + " patched words as push data, re-materialized " + std::to_string(stagesRecompiled) + " stages and refused " + std::to_string(refused) + " words, expected 5, 0 and 0");
+    else Require(wordsForwarded == 0 && stagesRecompiled == 5, mode + ": without APS5_DRAW_CACHE_PUSH_WORD, five records forwarded " + std::to_string(wordsForwarded) + " words and re-materialized " + std::to_string(stagesRecompiled) + " stages, expected 0 and 5");
+    Require(verified == (verify ? 5u : 0u), mode + ": " + std::to_string(verified) + " forwarded words were verified against a full build, expected " + std::to_string(verify ? 5 : 0));
+    if (std::getenv("APS5_TEST_RECORD_RECIPE_REGRESSIONS") != nullptr) {
+        const auto recipeHitsAfter = AgcDriver::VulkanDevice::RecipeHits(AgcDriver::VulkanDevice::RecipeKind::Draw);
+        const bool disabled = std::getenv("APS5_NO_DRAW_RECIPE") != nullptr;
+        Require(disabled ? recipeHitsAfter == recipeHitsBefore : recipeHitsAfter > recipeHitsBefore,
+                mode + (disabled ? ": disabled draw recipes recorded a replay" : ": repeated CPU-resolved DIRECT records made no draw-recipe replay"));
+    }
 }
+void CpuResolvedRecordRecipesRefreshCurrentResources(bool libraries) {
+    const auto mode = std::string(libraries ? "with" : "without") + " graphics pipeline libraries";
+    const auto recipeHitsBefore = AgcDriver::VulkanDevice::RecipeHits(AgcDriver::VulkanDevice::RecipeKind::Draw);
+    const bool cached = std::getenv("APS5_DRAW_CACHE_INDIRECT") != nullptr;
+    Registered(OffsetTriangleVertexHeader, OffsetTriangleVertexCode.data(), sizeof(OffsetTriangleVertexCode), 2);
+    Registered(ConstantPixelHeader, ConstantPixelCode.data(), sizeof(ConstantPixelCode), 1);
+    const auto constantAddress = reinterpret_cast<std::uintptr_t>(PixelConstantAddress);
+    float currentConstant = 0.0f;
+    const auto submitRecord = [&](std::uint32_t firstVertex, float constant) {
+        OffsetRecord[2] = firstVertex;
+        if (currentConstant != constant) {
+            const std::array<float, 4> words{constant, 0.0f, 0.0f, 0.0f};
+            AgcDriver::GuestMemory::Write(constantAddress, std::as_bytes(std::span<const float>(words)));
+            currentConstant = constant;
+        }
+        ClearColorMemory();
+        auto commands = Draws(32.0f, OffsetTriangleVertexCode.data(), 1, ConstantPixelCode.data(), 2, {});
+        Append(commands, 0x76, {0x00c, static_cast<std::uint32_t>(constantAddress)});
+        Append(commands, 0x76, {0x00d, static_cast<std::uint32_t>(constantAddress >> 32u)});
+        Append(commands, 0x79, {0x24a, 0});
+        const auto records = reinterpret_cast<std::uintptr_t>(OffsetRecord.data());
+        Append(commands, 0x11, {1, static_cast<std::uint32_t>(records), static_cast<std::uint32_t>(records >> 32u)});
+        Append(commands, 0x24, {0, 0x8c, 0, 2});
+        return Submit(commands);
+    };
+    const auto wrote = [&](unsigned expected, const std::string& what) {
+        const auto actual = BrightestColorByte();
+        Require(actual == expected, mode + ": " + what + " wrote " + std::to_string(actual) + ", expected " + std::to_string(expected));
+    };
+    const auto before = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+    submitRecord(0, 0.25f);
+    wrote(64, "the CPU-resolved direct record using its current moved pixel constant");
+    submitRecord(0, 0.25f);
+    wrote(64, "the second sight of the CPU-resolved record before it enters the draw cache");
+    const auto warm = submitRecord(0, 0.25f);
+    wrote(64, "the warmed CPU-resolved direct record using its current moved pixel constant");
+    submitRecord(4, 1.0f);
+    wrote(0, "the changed CPU-resolved direct record with a current moved pixel constant and off-screen vertex");
+    const auto changedRecipeHits = AgcDriver::VulkanDevice::RecipeHits(AgcDriver::VulkanDevice::RecipeKind::Draw);
+    const auto current = submitRecord(0, 1.0f);
+    wrote(255, "the changed CPU-resolved direct record using the refreshed moved pixel constant");
+    Require(current.lookups - before.lookups == 5, mode + ": five CPU-resolved indirect records made " + std::to_string(current.lookups - before.lookups) + " draw-cache lookups, expected 5");
+    if (cached) {
+        Require(warm.inserts - before.inserts == 1 && warm.hits - before.hits == 1,
+                mode + ": the warmed CPU-resolved record inserted " + std::to_string(warm.inserts - before.inserts) + " entries and hit " + std::to_string(warm.hits - before.hits) + " times, expected 1 and 1");
+    } else {
+        Require(current.inserts == before.inserts && current.hits == before.hits,
+                mode + ": CPU-resolved indirect records were cached without APS5_DRAW_CACHE_INDIRECT");
+    }
+    const auto recipeHitsAfter = AgcDriver::VulkanDevice::RecipeHits(AgcDriver::VulkanDevice::RecipeKind::Draw);
+    const bool disabled = std::getenv("APS5_NO_DRAW_RECIPE") != nullptr;
+    Require(disabled ? recipeHitsAfter == changedRecipeHits : recipeHitsAfter > changedRecipeHits,
+            mode + (disabled ? ": disabled draw recipes recorded a replay" : ": the current moved pixel constant was not consumed by a warmed draw-recipe replay"));
+}
+
+void CpuResolvedRecordRecipeRegressions(bool libraries) {
+    Require(std::getenv("APS5_DRAW_CACHE_INDIRECT") != nullptr, "record recipe regressions require APS5_DRAW_CACHE_INDIRECT");
+    Require(std::getenv("APS5_DRAW_CACHE_PUSH_WORD") != nullptr, "record recipe regressions require APS5_DRAW_CACHE_PUSH_WORD");
+    Require(std::getenv("APS5_NO_INDIRECT_INPUT_ROUTES") != nullptr, "record recipe regressions require the forced CPU indirect route");
+    RecordsKeepThePacketsFragmentWord(libraries);
+    RecordWordsReachTheShader(libraries);
+    CpuResolvedRecordRecipesRefreshCurrentResources(libraries);
+}
+
 
 void SightingsKeepCollidingKeys() {
     DrawKeySightings sightings(DrawKeySightings::Ways);
@@ -404,16 +582,32 @@ void SightingsKeepCollidingKeys() {
 }
 
 int main() {
+    std::unique_ptr<WatchedGuestBlock> residentColor;
+    std::unique_ptr<WatchedGuestBlock> residentConstant;
     try {
         SightingsKeepCollidingKeys();
         bool libraries = false;
+        const bool recipeRegressions = std::getenv("APS5_TEST_RECORD_RECIPE_REGRESSIONS") != nullptr;
         {
             const auto device = OpenVulkanTestDevice();
             if (!device) return VulkanTestSkipped;
             libraries = device->GraphicsPipelineLibraries();
+            if (recipeRegressions) {
+                if (!AgcDriver::GuestMemory::WriteWatched()) {
+                    std::puts("CPU record recipe regressions skipped: guest write watch is unavailable");
+                    return VulkanTestSkipped;
+                }
+                residentColor = std::make_unique<WatchedGuestBlock>();
+                residentConstant = std::make_unique<WatchedGuestBlock>();
+                ColorTargetAddress = residentColor->Data();
+                PixelConstantAddress = residentConstant->Data();
+                ResidentRecipeTarget = true;
+            }
         }
         if (!libraries && std::getenv("APS5_NO_GPL") == nullptr) return VulkanTestSkipped;
-        if (std::getenv("APS5_VERIFY_DRAW_ENTRIES") != nullptr) {
+        if (recipeRegressions) {
+            CpuResolvedRecordRecipeRegressions(libraries);
+        } else if (std::getenv("APS5_VERIFY_DRAW_ENTRIES") != nullptr) {
             RefreshedStageDataVerifies();
         } else {
             ThirdDrawHitsTheCache(libraries);

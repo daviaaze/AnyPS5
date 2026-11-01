@@ -5137,6 +5137,9 @@ void VulkanDevice::NoteRecipe(RecipeEvent event, RecipeKind kind) {
     auto& counters = Recipes().kinds[static_cast<std::size_t>(kind)];
     (event == RecipeEvent::Restart ? counters.restarts : counters.attaches).fetch_add(1, std::memory_order_relaxed);
 }
+std::uint64_t VulkanDevice::RecipeHits(RecipeKind kind) {
+    return Recipes().kinds[static_cast<std::size_t>(kind)].hits.load(std::memory_order_relaxed);
+}
 
 void VulkanDevice::NoteDrawRecipeMiss(DrawRecipePrecheck miss) {
     auto& counters = Recipes().kinds[static_cast<std::size_t>(RecipeKind::Draw)];

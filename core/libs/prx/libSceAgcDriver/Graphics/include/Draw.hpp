@@ -111,12 +111,9 @@ struct DrawRecipeOutcome {
     double proofUs = 0;
     double recordUs = 0;
 };
-// A draw-cache hit recorded from its recipe, under GuestMemory::GpuMutex after the packet's labels
-// (design_cpu_final M8, step 8b): the validation with the recipe's stored outputs, the index and
-// vertex work as Draw's, the resident-target proof on the stored images (Refresh while Cached()),
-// the template's proof (ProveCurrent) with the alias checks repeated, the pipeline and framebuffer
-// from the recipe, then the record as Draw's (pass continued or begun, Kept, MarkGpuWrites). A
-// miss records nothing.
+// A draw-cache hit recorded from its recipe, under GuestMemory::GpuMutex after the packet's labels:
+// validate stored targets, pipeline, template/resources, current push payload, and moved buffers
+// before recording. A miss records nothing.
 DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe, const DrawTraceContext* trace = nullptr);
 // Whether recorded draws build recipes and draw-cache hits use them (APS5_NO_DRAW_RECIPE unset).
 bool DrawRecipes();

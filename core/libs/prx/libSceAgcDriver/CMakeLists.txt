@@ -3616,6 +3616,14 @@ if(BUILD_TESTING)
     set_tests_properties(agc_driver_draw_cache_reuse_push_word PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_DRAW_CACHE_INDIRECT=1;APS5_DRAW_CACHE_PUSH_WORD=1;APS5_PROFILE_DRAW=1" SKIP_RETURN_CODE 77)
     add_test(NAME agc_driver_draw_cache_reuse_push_word_verify COMMAND agc_driver_draw_cache_reuse_tests)
     set_tests_properties(agc_driver_draw_cache_reuse_push_word_verify PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_DRAW_CACHE_INDIRECT=1;APS5_DRAW_CACHE_PUSH_WORD=1;APS5_VERIFY_DRAW_PUSH_WORD=1;APS5_PROFILE_DRAW=1" SKIP_RETURN_CODE 77)
+    add_test(NAME agc_driver_draw_cache_reuse_cpu_record_recipes COMMAND agc_driver_draw_cache_reuse_tests)
+    set_tests_properties(agc_driver_draw_cache_reuse_cpu_record_recipes PROPERTIES
+        ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_DRAW_CACHE_INDIRECT=1;APS5_DRAW_CACHE_PUSH_WORD=1;APS5_NO_INDIRECT_INPUT_ROUTES=1;APS5_TEST_RECORD_RECIPE_REGRESSIONS=1"
+        SKIP_RETURN_CODE 77 FAIL_REGULAR_EXPRESSION "FATAL:")
+    add_test(NAME agc_driver_draw_cache_reuse_cpu_record_recipes_no_recipe COMMAND agc_driver_draw_cache_reuse_tests)
+    set_tests_properties(agc_driver_draw_cache_reuse_cpu_record_recipes_no_recipe PROPERTIES
+        ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_DRAW_CACHE_INDIRECT=1;APS5_DRAW_CACHE_PUSH_WORD=1;APS5_NO_INDIRECT_INPUT_ROUTES=1;APS5_TEST_RECORD_RECIPE_REGRESSIONS=1;APS5_NO_DRAW_RECIPE=1"
+        SKIP_RETURN_CODE 77 FAIL_REGULAR_EXPRESSION "FATAL:")
     set_tests_properties(agc_driver_draw_cache_reuse agc_driver_draw_cache_reuse_off agc_driver_draw_cache_reuse_verify agc_driver_draw_cache_reuse_inline agc_driver_draw_cache_reuse_indirect agc_driver_draw_cache_reuse_push_word agc_driver_draw_cache_reuse_push_word_verify PROPERTIES FAIL_REGULAR_EXPRESSION "FATAL:")
     set_property(TEST agc_driver_draw_cache_reuse agc_driver_draw_cache_reuse_off APPEND PROPERTY ENVIRONMENT "APS5_VERIFY_DRAW_RECIPE=1" "APS5_VERIFY_REGISTER_KEYS=1")
     add_test(NAME agc_driver_draw_data_hit_user_words_verify COMMAND agc_driver_draw_data_hit_user_words_tests)
@@ -3623,9 +3631,12 @@ if(BUILD_TESTING)
     add_test(NAME agc_driver_draw_data_hit_user_words_refresh COMMAND agc_driver_draw_data_hit_user_words_tests)
     set_tests_properties(agc_driver_draw_data_hit_user_words_refresh PROPERTIES ENVIRONMENT "APS5_DRAW_PIPELINE=1" SKIP_RETURN_CODE 77)
     if(WIN32)
-        set_tests_properties(agc_driver_draw_cache_reuse_off agc_driver_draw_cache_reuse_verify agc_driver_draw_cache_reuse_inline agc_driver_draw_cache_reuse_indirect agc_driver_draw_cache_reuse_push_word agc_driver_draw_cache_reuse_push_word_verify agc_driver_draw_data_hit_user_words_verify agc_driver_draw_data_hit_user_words_refresh PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_driver_draw_cache_reuse_off agc_driver_draw_cache_reuse_verify agc_driver_draw_cache_reuse_inline agc_driver_draw_cache_reuse_indirect agc_driver_draw_cache_reuse_push_word agc_driver_draw_cache_reuse_push_word_verify agc_driver_draw_cache_reuse_cpu_record_recipes agc_driver_draw_cache_reuse_cpu_record_recipes_no_recipe agc_driver_draw_data_hit_user_words_verify agc_driver_draw_data_hit_user_words_refresh PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    # RecipeHits is exchanged by profile reporting; keep both recipe controls independent of inherited profile flags.
+    set_property(TEST agc_driver_draw_cache_reuse_cpu_record_recipes agc_driver_draw_cache_reuse_cpu_record_recipes_no_recipe APPEND PROPERTY ENVIRONMENT_MODIFICATION
+        "APS5_PROFILE_DRAW=unset:")
 
     add_test(NAME agc_driver_stencil_replay_no_gpl COMMAND agc_driver_stencil_replay_tests)
     set_tests_properties(agc_driver_stencil_replay_no_gpl PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_GPL=1" TIMEOUT 30 SKIP_RETURN_CODE 77)
