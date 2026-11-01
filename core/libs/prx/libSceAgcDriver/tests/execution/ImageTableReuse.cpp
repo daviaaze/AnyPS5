@@ -312,12 +312,9 @@ void RunTests(AgcDriver::VulkanDevice& device, const GuestBlock& block, const Gu
     if (std::getenv("APS5_NO_TABLE_REPLAY") == nullptr) Require(AgcDriver::Graphics::ImageTableReuses().replayed - before.replayed == 2u, "image table reuse: three dispatches of one table in one epoch did not replay the bound table twice");
     ExpectWrites(before, 3, 0, "three dispatches of one table in one epoch");
 
-    before = AgcDriver::Graphics::ImageTableReuses();
     AgcDriver::Graphics::ClearCachedTextures(device.Device());
     Require(Dispatch(device, result, 7) == Row(block.Texels(7)), "image table reuse: the table after the texture cache was cleared sampled the wrong entry");
     Require(Dispatch(device, result, 9) == Row(block.Texels(9)), "image table reuse: the table resolved after the texture cache was cleared sampled the wrong entry");
-    Expect(before, 1, 1, "a kept table whose textures the texture cache dropped");
-    ExpectWrites(before, 1, 1, "a kept table whose textures the texture cache dropped");
 
     before = AgcDriver::Graphics::ImageTableReuses();
     std::vector<float> stored(Width * Height);
@@ -373,6 +370,71 @@ void RunTests(AgcDriver::VulkanDevice& device, const GuestBlock& block, const Gu
     before = AgcDriver::Graphics::ImageTableReuses();
     Require(Dispatch(device, result, 29) == Row(block.Texels(29)), "image table reuse: a kept table whose textures were destroyed sampled the wrong entry");
     ExpectWrites(before, 0, 1, "a kept table whose textures were destroyed");
+}
+
+void RunEvictedSnapshotTests(AgcDriver::VulkanDevice& device, const GuestBlock& block, const GuestBlock& snapshots) {
+    using namespace AgcDriver::Graphics;
+    // All records bind the same owned snapshot, so pressure cannot evict an
+    // unrelated table entry and accidentally satisfy the regression.
+    Fill(snapshots, 0, 0.375f);
+    Fill(snapshots, 1, 0.625f);
+    for (std::uint32_t record = 0; record < Records; ++record) SetRecordAddress(block, record, snapshots.Texels(0));
+    const auto srt = Buffer(block.Table(), Records * Stride);
+    const auto keys = Buffer(Keys.data(), static_cast<std::uint32_t>(sizeof(Keys)));
+    std::copy(srt.begin(), srt.end(), Srt.begin());
+    std::copy(keys.begin(), keys.end(), Srt.begin() + 4);
+    SetOutput(Output.data());
+    const auto result = Compile(device, block);
+    ClearCachedTextures(device.Device());
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    Require(AgcDriver::GuestMemory::WriteWatched(), "image table eviction: tracked guest writes are required");
+    const auto originalRow = Row(snapshots.Texels(0));
+    Require(Dispatch(device, result, 0) == originalRow, "image table eviction: initial GPU output is wrong");
+    std::array<std::uint32_t, 8> descriptor{};
+    const auto image = Image(snapshots.Texels(0));
+    std::copy(image.begin(), image.end(), descriptor.begin());
+    const auto held = CachedSampledTexture(device.graphicsContext(), descriptor);
+    device.WaitIdle();
+    Require(held != nullptr && held->SharedStorageSource() == nullptr && !held->Released(), "image table eviction: the table did not bind a cached owned snapshot");
+    const auto initial = TextureCacheUsage();
+    Require(initial.sampledEntries == 1u && initial.sampledBytes == held->AllocationBytes() && initial.sampledBytes != 0u, "image table eviction: the initial table does not have exactly one accounted snapshot");
+    const auto ready = AgcDriver::Graphics::ImageTableReuses();
+    Require(Dispatch(device, result, 0) == originalRow, "image table eviction: unpressured GPU output is wrong");
+    Expect(ready, 1, 0, "an unchanged tracked snapshot before budget pressure");
+
+    // A second equally sized live allocation cannot fit within a one-image
+    // budget's 125% ceiling: the oldest held entry must leave the sampled index.
+    // Do not clear caches or change the guest generation across this boundary.
+    OverrideCacheBudgetForTest(initial.sampledBytes);
+    try {
+        std::array<std::uint32_t, 8> pressureDescriptor{};
+        const auto pressureImage = Image(snapshots.Texels(1));
+        std::copy(pressureImage.begin(), pressureImage.end(), pressureDescriptor.begin());
+        const auto pressure = CachedSampledTexture(device.graphicsContext(), pressureDescriptor);
+        device.WaitIdle();
+        const auto pressured = TextureCacheUsage();
+        Require(pressure != nullptr && pressure != held && pressure->SharedStorageSource() == nullptr && !pressure->Released(), "image table eviction: competing surface was not admitted as an owned snapshot");
+        Require(held->Released() && pressured.sampledEntries == 1u && pressured.sampledBytes == pressure->AllocationBytes() && pressured.overflowEntries == 0u, "image table eviction: budget pressure did not evict the still-live table snapshot");
+        const auto before = AgcDriver::Graphics::ImageTableReuses();
+        Require(Dispatch(device, result, 0) == originalRow, "image table eviction: unchanged evicted snapshot sampled wrong GPU bytes");
+        Expect(before, 1, 0, "a still-live owned snapshot after sampled-cache eviction");
+
+        std::vector<float> changed(Width * Height);
+        for (std::uint32_t texel = 0; texel < Width * Height; ++texel) changed[texel] = -32.0f - static_cast<float>(texel);
+        const auto beforeWrite = AgcDriver::Graphics::ImageTableReuses();
+        AgcDriver::GuestMemory::Write(AddressOf(snapshots.Texels(0)), std::as_bytes(std::span(changed)));
+        Require(Dispatch(device, result, 0) == Row(changed.data()), "image table eviction: guest write reused stale evicted snapshot GPU bytes");
+        Expect(beforeWrite, 0, 1, "a guest write over an evicted owned snapshot");
+        const auto current = CachedSampledTexture(device.graphicsContext(), descriptor);
+        device.WaitIdle();
+        Require(current != held && current->SharedStorageSource() == nullptr, "image table eviction: guest write did not replace the old immutable snapshot");
+        Require(Dispatch(device, result, 0) == Row(changed.data()), "image table eviction: current guest bytes were not preserved on the next GPU dispatch");
+    } catch (...) {
+        device.WaitIdle();
+        OverrideCacheBudgetForTest(0);
+        throw;
+    }
+    OverrideCacheBudgetForTest(0);
 }
 
 void RunOverflowTableTests(AgcDriver::VulkanDevice& device, const GuestBlock& block, const GuestBlock& snapshots) {
@@ -439,6 +501,7 @@ int main(int argc, char** argv) {
         if (!device) return VulkanTestSkipped;
         if (overflowMode) {
             GuestBlock snapshots;
+            RunEvictedSnapshotTests(*device, block, snapshots);
             RunOverflowTableTests(*device, block, snapshots);
             std::puts("image table reuse overflow tests passed");
             return 0;

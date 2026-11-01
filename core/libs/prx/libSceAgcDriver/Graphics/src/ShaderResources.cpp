@@ -2130,23 +2130,35 @@ bool TableCurrent(ReusedTable& table) {
     return true;
 }
 
-bool CachedTableTextures(const ReusedTable& table, std::vector<std::shared_ptr<Texture>>& cached) {
+// TableCurrent must have proved the descriptor, guest bytes and pending-write state first.
+bool RetainedTableTextures(const ReusedTable& table, std::vector<std::shared_ptr<Texture>>& textures) {
     auto& cache = Textures();
     std::lock_guard lock(TableWaits::Acquire(TableWaits::TableTexturesMutex, cache.mutex), std::adopt_lock);
     expireOverflow(cache);
     std::vector<CacheRef> entries;
     entries.reserve(table.queries.size());
+    textures.clear();
+    textures.reserve(table.queries.size());
     for (const auto& element : table.elements) {
         if (element.rejected) continue;
+        auto texture = element.texture.lock();
+        if (texture == nullptr) {
+            textures.clear();
+            return false;
+        }
         const auto ref = findTexture(cache, element.key);
-        if (ref.entry == cacheEntries(cache, ref.overflow).end() || ref.entry->texture != element.texture.lock()) return false;
-        entries.push_back(ref);
+        if (ref.entry != cacheEntries(cache, ref.overflow).end() && ref.entry->texture == texture) {
+            entries.push_back(ref);
+        } else if (texture->SharedStorageSource() != nullptr || texture->OwnedImageHandle() == VK_NULL_HANDLE) {
+            textures.clear();
+            return false;
+        }
+        // Admitted snapshots are tracked, uncompressed and non-DCC. Cache eviction does not
+        // mutate their owned image; the independent TableCurrent proof still governs freshness.
+        // Storage-backed views retain the sampled-cache identity requirement above.
+        textures.push_back(std::move(texture));
     }
-    cached.reserve(entries.size());
-    for (const auto ref : entries) {
-        cached.push_back(ref.entry->texture);
-        touchTexture(cache, ref);
-    }
+    for (const auto ref : entries) touchTexture(cache, ref);
     return true;
 }
 
@@ -3886,7 +3898,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
             const auto* images = tableImages(shaders, table.stage);
             if (images == nullptr || images->count != table.elementTextures.size()) return false;
             std::vector<std::shared_ptr<Texture>> cached;
-            if (auto* reused = FindReusedTable(context.device, *images, CurrentTableState()); reused != nullptr && TableCurrent(*reused) && CachedTableTextures(*reused, cached)) {
+            if (auto* reused = FindReusedTable(context.device, *images, CurrentTableState()); reused != nullptr && TableCurrent(*reused) && RetainedTableTextures(*reused, cached)) {
                 auto next = cached.begin();
                 bool same = true;
                 for (std::uint32_t element = 0; same && element < images->count; ++element) {
@@ -5537,7 +5549,7 @@ void ShaderResources::resolveImageTables() {
         auto* reused = storageTable || item == nullptr ? nullptr : FindReusedTable(context.device, binding, state);
         std::size_t missReason = storageTable ? 1u : item == nullptr ? 2u : reused == nullptr ? 3u : 0u;
         if (reused != nullptr && !TableCurrent(*reused)) missReason = 4u;
-        else if (reused != nullptr && !CachedTableTextures(*reused, cached)) missReason = 5u;
+        else if (reused != nullptr && !RetainedTableTextures(*reused, cached)) missReason = 5u;
         else if (reused != nullptr && StorageTexture::PendingSerial() != reused->pendingSerial) missReason = 6u;
         if (missReason != 0u) counters.tableMiss[missReason].fetch_add(1, std::memory_order_relaxed);
         if (reused != nullptr && missReason == 0u) {

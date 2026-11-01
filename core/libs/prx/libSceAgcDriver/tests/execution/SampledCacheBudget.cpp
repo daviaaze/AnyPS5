@@ -1297,7 +1297,7 @@ ShaderRecompiler::RecompileResult StorageProgram(std::uint64_t address) {
     binding.imageWritten.assign(1, false);
     binding.imageSamplers.assign(1, 0u);
     const auto words = Descriptor(address);
-    binding.guestDescriptor.assign(words.begin(), words.end());
+    binding.guestDescriptor = ShaderRecompiler::SharedValues<std::uint32_t>(std::vector<std::uint32_t>(words.begin(), words.end()));
     ShaderRecompiler::RecompileResult program;
     program.bindings.push_back(std::move(binding));
     return program;
