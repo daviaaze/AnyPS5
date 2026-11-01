@@ -369,6 +369,13 @@ inline std::optional<std::uint32_t> ZeroFetchVertex(std::span<const ShaderRecomp
 
 inline std::optional<std::uint32_t> ClampDrawIndices(std::span<std::byte> indices, std::uint32_t indexSize, bool skipRestart, std::uint32_t limit) {
     Require(indexSize == 2 || indexSize == 4, "unsupported index size");
+    if (!skipRestart && limit == 0u) {
+        // Both supported widths are powers of two; leave any partial trailing index untouched.
+        const auto bytes = indices.size() & ~(static_cast<std::size_t>(indexSize) - 1u);
+        if (bytes == 0u) return std::nullopt;
+        std::memset(indices.data(), 0, bytes);
+        return 0u;
+    }
     const auto restartIndex = indexSize == 2 ? 0xffffu : 0xffffffffu;
     std::optional<std::uint32_t> highest;
     for (std::size_t offset = 0; offset + indexSize <= indices.size(); offset += indexSize) {

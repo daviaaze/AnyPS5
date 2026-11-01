@@ -11400,6 +11400,23 @@ void validationTests() {
             Require(AgcDriver::Graphics::ClampDrawIndices(std::as_writable_bytes(std::span(indices)), 4, false, 9u) == 9u && indices == std::array<std::uint32_t, 4>{9u, 2u, 9u, 9u}, "clamping without restart kept a 0xffffffff index");
             std::array<std::uint16_t, 2> narrow{0xffffu, 1u};
             Require(AgcDriver::Graphics::ClampDrawIndices(std::as_writable_bytes(std::span(narrow)), 2, false, 4u) == 4u && narrow[0] == 4u && narrow[1] == 1u, "clamping 16-bit indices failed");
+            for (const auto width : {2u, 4u}) {
+                std::array<std::byte, 11> raw;
+                raw.fill(std::byte{0xa5});
+                const auto complete = 2u * width;
+                Require(AgcDriver::Graphics::ClampDrawIndices(std::span(raw).subspan(1, complete + 1u), width, false, 0u) == 0u, "zero-bound clamping lost its complete indices");
+                for (std::size_t i = 0; i < raw.size(); ++i) {
+                    const auto expected = i >= 1u && i < 1u + complete ? std::byte{0} : std::byte{0xa5};
+                    Require(raw[i] == expected, "zero-bound clamping changed a guard or partial trailing index");
+                }
+                raw.fill(std::byte{0xa5});
+                Require(!AgcDriver::Graphics::ClampDrawIndices(std::span(raw).subspan(1, width - 1u), width, false, 0u).has_value(), "a partial zero-bound index produced a maximum");
+                Require(std::all_of(raw.begin(), raw.end(), [](auto byte) { return byte == std::byte{0xa5}; }), "a partial zero-bound index was written");
+            }
+            std::array<std::uint32_t, 3> restarted{0xffffffffu, 17u, 5u};
+            Require(AgcDriver::Graphics::ClampDrawIndices(std::as_writable_bytes(std::span(restarted)), 4, true, 0u) == 0u && restarted == std::array<std::uint32_t, 3>{0xffffffffu, 0u, 0u}, "zero-bound clamping consumed a restart marker");
+            restarted.fill(0xffffffffu);
+            Require(!AgcDriver::Graphics::ClampDrawIndices(std::as_writable_bytes(std::span(restarted)), 4, true, 0u).has_value() && restarted == std::array<std::uint32_t, 3>{0xffffffffu, 0xffffffffu, 0xffffffffu}, "an all-restart zero-bound range became drawable");
         }
         attribute.fetchIndex = 1;
         Require(AgcDriver::Graphics::VertexBufferReadOffset(attribute, 2, 7) == 224, "instance range includes records before the first instance");
