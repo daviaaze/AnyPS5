@@ -2758,8 +2758,16 @@ void copyCommitted(std::uint64_t address, std::span<std::byte> destination) {
         copyCommittedBytes(destination.data(), address, destination.size());
         return;
     }
-    std::memset(destination.data(), 0, destination.size());
-    for (const auto& [begin, end] : CommittedRanges(address, destination.size())) copyCommittedBytes(destination.data() + (begin - address), begin, static_cast<std::size_t>(end - begin));
+    std::size_t copied = 0;
+    for (const auto& [begin, end] : CommittedRanges(address, destination.size())) {
+        const auto offset = static_cast<std::size_t>(begin - address);
+        if (offset > copied) std::memset(destination.data() + copied, 0, offset - copied);
+        const auto bytes = static_cast<std::size_t>(end - begin);
+        // The copy also initializes chunks that become unreadable on Windows.
+        copyCommittedBytes(destination.data() + offset, begin, bytes);
+        copied = offset + bytes;
+    }
+    if (copied < destination.size()) std::memset(destination.data() + copied, 0, destination.size() - copied);
 }
 
 }

@@ -3755,11 +3755,9 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
         record.reorderPass = reorderPass;
         record.depthLocations = depthLocations;
         recordDraw(context, state, draw, shaders, inputs, record, outcome, timer, ownWaitedMs, prepared.trace);
-        // The recipe for the caller's draw-cache entry (design_cpu_final M8, rule R3 for draws):
-        // only a template the resource cache serves under this content key (reusable: no lease,
-        // no copied writes, every direct region import- or mirror-served) of a direct draw, so a
-        // hit's proof is the template's ProveCurrent and nothing needs completion work.
-        if (recipeOut != nullptr && DrawRecipes() && cacheable && !outcome.waited && args == nullptr && resources->Reusable() && resolved.moved.empty() && !multisampled && !pipeline->ReordersSamples()) {
+        // The recipe stores the reusable resource template, not per-draw moved bindings:
+        // DrawWithRecipe re-proves and supplies those bindings on every hit.
+        if (recipeOut != nullptr && DrawRecipes() && cacheable && !outcome.waited && args == nullptr && resources->Reusable() && !multisampled && !pipeline->ReordersSamples()) {
             auto recipe = std::make_shared<DrawRecipe>();
             recipe->device = context.device;
             recipe->templateRef = resources;

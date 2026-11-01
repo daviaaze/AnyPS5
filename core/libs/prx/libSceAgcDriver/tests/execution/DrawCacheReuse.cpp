@@ -51,6 +51,9 @@ alignas(256) constexpr std::array<std::uint32_t, 16> OffsetTriangleVertexCode{
 };
 alignas(256) constexpr std::array<std::uint32_t, 8> PixelCode{0x7e000200u, 0x7e020280u, 0xf800180fu, 0x00010100u, 0xbf810000u, 0xbf810000u, 0xbf810000u, 0xbf810000u};
 alignas(256) constexpr std::array<std::uint32_t, 8> ConstantPixelCode{0xf4000080u, 0xfa000000u, 0xbf8cc07fu, 0x7e000202u, 0x7e020280u, 0xf800180fu, 0x00010100u, 0xbf810000u};
+alignas(256) constexpr std::array<std::uint32_t, 8> MovedConstantPixelCode{
+    0xf4000080u, 0xfa000000u, 0xbf8cc07fu, 0x7e000202u, 0x7e020280u, 0xf800180fu, 0x00010100u, 0xbf810000u,
+};
 alignas(256) std::array<std::byte, 1024> ColorMemory{};
 alignas(256) std::array<float, 4> PixelConstant{};
 std::byte* PixelConstantAddress = reinterpret_cast<std::byte*>(PixelConstant.data());
@@ -126,6 +129,7 @@ alignas(8) Header PixelHeader{};
 alignas(8) Header TriangleVertexHeader{};
 alignas(8) Header ConstantPixelHeader{};
 alignas(8) Header OffsetTriangleVertexHeader{};
+alignas(8) Header MovedConstantPixelHeader{};
 alignas(256) std::array<std::uint32_t, 4> IndirectRecord{3, 1, 0, 0};
 alignas(256) std::array<std::uint32_t, 8> OffsetRecords{3, 1, 4, 0, 3, 1, 0, 0};
 alignas(256) std::array<std::uint32_t, 4> OffsetRecord{3, 1, 0, 0};
@@ -558,14 +562,69 @@ void CpuResolvedRecordRecipesRefreshCurrentResources(bool libraries) {
     Require(disabled ? recipeHitsAfter == changedRecipeHits : recipeHitsAfter > changedRecipeHits,
             mode + (disabled ? ": disabled draw recipes recorded a replay" : ": the current moved pixel constant was not consumed by a warmed draw-recipe replay"));
 }
+void CpuResolvedMovedDataRecipesUseCurrentGuestData(bool libraries, std::vector<std::unique_ptr<WatchedGuestBlock>>& owned) {
+    const auto mode = std::string(libraries ? "with" : "without") + " graphics pipeline libraries";
+    Registered(OffsetTriangleVertexHeader, OffsetTriangleVertexCode.data(), sizeof(OffsetTriangleVertexCode), 2);
+    Registered(MovedConstantPixelHeader, MovedConstantPixelCode.data(), sizeof(MovedConstantPixelCode), 1);
 
-void CpuResolvedRecordRecipeRegressions(bool libraries) {
+    auto source = std::make_unique<WatchedGuestBlock>();
+    const auto constantAddress = reinterpret_cast<std::uintptr_t>(source->Data());
+    owned.emplace_back(std::move(source));
+    float currentConstant = 0.0f;
+    const auto submitRecord = [&](float constant) {
+        OffsetRecord[2] = 0;
+        if (currentConstant != constant) {
+            const std::array<float, 4> words{constant, 0.0f, 0.0f, 0.0f};
+            AgcDriver::GuestMemory::Write(constantAddress, std::as_bytes(std::span<const float>(words)));
+            currentConstant = constant;
+        }
+        ClearColorMemory();
+        auto commands = Draws(32.0f, OffsetTriangleVertexCode.data(), 1, MovedConstantPixelCode.data(), 2, {});
+        Append(commands, 0x76, {0x00c, static_cast<std::uint32_t>(constantAddress)});
+        Append(commands, 0x76, {0x00d, static_cast<std::uint32_t>(constantAddress >> 32u)});
+        Append(commands, 0x79, {0x24a, 0});
+        const auto records = reinterpret_cast<std::uintptr_t>(OffsetRecord.data());
+        Append(commands, 0x11, {1, static_cast<std::uint32_t>(records), static_cast<std::uint32_t>(records >> 32u)});
+        Append(commands, 0x24, {0, 0x8c, 0, 2});
+        return Submit(commands);
+    };
+    const auto wrote = [&](unsigned expected, const std::string& what) {
+        const auto actual = BrightestColorByte();
+        Require(actual == expected, mode + ": " + what + " wrote " + std::to_string(actual) + ", expected " + std::to_string(expected));
+    };
+    const auto drawCountersBefore = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+    const auto recipeHitsBefore = AgcDriver::VulkanDevice::RecipeHits(AgcDriver::VulkanDevice::RecipeKind::Draw);
+    const auto firstA = submitRecord(0.25f);
+    wrote(64, "the first CPU-resolved record reading the moved guest constant at 0.25");
+    const auto secondA = submitRecord(0.25f);
+    wrote(64, "the second CPU-resolved record reading the moved guest constant at 0.25");
+    const auto firstB = submitRecord(0.5f);
+    wrote(128, "the CPU-resolved record reading the moved guest constant at 0.5");
+    const auto hitsBeforeRepeat = AgcDriver::VulkanDevice::RecipeHits(AgcDriver::VulkanDevice::RecipeKind::Draw);
+    const auto secondB = submitRecord(0.5f);
+    wrote(128, "the repeated CPU-resolved record reading the moved guest constant at 0.5");
+    const auto after = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+    Require(after.recordWordsForwarded - drawCountersBefore.recordWordsForwarded == 4 &&
+                after.recordStagesRecompiled == drawCountersBefore.recordStagesRecompiled &&
+                after.recordWordsRefused == drawCountersBefore.recordWordsRefused,
+            mode + ": four CPU-resolved records forwarded " + std::to_string(after.recordWordsForwarded - drawCountersBefore.recordWordsForwarded) +
+                " words, re-materialized " + std::to_string(after.recordStagesRecompiled - drawCountersBefore.recordStagesRecompiled) +
+                " stages and refused " + std::to_string(after.recordWordsRefused - drawCountersBefore.recordWordsRefused));
+    const auto hitsAfterRepeat = AgcDriver::VulkanDevice::RecipeHits(AgcDriver::VulkanDevice::RecipeKind::Draw);
+    const bool disabled = std::getenv("APS5_NO_DRAW_RECIPE") != nullptr;
+    Require(disabled ? hitsAfterRepeat == recipeHitsBefore : hitsAfterRepeat > hitsBeforeRepeat,
+            mode + (disabled ? ": disabled draw recipes recorded a moved-data replay" : ": the repeated moved-data record made no draw-recipe replay"));
+}
+
+
+void CpuResolvedRecordRecipeRegressions(bool libraries, std::vector<std::unique_ptr<WatchedGuestBlock>>& owned) {
     Require(std::getenv("APS5_DRAW_CACHE_INDIRECT") != nullptr, "record recipe regressions require APS5_DRAW_CACHE_INDIRECT");
     Require(std::getenv("APS5_DRAW_CACHE_PUSH_WORD") != nullptr, "record recipe regressions require APS5_DRAW_CACHE_PUSH_WORD");
     Require(std::getenv("APS5_NO_INDIRECT_INPUT_ROUTES") != nullptr, "record recipe regressions require the forced CPU indirect route");
     RecordsKeepThePacketsFragmentWord(libraries);
     RecordWordsReachTheShader(libraries);
     CpuResolvedRecordRecipesRefreshCurrentResources(libraries);
+    CpuResolvedMovedDataRecipesUseCurrentGuestData(libraries, owned);
 }
 
 
@@ -584,6 +643,7 @@ void SightingsKeepCollidingKeys() {
 int main() {
     std::unique_ptr<WatchedGuestBlock> residentColor;
     std::unique_ptr<WatchedGuestBlock> residentConstant;
+    std::vector<std::unique_ptr<WatchedGuestBlock>> residentInputs;
     try {
         SightingsKeepCollidingKeys();
         bool libraries = false;
@@ -606,7 +666,7 @@ int main() {
         }
         if (!libraries && std::getenv("APS5_NO_GPL") == nullptr) return VulkanTestSkipped;
         if (recipeRegressions) {
-            CpuResolvedRecordRecipeRegressions(libraries);
+            CpuResolvedRecordRecipeRegressions(libraries, residentInputs);
         } else if (std::getenv("APS5_VERIFY_DRAW_ENTRIES") != nullptr) {
             RefreshedStageDataVerifies();
         } else {
