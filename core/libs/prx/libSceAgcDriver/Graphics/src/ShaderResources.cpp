@@ -572,10 +572,6 @@ struct LookupRecord {
     std::uint64_t generation;
     const StorageTexture* source;
     bool depth = false;
-    // A partially resident snapshot's proof: its committed ranges and the generation they were
-    // collected at (generation above is 0 then).
-    std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> committed{};
-    std::uint64_t committedGeneration = 0;
 };
 
 thread_local std::vector<LookupRecord>* lookupLogSlot = nullptr;
@@ -1122,9 +1118,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 it->committed = std::move(committed);
                 it->untracked = untracked;
                 touchTexture(cache, ref);
-                logLookup({it->texture.get(), resource, guestBytes, *keys, generation, nullptr, false,
-                           it->committed ? std::make_shared<const std::vector<std::pair<std::uint64_t, std::uint64_t>>>(*it->committed) : nullptr,
-                           it->committed ? it->generation : 0});
+                logLookup({it->texture.get(), resource, guestBytes, *keys, generation, nullptr});
                 reportTextureCounters();
                 if (profile) LookupOutcomes::Add(LookupOutcomes::SampledHitSnapshot, start);
                 return it->texture;
@@ -1206,8 +1200,6 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     auto texture = entry.texture;
     const bool admitted = admitTexture(context, cache, key, entry.accounted, budget);
     const auto ceiling = budget + budget / 4u;
-    const auto committedProof = source == nullptr && entry.committed ? std::make_shared<const std::vector<std::pair<std::uint64_t, std::uint64_t>>>(*entry.committed) : nullptr;
-    const auto committedGeneration = committedProof ? entry.generation : 0;
     if (!admitted) {
         if (entry.accounted == 0 || entry.accounted > ceiling || cache.overflowIndex.contains(key) || cache.bytes > ceiling - entry.accounted || cache.overflowBytes > ceiling - entry.accounted - cache.bytes) {
             ++cache.counts.uncached;
@@ -1224,7 +1216,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         cache.overflowEntries.push_front(std::move(entry));
         cache.overflowIndex[key] = cache.overflowEntries.begin();
         if (source != nullptr) cache.overflowViews.emplace(source.get(), cache.overflowEntries.begin());
-        logLookup({texture.get(), resource, guestBytes, *keys, generation, source.get(), false, committedProof, committedGeneration});
+        logLookup({texture.get(), resource, guestBytes, *keys, generation, source.get()});
         reportCacheCounts(cache, budget);
         reportTextureCounters();
         if (profile) LookupOutcomes::Add(source != nullptr ? LookupOutcomes::SampledMadeView : LookupOutcomes::SampledMadeSnapshot, start);
@@ -1233,7 +1225,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     cache.bytes += entry.accounted;
     entry.present = Recorder::Presents();
     ++cache.counts.inserted;
-    logLookup({texture.get(), resource, guestBytes, *keys, generation, source.get(), false, committedProof, committedGeneration});
+    logLookup({texture.get(), resource, guestBytes, *keys, generation, source.get()});
     cache.entries.push_front(std::move(entry));
     cache.index[key] = cache.entries.begin();
     if (source != nullptr) cache.views.emplace(source.get(), cache.entries.begin());
@@ -2092,10 +2084,6 @@ struct ReusedTableElement {
     bool firstLayer = false;
     bool rejected = false;
     std::string message;
-    // A partially resident snapshot: its committed ranges and their generation replace the
-    // element's whole-range query.
-    std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> committed{};
-    std::uint64_t committedGeneration = 0;
 };
 
 struct ReusedTable {
@@ -2213,20 +2201,6 @@ bool TableCurrent(ReusedTable& table) {
         for (const auto& query : table.queries) {
             if (GuestMemory::CollectWrites(query.address, query.bytes) == 0) { tableCurrentReason = 7; return false; }
         }
-    }
-    // Partially resident snapshots: the same committed ranges (a commit change makes them
-    // differ), collected in a new epoch, unchanged since their generation, and no recorded GPU
-    // write over them, as cachedTexture's own `unchanged` check for such snapshots.
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
-    for (const auto& element : table.elements) {
-        if (element.rejected || element.committed == nullptr) continue;
-        const auto address = element.resource.baseAddress;
-        const auto bytes = static_cast<std::size_t>(element.guestBytes);
-        if (earlier) {
-            ranges.clear();
-            if (GuestMemory::CollectCommittedWrites(address, bytes, ranges) == 0 || ranges != *element.committed) { tableCurrentReason = 7; return false; }
-        }
-        if (Recorder::SnapshotWriteOverlaps(address, bytes) || !GuestMemory::UnchangedCommittedSince(*element.committed, element.committedGeneration)) { tableCurrentReason = 7; return false; }
     }
     if (!GuestMemory::UnchangedSinceAll(table.queries)) {
         tableCurrentReason = std::any_of(table.queries.begin(), table.queries.end(), [](const auto& query) { return query.generation == 0; }) ? 6 : 7;
@@ -5797,9 +5771,7 @@ void ShaderResources::resolveImageTables() {
                         StorageImageServesKeys(*source, resource.dccAddress);
                 // DCC metadata is no bar while the lookup proved the keys uncompressed: TableCurrent
                 // re-proves them (TableElementKeysUncompressed) before every reuse.
-                const bool committedSnapshot = looked != nullptr && looked->source == nullptr && looked->generation == 0 &&
-                        looked->committed != nullptr && looked->committedGeneration != 0;
-                const bool snapshotCurrent = looked != nullptr && looked->source == nullptr && (looked->generation != 0 || committedSnapshot) &&
+                const bool snapshotCurrent = looked != nullptr && looked->source == nullptr && looked->generation != 0 &&
                         looked->keys == DccKeys::Uncompressed;
                 const bool storageCurrent = exactStorageView && looked != nullptr && looked->source == source.get();
                 if (!(looked != nullptr && looked->object == texture.get() && (snapshotCurrent || storageCurrent))) deny(looked == nullptr ? 5u : looked->object != texture.get() ? 6u : looked->keys != DccKeys::Uncompressed ? 10u : resource.dccAddress != 0 ? 7u : 8u);
@@ -5813,12 +5785,9 @@ void ShaderResources::resolveImageTables() {
                     counters.tableProofFail[why].fetch_add(1, std::memory_order_relaxed);
                 }
                 if (reusable) {
-                    fresh.elements.push_back({MakeTextureKey(context.device, sampledWords, components, depthCompare), texture, resource, guestBytes, firstLayer, false, {},
-                                              committedSnapshot ? looked->committed : nullptr, committedSnapshot ? looked->committedGeneration : 0});
-                    if (!committedSnapshot) {
-                        const auto generation = storageCurrent ? source->GenerationFor(resource.baseAddress, static_cast<std::size_t>(guestBytes)) : looked->generation;
-                        fresh.queries.push_back({resource.baseAddress, static_cast<std::size_t>(guestBytes), generation});
-                    }
+                    fresh.elements.push_back({MakeTextureKey(context.device, sampledWords, components, depthCompare), texture, resource, guestBytes, firstLayer, false, {}});
+                    const auto generation = storageCurrent ? source->GenerationFor(resource.baseAddress, static_cast<std::size_t>(guestBytes)) : looked->generation;
+                    fresh.queries.push_back({resource.baseAddress, static_cast<std::size_t>(guestBytes), generation});
                 }
             }
             fresh.bound[element] = bind(element, sampledWords, std::move(texture), resource, guestBytes, firstLayer);
