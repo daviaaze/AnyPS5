@@ -730,18 +730,26 @@ std::uint64_t storageBudget(const Context& context, std::uint64_t required = 0) 
     return cached.budget;
 }
 
-std::uint64_t sampledBudget(const Context& context, TextureCache& cache) {
+std::uint64_t sampledBudget(const Context& context, TextureCache& cache, std::uint64_t required = 0) {
     if (const auto forced = forcedCacheBudget(); forced != 0) return forced;
     if (context.memoryProperties2 == nullptr || context.physical == VK_NULL_HANDLE) return TextureCacheBudget(context.memory);
     const auto now = std::chrono::steady_clock::now();
-    if (cache.budgetDevice == context.physical && now - cache.budgetRead < std::chrono::seconds(1)) return cache.budget;
+    const bool refresh = cache.budgetDevice != context.physical || now - cache.budgetRead >= std::chrono::seconds(1);
+    if (!refresh && required <= cache.budget) return cache.budget;
     VkPhysicalDeviceMemoryBudgetPropertiesEXT reported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
     VkPhysicalDeviceMemoryProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
     properties.pNext = &reported;
-    context.memoryProperties2(context.physical, &properties);
-    const auto sampled = SampledTextureMemory();
-    const auto storage = storageCacheBytes();
-    const auto budget = SampledTextureBudget(context.memory, &reported, sampled + storage, storage);
+    std::uint64_t sampled = 0;
+    std::uint64_t storage = 0;
+    const auto read = [&] {
+        context.memoryProperties2(context.physical, &properties);
+        sampled = SampledTextureMemory();
+        storage = storageCacheBytes();
+        return SampledTextureBudget(context.memory, &reported, sampled + storage, storage);
+    };
+    auto budget = refresh ? read() : cache.budget;
+    if (required > budget && context.bufferPool != nullptr && context.bufferPool->ReclaimIdleDevice(required - budget, now) != 0) budget = read();
+    else if (!refresh) return budget;
     const bool fresh = cache.budgetDevice != context.physical;
     const auto storageLimit = storageBudget(context);
     if (const auto heap = largestDeviceLocalHeap(context.memory); heap && (fresh || SampledBudgetReportDue(cache.reportedBudget, budget, now - cache.reportedAt) || SampledBudgetReportDue(cache.reportedStorage, storageLimit, now - cache.reportedAt))) {
@@ -1040,7 +1048,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     const CacheHold held(sampledCacheHeld);
     expireOverflow(cache);
     dropUncachedViews(cache);
-    const auto budget = sampledBudget(context, cache);
+    auto budget = sampledBudget(context, cache);
     trimOverflowToBudget(cache, budget);
     const auto ref = findTexture(cache, key);
     const auto present = Recorder::Presents();
@@ -1167,6 +1175,8 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         counters.snapshots.fetch_add(1, std::memory_order_relaxed);
     }
     auto texture = entry.texture;
+    const auto required = cache.bytes + std::min(entry.accounted, std::numeric_limits<std::uint64_t>::max() - cache.bytes);
+    budget = sampledBudget(context, cache, required);
     const bool admitted = admitTexture(cache, key, entry.accounted, budget);
     const auto ceiling = budget + budget / 4u;
     if (!admitted) {
