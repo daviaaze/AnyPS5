@@ -2398,6 +2398,7 @@ void verifyRegisteredViewTransaction(std::string_view mode) {
     IrResourcePlan plan;
     plan.srtPlanComplete = true;
     plan.resourceTrackingComplete = true;
+    plan.userDataCount = 0u;
     plan.materializationSources = {0u};
     std::vector<std::unique_ptr<IrValue>> values;
     DescriptorSource source;
