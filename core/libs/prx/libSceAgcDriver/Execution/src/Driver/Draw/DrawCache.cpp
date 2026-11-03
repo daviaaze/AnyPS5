@@ -14,8 +14,9 @@ bool DrawRecipeRecord::Matches(const std::vector<std::shared_ptr<DispatchVariant
     for (std::size_t i = 0; i < stages.size(); ++i) {
         if (stages[i].owner_before(variants[i]) || variants[i].owner_before(stages[i])) return false;
     }
+    // A materialized specialization can differ while retaining its translation artifact ID.
     for (std::size_t i = 0; i < compiled.size(); ++i) {
-        if (compiled[i].program == nullptr || compiledVariants[i] == 0 || compiledVariants[i] != compiled[i].program->variantId) return false;
+        if (compiled[i].program == nullptr || compiledVariants[i] == 0 || compiledVariants[i] != compiled[i].program->PipelineVariantId()) return false;
     }
     return true;
 }
@@ -275,8 +276,8 @@ void Driver::attachDrawRecipe(std::uint64_t key, const std::vector<std::shared_p
     fresh.stages.assign(stages.begin(), stages.end());
     fresh.compiledVariants.reserve(compiled.size());
     for (const auto& shader : compiled) {
-        if (shader.program == nullptr || shader.program->variantId == 0) return;
-        fresh.compiledVariants.push_back(shader.program->variantId);
+        if (shader.program == nullptr || shader.program->PipelineVariantId() == 0) return;
+        fresh.compiledVariants.push_back(shader.program->PipelineVariantId());
     }
     fresh.recipe = std::move(recipe);
     records->push_back(std::move(fresh));

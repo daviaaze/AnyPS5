@@ -1395,7 +1395,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         const bool pushWord = drawCachePushWord();
         // Stage-data hits patch copied descriptor words but preserve the matched stage ABI.
         // DrawWithRecipe still proves this record's current descriptors and moved buffers.
-        const bool indirectRecipeMode = registerKey && drawHit && drawCacheIndirect() && pushWord && Graphics::DrawRecipes() && !graphics.rectList && !graphics.stages.tessellationGeometry && std::all_of(stages.begin(), stages.end(), [](const auto& shader) { return shader.program != nullptr && shader.program->variantId != 0; });
+        const bool indirectRecipeMode = registerKey && drawHit && drawCacheIndirect() && pushWord && Graphics::DrawRecipes() && !graphics.rectList && !graphics.stages.tessellationGeometry && std::all_of(stages.begin(), stages.end(), [](const auto& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; });
         std::vector<std::shared_ptr<DispatchVariant>> indirectRecipeStages;
         if (indirectRecipeMode) {
             indirectRecipeStages.reserve(programs.size());
@@ -1589,7 +1589,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     }
 
     std::vector<std::shared_ptr<DispatchVariant>> recipeStages;
-    if (registerKey && (!drawParameters.indirect || (indirectGpuCandidate && drawCacheIndirect())) && !patchedStages && !graphics.stages.tessellationGeometry && Graphics::DrawRecipes() && std::all_of(stages.begin(), stages.end(), [](const auto& shader) { return shader.program != nullptr && shader.program->variantId != 0; })) {
+    if (registerKey && (!drawParameters.indirect || (indirectGpuCandidate && drawCacheIndirect())) && !patchedStages && !graphics.stages.tessellationGeometry && Graphics::DrawRecipes() && std::all_of(stages.begin(), stages.end(), [](const auto& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; })) {
         recipeStages.reserve(programs.size());
         for (std::size_t i = 0; i < programs.size(); ++i) recipeStages.push_back(drawHit ? matched[i] : fresh[i]);
         if (std::all_of(recipeStages.begin(), recipeStages.end(), [](const std::shared_ptr<DispatchVariant>& variant) { return variant == nullptr; })) recipeStages.clear();
