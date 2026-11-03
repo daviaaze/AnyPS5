@@ -5,6 +5,7 @@
 #include "UserDataUse.hpp"
 
 #include <atomic>
+#include <array>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -70,6 +71,29 @@ using SrtDescriptorScope = std::uint64_t (*)(void* userData, std::size_t bytes);
 // flattened leaf as (flat offset, address), and every structural raw read address.
 // Transfer-footprint leaves belong to both sets: materialization needs their values,
 // but changing them must invalidate data-only cache reuse.
+struct SrtImageViewIdentity {
+    std::uint64_t generation = 0;
+    std::uint64_t address = 0;
+    std::uint64_t rangeAddress = 0;
+    std::uint64_t rangeBytes = 0;
+    std::uint64_t allocationAddress = 0;
+    std::uint64_t allocationBytes = 0;
+    std::uint64_t backingSerial = 0;
+    bool hasRange = false;
+    bool readable = false;
+    bool writable = false;
+    bool gpu = false;
+
+    bool operator==(const SrtImageViewIdentity& other) const = default;
+};
+
+using SrtImageViewNormalizer = bool (*)(void* userData, std::uint32_t maxArrayLayers, std::array<std::uint32_t, 8>& descriptor, SrtImageViewIdentity& identity);
+using SrtImageViewGeneration = std::uint64_t (*)(void* userData);
+
+// The guest addresses a walk dereferenced (Detail::Evaluator::EvaluateRawRead): the leaf read of
+// each pure flat slot (IrResourcePlan::pureFlatSlots) as (flat offset, address), set by the
+// flattened loop through `leaf`/`leafSlot` around that slot's evaluation, and every other raw read
+// address.
 struct SrtReadTrace {
     const IrValue* leaf = nullptr;
     std::uint32_t leafSlot = 0;
@@ -93,6 +117,8 @@ struct SrtRuntime {
     SrtMemorySupplier supplyWords = nullptr;
     SrtUserDataUse* userDataUse = nullptr;
     SrtDescriptorScope descriptorScope = nullptr;
+    SrtImageViewNormalizer normalizeImageView = nullptr;
+    SrtImageViewGeneration imageViewGeneration = nullptr;
 };
 
 struct SrtForceSyncScope {
@@ -111,6 +137,16 @@ struct SrtForceSyncScope {
 enum class RuntimeValueType {
     Any,
     Integer
+};
+
+bool& SrtEvaluatingBranch();
+
+struct SrtBranchScope {
+    bool saved;
+    SrtBranchScope() : saved(SrtEvaluatingBranch()) { SrtEvaluatingBranch() = true; }
+    ~SrtBranchScope() { SrtEvaluatingBranch() = saved; }
+    SrtBranchScope(const SrtBranchScope&) = delete;
+    SrtBranchScope& operator=(const SrtBranchScope&) = delete;
 };
 
 class SrtWalker {

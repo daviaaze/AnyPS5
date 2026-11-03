@@ -13,9 +13,8 @@
 
 namespace ShaderRecompiler::ShaderDiskCache {
 
-// Union of local format 48 and upstream format 35, plus complete nested mesh
-// barycentric/fragment metadata. Reject format 49's incomplete mesh payloads too.
-inline constexpr std::uint32_t FormatVersion = 50;
+// Combined upstream format 52 and local explicit cache ownership codec; reject old payload layouts.
+inline constexpr std::uint32_t FormatVersion = 53;
 
 enum class LoadStatus {
     Loaded,

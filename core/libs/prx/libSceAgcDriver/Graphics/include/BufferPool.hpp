@@ -82,7 +82,7 @@ public:
     void PutImageMemory(VkDeviceMemory memory, VkDeviceSize bytes, std::uint32_t memoryType) noexcept;
     std::size_t RetainedImages();
     std::optional<BufferAllocation> TakeHostTransfer(std::size_t bytes, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, VkDeviceSize requirementSize, VkDeviceSize alignment, std::uint32_t typeBits, std::uint32_t selectedType);
-    std::optional<BufferAllocation> Take(std::size_t bytes, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    std::optional<BufferAllocation> Take(std::size_t bytes, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, const char* category = nullptr);
     void Put(const BufferAllocation& allocation) noexcept;
     void NotePresent() noexcept;
     VkDeviceSize ReclaimIdleDevice(VkDeviceSize bytes, std::chrono::steady_clock::time_point now);
@@ -151,7 +151,7 @@ private:
     static VkDeviceSize deviceBudget(const Context& context);
     static bool DeviceTiered(VkMemoryPropertyFlags properties);
     static std::size_t NextCapacity(std::size_t capacity);
-    VkDeviceSize destroy(const BufferAllocation& allocation) noexcept;
+    VkDeviceSize destroy(const BufferAllocation& allocation, bool retained = false) noexcept;
     VkDeviceSize trim();
     // Moves the tier's least recently used slot (the oldest front of its lists) to `evicted`; the
     // caller destroys those after releasing the mutex, so builds taking buffers on other threads
