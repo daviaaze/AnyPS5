@@ -2663,7 +2663,6 @@ private:
     };
     std::vector<EdgeSelectorEntry> m_edgeSelectors;
     bool m_unknownBdaAccess = false;
-    std::unordered_map<const IrValue*, std::string> m_splitFailures;
     bool m_foldedWeb = false;
 };
 

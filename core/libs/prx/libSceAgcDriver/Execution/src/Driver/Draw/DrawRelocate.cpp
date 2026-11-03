@@ -356,12 +356,27 @@ void Driver::applyShaderDataPatches(DispatchVariant& variant) {
     for (const auto& [slot, value] : variant.shaderDataPatches) {
         const auto at = static_cast<std::size_t>(slot) * sizeof(std::uint32_t);
         if (at + sizeof(std::uint32_t) <= rebased->pushConstants.size()) std::memcpy(rebased->pushConstants.data() + at, &value, sizeof(value));
-        for (auto& binding : rebased->bindings) {
-            if (binding.role == ShaderRecompiler::DescriptorRole::ShaderData && slot < binding.guestDescriptor.size()) binding.guestDescriptor[slot] = value;
-        }
     }
-    for (const auto& [binding, word, value] : variant.descriptorPatches) {
-        if (binding < rebased->bindings.size() && word < rebased->bindings[binding].guestDescriptor.size()) rebased->bindings[binding].guestDescriptor[word] = value;
+    for (std::size_t index = 0; index < rebased->bindings.size(); ++index) {
+        auto& binding = rebased->bindings[index];
+        const bool shaderData = binding.role == ShaderRecompiler::DescriptorRole::ShaderData;
+        const auto size = binding.guestDescriptor.size();
+        const bool forwarded = shaderData && std::any_of(variant.shaderDataPatches.begin(), variant.shaderDataPatches.end(), [&](const auto& patch) { return patch.first < size; });
+        const bool patched = std::any_of(variant.descriptorPatches.begin(), variant.descriptorPatches.end(), [&](const auto& patch) {
+            const auto& [target, word, value] = patch;
+            return target == index && word < size;
+        });
+        if (!forwarded && !patched) continue;
+        auto words = binding.guestDescriptor.Copy();
+        if (shaderData) {
+            for (const auto& [slot, value] : variant.shaderDataPatches) {
+                if (slot < words.size()) words[slot] = value;
+            }
+        }
+        for (const auto& [target, word, value] : variant.descriptorPatches) {
+            if (target == index && word < words.size()) words[word] = value;
+        }
+        binding.guestDescriptor = ShaderRecompiler::SharedValues<std::uint32_t>(std::move(words));
     }
     variant.compiled = std::move(rebased);
     variant.shaderDataPatches.clear();

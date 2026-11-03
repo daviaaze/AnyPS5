@@ -890,30 +890,31 @@ bool BackingSpanAt(std::uintptr_t cursor, std::uintptr_t end, BackingSpan& span)
 }
 
 bool SharedBackingRuns(std::uintptr_t address, std::size_t bytes, int* file, GuestArena::SharedBackingRun* runs, std::size_t capacity, std::size_t* count) {
-    std::lock_guard lock(g_directLock);
+    if (file == nullptr || count == nullptr || (capacity != 0 && runs == nullptr) ||
+        bytes == 0 || bytes > std::numeric_limits<std::uintptr_t>::max() - address) return false;
+    *file = -1;
     *count = 0;
-    const auto next = g_directMappings.upper_bound(address);
-    if (bytes == 0 || bytes > std::numeric_limits<std::uintptr_t>::max() - address || next == g_directMappings.begin()) return false;
-    auto it = std::prev(next);
-    if (address >= it->second.end) return false;
-    const int backingFile = it->second.backing->File();
+    std::lock_guard lock(g_directLock);
     const auto end = address + bytes;
+    BackingSpan span{};
+    int backingFile = -1;
     std::size_t filled = 0;
     for (auto cursor = address; cursor < end;) {
-        if (it == g_directMappings.end() || it->first > cursor || it->second.backing->File() != backingFile) return false;
-        const auto phys = it->second.phys + (cursor - it->first);
-        const auto page = g_physPages.find(phys - phys % PS5_PAGE_SIZE);
-        if (page == g_physPages.end() || page->second.backing != it->second.backing) return false;
-        const auto stop = std::min(end, static_cast<std::uintptr_t>(it->second.end));
-        const auto offset = it->second.backing->FileOffset() + page->second.offset + phys % PS5_PAGE_SIZE;
-        if (filled != 0 && runs[filled - 1].offset + runs[filled - 1].bytes == offset) {
-            runs[filled - 1].bytes += stop - cursor;
+        if (!BackingSpanAt(cursor, end, span) || span.bytes == 0 ||
+            span.backing->FileOffset() > std::numeric_limits<std::uint64_t>::max() - span.offset) return false;
+        const int spanFile = span.backing->File();
+        if (backingFile == -1) backingFile = spanFile;
+        else if (backingFile != spanFile) return false;
+        const auto offset = span.backing->FileOffset() + span.offset;
+        if (offset > std::numeric_limits<std::uint64_t>::max() - (span.bytes - 1)) return false;
+        if (filled != 0 && runs[filled - 1].offset <= std::numeric_limits<std::uint64_t>::max() - runs[filled - 1].bytes &&
+            runs[filled - 1].offset + runs[filled - 1].bytes == offset) {
+            runs[filled - 1].bytes += span.bytes;
         } else {
             if (filled == capacity) return false;
-            runs[filled++] = GuestArena::SharedBackingRun{offset, static_cast<std::size_t>(stop - cursor)};
+            runs[filled++] = GuestArena::SharedBackingRun{offset, span.bytes};
         }
-        cursor = stop;
-        ++it;
+        cursor += span.bytes;
     }
     const int duplicate = fcntl(backingFile, F_DUPFD_CLOEXEC, 0);
     if (duplicate < 0) throw std::system_error(errno, std::generic_category(), "duplicate direct memory backing");
@@ -1328,7 +1329,8 @@ void UnmapRegistered(GuestAllocations::Mutation& mutation, void* addr, size_t le
         change.Commit();
 #elif defined(__EMSCRIPTEN__)
         EraseMappings(reinterpret_cast<std::uintptr_t>(piece), reinterpret_cast<std::uintptr_t>(piece) + pieceBytes);
-#if defined(__linux__) || defined(__EMSCRIPTEN__) || defined(__APPLE__)
+        Unmap(pieceAddress, pieceBytes);
+#elif defined(__APPLE__)
         Unmap(pieceAddress, pieceBytes);
 #else
         if (KernelArena::Get().Contains(pieceAddress, pieceBytes)) munmap(pieceAddress, pieceBytes);

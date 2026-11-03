@@ -279,6 +279,8 @@ Pad::InputCommandFile& InjectedCommands() {
 #endif
             return path ? std::filesystem::path(path) : std::filesystem::path{};
         }());
+    return commands;
+}
 Pad::InputCommandFile::Input InjectedInput(std::uint64_t now) {
     static Pad::InputCommandFile::Input lastInjected;
     const auto injected = InjectedCommands().Poll(now);

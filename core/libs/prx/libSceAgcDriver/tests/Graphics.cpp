@@ -6939,17 +6939,17 @@ void resourceTests() {
     expectSingleAccepted(changed([](auto& binding) { mutateGuestDescriptor(binding, [](auto& words) { words[2] = 32768; }); }), "an unregistered V# past the range limit");
     expectSingleAccepted(changed([](auto& binding) { setGuestDescriptor(binding, vsharp(reinterpret_cast<const void*>(0x1000), 8)); }), "an unmapped V#");
     expectSingleFailure(changed([&](auto& binding) { setGuestDescriptor(binding, vsharp(reinterpret_cast<const void*>(state.color.address), 64)); }), "aliases the render target");
-    expectSingleFailure(changed([](auto& binding) { binding.role = Role::ShaderData; binding.count = 2; binding.guestDescriptor = {1, 2}; }), "must not be arrays");
-    expectSingleFailure(changed([](auto& binding) { binding.role = Role::ShaderData; binding.guestDescriptor.clear(); }), "empty shader data descriptor");
+    expectSingleFailure(changed([](auto& binding) { binding.role = Role::ShaderData; binding.count = 2; setGuestDescriptor(binding, {1, 2}); }), "must not be arrays");
+    expectSingleFailure(changed([](auto& binding) { binding.role = Role::ShaderData; setGuestDescriptor(binding, {}); }), "empty shader data descriptor");
     expectSingleFailure(changed([](auto& binding) { binding.role = Role::ShaderData; }), "invalid compact shader data size");
-    expectSingleFailure(changed([](auto& binding) { binding.role = Role::ShaderData; binding.guestDescriptor = ShaderDataWords({}); binding.guestDescriptor.pop_back(); }), "invalid compact shader data size");
-    expectSingleFailure(changed([](auto& binding) { binding.role = Role::FlattenedSrt; binding.guestDescriptor.clear(); }), "empty shader data descriptor");
-    expectSingleAccepted(changed([](auto& binding) { binding.guestDescriptor[1] |= 0x40000000u; }), "a V# with reserved bit 30");
-    expectSingleFailure(changed([](auto& binding) { binding.guestDescriptor[3] |= 0x40000000u; }), "unsupported type");
-    expectSingleAccepted(changed([](auto& binding) { binding.guestDescriptor[1] |= 0x3fffu << 16u; binding.guestDescriptor[2] = 0xffffffffu; }), "an unregistered V# past the range limit");
-    expectSingleAccepted(changed([](auto& binding) { binding.guestDescriptor[2] = 32768; }), "an unregistered V# past the range limit");
-    expectSingleAccepted(changed([](auto& binding) { binding.guestDescriptor = vsharp(reinterpret_cast<const void*>(0x1000), 8); }), "an unmapped V#");
-    expectSingleFailure(changed([&](auto& binding) { binding.guestDescriptor = vsharp(reinterpret_cast<const void*>(state.color.address), 64); }), "aliases the render target");
+    expectSingleFailure(changed([](auto& binding) { binding.role = Role::ShaderData; setGuestDescriptor(binding, ShaderDataWords({})); mutateGuestDescriptor(binding, [](auto& words) { words.pop_back(); }); }), "invalid compact shader data size");
+    expectSingleFailure(changed([](auto& binding) { binding.role = Role::FlattenedSrt; setGuestDescriptor(binding, {}); }), "empty shader data descriptor");
+    expectSingleAccepted(changed([](auto& binding) { mutateGuestDescriptor(binding, [](auto& words) { words[1] |= 0x40000000u; }); }), "a V# with reserved bit 30");
+    expectSingleFailure(changed([](auto& binding) { mutateGuestDescriptor(binding, [](auto& words) { words[3] |= 0x40000000u; }); }), "unsupported type");
+    expectSingleAccepted(changed([](auto& binding) { mutateGuestDescriptor(binding, [](auto& words) { words[1] |= 0x3fffu << 16u; words[2] = 0xffffffffu; }); }), "an unregistered V# past the range limit");
+    expectSingleAccepted(changed([](auto& binding) { mutateGuestDescriptor(binding, [](auto& words) { words[2] = 32768; }); }), "an unregistered V# past the range limit");
+    expectSingleAccepted(changed([](auto& binding) { setGuestDescriptor(binding, vsharp(reinterpret_cast<const void*>(0x1000), 8)); }), "an unmapped V#");
+    expectSingleFailure(changed([&](auto& binding) { setGuestDescriptor(binding, vsharp(reinterpret_cast<const void*>(state.color.address), 64)); }), "aliases the render target");
     mock = MockVulkan{};
     {
         auto color = state.color;
@@ -7131,7 +7131,7 @@ void unsetFormatStorageImageTests() {
         binding.binding = ShaderRecompiler::RuntimeAbi::FirstStorageImageBinding;
         binding.count = 1;
         binding.imageWritten = {true};
-        binding.guestDescriptor = words(format, baseAddress);
+        binding.guestDescriptor = ShaderRecompiler::SharedValues<std::uint32_t>(words(format, baseAddress));
         return binding;
     };
     for (const std::uint32_t format : {0u, 0x1ffu}) {
@@ -7190,7 +7190,9 @@ void unsetFormatStorageImageTests() {
         sampled.imageWritten.clear();
         sampled.imageShape = DescriptorImageShape::Image1DArray;
         sampled.imageSamplers = {0};
-        sampled.guestDescriptor[3] = (sampled.guestDescriptor[3] & ~(0xfu << 28u)) | (12u << 28u);
+        auto words = sampled.guestDescriptor.Copy();
+        words[3] = (words[3] & ~(0xfu << 28u)) | (12u << 28u);
+        sampled.guestDescriptor = ShaderRecompiler::SharedValues<std::uint32_t>(std::move(words));
         vertex.bindings.push_back(sampled);
         const auto color = AgcDriver::Graphics::DecodeState(makeState()).color;
         {
@@ -7216,7 +7218,9 @@ void unsetFormatStorageImageTests() {
         sampled.imageWritten.clear();
         sampled.imageShape = DescriptorImageShape::Image2D;
         sampled.imageSamplers = {0};
-        sampled.guestDescriptor[3] = (sampled.guestDescriptor[3] & ~(0xfu << 28u)) | (2u << 28u);
+        auto words = sampled.guestDescriptor.Copy();
+        words[3] = (words[3] & ~(0xfu << 28u)) | (2u << 28u);
+        sampled.guestDescriptor = ShaderRecompiler::SharedValues<std::uint32_t>(std::move(words));
         vertex.bindings.push_back(sampled);
         const auto color = AgcDriver::Graphics::DecodeState(makeState()).color;
         {

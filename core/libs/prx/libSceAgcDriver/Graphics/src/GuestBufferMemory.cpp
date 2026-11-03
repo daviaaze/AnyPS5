@@ -995,7 +995,8 @@ bool createSparseDmaBufImport(const Context& context, HostImport& entry, int fil
             const auto size = std::min<VkDeviceSize>(ImportChunkBytes - within, piece.bytes - done);
             const char* step = nullptr;
             VkResult failure = VK_SUCCESS;
-            auto chunk = importChunk(context, file, index, requirements.memoryTypeBits, step, failure);
+            bool fits = true;
+            auto chunk = importChunk(context, file, index, requirements.memoryTypeBits, step, failure, fits);
             if (chunk == nullptr) fail(step, failure);
             if (((requirements.memoryTypeBits >> chunk->memoryType) & 1u) == 0) fail("the memory type of a chunk import", VK_ERROR_FORMAT_NOT_SUPPORTED);
             binds.push_back({piece.resource + done, size, chunk->memory, within, 0});
@@ -1134,12 +1135,14 @@ const char* createFragmentedDmaBufImport(const Context& context, HostImport& ent
 const char* createBackingImport(const Context& context, HostImport& entry, BackingFile& backing, VkResult& failure) {
     if (backing.segments.size() == 1) {
         const auto segment = backing.segments.front();
-        if (createSparseDmaBufImport(context, entry, segment.file, segment.offset)) return nullptr;
+        const GuestArena::SharedBackingRun run{segment.offset, segment.bytes};
+        const std::span<const GuestArena::SharedBackingRun> runs(&run, 1);
+        if (createSparseDmaBufImport(context, entry, segment.file, runs)) return nullptr;
         bool fits = false;
         const char* step = createChunkedDmaBufImport(context, entry, segment.file, segment.offset, fits, failure);
         if (fits) return step;
         backing.segments.front().file = -1;
-        return createDmaBufImport(context, entry, segment.file, segment.offset, failure);
+        return createDmaBufImport(context, entry, segment.file, runs, failure);
     }
     return createFragmentedDmaBufImport(context, entry, backing, failure);
 }
@@ -1662,7 +1665,10 @@ bool importStaysWatched(const Context& context, HostImports& state, const Import
     return importWatching(context, state, !pages.writable, pages.writable, run.bytes).hostPointer;
 #else
     const auto watching = importWatching(context, state, false, true, run.bytes);
-    return watching.hostPointer && (watching.dmaBuf || !sharedBacked(context, run.base, run.bytes));
+    if (!watching.hostPointer) return false;
+    if (watching.dmaBuf) return true;
+    BackingFile backing;
+    return !sharedBacking(context, run.base, run.bytes, backing);
 #endif
 }
 
@@ -2462,18 +2468,6 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
     }, watchedHostPointer);
 #endif
 #ifndef _WIN32
-    if (step != nullptr && watchedDmaBuf != watchedHostPointer && state.dmaBufImportsCoherent) {
-        int runsFile = -1;
-        std::array<GuestArena::SharedBackingRun, DmaBufRunLimit> runs{};
-        std::size_t count = 0;
-        if (resolveBackingRuns(entry, runsFile, runs, count)) {
-            OwnedDescriptor owned(runsFile);
-            GuestMemory::ImportWatched(base, bytes, [&] {
-                step = createBackingImport(context, entry, owned.Release(), runs.data(), count, result);
-                return step == nullptr;
-            }, watchedDmaBuf, false);
-        }
-    }
     if (step == nullptr && entry.dmaBuf && bytes >= settleFloorBytes && context.settleQueue != VK_NULL_HANDLE && context.settleQueueMutex != nullptr) {
         static const bool traceSettle = std::getenv("APS5_TRACE_HOST_IMPORT") != nullptr;
         const auto start = std::chrono::steady_clock::now();
@@ -4293,7 +4287,7 @@ ImportProbe ProbeImportWriteProtection(const Context& context) {
     std::uint32_t touched = 0;
     if (!collect(touched)) probe.failure = "GetWriteWatch";
     else if (context.settleQueue == VK_NULL_HANDLE || context.settleQueueMutex == nullptr) probe.failure = "the settle queue";
-    else runImportProbe(context, base, bytes, [&](HostImport& import, VkResult& result) { return createImport(context, import, result, false); }, collect, probe, [&](HostImport& import, VkResult& result) { return settleImport(context, Imports(), import, result); });
+    else runImportProbe(context, base, bytes, [&](HostImport& import, VkResult& result) { return createHostPointerImport(context, import, result); }, collect, probe, [&](HostImport& import, VkResult& result) { return settleImport(context, Imports(), import, result); });
     VirtualFree(raw, 0, MEM_RELEASE);
     return probe;
 #else
@@ -4316,7 +4310,7 @@ ImportProbe ProbeImportWriteProtection(const Context& context) {
     auto* scratch = reinterpret_cast<volatile std::uint8_t*>(base);
     for (std::uint64_t offset = 0; offset < bytes; offset += page) scratch[offset] = 1;
     if (GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix()) GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(reinterpret_cast<const void*>(base), bytes);
-    runImportProbe(context, base, bytes, [&](HostImport& import, VkResult& result) { return createImport(context, import, result, false); }, [&](std::uint32_t& pages) { return collectWriteWatch(base, bytes, pages); }, probe);
+    runImportProbe(context, base, bytes, [&](HostImport& import, VkResult& result) { return createHostPointerImport(context, import, result); }, [&](std::uint32_t& pages) { return collectWriteWatch(base, bytes, pages); }, probe);
     if (GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix()) GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(reinterpret_cast<const void*>(base), bytes);
     munmap(raw, bytes + alignment);
     return probe;

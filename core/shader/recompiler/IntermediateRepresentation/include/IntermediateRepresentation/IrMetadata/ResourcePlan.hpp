@@ -17,7 +17,6 @@
 #include <mutex>
 #include <new>
 #include <algorithm>
-#include <atomic>
 #include <span>
 #include <stdexcept>
 #include <type_traits>
@@ -55,12 +54,6 @@ struct RegisteredImageView {
         return resource == other.resource && record == other.record && provenance == other.provenance && effective == other.effective && address == other.address && rangeAddress == other.rangeAddress && rangeBytes == other.rangeBytes && allocationAddress == other.allocationAddress && allocationBytes == other.allocationBytes && backingSerial == other.backingSerial && hasRange == other.hasRange && readable == other.readable && writable == other.writable && gpu == other.gpu;
     }
 };
-
-template <typename T>
-class SharedValues {
-public:
-    SharedValues() = default;
-    explicit SharedValues(std::vector<T> values) : block(values.empty() ? nullptr : std::make_shared<const Block>(std::move(values))) {}
 
 enum class BufferAccessClass : std::uint8_t { Read = 1, Write = 2, Atomic = 3 };
 
