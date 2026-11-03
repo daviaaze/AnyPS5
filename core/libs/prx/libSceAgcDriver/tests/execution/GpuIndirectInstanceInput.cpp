@@ -363,7 +363,7 @@ int main(int argc, char** argv) {
             setenv(name, "1", 1);
 #endif
         };
-        if (recipeMode) enable("APS5_PROFILE_DRAW");
+        enable("APS5_PROFILE_DRAW");
         if (argc == 2 && std::string(argv[1]) == "--verify") {
             enable("APS5_VERIFY_DRAW_ENTRIES");
             enable("APS5_VERIFY_DRAW_DATA_HITS");
