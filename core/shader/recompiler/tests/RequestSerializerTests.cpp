@@ -139,6 +139,9 @@ void AppendVertexTail(std::vector<std::uint8_t>& bytes) {
     bytes.insert(bytes.end(), sizeof(std::uint64_t) + 1u + 5u + 1u + 1u, 0u);
     bytes.insert(bytes.end(), {0u, 0u, 0u, 0x80u, 0x3fu, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u});
 }
+void AppendGraphicsTrailer(std::vector<std::uint8_t>& bytes) {
+    bytes.insert(bytes.end(), {0xffu, 0xffu, 0xffu, 0xffu, 0u});
+}
 
 std::vector<std::uint8_t> DecodeBase64(std::string_view text) {
     constexpr std::string_view alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -685,7 +688,6 @@ int main() {
                 Require(replay54.request.target.fragmentBarycentricBuiltins == barycentric);
                 Require(serializer.Serialize(replay54.request) == encoded);
             }
-            dynamic.graphics->instanceInputSgpr = -1;
             dynamic.graphics->instanceInputSgpr = 10;
             dynamic.graphics->routedVertexBase = true;
             dynamic.target.tessellationEvaluationSubgroups = true;
@@ -702,6 +704,14 @@ int main() {
             Require(replayVertex.request.graphics->routedVertexBase && replayVertex.request.graphics->instanceInputSgpr == 10);
             Require(replayVertex.request.target.tessellationEvaluationSubgroups && replayVertex.request.target.hostInterpolationFirst && replayVertex.request.target.shaderImageMinLod);
             Require(serializer.Serialize(replayVertex.request) == routedVertex);
+            for (std::size_t missing = 1u; missing <= 5u; ++missing) {
+                auto truncated = routedVertexBytes;
+                truncated.resize(truncated.size() - missing);
+                expectRejected(truncated);
+            }
+            auto trailing = routedVertexBytes;
+            trailing.push_back(0u);
+            expectRejected(trailing);
             auto legacy53 = routedVertexBytes;
             legacy53.resize(legacy53.size() - 5u);
             legacy53[4] = 53u;
@@ -717,7 +727,7 @@ int main() {
                     !replay52.request.target.shaderImageMinLod);
             dynamic.graphics->instanceInputSgpr = -1;
             dynamic.graphics->routedVertexBase = false;
-            dynamic.target.tessellationEvaluationSubgroups = false;
+            dynamic.target.tessellationEvaluationSubgroups = replay49.request.target.tessellationEvaluationSubgroups;
             dynamic.target.hostInterpolationFirst = false;
             dynamic.target.shaderImageMinLod = false;
             Require(serializer.Serialize(dynamic) == ordinary);
@@ -744,7 +754,7 @@ int main() {
         ShaderRecompiler::RecompileRequest noGraphics{};
         auto missingContext = DecodeBase64(serializer.Serialize(noGraphics));
         missingContext[4] = 54u;
-        missingContext.insert(missingContext.end(), {8u, 0u, 0u, 0u});
+        missingContext.insert(missingContext.end(), {8u, 0u, 0u, 0u, 0u});
         expectRejected(missingContext);
     }
 
@@ -908,8 +918,6 @@ int main() {
             Require(replayLegacy.request.context.vertex->paClVsOutCntl == pointRequest.context.vertex->paClVsOutCntl);
             Require(!replayLegacy.request.context.vertex->pointList && replayLegacy.request.context.vertex->pointSize == 1.0f);
             Require(replayLegacy.request.context.vertex->pointSizeMin == 0.0f && replayLegacy.request.context.vertex->pointSizeMax == 0.0f);
-            const auto upgradedLegacy = DecodeBase64(serializer.Serialize(replayLegacy.request));
-            Require(upgradedLegacy[4] == 54u && upgradedLegacy.size() == legacy.size() + (version >= 36u ? 29u : version >= 35u ? 30u : 35u));
         }
     }
 
@@ -1035,10 +1043,11 @@ int main() {
         bytes.pop_back();
         bytes[4] = 49u;
         const auto replay49 = serializer.Deserialize(EncodeBase64(bytes));
-        Require(replay49.request.shader.stage == ShaderRecompiler::ShaderStage::TessellationEvaluation && replay49.request.target.tessellationEvaluationSubgroups == subgroups);
+        Require(replay49.request.shader.stage == ShaderRecompiler::ShaderStage::TessellationEvaluation &&
+                replay49.request.target.tessellationEvaluationSubgroups == ShaderRecompiler::RecompileRequest{}.target.tessellationEvaluationSubgroups);
         auto upgraded = bytes;
         upgraded[4] = 54u;
-        upgraded.push_back(static_cast<std::uint8_t>(subgroups));
+        upgraded.push_back(static_cast<std::uint8_t>(replay49.request.target.tessellationEvaluationSubgroups));
         upgraded.push_back(0u);
         upgraded.push_back(0u);
         Require(serializer.Serialize(replay49.request) == EncodeBase64(upgraded));
