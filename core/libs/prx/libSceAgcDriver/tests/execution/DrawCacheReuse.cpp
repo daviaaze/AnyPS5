@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "VulkanTestDevice.hpp"
+#include "WatchedGuestBlock.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -59,54 +60,6 @@ alignas(256) std::array<float, 4> PixelConstant{};
 std::byte* PixelConstantAddress = reinterpret_cast<std::byte*>(PixelConstant.data());
 std::byte* ColorTargetAddress = ColorMemory.data();
 
-class WatchedGuestBlock {
-public:
-    static constexpr std::size_t Bytes = 65536;
-
-    WatchedGuestBlock() {
-        Require(AgcDriver::GuestMemory::WriteWatched(), "the recipe target requires guest write watch");
-#ifdef _WIN32
-        data = static_cast<std::byte*>(GuestArena::GuestArenaAllocate_nid_postfix(Bytes, Bytes));
-        if (data != nullptr) GuestArena::GuestArenaCommit_nid_postfix(data, Bytes, PAGE_READWRITE, Bytes);
-#else
-        void* mapped = mmap(nullptr, Bytes * 2u, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        Require(mapped != MAP_FAILED, "cannot reserve watched guest color target memory");
-        const auto begin = reinterpret_cast<std::uintptr_t>(mapped);
-        const auto aligned = (begin + Bytes - 1u) & ~(static_cast<std::uintptr_t>(Bytes) - 1u);
-        if (aligned != begin) munmap(mapped, aligned - begin);
-        if (aligned + Bytes != begin + Bytes * 2u) munmap(reinterpret_cast<void*>(aligned + Bytes), begin + Bytes * 2u - aligned - Bytes);
-        data = reinterpret_cast<std::byte*>(aligned);
-#endif
-        Require(data != nullptr, "cannot allocate watched guest color target memory");
-        std::memset(data, 0, Bytes);
-#ifndef _WIN32
-        GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(data, Bytes);
-#endif
-        GuestAllocations::Mutation().Add(data, Bytes, true, true, true);
-        Require((reinterpret_cast<std::uintptr_t>(data) & (Bytes - 1u)) == 0 &&
-                    AgcDriver::GuestMemory::Watched(reinterpret_cast<std::uintptr_t>(data), Bytes),
-                "the resident recipe target is not a watched, aligned guest allocation");
-    }
-
-    ~WatchedGuestBlock() {
-        GuestAllocations::Mutation().Remove(data);
-#ifdef _WIN32
-        GuestArena::GuestArenaReset_nid_postfix(data, Bytes);
-        GuestArena::GuestArenaRelease_nid_postfix(data, Bytes);
-#else
-        munmap(data, Bytes);
-        GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(data, Bytes);
-#endif
-    }
-
-    WatchedGuestBlock(const WatchedGuestBlock&) = delete;
-    WatchedGuestBlock& operator=(const WatchedGuestBlock&) = delete;
-
-    std::byte* Data() const { return data; }
-
-private:
-    std::byte* data = nullptr;
-};
 bool ResidentRecipeTarget = false;
 alignas(256) std::array<std::byte, WatchedGuestBlock::Bytes> ResidentTargetZeros{};
 alignas(256) std::array<std::byte, WatchedGuestBlock::Bytes> ResidentTargetReadback{};

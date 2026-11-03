@@ -9,10 +9,13 @@
 
 namespace AgcDriver::DriverDetail {
 
-bool DrawRecipeRecord::Matches(const std::vector<std::shared_ptr<DispatchVariant>>& variants) const {
-    if (stages.size() != variants.size()) return false;
+bool DrawRecipeRecord::Matches(const std::vector<std::shared_ptr<DispatchVariant>>& variants, std::span<const Graphics::CompiledShader> compiled) const {
+    if (stages.size() != variants.size() || compiledVariants.size() != compiled.size()) return false;
     for (std::size_t i = 0; i < stages.size(); ++i) {
         if (stages[i].owner_before(variants[i]) || variants[i].owner_before(stages[i])) return false;
+    }
+    for (std::size_t i = 0; i < compiled.size(); ++i) {
+        if (compiled[i].program == nullptr || compiledVariants[i] == 0 || compiledVariants[i] != compiled[i].program->variantId) return false;
     }
     return true;
 }
@@ -243,7 +246,7 @@ bool DecodeProgramsCurrent(const DrawDecode& decode, const ShaderRegistry&) {
     });
 }
 
-std::shared_ptr<const DrawRecipe> Driver::findDrawRecipe(std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages) {
+std::shared_ptr<const DrawRecipe> Driver::findDrawRecipe(std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages, std::span<const Graphics::CompiledShader> compiled) {
     std::shared_ptr<const std::vector<DrawRecipeRecord>> records;
     {
         std::lock_guard cacheLock(drawCacheMutex);
@@ -253,12 +256,12 @@ std::shared_ptr<const DrawRecipe> Driver::findDrawRecipe(std::uint64_t key, cons
     }
     if (records == nullptr) return nullptr;
     for (const auto& record : *records) {
-        if (record.Matches(stages)) return record.recipe;
+        if (record.Matches(stages, compiled)) return record.recipe;
     }
     return nullptr;
 }
 
-void Driver::attachDrawRecipe(std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages, std::shared_ptr<const DrawRecipe> recipe) {
+void Driver::attachDrawRecipe(std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages, std::span<const Graphics::CompiledShader> compiled, std::shared_ptr<const DrawRecipe> recipe) {
     std::shared_ptr<DrawEntry> entry;
     {
         std::lock_guard cacheLock(drawCacheMutex);
@@ -268,10 +271,18 @@ void Driver::attachDrawRecipe(std::uint64_t key, const std::vector<std::shared_p
     }
     const auto old = entry->recipes.load();
     auto records = std::make_shared<std::vector<DrawRecipeRecord>>();
-    records->push_back({std::vector<std::weak_ptr<const DispatchVariant>>(stages.begin(), stages.end()), std::move(recipe)});
+    DrawRecipeRecord fresh;
+    fresh.stages.assign(stages.begin(), stages.end());
+    fresh.compiledVariants.reserve(compiled.size());
+    for (const auto& shader : compiled) {
+        if (shader.program == nullptr || shader.program->variantId == 0) return;
+        fresh.compiledVariants.push_back(shader.program->variantId);
+    }
+    fresh.recipe = std::move(recipe);
+    records->push_back(std::move(fresh));
     if (old != nullptr) {
         for (const auto& record : *old) {
-            if (record.Matches(stages) || record.Expired() || records->size() >= dispatchVariants()) continue;
+            if (record.Matches(stages, compiled) || record.Expired() || records->size() >= dispatchVariants()) continue;
             records->push_back(record);
         }
     }

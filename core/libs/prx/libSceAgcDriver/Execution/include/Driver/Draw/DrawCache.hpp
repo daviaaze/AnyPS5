@@ -64,8 +64,10 @@ std::vector<PreparedGraphicsStage> PrepareGraphicsStages(const DrawDecode& decod
 
 struct DrawRecipeRecord {
     std::vector<std::weak_ptr<const DispatchVariant>> stages;
+    // Actual compiled-stage ABI identity; zero IDs cannot prove a reusable shader variant.
+    std::vector<std::uint64_t> compiledVariants;
     std::shared_ptr<const DrawRecipe> recipe;
-    bool Matches(const std::vector<std::shared_ptr<DispatchVariant>>& variants) const;
+    bool Matches(const std::vector<std::shared_ptr<DispatchVariant>>& variants, std::span<const Graphics::CompiledShader> compiled) const;
     bool Expired() const;
 };
 

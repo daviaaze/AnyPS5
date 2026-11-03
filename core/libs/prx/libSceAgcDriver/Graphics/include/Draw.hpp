@@ -32,9 +32,9 @@ struct DrawTraceContext {
 
 std::size_t CaptureDrawRequest(const DrawTraceContext& trace, std::size_t stage, std::size_t subdraw, std::uint64_t shader, std::uint64_t variant, std::string_view serialized);
 
-// `recipe`, when given, receives the DrawRecipe a recorded, cacheable, reusable, non-indirect draw
-// built for its draw-cache entry (design_cpu_final M8; null otherwise, and always under
-// APS5_NO_DRAW_RECIPE=1).
+// `recipe`, when given, receives the DrawRecipe a recorded, cacheable, reusable draw built for its
+// draw-cache entry, including a GPU indirect draw only when its current records/count remain GPU
+// readable; null otherwise, and always under APS5_NO_DRAW_RECIPE=1.
 void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, const DrawTraceContext* trace = nullptr, std::uint64_t shape = 0);
 
 struct PixelFunctionLdsLayouts {
@@ -104,10 +104,10 @@ std::optional<MeshGrid> MeshGridFor(const Context& context, std::uint32_t groups
 MeshArguments ResolveMeshArguments(const Pm4::DrawArguments& record, const MeshArgumentRules& rules);
 
 // Why DrawWithRecipe did not record from the recipe (the caller then runs Draw): the draw is not
-// recordable (no recorder, APS5_SYNC_DRAWS, APS5_DUMP_TARGETS), a resident target is gone from the
-// storage cache, the template is gone, the pipeline is gone from the pipeline store, or the
-// template's proof failed (ShaderResources::ProveCurrent; the template is removed from the
-// resource cache and kept by the batch).
+// recordable (including a GPU-indirect draw whose current arguments/count are no longer GPU
+// readable), a resident target is gone from the storage cache, the template is gone, the pipeline
+// is gone from the pipeline store, or the template's proof failed (ShaderResources::ProveCurrent;
+// the template is removed from the resource cache and kept by the batch).
 enum class DrawRecipeMiss : std::uint8_t { None, NotRecordable, TargetGone, TemplateGone, ObjectsGone, Proof, Count };
 const char* DrawRecipeMissName(DrawRecipeMiss miss);
 struct DrawRecipeOutcome {

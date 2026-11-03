@@ -68,8 +68,9 @@ enum class RecipeOutcome { Recorded, Rebuild };
 // the per-draw derivations needed to prove pipeline compatibility: vertex input layout, masked
 // state, fragment outputs, pipeline stages and depth-target presence. Push bytes are not cached:
 // replay assembles them from current compiled stages and current resource patches. Recipes are
-// built for recordable direct draws, including CPU-resolved indirect records, and attached to
-// matched draw-stage variants; immutable.
+// built for recordable draws, including CPU-resolved indirect records and GPU indirect draws;
+// current GPU argument/count imports and their synchronization are re-proved on replay and are
+// never stored here. Recipes are attached to matched draw-stage variants; immutable.
 struct DrawRecipe {
     VkDevice device = VK_NULL_HANDLE;
     std::weak_ptr<Graphics::ShaderResources> templateRef;

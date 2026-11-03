@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "VulkanTestDevice.hpp"
+#include "WatchedGuestBlock.hpp"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -11,7 +12,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
+#include <memory>
 #include <new>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -22,9 +25,16 @@ using AgcDriver::Graphics::Require;
 constexpr std::uint32_t Sentinel = 0xdeadbeefu;
 constexpr std::uint32_t Marker = 0x5a17c0deu;
 constexpr std::size_t AllocationBytes = 65536u;
-alignas(256) std::array<std::uint32_t, 96> Output{};
+struct alignas(AllocationBytes) OutputAllocation {
+    std::array<std::uint32_t, 96> values{};
+};
+OutputAllocation OutputBacking;
+auto& Output = OutputBacking.values;
+bool OutputRegistered = false;
 alignas(256) std::array<std::uint32_t, 16> Table{};
 alignas(256) std::array<std::byte, 1024> Pixels{};
+const std::byte* ColorTargetAddress = Pixels.data();
+std::unique_ptr<WatchedGuestBlock> ResidentColor;
 alignas(256) std::array<std::uint32_t, 8> RecordDescriptor{};
 alignas(256) constexpr std::array<std::uint16_t, 3> Indices{0, 1, 2};
 std::uint32_t* Records = nullptr;
@@ -78,7 +88,7 @@ void Append(std::vector<std::uint32_t>& commands, std::uint32_t opcode, std::ini
 void State(std::vector<std::uint32_t>& commands, std::uint32_t wave, std::uint32_t base) {
     const auto vertex = reinterpret_cast<std::uintptr_t>(VertexCode.data());
     const auto pixel = reinterpret_cast<std::uintptr_t>(PixelCode.data());
-    const auto color = reinterpret_cast<std::uintptr_t>(Pixels.data());
+    const auto color = reinterpret_cast<std::uintptr_t>(ColorTargetAddress);
     const std::vector<std::pair<std::uint32_t, std::uint32_t>> context{
         {0x2d5, 0x2000u | (wave == 32u ? 0x400000u : 0u)},
         {0x1b6, wave == 32u ? 0x8000u : 0u}, {0x207, 0x01200000}, {0x200, 0}, {0x203, 0x800},
@@ -89,7 +99,7 @@ void State(std::vector<std::uint32_t>& commands, std::uint32_t wave, std::uint32
         {0x8e, 0xf}, {0x8f, 0xf}, {0x202, 0xcc0010},
         {0x1c4, 0}, {0x1c5, 9}, {0x1c3, 4}, {0x31c, 0x28028},
         {0x31b, 0}, {0x31d, 0}, {0x3b0, (63u << 14u) | 3u},
-        {0x3b8, 0x9000000}, {0x1e0, 0},
+        {0x3b8, ResidentColor != nullptr ? (0x09000000u | (9u << 14u)) : 0x09000000u}, {0x1e0, 0},
         {0xc, 0}, {0xd, 0x40040}, {0x81, 0x80000000}, {0x82, 0x40040},
         {0x90, 0x80000000}, {0x91, 0x40040}, {0x94, 0x80000000}, {0x95, 0x40040},
         {0x10f, std::bit_cast<std::uint32_t>(32.0f)}, {0x110, std::bit_cast<std::uint32_t>(32.0f)},
@@ -110,7 +120,7 @@ void State(std::vector<std::uint32_t>& commands, std::uint32_t wave, std::uint32
     for (const auto& [offset, value] : shader) Append(commands, 0x76, {offset, value});
 }
 
-void WriteRecord(std::vector<std::uint32_t>& commands, std::uint32_t base, std::uint32_t instances, std::uint32_t record = 0u) {
+void WriteRecord(std::vector<std::uint32_t>& commands, std::uint32_t base, std::uint32_t instances, std::uint32_t record = 0u, std::uint32_t vertexCount = 3u) {
     const auto code = reinterpret_cast<std::uintptr_t>(WriterCode.data());
     Append(commands, 0x76, {0x20c, static_cast<std::uint32_t>(code >> 8u)});
     Append(commands, 0x76, {0x20d, static_cast<std::uint32_t>(code >> 40u)});
@@ -118,7 +128,7 @@ void WriteRecord(std::vector<std::uint32_t>& commands, std::uint32_t base, std::
     Append(commands, 0x76, {0x212, 0});
     Append(commands, 0x76, {0x213, 6u << 1u});
     const auto* descriptor = RecordDescriptor.data() + record * 4u;
-    const std::array<std::uint32_t, 6> words{Low(descriptor), High(descriptor), 3u, instances, 0u, base};
+    const std::array<std::uint32_t, 6> words{Low(descriptor), High(descriptor), vertexCount, instances, 0u, base};
     for (std::uint32_t i = 0; i < words.size(); ++i) Append(commands, 0x76, {0x240u + i, words[i]});
     Append(commands, 0x15, {1, 1, 1, 0x8041u});
 }
@@ -249,9 +259,79 @@ void Run() {
     CheckPath(indexedBefore, selected);
     std::puts("GPU indexed and non-indexed indirect draws with a record vertex base matched the rewrite output");
 }
+void RunChangingIndirectInputs() {
+    // Reuse the record address across GPU-written arguments and the zero-instance transition.
+    // Writing another SGPR leaves the shader's s2 constant unchanged.
+    struct Case { std::uint32_t base; std::uint32_t instances; std::uint32_t inputLocation; };
+    for (const auto& test : {Case{2u, 3u, 0x8eu}, Case{5u, 1u, 0x8fu}, Case{1u, 0u, 0x8eu}, Case{7u, 2u, 0x8eu}}) {
+        Output.fill(Sentinel);
+        std::fill_n(Records, 4u, 0u);
+        std::vector<std::uint32_t> commands;
+        State(commands, 64u, 0xbadc0ffeu);
+        WriteRecord(commands, test.base, test.instances);
+        Append(commands, 0x11, {1, Low(Records), High(Records)});
+        Append(commands, 0x24, {0, 0x280, test.inputLocation, 2});
+        Submit(commands);
+        Check(test.inputLocation == 0x8eu ? test.base : 0xbadc0ffeu, test.instances);
+        Require(Records[0] == 3u && Records[1] == test.instances && Records[2] == 0u && Records[3] == test.base,
+            "the changed GPU indirect arguments were not consumed");
+    }
+}
+
+void RunRecipeInputs(bool countSupported) {
+    const auto hitCount = [] { return AgcDriver::VulkanDevice::RecipeHits(AgcDriver::VulkanDevice::RecipeKind::Draw); };
+    const auto replay = [&](std::uint32_t location, std::uint32_t base, std::uint32_t instances, std::optional<std::uint32_t> count) {
+        Output.fill(Sentinel);
+        std::vector<std::uint32_t> commands;
+        State(commands, 64u, 0xbadc0ffeu);
+        WriteRecord(commands, base, instances);
+        if (count) WriteRecord(commands, 0u, 0u, 1u, *count);
+        Append(commands, 0x11, {1, Low(Records), High(Records)});
+        if (count) Append(commands, 0x2c, {0, 0x280, location, 1u << 30u, 1u, Low(Records + 4u), High(Records + 4u), 16u, 2u});
+        else Append(commands, 0x24, {0, 0x280, location, 2});
+        const auto beforePath = AgcDriver::Graphics::IndirectDrawCounts();
+        const auto beforeHits = hitCount();
+        Submit(commands);
+        Check(location == 0x8eu ? base : 0xbadc0ffeu, count && *count == 0u ? 0u : instances);
+        CheckPath(beforePath, AgcDriver::Graphics::IndirectDrawPath::Gpu);
+        Require(Records[0] == 3u && Records[1] == instances && Records[2] == 0u && Records[3] == base,
+            "recipe replay did not preserve the GPU-written argument record");
+        if (count) Require(Records[4] == *count, "the GPU count producer did not publish its current count");
+        return hitCount() - beforeHits;
+    };
+    const auto warm = [&](std::uint32_t location, bool counted) {
+        for (unsigned attempt = 0; attempt < 8u; ++attempt) {
+            if (replay(location, 1u, 2u, counted ? std::optional<std::uint32_t>{1u} : std::nullopt) != 0u) return;
+        }
+        Require(false, "imported-output GPU draw did not establish a reusable recipe");
+    };
+    warm(0x8eu, false);
+    Require(replay(0x8eu, 5u, 1u, {}) == 1u, "changed GPU first-instance arguments missed their warmed recipe");
+    warm(0x8fu, false);
+    Require(replay(0x8fu, 7u, 2u, {}) == 1u, "the alternate compiled input ABI did not replay correctly");
+    Require(replay(0x8eu, 2u, 3u, {}) == 1u, "returning to the original compiled input ABI lost its recipe");
+    replay(0x8eu, 3u, 0u, {});
+    if (countSupported) {
+        warm(0x8eu, true);
+        Require(replay(0x8eu, 7u, 1u, 0u) == 1u, "zero GPU draw-count replay lost its recipe");
+        Require(replay(0x8eu, 2u, 3u, 1u) == 1u, "nonzero GPU draw-count replay lost its recipe");
+    }
+    std::puts("GPU recipes preserved changed arguments, compiled input ABIs, zero work and supported count-buffer output");
+}
 
 void Cleanup() {
+    if (ResidentColor != nullptr) {
+        AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(ResidentColor->Data()), WatchedGuestBlock::Bytes);
+    }
     AgcDriverShutdown_nid_postfix();
+    ResidentColor.reset();
+    ColorTargetAddress = Pixels.data();
+    if (OutputRegistered) {
+        GuestAllocations::Mutation mutation;
+        mutation.RequireUnpinned(&OutputBacking, sizeof(OutputBacking));
+        mutation.Remove(&OutputBacking);
+        OutputRegistered = false;
+    }
     if (Records != nullptr) {
         {
             GuestAllocations::Mutation mutation;
@@ -266,6 +346,8 @@ void Cleanup() {
 }
 
 int main(int argc, char** argv) {
+    const bool recipeMode = argc == 2 && std::string(argv[1]) == "--recipe";
+    bool countSupported = false;
     try {
         if (argc == 2 && std::string(argv[1]) == "--late-fallback") {
 #ifdef _WIN32
@@ -281,7 +363,7 @@ int main(int argc, char** argv) {
             setenv(name, "1", 1);
 #endif
         };
-        enable("APS5_PROFILE_DRAW");
+        if (recipeMode) enable("APS5_PROFILE_DRAW");
         if (argc == 2 && std::string(argv[1]) == "--verify") {
             enable("APS5_VERIFY_DRAW_ENTRIES");
             enable("APS5_VERIFY_DRAW_DATA_HITS");
@@ -293,13 +375,28 @@ int main(int argc, char** argv) {
         {
             const auto device = OpenVulkanTestDevice();
             if (!device) return VulkanTestSkipped;
+            countSupported = device->DrawIndirectSupport().count;
+            if (recipeMode) {
+                if (!AgcDriver::GuestMemory::WriteWatched()) {
+                    std::puts("GPU recipe case skipped: guest write watch is unavailable");
+                    return VulkanTestSkipped;
+                }
+                ResidentColor = std::make_unique<WatchedGuestBlock>();
+                ColorTargetAddress = ResidentColor->Data();
+            }
         }
         Records = static_cast<std::uint32_t*>(::operator new(AllocationBytes, std::align_val_t{AllocationBytes}));
         {
             GuestAllocations::Mutation mutation;
             mutation.Add(Records, AllocationBytes, true, true, true);
+            if (recipeMode) {
+                mutation.Add(&OutputBacking, sizeof(OutputBacking), true, true, true);
+                OutputRegistered = true;
+            }
         }
         Run();
+        RunChangingIndirectInputs();
+        if (recipeMode) RunRecipeInputs(countSupported);
         Cleanup();
         return 0;
     } catch (const std::exception& error) {

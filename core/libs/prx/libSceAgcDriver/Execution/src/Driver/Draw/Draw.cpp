@@ -1348,6 +1348,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             indirectCpu = Graphics::IndirectDrawPath::NotFolded;
         }
     }
+    const bool indirectGpuCandidate = drawParameters.indirect.has_value() && !indirectCpu.has_value();
     snapshot();
     if (tail.trace.payloadOrdinal != 0 && !drawParameters.indirect) CaptureSelectedDrawRequests(programs, stageCaptures, matched, memory, linked, tail.trace, 0);
     timing.Mark("post_compile_prepare");
@@ -1394,7 +1395,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         const bool pushWord = drawCachePushWord();
         // Stage-data hits patch copied descriptor words but preserve the matched stage ABI.
         // DrawWithRecipe still proves this record's current descriptors and moved buffers.
-        const bool indirectRecipeMode = registerKey && drawHit && drawCacheIndirect() && pushWord && Graphics::DrawRecipes() && !graphics.rectList && !graphics.stages.tessellationGeometry;
+        const bool indirectRecipeMode = registerKey && drawHit && drawCacheIndirect() && pushWord && Graphics::DrawRecipes() && !graphics.rectList && !graphics.stages.tessellationGeometry && std::all_of(stages.begin(), stages.end(), [](const auto& shader) { return shader.program != nullptr && shader.program->variantId != 0; });
         std::vector<std::shared_ptr<DispatchVariant>> indirectRecipeStages;
         if (indirectRecipeMode) {
             indirectRecipeStages.reserve(programs.size());
@@ -1531,7 +1532,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                 rejected = std::move(*known);
                 return DrawVerdict::Rejected;
             }
-            auto recordRecipe = recipeSafe ? findDrawRecipe(drawKey, indirectRecipeStages) : std::shared_ptr<const DrawRecipe>{};
+            auto recordRecipe = recipeSafe ? findDrawRecipe(drawKey, indirectRecipeStages, stages) : std::shared_ptr<const DrawRecipe>{};
             if (recipeSafe && recordRecipe == nullptr) VulkanDevice::NoteDrawRecipeMiss(VulkanDevice::DrawRecipePrecheck::NoRecipe);
             if (pipelined && pipelinedIndirect && record == lastDrawable && !gpuLock.owns_lock() && deferredLabels().labels.empty()) {
                 runCaptureCheckHook();
@@ -1577,7 +1578,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             if (recordRecipe != nullptr) VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
             std::shared_ptr<const DrawRecipe> built;
             localDevice->Draw(graphics, direct, stages, snapshots, recipeSafe ? &built : nullptr, tracePtr, tail.shapeKey);
-            if (built != nullptr) attachDrawRecipe(drawKey, indirectRecipeStages, std::move(built));
+            if (built != nullptr) attachDrawRecipe(drawKey, indirectRecipeStages, stages, std::move(built));
             phaseTiming.Phase(DrawRowGraphics);
         }
         countRecordWords();
@@ -1586,14 +1587,14 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     }
 
     std::vector<std::shared_ptr<DispatchVariant>> recipeStages;
-    if (registerKey && !drawParameters.indirect && !patchedStages && !graphics.stages.tessellationGeometry && Graphics::DrawRecipes()) {
+    if (registerKey && (!drawParameters.indirect || (indirectGpuCandidate && drawCacheIndirect())) && !patchedStages && !graphics.stages.tessellationGeometry && Graphics::DrawRecipes() && std::all_of(stages.begin(), stages.end(), [](const auto& shader) { return shader.program != nullptr && shader.program->variantId != 0; })) {
         recipeStages.reserve(programs.size());
         for (std::size_t i = 0; i < programs.size(); ++i) recipeStages.push_back(drawHit ? matched[i] : fresh[i]);
         if (std::all_of(recipeStages.begin(), recipeStages.end(), [](const std::shared_ptr<DispatchVariant>& variant) { return variant == nullptr; })) recipeStages.clear();
     }
     std::shared_ptr<const DrawRecipe> recipe;
     if (drawHit && !recipeStages.empty()) {
-        recipe = findDrawRecipe(drawKey, recipeStages);
+        recipe = findDrawRecipe(drawKey, recipeStages, stages);
         if (recipe == nullptr) VulkanDevice::NoteDrawRecipeMiss(VulkanDevice::DrawRecipePrecheck::NoRecipe);
     }
     if (recipe == nullptr) {
@@ -1656,7 +1657,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     std::shared_ptr<const DrawRecipe> built;
     localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, tracePtr, tail.shapeKey);
     phaseTiming.Phase(DrawRowGraphics);
-    if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built));
+    if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, stages, std::move(built));
     timing.Mark("draw_and_resource_release");
     return drawn();
 }
@@ -1715,7 +1716,7 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
     }
     std::shared_ptr<const DrawRecipe> built;
     localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, tracePtr, shape);
-    if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built));
+    if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, stages, std::move(built));
 }
 
 }

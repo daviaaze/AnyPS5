@@ -2128,9 +2128,8 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     return resolved;
 }
 
-// A GPU-side indirect draw's records (Draw's recorded path; a recipe draw has none) as recordDraw
-// takes them: the arguments, how they are read, their host imports and, on the CPU path, the
-// records read.
+// Current GPU-side indirect arguments and their imports. Ordinary Draw may also attach the CPU
+// records it read; recipe replay fills only current args/imports after revalidating their GPU path.
 struct IndirectRecord {
     const Pm4::DrawParameters::IndirectDraw* args = nullptr;
     IndirectDrawPath path = IndirectDrawPath::Gpu;
@@ -3308,6 +3307,39 @@ bool storesIntoResident(const ShaderResources& resources, const StorageTexture& 
     return std::ranges::any_of(resources.StorageImages(), [&](const std::pair<VkImage, bool>& image) { return image.first == resident.Image() && image.second; });
 }
 
+// Current GPU indirect import and synchronization decision, shared with recipe replay. This does
+// not read records on the CPU; ordinary prepareDraw retains that fallback where it was.
+IndirectDrawPath gpuIndirectPath(const Context& context, const DrawInputs& inputs, const Pm4::DrawParameters::IndirectDraw& args, Recorder* recorder, const std::vector<std::shared_ptr<ShaderResources>>& copiedWriters, const std::vector<std::shared_ptr<ShaderResources>>* contextWriters, const HostImport*& argumentImport, const HostImport*& countImport) {
+    argumentImport = nullptr;
+    countImport = nullptr;
+    const auto rangeBytes = args.RangeBytes();
+    if (rangeBytes == 0) return IndirectDrawPath::NotImported;
+    Require(rangeBytes <= std::numeric_limits<std::size_t>::max(), "indirect draw record range overflow");
+    static const bool gpuIndirectDraws = std::getenv("APS5_NO_GPU_INDIRECT_DRAW") == nullptr;
+    if (!gpuIndirectDraws) return IndirectDrawPath::Disabled;
+    if (inputs.listRestartPrimitive != 0) return IndirectDrawPath::FeatureGap;
+    const auto decide = [&](std::uint64_t address, std::size_t bytes, const HostImport*& import) {
+        if (StorageTexture::FlushPending(address, bytes, nullptr, "indirect draw arguments")) {
+            if (recorder != nullptr) {
+                Recorder::CountSync(2);
+                recorder->Sync();
+            }
+            return IndirectDrawPath::PendingImage;
+        }
+        if (recorder != nullptr && recorder->PendingLabelIn(address, bytes)) return IndirectDrawPath::PendingLabelOrCopy;
+        const auto overlaps = [&](const auto& writer) { return writer->CopiedWritesOverlap(address, bytes); };
+        if (contextWriters != nullptr && std::any_of(contextWriters->begin(), contextWriters->end(), overlaps)) return IndirectDrawPath::PendingLabelOrCopy;
+        if (std::any_of(copiedWriters.begin(), copiedWriters.end(), overlaps)) return IndirectDrawPath::PendingLabelOrCopy;
+        if ((import = HostImportFor(context, address, bytes)) == nullptr) return IndirectDrawPath::NotImported;
+        return IndirectDrawPath::Gpu;
+    };
+    auto path = decide(args.arguments, static_cast<std::size_t>(rangeBytes), argumentImport);
+    if (path == IndirectDrawPath::Gpu && args.countIndirect) {
+        Require(context.drawIndirectCount, "indirect draw count without VK_KHR_draw_indirect_count must be resolved by the driver");
+        path = decide(args.countAddress, 4, countImport);
+    }
+    return path;
+}
 bool prepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, PreparedDraw& prepared) {
     auto*& recipeOut = prepared.recipeOut;
     auto& stencilReferences = prepared.stencilReferences;
@@ -3528,51 +3560,17 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     const auto& contentKey = resolved.contentKey;
     const bool cacheable = resolved.cacheable;
     built = resolved.built;
-    // The memory-state decision of an indirect draw, made here after the resource build (which may
-    // retire imports and wait for recorded work) and before anything is recorded, exactly as
-    // VulkanDevice::dispatch decides for DISPATCH_INDIRECT: the GPU reads the records in place from
-    // the host import unless storage-image results are pending over them (flushed, then synced), a
-    // label or a copied buffer's write-back still has to land on them, or they are not imported; in
-    // those cases (and with APS5_NO_GPU_INDIRECT_DRAW=1) the CPU reads them through the flush hook
-    // and records plain draws with the same per-dimension rules. The import pointer stays valid:
-    // refreshImports runs only under GuestMemory::GpuMutex, held here, and a retired import's
-    // buffer is kept while the recorder is busy.
     auto& indirect = prepared.indirect;
     indirect.args = args;
     auto& records = prepared.records;
     if (args != nullptr) {
-        static const bool gpuIndirectDraws = std::getenv("APS5_NO_GPU_INDIRECT_DRAW") == nullptr;
-        const auto decide = [&](std::uint64_t address, std::size_t bytes, const HostImport*& import) {
-            if (StorageTexture::FlushPending(address, bytes, nullptr, "indirect draw arguments")) {
-                if (recorder != nullptr) {
-                    Recorder::CountSync(2);
-                    recorder->Sync();
-                }
-                return IndirectDrawPath::PendingImage;
-            }
-            if (recorder != nullptr && recorder->PendingLabelIn(address, bytes)) return IndirectDrawPath::PendingLabelOrCopy;
-            const auto overlaps = [&](const auto& writer) { return writer->CopiedWritesOverlap(address, bytes); };
-            if (context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), overlaps)) return IndirectDrawPath::PendingLabelOrCopy;
-            if (std::any_of(DrawCopiedWriters()->begin(), DrawCopiedWriters()->end(), overlaps)) return IndirectDrawPath::PendingLabelOrCopy;
-            if ((import = HostImportFor(context, address, bytes)) == nullptr) return IndirectDrawPath::NotImported;
-            return IndirectDrawPath::Gpu;
-        };
-        const auto rangeBytes = args->RangeBytes();
-        if (rangeBytes == 0) {
+        const auto path = gpuIndirectPath(context, inputs, *args, recorder, *DrawCopiedWriters(), context.copiedWriters, indirect.argumentImport, indirect.countImport);
+        indirect.path = path;
+        if (path == IndirectDrawPath::NotImported && args->RangeBytes() == 0) {
             report(" indirect draw without records");
             return false;
         }
-        Require(rangeBytes <= std::numeric_limits<std::size_t>::max(), "indirect draw record range overflow");
-        if (!gpuIndirectDraws) indirect.path = IndirectDrawPath::Disabled;
-        else if (inputs.listRestartPrimitive != 0) indirect.path = IndirectDrawPath::FeatureGap;
-        else indirect.path = decide(args->arguments, static_cast<std::size_t>(rangeBytes), indirect.argumentImport);
-        if (indirect.path == IndirectDrawPath::Gpu && args->countIndirect) {
-            Require(context.drawIndirectCount, "indirect draw count without VK_KHR_draw_indirect_count must be resolved by the driver");
-            indirect.path = decide(args->countAddress, 4, indirect.countImport);
-        }
-        if (indirect.path != IndirectDrawPath::Gpu) {
-            // The reads wait for the producing batch through the flush hook, as the driver's
-            // resolve did for every indirect dispatch before its GPU path.
+        if (path != IndirectDrawPath::Gpu) {
             const auto readStart = std::chrono::steady_clock::now();
             const auto count = std::min(args->countIndirect ? Pm4::ReadDrawCount(*args) : args->count, args->count);
             records.reserve(count);
@@ -3792,9 +3790,8 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
         record.reorderPass = reorderPass;
         record.depthLocations = depthLocations;
         recordDraw(context, state, draw, shaders, inputs, record, outcome, timer, ownWaitedMs, prepared.trace);
-        // The recipe stores the reusable resource template, not per-draw moved bindings:
-        // DrawWithRecipe re-proves and supplies those bindings on every hit.
-        if (recipeOut != nullptr && DrawRecipes() && cacheable && !outcome.waited && args == nullptr && resources->Reusable() && !multisampled && !pipeline->ReordersSamples()) {
+        // DrawWithRecipe re-proves and supplies current moved bindings on every hit.
+        if (recipeOut != nullptr && DrawRecipes() && cacheable && !outcome.waited && (args == nullptr || (indirect.path == IndirectDrawPath::Gpu && inputs.listRestartPrimitive == 0)) && resources->Reusable() && !multisampled && !pipeline->ReordersSamples()) {
             auto recipe = std::make_shared<DrawRecipe>();
             recipe->device = context.device;
             recipe->templateRef = resources;
@@ -4217,7 +4214,8 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         }
         return result;
     };
-    Require(!draw.indirect, "a draw recipe covers direct draws only");
+    // Resolve indirect imports only after target/resource preparation, which may retire imports
+    // or synchronize pending writes, just as the ordinary draw path does.
     auto* recorder = Recorder::Active();
     if (state.quadList || StripPatches(state, shaders) || !RecordDraws() || recorder == nullptr || DumpTargetLimit() != 0) return miss(DrawRecipeMiss::NotRecordable);
     if (recipe.hasDepth != state.depth.has_value()) return miss(DrawRecipeMiss::TargetGone);
@@ -4298,6 +4296,12 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     }
     timer.phase(PhasePipeline);
     const auto recordStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    IndirectRecord recipeIndirect;
+    if (draw.indirect) {
+        recipeIndirect.args = &*draw.indirect;
+        recipeIndirect.path = gpuIndirectPath(context, inputs, *draw.indirect, recorder, *DrawCopiedWriters(), context.copiedWriters, recipeIndirect.argumentImport, recipeIndirect.countImport);
+        if (recipeIndirect.path != IndirectDrawPath::Gpu) return miss(DrawRecipeMiss::NotRecordable);
+    }
     RecordedDraw record;
     record.recorder = recorder;
     record.completion = outcome.completion;
@@ -4309,6 +4313,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     record.moved = *moved;
     for (const auto& color : state.colors) record.targetSlices.emplace_back(color.arraySlice, color.arrayLastSlice != 0 ? color.layers : 1u);
     record.depthLocations = passDepthLocations(context, state, *record.pipeline);
+    record.indirect = draw.indirect ? &recipeIndirect : nullptr;
     recordDraw(context, state, draw, shaders, inputs, record, outcome, timer, ownWaitedMs, trace);
     if (profile) {
         result.recordUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - recordStart).count();

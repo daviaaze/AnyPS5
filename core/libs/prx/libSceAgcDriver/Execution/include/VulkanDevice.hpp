@@ -360,8 +360,8 @@ public:
     enum class DrawRecipePrecheck : std::size_t { NoRecipe, Device };
     static void NoteDrawRecipeMiss(DrawRecipePrecheck miss);
     using DrawTraceContext = Graphics::DrawTraceContext;
-    // `recipe`, when given, receives the DrawRecipe built for this recordable direct draw
-    // (including a CPU-resolved indirect record), null otherwise.
+    // `recipe`, when given, receives the DrawRecipe built for a recordable direct draw or GPU-path
+    // indirect draw; CPU-resolved indirect records are passed as direct draws. Null otherwise.
     void Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, const DrawTraceContext* trace = nullptr, std::uint64_t shape = 0);
     bool DrawInputsInPlace() const;
     std::optional<std::string> KnownDrawRejection(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders) const;
