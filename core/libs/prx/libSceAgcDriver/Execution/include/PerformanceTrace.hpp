@@ -226,7 +226,7 @@ public:
         waitFirstLost = {};
         nextWaitId = 0;
     }
-    static constexpr std::size_t WaitEventCapacity = 4096;
+    static constexpr std::size_t WaitEventCapacity = 32768;
 
 
     void NoteWaitEvent(const WaitTraceEvent& event) {
