@@ -460,11 +460,19 @@ std::uint64_t SampledTextureMemory() {
     return SampledMemoryCounter().load(std::memory_order_relaxed);
 }
 
-Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare, double readTextureSurfaceMs) : Texture(context, detiler, descriptor, components, snapshot, nullptr, depthCompare, readTextureSurfaceMs, 0.0) {}
+Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare, double readTextureSurfaceMs, const char* snapshotRefusal) : Texture(context, detiler, descriptor, components, snapshot, nullptr, depthCompare, readTextureSurfaceMs, 0.0, {}, snapshotRefusal) {}
 
-Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::shared_ptr<Buffer> staging, bool depthCompare, double readTextureSurfaceMs, double providedStagingMs) : Texture(context, detiler, descriptor, components, {}, std::move(staging), depthCompare, readTextureSurfaceMs, providedStagingMs) {}
+Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::shared_ptr<Buffer> staging, bool depthCompare, double readTextureSurfaceMs, double providedStagingMs, const char* snapshotRefusal) : Texture(context, detiler, descriptor, components, {}, std::move(staging), depthCompare, readTextureSurfaceMs, providedStagingMs, {}, snapshotRefusal) {}
 
-Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, std::shared_ptr<Buffer> staging, bool depthCompare, double readTextureSurfaceMs, double providedStagingMs) : context(context) {
+Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, GpuBufferInput input, GpuInputTag, bool depthCompare) : Texture(context, detiler, descriptor, components, {}, {}, depthCompare, 0.0, 0.0, std::move(input)) {}
+
+Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, std::shared_ptr<Buffer> staging, bool depthCompare, double readTextureSurfaceMs, double providedStagingMs, GpuBufferInput gpuInput, const char* snapshotRefusal) : context(context) {
+
+    if (gpuInput.buffer != nullptr) {
+        Require(gpuInput.recorder != nullptr && gpuInput.recorder == Recorder::Active() && gpuInput.device == context.device,
+            "a GPU texture input must be consumed by the active recorder and device that recorded its private copy");
+    }
+    residentGpuInput = gpuInput.buffer != nullptr;
 
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     TextureImageTiming imageTiming{};
@@ -495,8 +503,8 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
 #endif
 
         const auto guestBytes = geometry.guestBytes;
-        Require((staging != nullptr ? staging->Size() : snapshot.size()) == guestBytes, "texture snapshot size mismatch");
-
+        Require(gpuInput.buffer != nullptr ? gpuInput.buffer->Size() == guestBytes :
+            (staging != nullptr ? staging->Size() : snapshot.size()) == guestBytes, "texture input size mismatch");
         const auto sliceLinearBytes = geometry.sliceLinearBytes;
         Require(arrayLayers == 0 || sliceLinearBytes <= UINT64_MAX / arrayLayers, "detiled texture buffer size overflows");
         const auto linearBytes = sliceLinearBytes * arrayLayers;
@@ -654,13 +662,14 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
                 }
             }
             if (profile) uploadSetupMs = stageTimer.lap();
-            if (staging == nullptr) {
+            if (staging == nullptr && gpuInput.buffer == nullptr) {
                 staging = std::make_shared<Buffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
                 if (profile) stagingMs = stageTimer.lap();
                 std::memcpy(staging->Bytes().data(), snapshot.data(), snapshot.size());
                 if (profile) memcpyMs = stageTimer.lap();
             }
-            auto tiled = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+            auto tiled = gpuInput.buffer != nullptr ? gpuInput.buffer :
+                std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
             if (profile) tiledMs = stageTimer.lap();
             auto linear = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(linearBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
             if (profile) linearMs = stageTimer.lap();
@@ -676,22 +685,28 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
             // recorder (tests). APS5_SYNC_TEXTURE_UPLOAD=1 restores the waiting batch for every upload.
             static const bool syncUploads = std::getenv("APS5_SYNC_TEXTURE_UPLOAD") != nullptr;
             auto* recorder = dumpWanted || syncUploads ? nullptr : Recorder::Active();
+            if (gpuInput.buffer != nullptr)
+                Require(recorder == gpuInput.recorder && recorder != nullptr,
+                    "a GPU texture input cannot be consumed by a different or synchronous command batch");
             std::unique_ptr<CommandBatch> batch;
             VkCommandBuffer commands = VK_NULL_HANDLE;
             if (recorder != nullptr) {
                 commands = recorder->Commands();
-                recorder->Keep(staging, static_cast<std::size_t>(guestBytes));
+                if (staging != nullptr) recorder->Keep(staging, static_cast<std::size_t>(guestBytes));
                 recorder->Keep(tiled, static_cast<std::size_t>(guestBytes));
                 recorder->Keep(linear, static_cast<std::size_t>(linearBytes));
                 recorder->Keep(owned);
                 if (uploadOwned != nullptr) recorder->Keep(uploadOwned);
+                if (gpuInput.owner != nullptr) recorder->Keep(gpuInput.owner);
             } else {
                 batch = std::make_unique<CommandBatch>(context);
                 commands = batch->Handle();
             }
 
-            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-            CopyBuffer(context, commands, staging->Handle(), 0, tiled->Handle(), 0, guestBytes);
+            if (gpuInput.buffer == nullptr) {
+                RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+                CopyBuffer(context, commands, staging->Handle(), 0, tiled->Handle(), 0, guestBytes);
+            }
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
 
             for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
@@ -921,10 +936,10 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
             if (totalMs + readTextureSurfaceMs + providedStagingMs > 50) {
                 // Disjoint constructor intervals; image internals are nested within imageMs,
                 // and driver allocation is nested within imagePoolMs.
-                AgcDriver::ProfilePrint_nid_no_patch("[texture-snapshot] address=0x%llx size=%ux%u dim=%d depthOrLastArray=%u mips=%u format=%u tile=%d guestBytes=%llu linearBytes=%llu totalMs=%.3f readTextureSurfaceMs=%.3f providedStagingMs=%.3f ctorMs=%.3f disjointCtorMs{setup=%.3f image=%.3f uploadSetup=%.3f stagingAlloc=%.3f memcpy=%.3f tiledAlloc=%.3f linearAlloc=%.3f detileRecordOrWait=%.3f tailViewRelease=%.3f} imageNestedMs{create=%.3f requirementsType=%.3f imagePool=%.3f driverAllocInPool=%.3f bind=%.3f}\n",
+                AgcDriver::ProfilePrint_nid_no_patch("[texture-snapshot] address=0x%llx size=%ux%u dim=%d depthOrLastArray=%u mips=%u format=%u tile=%d guestBytes=%llu linearBytes=%llu totalMs=%.3f readTextureSurfaceMs=%.3f providedStagingMs=%.3f ctorMs=%.3f disjointCtorMs{setup=%.3f image=%.3f uploadSetup=%.3f stagingAlloc=%.3f memcpy=%.3f tiledAlloc=%.3f linearAlloc=%.3f detileRecordOrWait=%.3f tailViewRelease=%.3f} imageNestedMs{create=%.3f requirementsType=%.3f imagePool=%.3f driverAllocInPool=%.3f bind=%.3f} gpuInputRefusal=%s\n",
                     static_cast<unsigned long long>(descriptor.baseAddress), descriptor.width, descriptor.height, static_cast<int>(descriptor.dimension), descriptor.depthOrLastArray, descriptor.mipCount, descriptor.format, static_cast<int>(descriptor.tileMode),
                     static_cast<unsigned long long>(guestBytes), static_cast<unsigned long long>(linearBytes), totalMs + readTextureSurfaceMs + providedStagingMs, readTextureSurfaceMs, providedStagingMs, totalMs, setupMs, imageMs, uploadSetupMs, stagingMs, memcpyMs, tiledMs, linearMs, gpuRecordMs, tailMs,
-                    imageTiming.createImage, imageTiming.requirementsAndType, imageTiming.imageMemoryPool, imageTiming.vkAllocateMemory, imageTiming.bindImage);
+                    imageTiming.createImage, imageTiming.requirementsAndType, imageTiming.imageMemoryPool, imageTiming.vkAllocateMemory, imageTiming.bindImage, snapshotRefusal != nullptr ? snapshotRefusal : "not_attempted");
             }
         }
     } catch (...) {

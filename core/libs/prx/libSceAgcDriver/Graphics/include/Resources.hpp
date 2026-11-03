@@ -5,6 +5,7 @@
 #include <span>
 
 namespace AgcDriver::Graphics {
+class Recorder;
 
 class Buffer {
 public:
@@ -72,6 +73,14 @@ private:
     std::shared_ptr<BufferPool> cache;
     bool hostPlaced = false;
     bool ready = false;
+};
+// Private upload bytes and a batch-only source lease. `recorder` and `device` prove that a consumer
+// records after the input copy in the same active batch; the lease must not escape that batch.
+struct GpuBufferInput {
+    std::shared_ptr<DeviceBuffer> buffer;
+    std::shared_ptr<void> owner;
+    Recorder* recorder = nullptr;
+    VkDevice device = VK_NULL_HANDLE;
 };
 
 // Records a whole-range buffer copy.

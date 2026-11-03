@@ -299,6 +299,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/WorkerSampler.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/HostAllocator.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/PerformanceTrace.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/P0Metrics.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/PerformanceTraceThread.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/TraceFile.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ThreadPriority.cpp
@@ -787,12 +788,23 @@ if(BUILD_TESTING)
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()
+if(BUILD_TESTING AND NOT WIN32 AND Python3_Interpreter_FOUND)
+    add_test_executable(agc_p0_table_atomic_tests EXCLUDE_FROM_ALL tests/P0TableAtomic.cpp)
+    target_include_directories(agc_p0_table_atomic_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_p0_table_atomic_tests PRIVATE libSceAgcDriver libkernel libc)
+    set_target_properties(agc_p0_table_atomic_tests PROPERTIES CXX_EXTENSIONS OFF EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_p0_table_atomic COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_p0_table_atomic.py $<TARGET_FILE:agc_p0_table_atomic_tests>)
+    set_tests_properties(agc_p0_table_atomic PROPERTIES TIMEOUT 30)
+endif()
+
 
 add_test_executable(agc_shader_memory_tests EXCLUDE_FROM_ALL
         tests/ShaderMemory.cpp
         Execution/src/ShaderMemory.cpp
         Execution/src/GuestMemory.cpp
         Execution/src/PerformanceTraceThread.cpp
+        Execution/src/P0Metrics.cpp
 )
 target_include_directories(agc_shader_memory_tests PRIVATE ${LIBS_INCLUDE_DIR})
 target_link_libraries(agc_shader_memory_tests PRIVATE shader_recompiler_agc_driver libc)
@@ -879,6 +891,7 @@ add_test_executable(agc_write_tracking_tests EXCLUDE_FROM_ALL
         tests/WriteTracking.cpp
         Execution/src/GuestMemory.cpp
         Execution/src/PerformanceTraceThread.cpp
+        Execution/src/P0Metrics.cpp
 )
 target_include_directories(agc_write_tracking_tests PRIVATE ${LIBS_INCLUDE_DIR})
 target_link_libraries(agc_write_tracking_tests PRIVATE shader_recompiler_agc_driver libc)
@@ -913,6 +926,7 @@ if(BUILD_TESTING AND NOT WIN32)
             tests/CollectMemoGeneration.cpp
             Execution/src/GuestMemory.cpp
             Execution/src/PerformanceTraceThread.cpp
+            Execution/src/P0Metrics.cpp
     )
     target_include_directories(agc_collect_memo_generation_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(agc_collect_memo_generation_tests PRIVATE shader_recompiler_agc_driver libc)

@@ -78,6 +78,7 @@ bool Driver::pipelineDispatch() {
 }
 
 void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments) {
+    AgcDriver::P0Metrics::Scope p0(submission.queue, AgcDriver::P0Metrics::Layer::Packet, AgcDriver::P0Metrics::Operation::Dispatch);
     PerformanceTimer timing("Driver.Dispatch");
     const auto address = (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20c)) << 8u) | (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20d) & 0xffu) << 40u);
     if (SkippedShader(address)) return;
@@ -496,6 +497,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         itemCommits.fetch_add(1, std::memory_order_relaxed);
         DrawPipeline::Queue0().Enqueue([this, localDevice = std::move(localDevice), result = compiledResult, snapshots = std::move(snapshots), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, dataHit, epoch, htileClearCompletion] {
             DrawPipeline::FollowEpoch(epoch);
+            AgcDriver::P0Metrics::Scope p0(queueId, AgcDriver::P0Metrics::Layer::Committer, AgcDriver::P0Metrics::Operation::Dispatch);
             GuestMemory::SetCurrentPacket(0x15, queueId);
             const auto& compiledCommit = *result;
             const bool noteWrites = writeEvidenceEnabled() || traceCapSync();

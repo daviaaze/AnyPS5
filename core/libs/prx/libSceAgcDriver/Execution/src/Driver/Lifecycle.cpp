@@ -8,10 +8,12 @@
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceOverlay.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "ShaderDiskCache.hpp"
 #include "prx/libc/include/GuestArena.hpp"
@@ -143,8 +145,11 @@ Driver::~Driver() {
 
 void Driver::Shutdown() {
     stop();
-    std::lock_guard lock(mutex);
-    rethrowFailure();
+    P0Metrics::Report();
+    {
+        std::lock_guard lock(mutex);
+        rethrowFailure();
+    }
 }
 
 void Driver::stop() {

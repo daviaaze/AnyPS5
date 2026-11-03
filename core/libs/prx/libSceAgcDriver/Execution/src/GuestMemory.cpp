@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WriteWatchCoverage.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -2657,6 +2658,7 @@ void FlushGpuWrites(std::uint64_t address, std::size_t bytes) {
 
 void Read(std::uint64_t address, std::span<std::byte> destination, std::size_t alignment) {
     if (destination.empty()) return;
+    P0Metrics::ReadRequested(static_cast<unsigned>(CurrentReadSite()), 0, destination.size());
     GuardRead(address, destination.size());
     FlushGpuWrites(address, destination.size());
     const TimedAccess timed(CounterRead, destination.size());
@@ -2791,6 +2793,7 @@ ZeroRange copyCommitted(std::uint64_t address, std::span<std::byte> destination,
 
 void ReadCommitted(std::uint64_t address, std::span<std::byte> destination) {
     if (destination.empty()) return;
+    P0Metrics::ReadRequested(static_cast<unsigned>(CurrentReadSite()), 1, destination.size());
     GuardRead(address, destination.size());
     FlushGpuWrites(address, destination.size());
     const TimedAccess timed(CounterRead, destination.size());
@@ -2800,6 +2803,7 @@ void ReadCommitted(std::uint64_t address, std::span<std::byte> destination) {
 
 ZeroRange ReadCommittedWithKnownZeros(std::uint64_t address, std::span<std::byte> destination, ZeroRange knownZeros) {
     if (destination.empty()) return {};
+    P0Metrics::ReadRequested(static_cast<unsigned>(CurrentReadSite()), 2, destination.size());
     GuardRead(address, destination.size());
     FlushGpuWrites(address, destination.size());
     const TimedAccess timed(CounterRead, destination.size());
@@ -2809,6 +2813,7 @@ ZeroRange ReadCommittedWithKnownZeros(std::uint64_t address, std::span<std::byte
 
 void ReadCommittedUnsynced(std::uint64_t address, std::span<std::byte> destination) {
     if (destination.empty()) return;
+    P0Metrics::ReadRequested(static_cast<unsigned>(CurrentReadSite()), 3, destination.size());
     GuardRead(address, destination.size());
     const TimedAccess timed(CounterRead, destination.size());
     CountReadCaller(__builtin_return_address(0));
@@ -2823,6 +2828,7 @@ bool EqualsCommitted(std::uint64_t address, std::span<const std::byte> bytes) {
 
 bool EqualsCommittedUnsynced(std::uint64_t address, std::span<const std::byte> bytes) {
     if (bytes.empty()) return true;
+    P0Metrics::ReadRequested(static_cast<unsigned>(CurrentReadSite()), 4, bytes.size());
     const TimedAccess timed(CounterCompare, bytes.size());
     if (Accessible(reinterpret_cast<const void*>(address), bytes.size())) return equalsCommittedBytes(address, bytes.data(), bytes.size());
     for (const auto& [begin, end] : CommittedRanges(address, bytes.size())) {

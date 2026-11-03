@@ -2,6 +2,7 @@
 #include "../tools/FrameReplay.cpp"
 #undef main
 #include "prx/libSceAgcDriver/Execution/include/FrameRecorder.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include <barrier>
 

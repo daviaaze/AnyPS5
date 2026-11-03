@@ -158,6 +158,7 @@ struct ImageTableReuseCounts {
     std::uint64_t writesMade = 0;
 };
 ImageTableReuseCounts ImageTableReuses();
+void ReportP0TableMetrics();
 std::uint64_t SampledLookupKeyScans();
 struct PreparedSnapshotStagingCounts {
     std::uint64_t prepared = 0;

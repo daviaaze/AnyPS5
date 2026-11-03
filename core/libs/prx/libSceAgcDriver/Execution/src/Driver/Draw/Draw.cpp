@@ -427,6 +427,7 @@ std::unordered_map<std::uint64_t, bool>& CpuIndirectPrograms() {
 }
 
 DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::size_t packetOffset, std::string& rejected) {
+    AgcDriver::P0Metrics::Scope p0(submission.queue, AgcDriver::P0Metrics::Layer::Packet, AgcDriver::P0Metrics::Operation::Draw);
     PerformanceTimer timing("Driver.Draw");
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto tailHolder = std::make_shared<DrawTail>();
@@ -873,6 +874,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         DrawFinisher::Get().Enqueue([this, tailHolder] {
             auto& job = *tailHolder;
             DrawPipeline::FollowEpoch(job.epoch);
+            AgcDriver::P0Metrics::Scope p0(job.submissionQueue, AgcDriver::P0Metrics::Layer::Finisher, AgcDriver::P0Metrics::Operation::Draw);
             GuestMemory::SetCurrentPacket(job.packetOpcode, job.submissionQueue);
             PerformanceTimer finishTiming("Driver.DrawFinish");
             try {
@@ -1629,6 +1631,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
 }
 
 void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, VulkanDevice::DrawTraceContext trace, std::uint64_t shape) {
+    AgcDriver::P0Metrics::Scope p0(queue, AgcDriver::P0Metrics::Layer::Committer, AgcDriver::P0Metrics::Operation::Draw);
     const auto* tracePtr = trace.token != 0 ? &trace : nullptr;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     using Clock = std::chrono::steady_clock;

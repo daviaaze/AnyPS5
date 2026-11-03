@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_TEXTURE_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
@@ -61,8 +62,10 @@ struct OwnedImage {
 
 class Texture {
 public:
-    Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare = false, double readTextureSurfaceMs = 0.0);
-    Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::shared_ptr<Buffer> staging, bool depthCompare = false, double readTextureSurfaceMs = 0.0, double providedStagingMs = 0.0);
+    Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare = false, double readTextureSurfaceMs = 0.0, const char* snapshotRefusal = nullptr);
+    Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::shared_ptr<Buffer> staging, bool depthCompare = false, double readTextureSurfaceMs = 0.0, double providedStagingMs = 0.0, const char* snapshotRefusal = nullptr);
+    struct GpuInputTag {};
+    Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, GpuBufferInput input, GpuInputTag, bool depthCompare = false);
     Texture(const Context& context, const std::shared_ptr<ResidentColor>& source, const GuestTextureResource& descriptor, VkComponentMapping components);
     // A view of a storage image's own VkImage: the sampled texture follows the image's content, so a
     // compute pass writing it and the next pass sampling it share one image and copy nothing.
@@ -96,6 +99,7 @@ public:
 
     // Snapshot/copy image only; null for a view borrowing a resident/storage image.
     VkImage OwnedImageHandle() const { return image; }
+    bool HasResidentGpuInput() const { return residentGpuInput; }
     VkImageView View() const;
     VkImageView FirstLayerView() const { return firstLayerView; }
     VkImageView BaseLevelView() const;
@@ -130,7 +134,7 @@ public:
     void MarkReleased() { released.store(true, std::memory_order_release); }
 
 private:
-    Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, std::shared_ptr<Buffer> staging, bool depthCompare, double readTextureSurfaceMs, double providedStagingMs);
+    Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, std::shared_ptr<Buffer> staging, bool depthCompare, double readTextureSurfaceMs, double providedStagingMs, GpuBufferInput gpuInput = {}, const char* snapshotRefusal = nullptr);
     void release() noexcept;
     bool refreshBlockCopy();
     bool refreshSrgbExpand();
@@ -163,6 +167,7 @@ private:
     std::shared_ptr<StorageTexture> storageSource;
     std::unique_ptr<CommandBatch> upload;
     PerUseCopy perUseCopy = PerUseCopy::None;
+    bool residentGpuInput = false;
     std::atomic<bool> released{false};
     bool copiedOnce = false;
     bool srgbExpand = false;

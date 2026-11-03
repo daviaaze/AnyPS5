@@ -32,6 +32,10 @@
 extern char** environ;
 #endif
 
+#include <atomic>
+#include <cstdio>
+#include <chrono>
+#include <string_view>
 namespace AgcDriver {
 
 namespace {
@@ -641,3 +645,4 @@ void PerformanceTrace::StopOutput() {
 }
 
 }
+

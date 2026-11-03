@@ -176,8 +176,19 @@ thread_local unsigned storageCacheReclaimable = 0;
 
 struct CacheHold {
     unsigned& depth;
-    explicit CacheHold(unsigned& depth) : depth(depth) { ++depth; }
-    ~CacheHold() { --depth; }
+    bool active = false;
+    explicit CacheHold(unsigned& depth) : depth(depth) { Resume(); }
+    ~CacheHold() { Pause(); }
+    void Pause() {
+        if (!active) return;
+        --depth;
+        active = false;
+    }
+    void Resume() {
+        if (active) return;
+        ++depth;
+        active = true;
+    }
     CacheHold(const CacheHold&) = delete;
     CacheHold& operator=(const CacheHold&) = delete;
 };
@@ -868,6 +879,7 @@ GuestTextureResource viewedSampledWindow(const GuestTextureResource& resource, s
 
 // `guestBytes` is the surface size when the caller described the surface already (0: described here).
 std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& requested, VkComponentMapping components, std::uint64_t guestBytes = 0, bool depthCompare = false, VkImageViewType multisampleViewType = VK_IMAGE_VIEW_TYPE_2D, std::shared_ptr<Buffer> preparedStaging = {}) {
+    AgcDriver::P0Metrics::ReadContext p0Read(AgcDriver::P0Metrics::ReadReason::LookupUnclassified);
     const auto resource = ArrayLayerWindow(requested, context.limits.maxImageArrayLayers);
     if (resource.baseAddress != requested.baseAddress) guestBytes = 0;
     if (resource.dimension == TextureDimension::k2DMsaa) {
@@ -1030,6 +1042,8 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     if (flushAsked) scanned.reset();
     if (!keys.has_value()) keys = scanKeys();
     if (disabled) {
+        AgcDriver::P0Metrics::LookupObserved(AgcDriver::P0Metrics::Lookup::Disabled);
+        p0Read.Set(AgcDriver::P0Metrics::ReadReason::Disabled);
         if (source != nullptr && depthCompare) {
             auto texture = std::make_shared<Texture>(context, source, resource, components, Texture::DepthCopyTag{});
             texture->RefreshDepthCopy();
@@ -1067,8 +1081,8 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     const auto untracked = source == nullptr && generation == 0 && !committed.has_value() && *keys == DccKeys::Uncompressed ? untrackedKey(address, bytes) : std::array<std::uint64_t, 4>{};
     auto& cache = Textures();
     const auto key = MakeTextureKey(context.device, words, components, depthCompare);
-    std::lock_guard lock(TableWaits::Acquire(TableWaits::SampledCacheMutex, cache.mutex), std::adopt_lock);
-    const CacheHold held(sampledCacheHeld);
+    std::unique_lock lock(TableWaits::Acquire(TableWaits::SampledCacheMutex, cache.mutex), std::adopt_lock);
+    CacheHold held(sampledCacheHeld);
     expireOverflow(cache);
     dropUncachedViews(cache);
     auto budget = sampledBudget(context, cache);
@@ -1088,6 +1102,8 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 if (it->texture->IsDepthCopy()) it->texture->RefreshDepthCopy();
                 it->keys = *keys;
                 touchTexture(cache, ref);
+                AgcDriver::P0Metrics::LookupObserved(AgcDriver::P0Metrics::Lookup::ViewHit);
+                p0Read.Set(AgcDriver::P0Metrics::ReadReason::ResidentValidationUnknown);
                 logLookup({it->texture.get(), resource, guestBytes, *keys, 0, it->source.get()});
                 reportTextureCounters();
                 if (profile) LookupOutcomes::Add(*keys != DccKeys::Uncompressed ? LookupOutcomes::SampledHitClearedView : LookupOutcomes::SampledHitView, start);
@@ -1099,7 +1115,9 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             // surface (counted, and named for the [hooksync] line).
             const auto equalsCommitted = [&] {
                 if (it->bytes.empty()) return false;
-                if (Recorder::SnapshotWriteOverlaps(address, bytes)) counters.pendingReads.fetch_add(1, std::memory_order_relaxed);
+                const bool pendingWrite = Recorder::SnapshotWriteOverlaps(address, bytes);
+                if (pendingWrite) counters.pendingReads.fetch_add(1, std::memory_order_relaxed);
+                p0Read.Set(pendingWrite ? AgcDriver::P0Metrics::ReadReason::PendingGpuOverlapObserved : AgcDriver::P0Metrics::ReadReason::ResidentValidationUnknown);
                 const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureCompare);
                 return GuestMemory::EqualsCommitted(address, it->bytes);
             };
@@ -1118,18 +1136,24 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 it->committed = std::move(committed);
                 it->untracked = untracked;
                 touchTexture(cache, ref);
+                AgcDriver::P0Metrics::LookupObserved(AgcDriver::P0Metrics::Lookup::SnapshotHit);
+                p0Read.Set(AgcDriver::P0Metrics::ReadReason::ResidentValidationUnknown);
                 logLookup({it->texture.get(), resource, guestBytes, *keys, generation, nullptr});
                 reportTextureCounters();
                 if (profile) LookupOutcomes::Add(LookupOutcomes::SampledHitSnapshot, start);
                 return it->texture;
             }
         }
+        AgcDriver::P0Metrics::LookupObserved(AgcDriver::P0Metrics::Lookup::ResidentStale);
+        p0Read.Set(AgcDriver::P0Metrics::ReadReason::ResidentStaleUnknown);
         if (it->bytes.size() == bytes) recycled = std::move(it->bytes);
         else parkSnapshot(cache, it->bytes);
         eraseTexture(cache, it);
         ++cache.counts.stale;
+    } else {
+        AgcDriver::P0Metrics::LookupObserved(AgcDriver::P0Metrics::Lookup::AbsentOriginUnknown);
+        p0Read.Set(AgcDriver::P0Metrics::ReadReason::AbsentOriginUnknown);
     }
-    if (source != nullptr) parkSnapshot(cache, recycled);
     CachedTexture entry{key, address, {}, nullptr, *keys, snapshotGeneration};
     entry.committed = std::move(committed);
     entry.surfaceBytes = bytes;
@@ -1158,9 +1182,45 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         entry.accounted = source->Cached() ? 0u : heldBytes(*source);
         counters.fromStorage.fetch_add(1, std::memory_order_relaxed);
     } else {
+        bool gpuInputUsed = false;
+        const char* gpuInputRefusal = "not_attempted";
+        const bool debugSnapshot = std::getenv("APS5_DUMP_TEXTURE") != nullptr ||
+            std::getenv("APS5_DUMP_TEXTURE_LAYERS") != nullptr || std::getenv("APS5_DUMP_TEXTURE_ROI") != nullptr ||
+            std::getenv("APS5_SYNC_TEXTURE_UPLOAD") != nullptr || std::getenv("APS5_TRACE_TEXTURES") != nullptr;
+        if (debugSnapshot) gpuInputRefusal = "debug_snapshot";
+        else if (depthCompare) gpuInputRefusal = "depth_compare";
+        else if (!context.textureCompressionBC) gpuInputRefusal = "bc_unsupported";
+        else if (resource.dccAddress != 0) gpuInputRefusal = "descriptor_has_dcc";
+        else if (*keys != DccKeys::Uncompressed) gpuInputRefusal = "compressed_dcc_keys";
+        else if (!IsBlockCompressed(resource.format)) gpuInputRefusal = "not_block_compressed";
+        else if (Recorder::SnapshotWriteOverlaps(address, bytes)) gpuInputRefusal = "pending_snapshot_writer";
+        else {
+            std::optional<GpuBufferInput> input;
+            std::shared_ptr<Texture> gpuTexture;
+            lock.unlock();
+            held.Pause();
+            try {
+                input = AcquireSampledTextureInput(context, address, bytes, &gpuInputRefusal);
+                if (input.has_value()) gpuTexture = std::make_shared<Texture>(context, *context.detiler, resource, components,
+                    std::move(*input), Texture::GpuInputTag{}, false);
+            } catch (...) {
+                lock.lock();
+                held.Resume();
+                throw;
+            }
+            lock.lock();
+            held.Resume();
+            if (gpuTexture != nullptr) {
+                entry.texture = std::move(gpuTexture);
+                entry.accounted = entry.texture->AllocationBytes();
+                gpuInputUsed = true;
+            }
+        }
+        if (!gpuInputUsed) {
         // Snapshot before the upload so a write racing with it is caught by the next comparison.
         const bool pending = *keys == DccKeys::Uncompressed && Recorder::SnapshotWriteOverlaps(address, bytes);
         if (pending) counters.pendingReads.fetch_add(1, std::memory_order_relaxed);
+        p0Read.Set(pending ? AgcDriver::P0Metrics::ReadReason::PendingGpuOverlapObserved : AgcDriver::P0Metrics::ReadReason::AbsentOriginUnknown);
         // Snapshot preparation is profile-only: the clocks bracket the read and constructor
         // independently, while the constructor emits its own disjoint allocation-stage record.
         const auto readStarted = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -1191,10 +1251,11 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             for (std::size_t i = 0; i < read.size(); i += 64) nonzero += read[i] != std::byte{0};
             std::fprintf(stderr, "[texture] 0x%llx %ux%u format %u tile %d: %zu of %zu sampled bytes nonzero\n", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, static_cast<int>(resource.tileMode), nonzero, read.size() / 64);
         }
-        if (staging != nullptr) entry.texture = createTexture(*context.detiler, resource, components, std::move(staging), depthCompare, profile ? readMs : 0.0);
-        else entry.texture = createTexture(*context.detiler, resource, components, entry.bytes, depthCompare, profile ? readMs : 0.0);
+        if (staging != nullptr) entry.texture = createTexture(*context.detiler, resource, components, std::move(staging), depthCompare, profile ? readMs : 0.0, 0.0, gpuInputRefusal);
+        else entry.texture = createTexture(*context.detiler, resource, components, entry.bytes, depthCompare, profile ? readMs : 0.0, gpuInputRefusal);
         entry.accounted = entry.texture->AllocationBytes();
         if (entry.bytes.size() > SnapshotCompareBytes && (entry.generation != 0 || entry.untracked[0] != 0)) parkSnapshot(cache, entry.bytes);
+        }
         counters.snapshots.fetch_add(1, std::memory_order_relaxed);
     }
     auto texture = entry.texture;
@@ -5205,8 +5266,19 @@ bool ShaderResources::precollectImages() {
                     }
                     static const bool noPreparedStaging = std::getenv("APS5_NO_PREPARED_SNAPSHOT_STAGING") != nullptr;
                     constexpr std::size_t SnapshotCompareBytes = 256u << 10u;
+                    const bool gpuInputCandidate = predictsMiss && record.source == nullptr &&
+                        std::getenv("APS5_NO_TEXTURE_CACHE") == nullptr &&
+                        IsBlockCompressed(record.resource.format) &&
+                        record.resource.dccAddress == 0 && context.textureCompressionBC &&
+                        std::getenv("APS5_DUMP_TEXTURE") == nullptr &&
+                        std::getenv("APS5_DUMP_TEXTURE_LAYERS") == nullptr &&
+                        std::getenv("APS5_DUMP_TEXTURE_ROI") == nullptr &&
+                        std::getenv("APS5_SYNC_TEXTURE_UPLOAD") == nullptr &&
+                        std::getenv("APS5_TRACE_TEXTURES") == nullptr &&
+                        !Recorder::SnapshotWriteOverlaps(record.resource.baseAddress, record.guestBytes) &&
+                        SampledTextureInputEligible(context, record.resource.baseAddress, record.guestBytes);
                     if (!noPreparedStaging && predictsMiss && record.generation != 0 &&
-                            record.keys == DccKeys::Uncompressed && record.guestBytes > SnapshotCompareBytes) {
+                            record.keys == DccKeys::Uncompressed && !gpuInputCandidate && record.guestBytes > SnapshotCompareBytes) {
                         const auto stagingResource = ArrayLayerWindow(record.resource, context.limits.maxImageArrayLayers);
                         const bool sameSurface = stagingResource.baseAddress == record.resource.baseAddress;
                         const auto stagingGuestBytes = sameSurface ? record.guestBytes : DescribeSurface(stagingResource).guestBytes;
@@ -5822,6 +5894,43 @@ PreparedSnapshotStagingCounts PreparedSnapshotStagings() {
 ImageTableReuseCounts ImageTableReuses() {
     const auto& counters = TextureCounts();
     return {counters.tablesReused.load(std::memory_order_relaxed) + counters.tablesReplayed.load(std::memory_order_relaxed), counters.tablesResolved.load(std::memory_order_relaxed), counters.tablesReplayed.load(std::memory_order_relaxed), counters.tableWritesKept.load(std::memory_order_relaxed), counters.tableWritesMade.load(std::memory_order_relaxed)};
+}
+void ReportP0TableMetrics() {
+    if (!AgcDriver::P0Metrics::Enabled()) return;
+    const auto& counters = TextureCounts();
+    const auto count = [](const auto& value) { return static_cast<unsigned long long>(value.load(std::memory_order_relaxed)); };
+    // Fixed JSON text plus the maximum 20-byte decimal representation of each
+    // uint64 counter and separators. 4096 bytes exceeds this schema's <2 KiB
+    // maximum record, including its newline.
+    std::array<char, 4096> record;
+    std::size_t used = 0;
+    const auto append = [&](const char* format, auto... values) {
+        if (used >= record.size()) throw std::runtime_error("P0 table metrics record buffer exhausted");
+        const int written = std::snprintf(record.data() + used, record.size() - used, format, values...);
+        if (written < 0 || static_cast<std::size_t>(written) >= record.size() - used)
+            throw std::runtime_error("P0 table metrics record formatting failed");
+        used += static_cast<std::size_t>(written);
+    };
+    append("{\"type\":\"aps5_p0_table_summary\",\"version\":1,\"cumulative\":true,\"cache_absent_origin\":\"unknown_first_seen_vs_evicted\",\"generation_change_writer\":\"unknown\",\"pending_gpu_overlap\":\"observation_not_proof\",\"reason_array_order\":\"existing table-reuse-denied/current-fail/proof-fail reason order; miss and stale arrays follow their existing counter indices\",\"reused\":%llu,\"replayed\":%llu,\"resolved\":%llu,\"writes_kept\":%llu,\"writes_made\":%llu,\"denied_by_reason\":[",
+        count(counters.tablesReused), count(counters.tablesReplayed), count(counters.tablesResolved),
+        count(counters.tableWritesKept), count(counters.tableWritesMade));
+    const auto appendArray = [&](const auto& values) {
+        for (std::size_t i = 0; i < values.size(); ++i)
+            append("%s%llu", i == 0 ? "" : ",", count(values[i]));
+        append("%s", "]");
+    };
+    appendArray(counters.tableDenied);
+    append("%s", ",\"miss_by_reason\":[");
+    appendArray(counters.tableMiss);
+    append("%s", ",\"stale_by_reason\":[");
+    appendArray(counters.tableStale);
+    append("%s", ",\"current_fail_by_reason\":[");
+    appendArray(counters.tableCurrentFail);
+    append("%s", ",\"proof_fail_by_reason\":[");
+    appendArray(counters.tableProofFail);
+    append("%s", "}\n");
+    if (std::fwrite(record.data(), 1, used, stderr) != used)
+        throw std::runtime_error("P0 table metrics record write failed");
 }
 
 void ShaderResources::finishImageTables() {

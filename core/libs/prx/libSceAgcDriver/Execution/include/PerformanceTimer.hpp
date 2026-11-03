@@ -17,8 +17,69 @@
 #include <stdexcept>
 #include <string_view>
 #include <utility>
+#include <array>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#if defined(__linux__)
+#include <time.h>
+#endif
 
 namespace AgcDriver {
+
+// Diagnostic cumulative counters. These measure host scopes, not GPU execution or
+// causal critical-path time. Different execution layers must never be summed.
+class P0Metrics {
+public:
+    enum class Layer : unsigned { Packet, Committer, Finisher };
+    enum class Operation : unsigned { Draw, Dispatch };
+    // Observations only: neither generation changes nor queued overlap prove writer identity.
+    enum class Lookup : unsigned { Unclassified, SnapshotHit, ViewHit, ResidentStale, AbsentOriginUnknown, Disabled, Count };
+    enum class ReadReason : unsigned { OutsideLookup, LookupUnclassified, ResidentValidationUnknown, ResidentStaleUnknown, AbsentOriginUnknown, PendingGpuOverlapObserved, Disabled, Count };
+    static void LookupObserved(Lookup outcome);
+    class ReadContext {
+    public:
+        explicit ReadContext(ReadReason reason);
+        ~ReadContext();
+        void Set(ReadReason reason);
+        ReadContext(const ReadContext&) = delete;
+        ReadContext& operator=(const ReadContext&) = delete;
+    private:
+        ReadReason previous;
+        bool enabled;
+    };
+    static bool Enabled();
+    static bool CpuNow(std::uint64_t& ns);
+    static bool Begin(unsigned layer);
+    static void End(std::uint32_t queue, unsigned layer, unsigned operation, bool active,
+                    std::uint64_t cpuStart, bool cpuAvailable,
+                    std::chrono::steady_clock::time_point start);
+    static void ReadRequested(unsigned site, unsigned api, std::size_t bytes);
+    static void Report();
+    class Scope {
+    public:
+        Scope(std::uint32_t queue, Layer layer, Operation operation)
+            : queue(queue), layer(static_cast<unsigned>(layer)), operation(static_cast<unsigned>(operation)) {
+            if (!Enabled()) return;
+            entered = true;
+            active = Begin(this->layer);
+            if (!active) return;
+            start = std::chrono::steady_clock::now();
+            cpuAvailable = CpuNow(cpuStart);
+        }
+        Scope(const Scope&) = delete;
+        Scope& operator=(const Scope&) = delete;
+        ~Scope() {
+            if (entered) End(queue, layer, operation, active, cpuStart, cpuAvailable, start);
+        }
+    private:
+        std::uint32_t queue;
+        unsigned layer, operation;
+        bool entered = false, active = false, cpuAvailable = false;
+        std::uint64_t cpuStart = 0;
+        std::chrono::steady_clock::time_point start{};
+    };
+};
 
 class FrameTiming {
 public:

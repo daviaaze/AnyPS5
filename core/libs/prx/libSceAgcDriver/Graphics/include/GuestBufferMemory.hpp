@@ -195,6 +195,15 @@ HostImportsProof HostImportsIdentity(const Context& context);
 // covers the range. A read-only mirror's bytes and VkBuffer never change, so a descriptor set written
 // against it stays valid while the serial is unchanged.
 std::uint64_t ImageMirrorSerial(const Context& context, std::uint64_t address, std::size_t bytes);
+// Preflight used only to avoid a speculative host staging allocation. It inspects the current tracked
+// committed map but creates no mirror and records no work.
+// It does not wait for the device lock: a busy device keeps normal prepared CPU staging.
+// Eligibility is advisory; acquisition revalidates the range under the device lock.
+bool SampledTextureInputEligible(const Context& context, std::uint64_t address, std::size_t bytes);
+// A compressed texture's owned tiled input, copied from the existing resident heap mirror in the
+// same recorder batch. Empty when the range cannot be served without a CPU snapshot; optional
+// refusal receives a stable literal reason for that attempt.
+std::optional<GpuBufferInput> AcquireSampledTextureInput(const Context& context, std::uint64_t address, std::size_t bytes, const char** refusal = nullptr);
 
 // Deferred lease release (see GuestBufferMemory.cpp). An address-based build leases every readable
 // registered allocation until its write-back, which runs when its batch completed; the guest's
