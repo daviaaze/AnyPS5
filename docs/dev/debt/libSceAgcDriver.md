@@ -369,6 +369,8 @@
 
 - [Draw](../../../core/libs/prx/libSceAgcDriver/Graphics/src/Draw.cpp) partitions layered mesh color draws into attachment windows within the host `maxMeshOutputLayers` limit, remaps output layers and reconstructs the guest layer for fragment ancillary input. Replay requires shaders without guest memory writes, clocks, GDS access or unproven side effects; those draws still throw until mesh output can be captured once and rasterized separately. Layered depth rendering remains unsupported. Vulkan layer-limit semantics follow [Layer](https://docs.vulkan.org/refpages/latest/refpages/source/Layer.html); PS5 behavior outside Vulkan’s defined layer range is unmeasured. Layered 2D array views remain unsupported by the existing color-view decoder.
 
+- [Registered-view snapshot stability](../../../core/shader/recompiler/Optimization/src/ResourceMaterializer.cpp) checks the allocation epoch only when a direct or table image-view normalizer query was recorded. Absence and failed normalization still record an identity and retain the epoch check; a snapshot with no query has no allocation-registry dependency. The epoch remains conservative for actual queries: an unrelated allocation change can still force a retry. Descriptor-scope validation and the three-attempt bound are unchanged.
+
 ### Opt-in draw paths
 
 - [Draw finisher](../../../core/libs/prx/libSceAgcDriver/Execution/src/Driver/Draw/DrawPipeline.cpp) (`APS5_DRAW_PIPELINE`) - opt-in. The Linux main-image page table it adds matches what Windows already does by default.

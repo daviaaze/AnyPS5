@@ -2945,13 +2945,6 @@ void ResourceMaterializer::Materialize(const IrResourcePlan& program, const SrtR
     activeSources.clear();
     try {
         bool completed = false;
-        struct RejectedSnapshot {
-            bool reachedGuard = false;
-            std::uint64_t beforeScope = 0, afterSnapshotScope = 0, afterTablesScope = 0;
-            std::uint64_t beforeImages = 0, afterImages = 0;
-            std::size_t directViews = 0, tableViews = 0;
-        };
-        std::array<RejectedSnapshot, 3> rejected{};
         for (std::uint32_t attempt = 0; attempt < 3u; ++attempt) {
             const SrtForceSyncScope forceSync(runtime, attempt == 2u);
             const auto beforeSnapshot = runtime.descriptorScope != nullptr ? runtime.descriptorScope(runtime.userContext, 0u) : 0u;
@@ -2963,18 +2956,13 @@ void ResourceMaterializer::Materialize(const IrResourcePlan& program, const SrtR
                 TableSnapshotter(plan, runtime, walker, activeSources, nextSnapshot.tables).Run();
                 const auto afterTables = runtime.descriptorScope != nullptr ? runtime.descriptorScope(runtime.userContext, 0u) : 0u;
                 const auto afterImageGeneration = runtime.imageViewGeneration != nullptr ? runtime.imageViewGeneration(runtime.userContext) : 0u;
-                if ((runtime.descriptorScope != nullptr && (afterTables != afterSnapshot || (plan.uniformFill.fill.kind != UniformFillKind::None && afterSnapshot != beforeSnapshot))) || afterImageGeneration != beforeImageGeneration) {
-                    auto& failure = rejected[attempt];
-                    failure.reachedGuard = true;
-                    failure.beforeScope = beforeSnapshot;
-                    failure.afterSnapshotScope = afterSnapshot;
-                    failure.afterTablesScope = afterTables;
-                    failure.beforeImages = beforeImageGeneration;
-                    failure.afterImages = afterImageGeneration;
-                    failure.directViews = nextSnapshot.registeredImages.size();
-                    for (const auto& table : nextSnapshot.tables.tables) {
-                        for (const auto& view : table.resourceViews) failure.tableViews += view.identities.size();
-                    }
+                // Normalizer calls record an identity even for absence or failed normalization.
+                // Without such a query, unrelated allocation churn is not a snapshot dependency.
+                const bool consultedRegisteredView = !nextSnapshot.registeredImages.empty() ||
+                    std::ranges::any_of(nextSnapshot.tables.tables, [](const auto& table) {
+                        return std::ranges::any_of(table.resourceViews, [](const auto& view) { return !view.identities.empty(); });
+                    });
+                if ((runtime.descriptorScope != nullptr && (afterTables != afterSnapshot || (plan.uniformFill.fill.kind != UniformFillKind::None && afterSnapshot != beforeSnapshot))) || (consultedRegisteredView && afterImageGeneration != beforeImageGeneration)) {
                     continue;
                 }
                 for (const auto& table : nextSnapshot.tables.tables) {
@@ -3000,23 +2988,7 @@ void ResourceMaterializer::Materialize(const IrResourcePlan& program, const SrtR
                 }
             }
         }
-        if (!completed) {
-            std::string message = "runtime resource snapshot did not stabilize; descriptorScope=" + std::to_string(runtime.descriptorScope != nullptr)
-                + " imageViewGeneration=" + std::to_string(runtime.imageViewGeneration != nullptr)
-                + " uniformFill=" + std::to_string(plan.uniformFill.fill.kind != UniformFillKind::None);
-            for (std::size_t attempt = 0; attempt < rejected.size(); ++attempt) {
-                const auto& failure = rejected[attempt];
-                message += "; attempt " + std::to_string(attempt + 1u);
-                if (!failure.reachedGuard) {
-                    message += " did not reach stability guard";
-                    continue;
-                }
-                message += " scope=" + std::to_string(failure.beforeScope) + "/" + std::to_string(failure.afterSnapshotScope) + "/" + std::to_string(failure.afterTablesScope)
-                    + " imageGeneration=" + std::to_string(failure.beforeImages) + "/" + std::to_string(failure.afterImages)
-                    + " directViews=" + std::to_string(failure.directViews) + " tableViews=" + std::to_string(failure.tableViews);
-            }
-            throw std::runtime_error(message);
-        }
+        if (!completed) throw std::runtime_error("runtime resource snapshot did not stabilize");
     } catch (...) {
         reportTables();
         throw;

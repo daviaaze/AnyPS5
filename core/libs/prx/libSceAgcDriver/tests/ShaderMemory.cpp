@@ -2389,6 +2389,107 @@ void verifyTypeZeroImageMaterialization() {
     }
 }
 
+// Exercise the real transaction, including the generation check after all outputs
+// have been collected. No scheduling or guest registry mutation is needed.
+void verifyRegisteredViewTransaction(std::string_view mode) {
+    using namespace ShaderRecompiler;
+    constexpr std::array<std::uint32_t, 8> words{
+        0x100u, 56u << 20u, 0u, 0xc0000facu, 3u, 0u, 0u, 0u};
+    IrResourcePlan plan;
+    plan.srtPlanComplete = true;
+    plan.resourceTrackingComplete = true;
+    plan.materializationSources = {0u};
+    std::vector<std::unique_ptr<IrValue>> values;
+    DescriptorSource source;
+    source.dwordCount = 8u;
+    for (std::uint32_t i = 0; i < words.size(); ++i) {
+        auto value = std::make_unique<IrValue>(IrOpcode::Void, IrType::U32, i);
+        value->SetImmediateU32(words[i]);
+        source.dwords[i] = value.get();
+        values.push_back(std::move(value));
+    }
+    plan.descriptorSources.push_back(source);
+    ImageResource image;
+    image.source = 0u;
+    image.resourceClass = ImageResourceClass::Sampled;
+    image.dimension = RdnaImageDimension::Dim1DArray;
+    image.read = true;
+    image.layerRowsCompatible = true;
+    plan.info.images.push_back(image);
+    plan.info.runtimeImageModes.push_back(ResourceMaterializer::RuntimeImageModes(image));
+    struct State {
+        std::uint64_t generation = 10u;
+        std::uint32_t lastLayer = 1u;
+        bool pending = false;
+        bool changed = false;
+        bool noQuery = false;
+        bool absent = false;
+    } state;
+    state.noQuery = mode == "--registered-view-no-query";
+    state.absent = mode == "--registered-view-absence";
+    SrtRuntime runtime{};
+    runtime.userContext = &state;
+    runtime.imageViewGeneration = +[](void* context) -> std::uint64_t {
+        auto& self = *static_cast<State*>(context);
+        if (self.noQuery) return ++self.generation;
+        if (self.pending && (self.absent || !self.changed)) {
+            ++self.generation;
+            self.lastLayer = 2u;
+            self.changed = true;
+        }
+        self.pending = false;
+        return self.generation;
+    };
+    if (!state.noQuery) {
+        runtime.normalizeImageView = +[](void* context, std::uint32_t, std::array<std::uint32_t, 8>& descriptor, SrtImageViewIdentity& identity) {
+            auto& self = *static_cast<State*>(context);
+            identity.generation = self.generation;
+            identity.address = 0x10000u;
+            self.pending = true;
+            if (self.absent) return false;
+            identity.hasRange = true;
+            identity.readable = true;
+            identity.gpu = true;
+            identity.rangeAddress = identity.allocationAddress = identity.address;
+            identity.rangeBytes = identity.allocationBytes = (self.lastLayer + 1u) * 256u;
+            identity.backingSerial = self.generation;
+            descriptor[4] = self.lastLayer;
+            return true;
+        };
+    }
+    ResourceSnapshot snapshot;
+    if (state.absent) {
+        bool rejected = false;
+        try {
+            ResourceMaterializer{}.Materialize(plan, runtime, snapshot);
+        } catch (const std::runtime_error&) {
+            rejected = true;
+        }
+        require(rejected, "an absent registered view with a changing identity was accepted");
+        require(snapshot.images.empty() && snapshot.registeredImages.empty(),
+                "a rejected absent-view transaction published partial resource outputs");
+        return;
+    }
+    ResourceMaterializer{}.Materialize(plan, runtime, snapshot);
+    auto expected = words;
+    expected[4] = state.noQuery ? words[4] : 2u;
+    require(snapshot.images.size() == 1u && snapshot.images.front().dwordCount == 8u &&
+                snapshot.images.front().dwords == expected,
+            "registered-view transaction returned a missing, stale, or mixed descriptor");
+    if (state.noQuery) {
+        require(snapshot.registeredImages.empty() && snapshot.imageAllocationGeneration == 0u,
+                "a resource that queried no registered view retained an allocation dependency");
+    } else {
+        require(snapshot.registeredImages.size() == 1u, "settled registered identity was lost");
+        const auto& view = snapshot.registeredImages.front();
+        require(view.provenance.dwords == words && view.effective.dwords == expected &&
+                    view.generation == 11u && view.backingSerial == 11u &&
+                    view.rangeBytes == 768u && view.allocationBytes == 768u &&
+                    snapshot.imageAllocationGeneration == 11u,
+                "settled descriptor and registered identity came from different attempts");
+    }
+}
+
 void verifyUnsetFormatImageMaterialization() {
     using namespace ShaderRecompiler;
     constexpr std::array<std::uint32_t, 8> measuredImage{0xffffffffu, 0xffffffffu, 0x00000019u, 0xc0017901u, 0x00000342u, 0xc8000000u, 0xc0064900u, 0x0000062fu};
@@ -11422,6 +11523,12 @@ int main(int argc, char** argv) {
         setenv("ANYPS5_NO_SHADER_CACHE", "1", 1);
 #endif
         using namespace ShaderRecompiler;
+        if (argc == 2 && (std::string_view(argv[1]) == "--registered-view-no-query" ||
+                          std::string_view(argv[1]) == "--registered-view-absence" ||
+                          std::string_view(argv[1]) == "--registered-view-transition")) {
+            verifyRegisteredViewTransaction(argv[1]);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--layer-specialization-release") {
             verifyLayerSpecializationRelease();
             std::cout << "Layer specialization metadata survives SPIR-V release and rebuild\n";
