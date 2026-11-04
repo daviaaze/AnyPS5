@@ -726,12 +726,8 @@ VkDeviceSize BufferPool::ReclaimIdleDevice(VkDeviceSize bytes, std::chrono::stea
             for (auto it = deviceTier.free.begin(); it != deviceTier.free.end(); ++it) {
                 if (it->second.empty()) continue;
                 const auto& slot = it->second.front();
-                // Buffer keys describe requested properties, not the backing memory type.
-                // Budget-driven host placement must not count as reclaimed device memory.
-                const auto type = slot.allocation.memoryType;
-                if ((slot.allocation.buffer == VK_NULL_HANDLE && !ImageSizeClasses()) || slot.allocation.slab || slot.allocation.hostPlaced ||
-                    type >= memoryProperties.memoryTypeCount || !DeviceTiered(memoryProperties.memoryTypes[type].propertyFlags) ||
-                    slot.lastUse > reclaimBefore || presentGeneration < slot.lastPresent || presentGeneration - slot.lastPresent < 2) continue;
+                if ((slot.allocation.buffer == VK_NULL_HANDLE && !ImageSizeClasses()) || slot.allocation.slab || slot.allocation.hostPlaced || slot.lastUse > reclaimBefore ||
+                    presentGeneration < slot.lastPresent || presentGeneration - slot.lastPresent < 2) continue;
                 if (oldest == deviceTier.free.end() || slot.lastUse < oldest->second.front().lastUse) oldest = it;
             }
             if (oldest == deviceTier.free.end()) {

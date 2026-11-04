@@ -1368,6 +1368,9 @@ void IdleReclaimSkipsHostPlaced() {
             Expect(mock.memoryTypes.at(device) == 0, "the younger device buffer was not placed in device-local memory");
         }
         auto& pool = *context.bufferPool;
+        // Neither idle buffer is eligible while the recent-frame protection still applies.
+        pool.NotePresent();
+        pool.NotePresent();
         const auto start = std::chrono::steady_clock::time_point{std::chrono::seconds(1)};
         Expect(pool.ReclaimIdleDevice(MiB, start) == 0, "the first pressure observation reclaimed a buffer");
         Expect(pool.ReclaimIdleDevice(MiB, start + std::chrono::seconds(1)) == 4 * MiB, "idle device reclaim counted a host-placed buffer as device memory");
