@@ -551,7 +551,7 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue, bool cpuFlip) {
             auto frame = std::make_shared<FrameTiming>(++frameSerial);
             frame->IncludeSubmission(accepted, now, now, now, true);
             frame->SetFlip(accepted, 0, now, now);
-            ++flipsCounted;
+            countFlip();
             submission.flips.begin()->second->GpuReady(frame);
             lock.unlock();
             Graphics::NoteHostImportFrame();

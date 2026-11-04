@@ -6,9 +6,41 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include <algorithm>
 #include "prx/libSceAgcDriver/Execution/include/TracyZone.hpp"
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
+#include <mutex>
+#include <string_view>
 
 namespace AgcDriver::DriverDetail {
+
+void Driver::countFlip() {
+    ++flipsCounted;
+    static const bool fpsLog = std::getenv("APS5_FPS_LOG") != nullptr && std::string_view(std::getenv("APS5_FPS_LOG")) == "1";
+    if (!fpsLog) return;
+    static std::mutex fpsMutex;
+    static std::chrono::steady_clock::time_point previous{};
+    static std::uint64_t previousTotal = 0;
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard lock(fpsMutex);
+    const auto total = flipsCounted.load(std::memory_order_relaxed);
+    if (previous == std::chrono::steady_clock::time_point{}) {
+        previous = now;
+        previousTotal = total;
+        return;
+    }
+    const auto elapsed = now - previous;
+    if (elapsed < std::chrono::seconds(10)) return;
+    const auto intervalMs = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
+    const auto monoMs = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+    std::fprintf(stderr, "[fps] flips=%llu interval_ms=%llu total_flips=%llu mono_ms=%llu\n", static_cast<unsigned long long>(total - previousTotal), static_cast<unsigned long long>(intervalMs), static_cast<unsigned long long>(total), static_cast<unsigned long long>(monoMs));
+    std::fflush(stderr);
+    previous = now;
+    previousTotal = total;
+}
+
+
+
 
 std::uint32_t Driver::ReserveEopFlip(const FlipInfo& info) {
     std::lock_guard lock(mutex);
