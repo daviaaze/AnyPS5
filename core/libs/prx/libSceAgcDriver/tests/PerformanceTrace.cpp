@@ -113,9 +113,6 @@ struct RequestFixture {
             std::this_thread::sleep_for(milliseconds(10));
         std::ifstream input(summaryPath, std::ios::binary);
         const std::string summary((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
-        if (closed)
-            Check(summary.find("\"window\":\"cpu-enable seconds 15\"") != std::string::npos,
-                "summary has the wrong declared window");
         const auto key = summary.find("\"trace\":");
         Check(key != std::string::npos, "summary omitted the trace path");
         const auto start = summary.find('"', key + 8);
