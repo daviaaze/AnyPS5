@@ -820,7 +820,7 @@ struct SpecializedModule {
     mutable SharedSpirv::Weak spirv;
 };
 
-void scanSpecializedBindings(SpecializedModule& module, std::span<const std::uint32_t> words) {
+void scanSpecializedBindings(SpecializedModule& module, std::span<const std::uint32_t> words, std::span<const PipelineSpecializationConstant> constants) {
     std::map<std::uint32_t, std::uint32_t> bindingNumbers;
     std::unordered_set<std::uint32_t> functionLdsBuffer;
     for (std::size_t cursor = 5; cursor < words.size();) {
@@ -831,6 +831,15 @@ void scanSpecializedBindings(SpecializedModule& module, std::span<const std::uin
         if (op == spv::OpVariable && count >= 4u && !functionLdsBuffer.contains(words[cursor + 2u])) {
             if (const auto found = bindingNumbers.find(words[cursor + 2u]); found != bindingNumbers.end()) module.bindings.push_back(found->second);
             module.pushData |= words[cursor + 3u] == spv::StorageClassPushConstant;
+        }
+        if (op == spv::OpDecorate && count == 4u && words[cursor + 2u] == spv::DecorationSpecId) {
+            const auto id = words[cursor + 3u];
+            const auto supplied = std::ranges::find(constants, id, &PipelineSpecializationConstant::id);
+            // Workgroup offsets are supplied at dispatch, not during module preparation.
+            if (supplied != constants.end() && std::ranges::find(module.specialization, id, &PipelineSpecializationConstant::id) == module.specialization.end()) {
+                if (module.specialization.empty()) module.specialization.reserve(constants.size());
+                module.specialization.push_back(*supplied);
+            }
         }
         cursor += count;
     }
@@ -843,7 +852,8 @@ struct SpecializedSpirv {
 
 SpecializedSpirv specializedModuleFromWords(std::vector<std::uint32_t> words, std::span<const PipelineSpecializationConstant> constants) {
     auto module = std::make_shared<SpecializedModule>();
-    scanSpecializedBindings(*module, words);
+    scanSpecializedBindings(*module, words, constants);
+    // Retained SpecIds outlive weak module words, including disk-cache payloads.
     auto spirv = InternSpirv(std::move(words));
     module->hash = spirv.ContentHash();
     module->spirv = spirv.Weaken();
@@ -1613,7 +1623,7 @@ void attachSubstitutes(CompiledVariant& variant) {
 
 SpecializedModuleBindings ScanSpecializedModuleBindings(std::span<const std::uint32_t> words) {
     SpecializedModule module;
-    scanSpecializedBindings(module, words);
+    scanSpecializedBindings(module, words, {});
     return {std::move(module.bindings), module.pushData};
 }
 
