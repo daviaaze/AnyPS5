@@ -1,6 +1,8 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
@@ -20,6 +22,8 @@
 #include <cstdlib>
 #include <cstdio>
 #include <iostream>
+#include <initializer_list>
+#include <limits>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -78,21 +82,22 @@ std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t by
 
 class WatchedTexture {
 public:
-    explicit WatchedTexture(std::size_t bytes = 65536, std::size_t committed = 0)
-        : bytes(bytes), committedBytes(committed == 0 ? bytes : committed) {
-        Require(bytes != 0 && bytes % 4096u == 0 && committedBytes != 0 &&
-                committedBytes <= bytes && committedBytes % 4096u == 0,
+    using Region = std::pair<std::size_t, std::size_t>;
+
+    explicit WatchedTexture(std::size_t bytes = 65536, std::size_t committed = 0) : bytes(bytes) {
+        const auto prefix = committed == 0 ? bytes : committed;
+        Require(bytes != 0 && bytes % 4096u == 0 && prefix != 0 &&
+                prefix <= bytes && prefix % 4096u == 0,
             "invalid BC3 sampled-input geometry");
         memory = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, 65536));
         Require(memory != nullptr, "cannot reserve the BC3 sampled input");
-#ifdef _WIN32
-        GuestArena::GuestArenaCommit_nid_postfix(memory, committedBytes, PAGE_READWRITE, 65536);
-#else
-        Require(mmap(memory, committedBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) != MAP_FAILED,
-            "cannot commit the BC3 sampled input");
-        GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(memory, committedBytes);
-#endif
-        GuestAllocations::Mutation().Add(memory, bytes, true, true, true);
+        try {
+            Commit(0, prefix);
+            SetRegisteredPieces({{0, bytes}});
+        } catch (...) {
+            Release();
+            throw;
+        }
     }
 
     ~WatchedTexture() { Release(); }
@@ -100,13 +105,41 @@ public:
     std::uint8_t* Data() const { return memory; }
     std::uint64_t Address() const { return reinterpret_cast<std::uint64_t>(memory); }
 
+    void Commit(std::size_t offset, std::size_t length) {
+        Require(offset <= bytes && length != 0 && length <= bytes - offset &&
+                offset % 4096u == 0 && length % 4096u == 0,
+            "invalid BC3 committed piece");
+#ifdef _WIN32
+        GuestArena::GuestArenaCommit_nid_postfix(memory + offset, length, PAGE_READWRITE, 65536);
+#else
+        Require(mmap(memory + offset, length, PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) != MAP_FAILED,
+            "cannot commit the BC3 sampled input");
+        GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(memory + offset, length);
+#endif
+        committed.emplace_back(offset, length);
+    }
+
+    void SetRegisteredPieces(std::initializer_list<Region> pieces, bool writable = true, bool gpu = true) {
+        for (const auto offset : registered) GuestAllocations::Mutation().Remove(memory + offset);
+        registered.clear();
+        for (const auto& [offset, length] : pieces) {
+            Require(offset <= bytes && length != 0 && length <= bytes - offset,
+                "invalid BC3 registered piece");
+            GuestAllocations::Mutation().Add(memory + offset, length, true, writable, gpu);
+            registered.push_back(offset);
+        }
+    }
+
     void Release() {
         if (memory == nullptr) return;
-        GuestAllocations::Mutation().Remove(memory);
+        for (const auto offset : registered) GuestAllocations::Mutation().Remove(memory + offset);
+        registered.clear();
 #ifdef _WIN32
         GuestArena::GuestArenaReset_nid_postfix(memory, bytes);
 #else
-        GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(memory, committedBytes);
+        for (const auto& [offset, length] : committed)
+            GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(memory + offset, length);
         munmap(memory, bytes);
 #endif
         GuestArena::GuestArenaRelease_nid_postfix(memory, bytes);
@@ -116,7 +149,8 @@ public:
 private:
     std::uint8_t* memory = nullptr;
     std::size_t bytes;
-    std::size_t committedBytes;
+    std::vector<Region> committed;
+    std::vector<std::size_t> registered;
 };
 
 std::array<std::uint32_t, 8> TextureDescriptor(std::uint64_t address, std::uint32_t format,
@@ -394,6 +428,178 @@ void residentBc3MipAndHolePixels(VulkanDevice& device) {
     }
 }
 
+void residentBc3ShortRegistration(VulkanDevice& device) {
+    const auto context = device.graphicsContext();
+    if (!context.textureCompressionBC || !context.sparseBinding ||
+        !context.sparseResidencyBuffer || !context.sparseResidencyAliased) return;
+    ClearCachedTextures(context.device);
+    WatchedTexture source(65536, 4096);
+    source.SetRegisteredPieces({{0, 4096}});
+    for (std::size_t offset = 0; offset < 4096; offset += 16)
+        FillBc3Solid(source.Data() + offset, 0x8410u);
+    AgcDriver::GuestMemory::CollectWritesUncached(source.Address(), 4096);
+    const auto image = TextureDescriptor(source.Address(), FormatBc3Srgb, 128, 128);
+    FillCoordinate(16.5f / 128.0f, 16.5f / 128.0f);
+    const auto committed = Sample(device, FormatBc3Srgb, FilterPoint, 0u, 0u, &image);
+    CheckSolid(committed.data(), {SrgbToLinear(132), SrgbToLinear(130), SrgbToLinear(132), 1.0f},
+        "short registered BC3 prefix");
+    FillCoordinate(80.5f / 128.0f, 80.5f / 128.0f);
+    const auto tail = Sample(device, FormatBc3Srgb, FilterPoint, 0u, 0u, &image);
+    CheckSolid(tail.data(), {0.0f, 0.0f, 0.0f, 0.0f}, "unregistered uncommitted BC3 tail");
+    Require(AgcDriver::Graphics::CachedSampledTexture(context, image)->HasResidentGpuInput(),
+        "short registered BC3 prefix did not create a private GPU input");
+    ClearCachedTextures(context.device);
+}
+void FillBc3Region(WatchedTexture& source, std::size_t offset, std::size_t bytes, std::uint16_t color) {
+    for (std::size_t at = offset; at < offset + bytes; at += 16)
+        FillBc3Solid(source.Data() + at, color);
+    AgcDriver::GuestMemory::CollectWritesUncached(source.Address() + offset, bytes);
+}
+
+bool SupportsPrivateBc3(const AgcDriver::Graphics::Context& context) {
+    return context.textureCompressionBC && context.sparseBinding &&
+        context.sparseResidencyBuffer && context.sparseResidencyAliased;
+}
+
+void residentBc3SegmentedPixels(VulkanDevice& device) {
+    const auto context = device.graphicsContext();
+    if (!SupportsPrivateBc3(context)) return;
+    ClearCachedTextures(context.device);
+    WatchedTexture source(65536, 4096);
+    source.Commit(12288, 4096);
+    source.SetRegisteredPieces({{0, 4096}, {12288, 4096}});
+    FillBc3Region(source, 0, 4096, 0x8410u);
+    FillBc3Region(source, 12288, 4096, 0xfc00u);
+    const auto image = TextureDescriptor(source.Address(), FormatBc3Srgb, 128, 128);
+    FillCoordinate(16.5f / 128.0f, 16.5f / 128.0f);
+    const auto first = Sample(device, FormatBc3Srgb, FilterPoint, 0u, 0u, &image);
+    CheckSolid(first.data(), {SrgbToLinear(132), SrgbToLinear(130), SrgbToLinear(132), 1.0f},
+        "first registered BC3 piece");
+    FillCoordinate(16.5f / 128.0f, 112.5f / 128.0f);
+    const auto second = Sample(device, FormatBc3Srgb, FilterPoint, 0u, 0u, &image);
+    CheckSolid(second.data(), {1.0f, SrgbToLinear(130), 0.0f, 1.0f}, "second registered BC3 piece");
+    FillCoordinate(16.5f / 128.0f, 64.5f / 128.0f);
+    const auto hole = Sample(device, FormatBc3Srgb, FilterPoint, 0u, 0u, &image);
+    CheckSolid(hole.data(), {0.0f, 0.0f, 0.0f, 0.0f}, "hole between registered BC3 pieces");
+    Require(AgcDriver::Graphics::CachedSampledTexture(context, image)->HasResidentGpuInput(),
+        "segmented BC3 source did not use a private GPU input");
+    ClearCachedTextures(context.device);
+}
+
+void residentBc3SegmentedRace(VulkanDevice& device) {
+    const auto context = device.graphicsContext();
+    if (!SupportsPrivateBc3(context)) return;
+    ClearCachedTextures(context.device);
+    WatchedTexture source(65536, 4096);
+    source.Commit(12288, 4096);
+    source.SetRegisteredPieces({{0, 4096}, {12288, 4096}});
+    FillBc3Region(source, 0, 4096, 0x8410u);
+    FillBc3Region(source, 12288, 4096, 0x8410u);
+    const auto image = TextureDescriptor(source.Address(), FormatBc3Srgb, 128, 128);
+    FillCoordinate(16.5f / 128.0f, 112.5f / 128.0f);
+    static_cast<void>(Sample(device, FormatBc3Srgb, FilterPoint, 0u, 0u, &image, RaceOutputs.data(), false));
+    const auto first = AgcDriver::Graphics::CachedSampledTexture(context, image);
+    Require(first->HasResidentGpuInput(), "old segmented BC3 snapshot did not use private input");
+    FillBc3Region(source, 0, 4096, 0xfc00u);
+    FillBc3Region(source, 12288, 4096, 0xfc00u);
+    static_cast<void>(Sample(device, FormatBc3Srgb, FilterPoint, 0u, 0u, &image,
+        RaceOutputs.data() + Threads * 4u, false));
+    const auto second = AgcDriver::Graphics::CachedSampledTexture(context, image);
+    Require(second->HasResidentGpuInput(), "new segmented BC3 snapshot did not use private input");
+    source.Release();
+    device.WaitIdle();
+    CheckSolid(RaceOutputs.data(), {SrgbToLinear(132), SrgbToLinear(130), SrgbToLinear(132), 1.0f},
+        "old segmented BC3 image after source removal");
+    CheckSolid(RaceOutputs.data() + Threads * 4u, {1.0f, SrgbToLinear(130), 0.0f, 1.0f},
+        "new segmented BC3 image after source removal");
+    ClearCachedTextures(context.device);
+}
+
+void residentBc3RegisteredHole(VulkanDevice& device, bool expectGpu) {
+    const auto context = device.graphicsContext();
+    if (!SupportsPrivateBc3(context)) return;
+    ClearCachedTextures(context.device);
+    WatchedTexture source(65536, 4096);
+    source.Commit(12288, 4096);
+    source.SetRegisteredPieces({{0, 65536}});
+    FillBc3Region(source, 0, 4096, 0x8410u);
+    FillBc3Region(source, 12288, 4096, 0xfc00u);
+    const auto image = TextureDescriptor(source.Address(), FormatBc3Srgb, 128, 128);
+    FillCoordinate(16.5f / 128.0f, 16.5f / 128.0f);
+    const auto first = Sample(device, FormatBc3Srgb, FilterPoint, 0u, 0u, &image);
+    CheckSolid(first.data(), {SrgbToLinear(132), SrgbToLinear(130), SrgbToLinear(132), 1.0f},
+        "registered BC3 segment before internal hole");
+    FillCoordinate(16.5f / 128.0f, 112.5f / 128.0f);
+    const auto last = Sample(device, FormatBc3Srgb, FilterPoint, 0u, 0u, &image);
+    CheckSolid(last.data(), {1.0f, SrgbToLinear(130), 0.0f, 1.0f}, "registered BC3 segment after internal hole");
+    FillCoordinate(16.5f / 128.0f, 64.5f / 128.0f);
+    const auto hole = Sample(device, FormatBc3Srgb, FilterPoint, 0u, 0u, &image);
+    CheckSolid(hole.data(), {0.0f, 0.0f, 0.0f, 0.0f}, "internal registered BC3 hole");
+    Require(AgcDriver::Graphics::CachedSampledTexture(context, image)->HasResidentGpuInput() == expectGpu,
+        "registered BC3 hole ignored the sparse-mirror policy");
+    ClearCachedTextures(context.device);
+}
+
+void residentBc3RefusedPieces(VulkanDevice& device) {
+    const auto context = device.graphicsContext();
+    if (!SupportsPrivateBc3(context)) return;
+    struct Policy { std::size_t registeredBytes; bool writable; bool gpu; };
+    for (const auto policy : {Policy{4096, true, true}, Policy{65536, false, true}, Policy{65536, true, false}}) {
+        ClearCachedTextures(context.device);
+        WatchedTexture source;
+        source.SetRegisteredPieces({{0, policy.registeredBytes}}, policy.writable, policy.gpu);
+        FillBc3Region(source, 0, 4096, 0x8410u);
+        FillBc3Region(source, 4096, 12288, 0xfc00u);
+        const auto image = TextureDescriptor(source.Address(), FormatBc3Srgb, 128, 128);
+        FillCoordinate(16.5f / 128.0f, 80.5f / 128.0f);
+        const auto pixels = Sample(device, FormatBc3Srgb, FilterPoint, 0u, 0u, &image);
+        CheckSolid(pixels.data(), {1.0f, SrgbToLinear(130), 0.0f, 1.0f},
+            "readable BC3 bytes preserved by CPU fallback");
+        Require(!AgcDriver::Graphics::CachedSampledTexture(context, image)->HasResidentGpuInput(),
+            "unsupported registered BC3 pieces entered the GPU path");
+        ClearCachedTextures(context.device);
+    }
+}
+
+void residentBc3InputGuards(VulkanDevice& device) {
+    const auto context = device.graphicsContext();
+    if (!SupportsPrivateBc3(context)) return;
+    ClearCachedTextures(context.device);
+    WatchedTexture source;
+    FillBc3Region(source, 0, 16384, 0x8410u);
+    const auto image = TextureDescriptor(source.Address(), FormatBc3Srgb, 128, 128);
+    FillCoordinate(16.5f / 128.0f, 16.5f / 128.0f);
+    const auto pixels = Sample(device, FormatBc3Srgb, FilterPoint, 0u, 0u, &image);
+    CheckSolid(pixels.data(), {SrgbToLinear(132), SrgbToLinear(130), SrgbToLinear(132), 1.0f},
+        "valid BC3 input before refusal checks");
+    {
+        std::lock_guard gpuLock(AgcDriver::GuestMemory::GpuMutex());
+        auto* recorder = AgcDriver::Graphics::Recorder::Active();
+        Require(recorder != nullptr && recorder->Device() == context.device,
+            "BC3 guard fixture has no device-owned recorder");
+        Require(AgcDriver::Graphics::SampledTextureInputEligible(context, source.Address(), 16384),
+            "valid BC3 guard fixture input was declined");
+        for (const auto [address, bytes] : {
+                std::pair<std::uint64_t, std::size_t>{source.Address() + 1, 16384},
+                std::pair<std::uint64_t, std::size_t>{source.Address(), 3},
+                std::pair<std::uint64_t, std::size_t>{std::numeric_limits<std::uint64_t>::max() - 3u, 16}}) {
+            Require(!AgcDriver::Graphics::SampledTextureInputEligible(context, address, bytes),
+                "invalid BC3 input geometry passed preflight");
+            Require(!AgcDriver::Graphics::AcquireSampledTextureInput(context, address, bytes),
+                "invalid BC3 input geometry reached GPU work");
+        }
+        recorder->NotePendingWrite(source.Address(), 16384);
+        Require(!AgcDriver::Graphics::SampledTextureInputEligible(context, source.Address(), 16384),
+            "pending BC3 writer passed preflight");
+        Require(!AgcDriver::Graphics::AcquireSampledTextureInput(context, source.Address(), 16384),
+            "pending BC3 writer entered the GPU snapshot path");
+    }
+    device.WaitIdle();
+    ClearCachedTextures(context.device);
+}
+
+
+
 void residentBc3LargeInputSmoke(VulkanDevice& device) {
     if (std::getenv("APS5_BC3_LARGE_INPUT_SMOKE") == nullptr) return;
     const auto context = device.graphicsContext();
@@ -409,6 +615,7 @@ void residentBc3LargeInputSmoke(VulkanDevice& device) {
         "the large BC3 input smoke descriptor does not match the 1024x1024x256, 11-mip guest byte count");
     ClearCachedTextures(context.device);
     WatchedTexture source(expectedBytes, committedBytes);
+    source.SetRegisteredPieces({{0, committedBytes}});
     const auto firstBlock = geometry.GuestOffset(0, geometry.mips.front());
     Require(firstBlock + 16u <= committedBytes, "the sampled BC3 mip block is outside committed memory");
     FillBc3Solid(source.Data() + firstBlock, 0x8410u);
@@ -430,10 +637,23 @@ void residentBc3LargeInputSmoke(VulkanDevice& device) {
 
 }
 
-int main() {
+int main(int argc, char** argv) {
     try {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
+        if (argc == 2 && std::string_view(argv[1]) == "--segmented-sparse-off") {
+            if (!SupportsPrivateBc3(device->graphicsContext())) return VulkanTestSkipped;
+            residentBc3RegisteredHole(*device, false);
+            std::puts("registered BC3 hole CPU fallback passed with sparse mirrors disabled");
+            return 0;
+        }
+        Require(argc == 1, "unknown image sample test mode");
+        residentBc3ShortRegistration(*device);
+        residentBc3SegmentedPixels(*device);
+        residentBc3SegmentedRace(*device);
+        residentBc3RegisteredHole(*device, true);
+        residentBc3RefusedPieces(*device);
+        residentBc3InputGuards(*device);
         residentBc3InputRace(*device);
         residentBc3MipAndHolePixels(*device);
         residentBc3LargeInputSmoke(*device);

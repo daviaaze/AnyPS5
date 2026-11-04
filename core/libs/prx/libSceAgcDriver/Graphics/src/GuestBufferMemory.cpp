@@ -7311,47 +7311,101 @@ std::uint64_t ImageMirrorSerial(const Context& context, std::uint64_t address, s
     const auto mirror = findMirror(context, address, address + bytes);
     return mirror != nullptr && !mirror->writable ? mirror->serial : 0;
 }
+namespace {
+struct SampledInputPiece {
+    std::uint64_t begin;
+    std::uint64_t end;
+    std::shared_ptr<const GuestAllocations::Range> range;
+    std::shared_ptr<ImageMirror> mirror;
+};
+
+// Only committed readable bytes may be copied. Holes have no owner requirement; readable bytes
+// without a registered owner must take the CPU path, never become synthetic zeroes.
+const char* sampledInputPieces(const GuestAllocations::Lease& lease, std::uint64_t address,
+    std::size_t bytes, Pieces& committed, std::vector<SampledInputPiece>& pieces) {
+    if (GuestMemory::CollectCommittedWrites(address, bytes, committed) == 0) return "untracked_committed_range";
+    if (committed.empty()) return "empty_committed_pieces";
+    auto cursor = address;
+    for (const auto& [first, last] : committed) {
+        if (first < cursor || first >= last || last > address + bytes ||
+            ((first - address) & 3u) != 0 || ((last - first) & 3u) != 0)
+            return "unaligned_committed_piece";
+        for (auto at = first; at < last;) {
+            auto range = leasedRangeOwner(lease, at, at + 1);
+            if (range == nullptr) return "unregistered_committed_piece";
+            if (range->bytes > std::numeric_limits<std::uint64_t>::max() - range->address)
+                return "bad_allocation_geometry";
+            if (!range->readable || !range->writable || !range->gpu || !range->releasable)
+                return "bad_allocation_flags";
+            const auto rangeEnd = range->address + range->bytes;
+            const auto end = std::min(last, rangeEnd);
+            if (end <= at) return "bad_allocation_geometry";
+            const auto segmentBegin = std::max(address, range->address);
+            const auto segmentEnd = std::min(address + bytes, rangeEnd);
+            if ((segmentBegin & 3u) != 0 || (segmentEnd & 3u) != 0) return "unaligned_committed_piece";
+            if (!pieces.empty() && pieces.back().range == range)
+                pieces.back().end = std::max(pieces.back().end, segmentEnd);
+            else pieces.push_back({segmentBegin, segmentEnd, std::move(range), {}});
+            at = end;
+        }
+        cursor = last;
+    }
+    return nullptr;
+}
+
+bool sampledInputBudget(const Context& context, const Pieces& committed,
+    const std::vector<SampledInputPiece>& pieces) {
+    auto& state = Mirrors();
+    std::lock_guard lock(state.mutex);
+    auto held = state.device == context.device ? state.heapBytes : 0;
+    std::uint64_t needed = 0;
+    for (const auto& piece : pieces) {
+        const auto bytes = piece.end - piece.begin;
+        const auto backed = clipPieces(committed, piece.begin, piece.end);
+        const bool full = backed.size() == 1 && backed.front().first == piece.begin && backed.front().second == piece.end;
+        if (!full && !sparseMirrorsEnabled()) return false;
+        const auto extent = full ? bytes : sparseExtent(piece.begin, bytes, backed);
+        if (extent > context.limits.sparseAddressSpaceSize) return false;
+        auto need = blockBytes(backed);
+        bool covered = false;
+        if (state.device == context.device) {
+            const auto found = state.entries.find(piece.begin);
+            if (found != state.entries.end()) {
+                const auto& mirror = *found->second;
+                if (sameRange(mirror.range, piece.range) && mirror.reserved == bytes &&
+                    mirror.writable && mirror.heap && !mirror.joinedHeap &&
+                    mirror.resident != nullptr && (!mirror.sparse || mirror.committed == backed) &&
+                    mirror.bytes >= backed.back().second - mirror.base) {
+                    covered = true;
+                } else if (mirror.heap && mirror.listed) {
+                    held -= mirror.accounted;
+                }
+            }
+        }
+        if (!covered) {
+            if (needed > heapMirrorBudget() || need > heapMirrorBudget() - needed) return false;
+            needed += need;
+        }
+    }
+    return held <= heapMirrorBudget() && needed <= heapMirrorBudget() - held;
+}
+}
+
 bool SampledTextureInputEligible(const Context& context, std::uint64_t address, std::size_t bytes) {
     auto& gpuMutex = GuestMemory::GpuMutex();
     std::unique_lock gpuLock(gpuMutex, std::defer_lock);
     if (!gpuMutex.HeldByThisThread() && !gpuLock.try_lock()) return false;
     auto* recorder = Recorder::Active();
-    if (!mirrorsEnabled() || SyncLeaseWork() || bytes == 0 || bytes % 4u != 0 ||
+    if (!mirrorsEnabled() || SyncLeaseWork() || bytes == 0 || ((address | bytes) & 3u) != 0 ||
         bytes > std::numeric_limits<std::uint64_t>::max() - address ||
         recorder == nullptr || recorder->PendingWriteOverlaps(address, bytes) ||
         StorageTexture::FindPending(address, bytes) != nullptr ||
         !context.sparseBinding || !context.sparseResidencyBuffer || !context.sparseResidencyAliased) return false;
     auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
-    const auto* range = containingRange(lease, address, address + bytes);
-    if (range == nullptr || !range->readable || !range->writable || !range->gpu || !range->releasable) return false;
-    auto rangeOwner = leasedRangeOwner(lease, address, address + bytes);
-    if (rangeOwner == nullptr) return false;
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> committed;
-    if (GuestMemory::CollectCommittedWrites(address, bytes, committed) == 0 || committed.empty()) return false;
-
-    const auto full = committed.size() == 1 && committed.front().first == address && committed.front().second == address + bytes;
-    if (!full && !sparseMirrorsEnabled()) return false;
-    const auto mirrorBytes = full ? static_cast<std::uint64_t>(bytes) : sparseExtent(address, bytes, committed);
-    const auto backed = clipPieces(committed, address, address + mirrorBytes);
-    const auto need = blockBytes(backed);
-    auto& state = Mirrors();
-    std::lock_guard lock(state.mutex);
-    std::uint64_t held = state.device == context.device ? state.heapBytes : 0;
-    if (state.device == context.device) {
-        const auto found = state.entries.find(address);
-        if (found != state.entries.end() && sameRange(found->second->range, rangeOwner)) {
-            if (found->second->reserved != bytes || !found->second->writable ||
-                !found->second->heap || found->second->joinedHeap) return false;
-            const auto& mirror = *found->second;
-            if (mirror.resident == nullptr) return false;
-            const auto lastCommitted = committed.back().second;
-            if (mirror.sparse && mirror.committed != committed) return false;
-            if (lastCommitted <= mirror.base + mirror.bytes) return true;
-            if (mirror.listed) held -= mirror.accounted;
-        }
-    }
-    return mirrorBytes <= context.limits.sparseAddressSpaceSize && held <= heapMirrorBudget() &&
-        need <= heapMirrorBudget() - held;
+    Pieces committed;
+    std::vector<SampledInputPiece> pieces;
+    return sampledInputPieces(lease, address, bytes, committed, pieces) == nullptr &&
+        sampledInputBudget(context, committed, pieces);
 }
 
 
@@ -7362,7 +7416,7 @@ std::optional<GpuBufferInput> AcquireSampledTextureInput(const Context& context,
     };
     if (!mirrorsEnabled()) return reject("policy_disabled");
     if (SyncLeaseWork()) return reject("policy_sync_lease");
-    if (bytes == 0 || bytes % 4 != 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address)
+    if (bytes == 0 || ((address | bytes) & 3u) != 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address)
         return reject("bad_allocation_geometry");
     auto* recorder = Recorder::Active();
     if (recorder == nullptr) return reject("no_active_recorder");
@@ -7371,46 +7425,49 @@ std::optional<GpuBufferInput> AcquireSampledTextureInput(const Context& context,
     GuestMemory::AssertGpuLockHeld("sampled texture GPU input");
     ensurePinWaiter();
 
+    if (!context.sparseBinding || !context.sparseResidencyBuffer || !context.sparseResidencyAliased)
+        return reject("resident_input_unsupported");
     auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
-    const auto* range = containingRange(lease, address, address + bytes);
-    if (range == nullptr) return reject("no_full_registered_allocation");
-    if (!range->readable || !range->writable || !range->gpu || !range->releasable)
-        return reject("bad_allocation_flags");
-    auto rangeOwner = leasedRangeOwner(lease, address, address + bytes);
-    if (rangeOwner == nullptr) return reject("missing_lease_owner");
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> committed;
-    const auto committedCount = GuestMemory::CollectCommittedWrites(address, bytes, committed);
-    if (committedCount == 0) return reject("untracked_committed_range");
-    if (committed.empty()) return reject("empty_committed_pieces");
+    Pieces committed;
+    std::vector<SampledInputPiece> pieces;
+    if (const auto* reason = sampledInputPieces(lease, address, bytes, committed, pieces)) return reject(reason);
+    if (!sampledInputBudget(context, committed, pieces)) return reject("mirror_budget_or_geometry");
     std::vector<RefreshBlock> blocks;
-    std::shared_ptr<ImageMirror> mirror;
     try {
-        mirror = acquireMirror(context, rangeOwner, blocks, true, address, bytes, false, true);
+        for (auto& piece : pieces) {
+            piece.mirror = acquireMirror(context, piece.range, blocks, true,
+                piece.begin, piece.end - piece.begin, false, true);
+            const auto& mirror = piece.mirror;
+            if (mirror == nullptr || mirror->resident == nullptr ||
+                piece.begin < mirror->base || piece.end - mirror->base > mirror->reserved)
+                return reject("missing_mirror_extent");
+            if (!mirror->sparse && prepareRefresh(*mirror, piece.begin, piece.end - piece.begin))
+                appendBlocks(blocks, *mirror, piece.begin, piece.end - piece.begin);
+        }
+        if (GuestMemory::DescribeCommitted(address, bytes).ranges != committed)
+            return reject("committed_geometry_changed");
+        const auto current = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+        for (const auto& piece : pieces) {
+            if (leasedRangeOwner(current, piece.begin, piece.end) != piece.range)
+                return reject("allocation_owner_changed");
+            for (const auto& [first, last] : committed) {
+                const auto begin = std::max(first, piece.begin);
+                const auto end = std::min(last, piece.end);
+                if (begin >= end) continue;
+                if (begin < piece.mirror->base || end - piece.mirror->base > piece.mirror->bytes)
+                    return reject("committed_outside_mirror");
+            }
+        }
     } catch (const std::runtime_error&) {
         return reject("mirror_acquisition_declined");
-    }
-    if (mirror == nullptr || mirror->resident == nullptr ||
-        address < mirror->base || address + bytes > mirror->base + mirror->reserved)
-        return reject("missing_mirror_extent");
-    if (!mirror->sparse && prepareRefresh(*mirror, address, bytes)) appendBlocks(blocks, *mirror, address, bytes);
-
-    if (GuestMemory::DescribeCommitted(address, bytes).ranges != committed) return reject("committed_geometry_changed");
-    for (const auto& [first, last] : committed) {
-        if (((first - address) & 3u) != 0 || ((last - first) & 3u) != 0) return reject("unaligned_committed_piece");
-    }
-    const auto mirrorEnd = mirror->base + mirror->bytes;
-    for (const auto& [first, last] : committed) {
-        if (first < mirror->base || last > mirrorEnd) return reject("committed_outside_mirror");
     }
 
     compareBlocks(blocks);
     ResidentBuffer::FlushChanged(context);
 
-    struct InputOwner {
-        std::shared_ptr<const GuestAllocations::Range> range;
-        std::shared_ptr<ImageMirror> mirror;
-    };
-    auto owner = std::make_shared<InputOwner>(InputOwner{std::move(rangeOwner), std::move(mirror)});
+    // The recorder, not the texture cache, owns all range pins and source mirrors until the
+    // private snapshot's copies complete. CPU writes/unmaps therefore retain the existing waiter.
+    auto owner = std::make_shared<std::vector<SampledInputPiece>>(std::move(pieces));
     auto input = std::make_shared<DeviceBuffer>(context, bytes,
         VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     recorder->Keep(owner);
@@ -7426,11 +7483,16 @@ std::optional<GpuBufferInput> AcquireSampledTextureInput(const Context& context,
         if (length != 0) context.Resolved(&DeviceFunctions::cmdFillBuffer, "vkCmdFillBuffer")(commands, input->Handle(), offset, length, 0u);
     };
     std::uint64_t cursor = address;
-    for (const auto& [first, last] : committed) {
-        fillZero(cursor, first);
-        CopyBuffer(context, commands, owner->mirror->resident->Handle(), first - owner->mirror->resident->Origin(),
-            input->Handle(), first - address, last - first);
-        cursor = last;
+    for (const auto& piece : *owner) {
+        for (const auto& [first, last] : committed) {
+            const auto begin = std::max(first, piece.begin);
+            const auto end = std::min(last, piece.end);
+            if (begin >= end) continue;
+            fillZero(cursor, begin);
+            CopyBuffer(context, commands, piece.mirror->resident->Handle(),
+                begin - piece.mirror->resident->Origin(), input->Handle(), begin - address, end - begin);
+            cursor = end;
+        }
     }
     fillZero(cursor, address + bytes);
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,

@@ -215,9 +215,10 @@ std::uint64_t ImageMirrorSerial(const Context& context, std::uint64_t address, s
 // It does not wait for the device lock: a busy device keeps normal prepared CPU staging.
 // Eligibility is advisory; acquisition revalidates the range under the device lock.
 bool SampledTextureInputEligible(const Context& context, std::uint64_t address, std::size_t bytes);
-// A compressed texture's owned tiled input, copied from the existing resident heap mirror in the
-// same recorder batch. Empty when the range cannot be served without a CPU snapshot; optional
-// refusal receives a stable literal reason for that attempt.
+// A compressed texture's private tiled input, assembled from the existing resident heap mirrors
+// for every registered committed segment in this recorder batch. Proven uncommitted holes are
+// zeroed; readable unregistered bytes require the CPU snapshot. Empty when any segment is unsupported.
+// Owners and source mirrors stay with the recorder until completion, never the texture cache.
 std::optional<GpuBufferInput> AcquireSampledTextureInput(const Context& context, std::uint64_t address, std::size_t bytes, const char** refusal = nullptr);
 
 // Deferred lease release (see GuestBufferMemory.cpp). An address-based build leases every readable
