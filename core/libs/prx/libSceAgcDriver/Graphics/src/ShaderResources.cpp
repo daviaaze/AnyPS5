@@ -1629,6 +1629,7 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
             bool flushed = false;
             auto handOver = StorageTexture::PrepareCreation(context, resource, guestBytes, std::move(detached), flushed);
             if (flushed && profile) start = LookupOutcomes::Add(LookupOutcomes::PendingFlush, start);
+            std::shared_ptr<StorageTexture> created;
             {
                 const CacheHold reclaimable(storageCacheReclaimable);
                 created = StorageTexture::Create(context, *context.detiler, resource, mip);
@@ -6181,7 +6182,7 @@ void ShaderResources::resolveImageTables() {
             const auto index = table.elementTextures[representative];
             const auto source = representativeSources.find(representative);
             if (index == std::numeric_limits<std::size_t>::max() || source == representativeSources.end()) {
-                table.map[faults + element] = rejectTableElement(table, words, "the dynamic-resolution variant this entry borrows from was rejected");
+                table.SetMapValue(faults + element, rejectTableElement(table, words, "the dynamic-resolution variant this entry borrows from was rejected"));
                 counters.variantRejected.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
@@ -6690,7 +6691,8 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     // pending-write safety. Buffer ownership, not contents or Vulkan handle reuse,
     // identifies immutable snapshot storage (including cached moved-word buffers).
     static const bool profileMemo = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    if (auto previous = drawBindingsMemo.lock(); previous != nullptr &&
+    // A per-draw fault record changes descriptor contents independently of snapshots.
+    if (auto previous = faultRecord == nullptr ? drawBindingsMemo.lock() : std::shared_ptr<DrawBindings>{}; previous != nullptr &&
             std::ranges::equal(previous->snapshots, result->snapshots, [](const auto& a, const auto& b) {
                 return a.allocation == b.allocation && a.address == b.address &&
                     a.buffer.get() == b.buffer.get() &&
@@ -6703,8 +6705,8 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     }
     if (profileMemo) DrawBindingMemoMisses.fetch_add(1, std::memory_order_relaxed);
     writeDrawSets(*result, selected, faultRecord);
-    recorder.Keep(result);
-    for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+    pin(result);
+    if (faultRecord == nullptr) drawBindingsMemo = result;
     return result;
 }
 
@@ -6770,9 +6772,6 @@ void ShaderResources::writeDrawSets(DrawBindings& result, std::span<const std::s
     }
     Require(nextWrite == writes.end(), "draw snapshot writes disagree with their descriptor bindings");
     context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
-    pin(result);
-    drawBindingsMemo = result;
-    return result;
 }
 
 ShaderResources::DrawUse::~DrawUse() {
