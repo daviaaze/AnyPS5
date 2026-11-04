@@ -29,7 +29,7 @@
 #include <cstdio>
 #include <cstring>
 #include <new>
-#include <unordered_map>
+#include <memory_resource>
 #include <atomic>
 #include <exception>
 #include <mutex>
@@ -244,6 +244,11 @@ std::string_view TrimmedReason(std::string_view reason) {
 
 struct DrawTail {
     using GpuLock = std::unique_lock<std::remove_reference_t<decltype(GuestMemory::GpuMutex())>>;
+    DrawTail() : scratchResource(scratch.data(), scratch.size()),
+            vertexInfos(&scratchResource), compiledStages(&scratchResource), runtimeData(&scratchResource), recordResults(&scratchResource),
+            stages(&scratchResource), programResults(&scratchResource), stageCaptures(&scratchResource), matched(&scratchResource),
+            matchedRegions(&scratchResource), fresh(&scratchResource), recompiled(&scratchResource), reused(&scratchResource),
+            stageData(&scratchResource) {}
     bool profile = false;
     std::array<double, DrawDriverPhaseCount> phaseMs{};
     std::uint64_t captures = 0;
@@ -268,24 +273,26 @@ struct DrawTail {
     const std::vector<DrawProgram>* programs = nullptr;
     std::vector<ShaderRecompiler::MemoryRegion> memory;
     std::vector<ShaderRecompiler::LinkedProgram> linked;
-    std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>> vertexInfos;
+    alignas(std::max_align_t) std::array<std::byte, 4096> scratch;
+    std::pmr::monotonic_buffer_resource scratchResource;
+    std::pmr::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>> vertexInfos;
     std::vector<std::vector<Graphics::DecodeRead>> decodeReads;
     std::unique_ptr<ShaderMemory> shaderMemory;
     std::vector<ShaderRecompiler::RecompileResult> results;
-    std::vector<std::shared_ptr<const ShaderRecompiler::RecompileResult>> compiledStages;
-    std::vector<Graphics::ShaderRuntimeData> runtimeData;
-    std::vector<std::shared_ptr<const ShaderRecompiler::RecompileResult>> recordResults;
-    std::vector<Graphics::CompiledShader> stages;
+    std::pmr::vector<std::shared_ptr<const ShaderRecompiler::RecompileResult>> compiledStages;
+    std::pmr::vector<Graphics::ShaderRuntimeData> runtimeData;
+    std::pmr::vector<std::shared_ptr<const ShaderRecompiler::RecompileResult>> recordResults;
+    std::pmr::vector<Graphics::CompiledShader> stages;
     std::uint32_t pushCursorBytes = 0;
-    std::vector<const ShaderRecompiler::RecompileResult*> programResults;
-    std::vector<StageCapture> stageCaptures;
-    std::vector<std::shared_ptr<DispatchVariant>> matched;
-    std::vector<std::vector<ShaderRecompiler::MemoryRegion>> matchedRegions;
-    std::vector<std::shared_ptr<DispatchVariant>> fresh;
-    std::vector<bool> recompiled;
+    std::pmr::vector<const ShaderRecompiler::RecompileResult*> programResults;
+    std::pmr::vector<StageCapture> stageCaptures;
+    std::pmr::vector<std::shared_ptr<DispatchVariant>> matched;
+    std::pmr::vector<std::vector<ShaderRecompiler::MemoryRegion>> matchedRegions;
+    std::pmr::vector<std::shared_ptr<DispatchVariant>> fresh;
+    std::pmr::vector<std::uint8_t> recompiled;
     DrawDataCandidates dataCandidates;
-    std::vector<bool> reused;
-    std::vector<StageDataHit> stageData;
+    std::pmr::vector<std::uint8_t> reused;
+    std::pmr::vector<StageDataHit> stageData;
     bool drawHit = false;
     bool verifyHit = false;
     bool stageEntries = false;
@@ -882,7 +889,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             GuestMemory::SetCurrentPacket(job.packetOpcode, job.submissionQueue);
             PerformanceTimer finishTiming("Driver.DrawFinish");
             try {
-                if (finishDraw(job, finishTiming) == DrawVerdict::Rejected) throw std::runtime_error(job.ownRejected);
+                if (finishDraw(tailHolder, finishTiming) == DrawVerdict::Rejected) throw std::runtime_error(job.ownRejected);
             } catch (const std::exception& error) {
                 CaptureTrace::Log("draw-error submission=%llu offset=%zu finisher=1 reason=%.256s", static_cast<unsigned long long>(job.submissionSerial), job.packetOffset, error.what());
                 throw std::runtime_error("draw at submission " + std::to_string(job.submissionSerial) + " offset " + std::to_string(job.packetOffset) + " (finished on the draw finisher): " + error.what());
@@ -900,10 +907,11 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     tail.packet = packet;
     tail.rejected = &rejected;
     tail.gpuLock = &gpuLock;
-    return finishDraw(tail, timing);
+    return finishDraw(tailHolder, timing);
 }
 
-DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
+DrawVerdict Driver::finishDraw(const std::shared_ptr<DrawTail>& holder, PerformanceTimer& timing) {
+    auto& tail = *holder;
     using Stage = ShaderRecompiler::ShaderStage;
     using Role = ShaderRecompiler::ProgramRole;
     const bool profile = tail.profile;
@@ -1330,8 +1338,8 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         for (const auto& region : memory) snapshots.push_back({region.guestAddress, region.bytes});
     };
     if (instanceInputSgpr >= 0 || routedVertexBase) {
-        auto dynamicCaptures = stageCaptures;
-        auto dynamicRecompiled = recompiled;
+        std::vector<StageCapture> dynamicCaptures(stageCaptures.begin(), stageCaptures.end());
+        std::vector<std::uint8_t> dynamicRecompiled(recompiled.begin(), recompiled.end());
         try {
             const auto compiled = materializeDrawStage(0, pushOffsets[0], queue, submission, packetOffset, trace.token, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, *shaderMemory, dynamicCaptures, dynamicRecompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected, meshBarycentrics, instanceInputSgpr, routedVertexBase);
             require(compiled->pushConstants.size() <= programResults[0]->pushConstants.size() && compiled->parameterExports == programResults[0]->parameterExports, "routed draw inputs changed the linked stage interface");
@@ -1569,12 +1577,13 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                 const auto commitQueue = submission.queue;
                 const auto commitPacket = tail.packetOpcode;
                 const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
-                auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), direct, runtimeData = std::move(tail.runtimeData), recordResults = std::move(tail.recordResults), stages = std::move(stages), snapshots = std::move(snapshots), commitQueue, commitPacket, epoch, trace = trace, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData), recipe = std::move(recordRecipe), recipeStages = recipeSafe ? std::move(indirectRecipeStages) : std::vector<std::shared_ptr<DispatchVariant>>{}, drawKey, shape = tail.shapeKey] {
-                    (void)runtimeData;
-                    (void)recordResults;
+                auto commit = [this, tailHolder, direct, snapshots = std::move(snapshots), commitQueue, commitPacket, epoch, trace = trace, recipe = std::move(recordRecipe), recipeStages = recipeSafe ? std::move(indirectRecipeStages) : std::vector<std::shared_ptr<DispatchVariant>>{}, drawKey, shape = tail.shapeKey] {
+                    const auto& commitTail = *tailHolder;
+                    (void)commitTail.runtimeData;
+                    (void)commitTail.recordResults;
                     DrawPipeline::FollowEpoch(epoch);
                     GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
-                    commitDraw(localDevice, commitQueue, decode->state, direct, stages, snapshots, recipe, recipeStages, drawKey, trace, shape);
+                    commitDraw(commitTail.localDevice, commitQueue, commitTail.decode->state, direct, commitTail.stages, snapshots, recipe, recipeStages, drawKey, trace, shape);
                 };
                 auto held = std::make_shared<decltype(commit)>(std::move(commit));
                 DrawPipeline::Queue0().Enqueue([held] { (*held)(); }, std::move(writes), 0, {}, std::move(reads), true);
@@ -1649,10 +1658,11 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         const auto commitPacket = tail.packetOpcode;
         const auto epoch = DrawFinisher::OnFinisherThread() ? tail.epoch : DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         auto reads = QueuedDrawReadRanges(drawParameters, stages);
-        auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, shape = tail.shapeKey, commitQueue, commitPacket, epoch, trace = trace, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData)]() mutable {
+        auto commit = [this, tailHolder, drawParameters, snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, shape = tail.shapeKey, commitQueue, commitPacket, epoch, trace = trace] {
+            const auto& commitTail = *tailHolder;
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
-            commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey, trace, shape);
+            commitDraw(commitTail.localDevice, commitQueue, commitTail.decode->state, drawParameters, commitTail.stages, snapshots, recipe, recipeStages, drawKey, trace, shape);
         };
         auto held = std::make_shared<decltype(commit)>(std::move(commit));
         DrawPipeline::Queue0().Enqueue([held] { (*held)(); }, std::move(writes), 0, {}, std::move(reads), true);

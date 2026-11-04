@@ -152,7 +152,7 @@ bool Driver::admitDrawKey(std::uint64_t key, std::uint64_t shape) {
     return drawShapeSightings->SeenBefore(shape);
 }
 
-void Driver::insertDrawEntry(std::uint64_t key, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::shared_ptr<const DrawDecode> decode, std::uint64_t shape, bool replaceShape) {
+void Driver::insertDrawEntry(std::uint64_t key, std::span<std::shared_ptr<DispatchVariant>> fresh, std::shared_ptr<const DrawDecode> decode, std::uint64_t shape, bool replaceShape) {
     std::lock_guard cacheLock(drawCacheMutex);
     auto& counters = drawEntryCounters;
     if (replaceShape && shape != 0) {
