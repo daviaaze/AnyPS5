@@ -341,7 +341,8 @@ public:
     void AddWritable(std::uint64_t address, std::size_t bytes, bool atomic = false, bool swept = false);
     void AddReadable(std::uint64_t address, std::size_t bytes);
     // Summarizes the immediately preceding matching descriptor registration; a clipped or
-    // missing registration stays Whole. All aliases are retained before merging transfer spans.
+    // missing registration stays Whole. A validated bounded summary narrows only that writable
+    // alias's effective writes; full descriptor regions and read initialization remain unchanged.
     void AddFootprint(std::uint64_t descriptorAddress, std::uint64_t descriptorBytes,
         const ShaderRecompiler::BufferTransferFootprint& footprint);
     // Device-local staging of written and atomic elements inside host imports (see

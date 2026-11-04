@@ -5423,6 +5423,14 @@ void GuestBufferMemory::AddFootprint(std::uint64_t descriptorAddress, std::uint6
     if (value.bounded && footprints.back().writable != (value.writeBegin < value.writeEnd))
         value.bounded = false;
     footprints.back().value = value;
+    if (value.bounded && footprints.back().writable) {
+        // AddWritable appends one entry per alias, without merging. Only the immediately
+        // preceding exact registration is summarized here, so its entry is still last.
+        // Retain every other alias, including unknown writers overlapping this descriptor.
+        // Regions keep their full geometry and input spans; this is only the effective
+        // write hull used by pending hazards, dirty marks and write-back.
+        writes.back() = {descriptorAddress + value.writeBegin, descriptorAddress + value.writeEnd};
+    }
 }
 
 void GuestBufferMemory::AddSnapshot(const GuestMemorySnapshot& snapshot) {

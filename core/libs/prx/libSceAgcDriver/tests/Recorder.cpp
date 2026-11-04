@@ -4227,7 +4227,9 @@ bool bdaStagingTests(const Device& device, Recorder& recorder) {
         const ShaderRecompiler::BufferTransferFootprint boundedFootprint{true, 0, 4, 256, 512};
         memory.AddFootprint(element, elementBytes, boundedFootprint);
         memory.AddWritable(element + 32, 16);
-        memory.AddFootprint(element + 32, 16, ShaderRecompiler::BufferTransferFootprint{});
+        // The second writer overlaps the first descriptor but its invalid clipped
+        // summary must stay conservative and cover the full alias.
+        memory.AddFootprint(element + 32, 16, ShaderRecompiler::BufferTransferFootprint{true, 0, 20, 4, 8});
         memory.AddReadable(element + 16, 64);
         memory.AddFootprint(element + 16, 64, ShaderRecompiler::BufferTransferFootprint{true, 0, 64, 0, 0});
         memory.AddReadable(address + (1u << 20u), 64);
@@ -4271,6 +4273,22 @@ bool bdaStagingTests(const Device& device, Recorder& recorder) {
         fill(commands, view.buffer, view.offset + adjustment + 64u * 4u, 64, 0x22222222u);
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
         memory.RecordCopyBacks(recorder);
+        recorder.NotePendingWrites(memory.Writes());
+        // The bounded writable alias covers [256, 512); this read is inside its
+        // descriptor but outside the transfer hull. A real CPU read must not drain
+        // the open GPU batch merely because the descriptor's untouched padding is
+        // still registered as readable input.
+        std::array<std::byte, 4> untouchedRead{};
+        AgcDriver::GuestMemory::Read(element + 120, untouchedRead);
+        Require(recorder.Recording() && recorder.PendingWriteOverlaps(element + 256, 4) &&
+            !recorder.PendingWriteOverlaps(element + 120, untouchedRead.size()),
+            "a CPU read outside the bounded write hull drained or falsely overlapped the open GPU batch");
+        // Conversely, reading a written byte must drain the actual GPU copy-back
+        // and return its new value, not the pre-dispatch contents.
+        std::uint32_t writtenRead = 0;
+        AgcDriver::GuestMemory::Read(element + 256, std::as_writable_bytes(std::span(&writtenRead, 1)));
+        Require(writtenRead == 0x22222222u && recorder.Idle(),
+            "a CPU read inside the bounded write hull did not synchronize to the GPU result");
         recorder.Sync();
         memory.MarkDirectWrites();
         std::size_t wrong = 0;
@@ -4284,6 +4302,17 @@ bool bdaStagingTests(const Device& device, Recorder& recorder) {
         }
         Require(wrong == 0, "overlapping unknown-alias copy-back changed untouched padding or lost a write");
         memory.WriteBack();
+        // The invalid bounded summary on the overlapping writer must still make
+        // a CPU read of that alias wait for its actual in-place GPU write.
+        commands = recorder.Commands();
+        fill(commands, importBuffer, element + 32 - importBase, 4, 0x33333335u);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        recorder.NotePendingWrites(memory.Writes());
+        std::uint32_t unknownAliasRead = 0;
+        AgcDriver::GuestMemory::Read(element + 32, std::as_writable_bytes(std::span(&unknownAliasRead, 1)));
+        Require(unknownAliasRead == 0x33333335u && recorder.Idle(),
+            "a CPU read of an unknown writable alias did not synchronize to its GPU result");
     }
     std::memset(block, 0x11, bytes);
     {
