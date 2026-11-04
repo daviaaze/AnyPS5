@@ -46,9 +46,18 @@ public:
     using Clock = std::chrono::steady_clock;
     enum class Edge { None, Open, Close };
 
-    static std::optional<TraceWindow> Parse(const char* frames, const char* seconds) {
-        if (frames == nullptr && seconds == nullptr) return std::nullopt;
-        if (frames != nullptr && seconds != nullptr) throw std::invalid_argument("APS5_TRACE_FRAMES and APS5_TRACE_SECONDS cannot be set together");
+    static std::optional<TraceWindow> Parse(const char* frames, const char* seconds, const char* requestedSeconds = nullptr) {
+        if (frames == nullptr && seconds == nullptr && requestedSeconds == nullptr) return std::nullopt;
+        if ((frames != nullptr) + (seconds != nullptr) + (requestedSeconds != nullptr) > 1)
+            throw std::invalid_argument("trace frame, seconds and requested-seconds windows cannot be set together");
+        if (requestedSeconds != nullptr) {
+            std::uint64_t length = 0;
+            if (!number(requestedSeconds, length) || length == 0)
+                throw std::invalid_argument("APS5_TRACE_ON_REQUEST_SECONDS must be an integer above 0");
+            auto window = TraceWindow(false, 0, length);
+            window.requested = true;
+            return window;
+        }
         const std::string_view name = frames != nullptr ? "APS5_TRACE_FRAMES" : "APS5_TRACE_SECONDS";
         const std::string_view text = frames != nullptr ? frames : seconds;
         const auto colon = text.find(':');
@@ -59,9 +68,18 @@ public:
         return TraceWindow(frames != nullptr, start, length);
     }
 
+    bool WaitingForRequest() const { return requested && state == State::Waiting && !requestReceived; }
+
+    bool Request() {
+        if (!WaitingForRequest()) return false;
+        requestReceived = true;
+        return true;
+    }
+
     Edge Present(std::uint64_t present, Clock::duration elapsed) {
         if (state == State::Closed) return Edge::None;
         if (state == State::Waiting) {
+            if (requested && !requestReceived) return Edge::None;
             if (frames ? present < start : wholeSeconds(elapsed) < start) return Edge::None;
             state = State::Open;
             openedPresent = present;
@@ -74,6 +92,7 @@ public:
     }
 
     std::string Describe() const {
+        if (requested) return "cpu-enable seconds " + std::to_string(length);
         return std::string(frames ? "frames " : "seconds ") + std::to_string(start) + ":" + std::to_string(length);
     }
 
@@ -93,6 +112,8 @@ private:
     }
 
     bool frames;
+    bool requested = false;
+    bool requestReceived = false;
     std::uint64_t start;
     std::uint64_t length;
     State state = State::Waiting;
@@ -1081,8 +1102,14 @@ class PerformanceTrace {
 public:
     static constexpr const char* RenderPassScope = "Graphics.RenderPass";
 
+
+    static bool Windowed() {
+        static const bool windowed = std::getenv("APS5_TRACE_FRAMES") != nullptr || std::getenv("APS5_TRACE_SECONDS") != nullptr || std::getenv("APS5_TRACE_ON_REQUEST_SECONDS") != nullptr;
+        return windowed;
+    }
+
     static bool Configured() {
-        static const bool configured = std::getenv("APS5_TRACE_FRAMES") != nullptr || std::getenv("APS5_TRACE_SECONDS") != nullptr || std::getenv("APS5_TRACE_SUMMARY_EVERY") != nullptr || std::getenv("APS5_TRACE_BENCH") != nullptr;
+        static const bool configured = Windowed() || std::getenv("APS5_TRACE_SUMMARY_EVERY") != nullptr || std::getenv("APS5_TRACE_BENCH") != nullptr;
         return configured;
     }
 

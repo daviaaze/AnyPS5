@@ -18,6 +18,9 @@
 #include <cerrno>
 #include <sys/utsname.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <semaphore.h>
+#endif
 #endif
 #if defined(__linux__)
 #include <sys/syscall.h>
@@ -49,6 +52,7 @@ struct Session {
     std::mutex mutex;
     std::vector<std::unique_ptr<TraceThread>> threads;
     bool started = false;
+    bool outputStopped = false;
     std::optional<TraceWindow> window;
     bool windowOpen = false;
     std::vector<std::vector<TraceThread::Total>> windowBase;
@@ -70,6 +74,12 @@ struct Session {
     bool bench = false;
     TraceBenchIntervals benchIntervals;
     std::uint64_t benchDropped = 0;
+#if defined(__linux__)
+    sem_t* requestSemaphore = SEM_FAILED;
+    ~Session() {
+        if (requestSemaphore != SEM_FAILED) sem_close(requestSemaphore);
+    }
+#endif
 };
 struct TraceEventCheckpoint {
     TraceSummary summary;
@@ -381,7 +391,7 @@ void PerformanceTrace::BindThread(const char* name, std::size_t capacity) {
         localName = name;
         return;
     }
-    const bool windowed = std::getenv("APS5_TRACE_FRAMES") != nullptr || std::getenv("APS5_TRACE_SECONDS") != nullptr;
+    const bool windowed = Windowed();
     if (windowed && capacity == TraceThread::DefaultCapacity) capacity = TraceThread::ParseCapacity(std::getenv("APS5_TRACE_EVENTS"));
     auto bound = std::make_unique<TraceThread>(name, presentCount, windowed ? capacity : 0, buffering, nativeThreadId());
     auto& state = session();
@@ -514,16 +524,43 @@ void PerformanceTrace::Present(std::uint32_t width, std::uint32_t height, const 
     BindThread("presenter");
     auto& state = session();
     std::lock_guard lock(state.mutex);
+    if (state.outputStopped) return;
     state.width = width;
     state.height = height;
     if (!state.started) {
-        state.window = TraceWindow::Parse(std::getenv("APS5_TRACE_FRAMES"), std::getenv("APS5_TRACE_SECONDS"));
+        const auto* requestSeconds = std::getenv("APS5_TRACE_ON_REQUEST_SECONDS");
+        state.window = TraceWindow::Parse(std::getenv("APS5_TRACE_FRAMES"), std::getenv("APS5_TRACE_SECONDS"), requestSeconds);
+        if (requestSeconds != nullptr) {
+#if defined(__linux__)
+            const auto* semaphoreName = std::getenv("APS5_TRACE_START_SEMAPHORE");
+            if (semaphoreName == nullptr || semaphoreName[0] != '/' || std::strchr(semaphoreName + 1, '/') != nullptr)
+                throw std::invalid_argument("APS5_TRACE_START_SEMAPHORE must be a POSIX semaphore name");
+            state.requestSemaphore = sem_open(semaphoreName, 0);
+            if (state.requestSemaphore == SEM_FAILED)
+                throw std::runtime_error("cannot open APS5_TRACE_START_SEMAPHORE");
+#else
+            throw std::runtime_error("request-triggered trace windows are supported only on Linux");
+#endif
+        }
         state.interval = TraceInterval::Parse(std::getenv("APS5_TRACE_SUMMARY_EVERY"));
         state.bench = TraceBench::Parse(std::getenv("APS5_TRACE_BENCH"), state.interval.has_value());
         state.first = now;
         state.started = true;
     }
     const auto present = state.present++;
+#if defined(__linux__)
+    if (state.window && state.window->WaitingForRequest()) {
+        if (state.requestSemaphore == SEM_FAILED)
+            throw std::runtime_error("request trace window has no open semaphore");
+        if (sem_trywait(state.requestSemaphore) == 0) {
+            state.window->Request();
+            sem_close(state.requestSemaphore);
+            state.requestSemaphore = SEM_FAILED;
+        } else if (errno != EAGAIN && errno != EINTR) {
+            throw std::runtime_error("cannot consume APS5_TRACE_START_SEMAPHORE request");
+        }
+    }
+#endif
     const auto edge = state.window ? state.window->Present(present, now - state.first) : TraceWindow::Edge::None;
     if (state.interval) {
         if (!state.intervalOpen) {
@@ -567,6 +604,12 @@ void PerformanceTrace::Present(std::uint32_t width, std::uint32_t height, const 
     state.presents.push_back(now);
     presentCount.fetch_add(1, std::memory_order_relaxed);
     if (edge != TraceWindow::Edge::Close) return;
+#if defined(__linux__)
+    if (state.requestSemaphore != SEM_FAILED) {
+        sem_close(state.requestSemaphore);
+        state.requestSemaphore = SEM_FAILED;
+    }
+#endif
     state.windowOpen = false;
     buffering.store(false, std::memory_order_relaxed);
     recording.store(state.interval.has_value(), std::memory_order_relaxed);
@@ -609,6 +652,7 @@ void PerformanceTrace::StopOutput() {
     auto& state = session();
     {
         std::lock_guard lock(state.mutex);
+        state.outputStopped = true;
         if (state.windowOpen && state.window && !state.presents.empty()) {
             buffering.store(false, std::memory_order_relaxed);
             recording.store(state.interval.has_value(), std::memory_order_relaxed);
@@ -638,6 +682,14 @@ void PerformanceTrace::StopOutput() {
                 state.presents.front(), presenter, state.firstPresent, process});
             state.windowOpen = false;
         }
+#if defined(__linux__)
+        if (state.requestSemaphore != SEM_FAILED) {
+            sem_close(state.requestSemaphore);
+            state.requestSemaphore = SEM_FAILED;
+        }
+#endif
+        buffering.store(false, std::memory_order_relaxed);
+        recording.store(false, std::memory_order_relaxed);
     }
     if (eventWriter()) eventWriter()->Stop();
     if (summaryWriter()) summaryWriter()->Stop();

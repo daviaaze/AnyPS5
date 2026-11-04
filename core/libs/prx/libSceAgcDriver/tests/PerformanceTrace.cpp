@@ -1,5 +1,9 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/TraceFile.hpp"
+#if defined(__linux__)
+#include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#endif
+#include <thread>
 #include "zlib.h"
 #include <charconv>
 #include <atomic>
@@ -8,10 +12,21 @@
 #include <iostream>
 #include <iterator>
 #include <mutex>
+#include <filesystem>
+#include <optional>
+#include <string_view>
+#include <cstdlib>
+#include <system_error>
+#include <sys/stat.h>
 #if defined(__linux__)
 #include <time.h>
 #endif
 
+#if defined(__linux__)
+#include <fcntl.h>
+#include <semaphore.h>
+#include <unistd.h>
+#endif
 namespace {
 
 using AgcDriver::TraceFormat;
@@ -26,6 +41,142 @@ void Check(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
 
+#if defined(__linux__)
+std::string ReadGzip(const std::filesystem::path& path);
+
+struct RequestFixture {
+    struct Variable {
+        std::string name;
+        std::optional<std::string> previous;
+        explicit Variable(const char* key) : name(key) {
+            if (const char* value = std::getenv(key)) previous = value;
+        }
+        ~Variable() {
+            if (previous) setenv(name.c_str(), previous->c_str(), 1);
+            else unsetenv(name.c_str());
+        }
+        void Set(const char* value) {
+            Check((value ? setenv(name.c_str(), value, 1) : unsetenv(name.c_str())) == 0,
+                "cannot isolate trace environment");
+        }
+    };
+    Variable frames{"APS5_TRACE_FRAMES"}, seconds{"APS5_TRACE_SECONDS"};
+    Variable summary{"APS5_TRACE_SUMMARY_EVERY"}, bench{"APS5_TRACE_BENCH"};
+    Variable events{"APS5_TRACE_EVENTS"}, request{"APS5_TRACE_ON_REQUEST_SECONDS"};
+    Variable semaphore{"APS5_TRACE_START_SEMAPHORE"}, output{"APS5_TRACE_DIR"};
+    std::filesystem::path directory;
+    std::string name;
+    sem_t* owner = SEM_FAILED;
+
+    RequestFixture() {
+        auto pattern = (std::filesystem::temp_directory_path() / "aps5-request-test-XXXXXX").string();
+        const char* created = mkdtemp(pattern.data());
+        Check(created != nullptr, "cannot create private trace directory");
+        directory = created;
+        try {
+            name = "/aps5-trace-test-" + std::to_string(getpid()) + "-" + directory.filename().string();
+            owner = sem_open(name.c_str(), O_CREAT | O_EXCL, 0600, 0);
+            Check(owner != SEM_FAILED, "cannot create owned request semaphore");
+            struct stat info{};
+            Check(stat(("/dev/shm/sem." + name.substr(1)).c_str(), &info) == 0
+                && (info.st_mode & 0777) == 0600, "owned request semaphore is not mode 0600");
+            int count = -1;
+            Check(sem_getvalue(owner, &count) == 0 && count == 0, "request semaphore did not start at zero");
+            frames.Set(nullptr); seconds.Set(nullptr); summary.Set(nullptr);
+            bench.Set(nullptr); events.Set(nullptr);
+            request.Set("15"); semaphore.Set(name.c_str()); output.Set(directory.c_str());
+        } catch (...) {
+            Release();
+            throw;
+        }
+    }
+    RequestFixture(const RequestFixture&) = delete;
+    RequestFixture& operator=(const RequestFixture&) = delete;
+    void Release() noexcept {
+        if (owner != SEM_FAILED) {
+            sem_close(owner);
+            sem_unlink(name.c_str());
+            owner = SEM_FAILED;
+        }
+        std::error_code error;
+        std::filesystem::remove_all(directory, error);
+    }
+    void Stop() {
+        AgcDriver::PerformanceTrace::StopOutput();
+    }
+    ~RequestFixture() { Release(); }
+    void Post() { Check(sem_post(owner) == 0, "cannot post owned request semaphore"); }
+    void AssertCapture(bool closed) const {
+        const auto summaryPath = directory / "aps5-summary.jsonl";
+        const auto deadline = Clock::now() + std::chrono::seconds(5);
+        while (!std::filesystem::exists(summaryPath) && Clock::now() < deadline)
+            std::this_thread::sleep_for(milliseconds(10));
+        std::ifstream input(summaryPath, std::ios::binary);
+        const std::string summary((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+        if (closed)
+            Check(summary.find("\"window\":\"cpu-enable seconds 15\"") != std::string::npos,
+                "summary has the wrong declared window");
+        const auto key = summary.find("\"trace\":");
+        Check(key != std::string::npos, "summary omitted the trace path");
+        const auto start = summary.find('"', key + 8);
+        const auto end = summary.find('"', start + 1);
+        Check(start != std::string::npos && end != std::string::npos, "summary trace path is malformed");
+        const auto capturePath = directory / summary.substr(start + 1, end - start - 1);
+        const auto capture = ReadGzip(capturePath);
+        if (closed)
+            Check(capture.find("\"declared_window\":\"cpu-enable seconds 15\"") != std::string::npos,
+                "published raw capture has the wrong declaration");
+        Check(capture.find(closed ? "\"declared_window_closed\":true" : "\"declared_window_closed\":false") != std::string::npos,
+            "published raw capture has the wrong completion state");
+        Check(capture.find("\"name\":\"RequestFixture.Work\"") != std::string::npos,
+            "published capture omitted genuine timed work");
+        Check(capture.find("\"name\":\"present\"") != std::string::npos,
+            "published capture omitted presentation witnesses");
+    }
+};
+
+void RequestWork() {
+    AgcDriver::PerformanceTimer scope("RequestFixture.Work");
+    std::this_thread::sleep_for(milliseconds(10));
+}
+
+void RequestSemaphoreSmoke(bool complete = false, bool stopWaiting = false) {
+    RequestFixture fixture;
+    AgcDriver::PerformanceTrace::Present(1, 1, nullptr);
+    Check(!AgcDriver::PerformanceTrace::CapturingRawWindow(), "native request window opened before semaphore post");
+    if (stopWaiting) {
+        AgcDriver::PerformanceTrace::StopOutput();
+        fixture.Post();
+        AgcDriver::PerformanceTrace::Present(1, 1, nullptr);
+        Check(!AgcDriver::PerformanceTrace::CapturingRawWindow(), "stopped waiting session reopened");
+        for (const auto& entry : std::filesystem::directory_iterator(fixture.directory))
+            Check(!entry.path().filename().string().starts_with("aps5-trace-"), "stopped waiting session published a capture");
+        return;
+    }
+    fixture.Post();
+    const auto beforeOpen = Clock::now();
+    AgcDriver::PerformanceTrace::Present(1, 1, nullptr);
+    Check(AgcDriver::PerformanceTrace::CapturingRawWindow(), "native request semaphore did not open raw trace");
+    do {
+        RequestWork();
+        AgcDriver::PerformanceTrace::Present(1, 1, nullptr);
+    } while (complete && AgcDriver::PerformanceTrace::CapturingRawWindow()
+        && Clock::now() - beforeOpen < std::chrono::seconds(17));
+    if (complete) {
+        Check(!AgcDriver::PerformanceTrace::CapturingRawWindow(), "request capture did not close automatically within 17 seconds");
+        Check(Clock::now() - beforeOpen >= std::chrono::seconds(15), "request capture closed before its declared duration");
+        fixture.Post();
+        AgcDriver::PerformanceTrace::Present(1, 1, nullptr);
+        Check(!AgcDriver::PerformanceTrace::CapturingRawWindow(), "completed one-shot capture reopened");
+    } else {
+        RequestWork();
+        AgcDriver::PerformanceTrace::Present(1, 1, nullptr);
+        Check(AgcDriver::PerformanceTrace::CapturingRawWindow(), "partial request capture unexpectedly closed");
+    }
+    fixture.Stop();
+    fixture.AssertCapture(complete);
+}
+#endif
 void WindowByFrames() {
     auto window = TraceWindow::Parse("3:2", nullptr).value();
     std::vector<Edge> edges;
@@ -42,6 +193,32 @@ void WindowBySeconds() {
     Check(edges == std::vector<Edge>{Edge::None, Edge::None, Edge::Open, Edge::None, Edge::Close, Edge::None}, "seconds window opened or closed at the wrong present");
     Check(window.Describe() == "seconds 2:1", "seconds window description changed");
 }
+void WindowByRequest() {
+    auto window = TraceWindow::Parse(nullptr, nullptr, "15").value();
+    Check(window.Describe() == "cpu-enable seconds 15", "request window declaration changed");
+    Check(window.WaitingForRequest(), "request window did not start waiting");
+    Check(window.Present(10, std::chrono::seconds(90)) == Edge::None, "request window opened before request");
+    Check(window.Request(), "request was not accepted while waiting");
+    Check(!window.Request(), "request was accepted more than once");
+    Check(window.Present(11, std::chrono::seconds(90)) == Edge::Open, "request did not open at next present");
+    Check(window.Present(12, std::chrono::seconds(104)) == Edge::None, "request window closed before 15 seconds");
+    Check(window.Present(13, std::chrono::seconds(105)) == Edge::Close, "request window did not close after 15 seconds");
+    Check(window.Present(14, std::chrono::seconds(120)) == Edge::None, "request window reopened");
+}
+
+void WindowRequestRejects() {
+    for (const auto* text : {"", "0", "-1", "1:1", "x"}) {
+        bool rejected = false;
+        try { TraceWindow::Parse(nullptr, nullptr, text); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        Check(rejected, "an invalid request duration was accepted");
+    }
+    bool rejected = false;
+    try { TraceWindow::Parse("1:1", nullptr, "15"); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    Check(rejected, "fixed and request windows were accepted together");
+}
+
 
 void WindowRejects() {
     Check(!TraceWindow::Parse(nullptr, nullptr).has_value(), "a window was made without a switch");
@@ -55,6 +232,10 @@ void WindowRejects() {
     try { TraceWindow::Parse("1:1", "1:1"); }
     catch (const std::invalid_argument&) { rejected = true; }
     Check(rejected, "frames and seconds were accepted together");
+    bool requestRejected = false;
+    try { TraceWindow::Parse(nullptr, "1:1", "15"); }
+    catch (const std::invalid_argument&) { requestRejected = true; }
+    Check(requestRejected, "seconds and request windows were accepted together");
 }
 
 void BufferCap() {
@@ -757,10 +938,23 @@ void AppendLines() {
 
 }
 
-int main() {
+int main(int argc, char** argv) {
     try {
+#if defined(__linux__)
+        if (argc == 2 && std::string_view(argv[1]) == "--request-close") {
+            RequestSemaphoreSmoke(true);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--request-stop-waiting") {
+            RequestSemaphoreSmoke(false, true);
+            return 0;
+        }
+#endif
+        Check(argc == 1, "unknown performance trace test mode");
         WindowByFrames();
         WindowBySeconds();
+        WindowByRequest();
+        WindowRequestRejects();
         WindowRejects();
         BufferCap();
         LostEventsCount();
@@ -791,6 +985,9 @@ int main() {
         ReplaceGzipFile();
         RollingSnapshotCheckpoint();
         AppendLines();
+#if defined(__linux__)
+        RequestSemaphoreSmoke();
+#endif
         std::cout << "performance trace tests passed\n";
         return 0;
     } catch (const std::exception& error) {

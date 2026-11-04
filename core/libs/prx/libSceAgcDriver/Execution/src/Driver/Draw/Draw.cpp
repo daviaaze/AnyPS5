@@ -128,7 +128,7 @@ std::uint64_t LogDrawStateDiagnostic(const QueueState& queue, const Graphics::St
         const auto parsed = text != nullptr ? std::strtoull(text, nullptr, 10) : 64ull;
         return std::min<std::uint64_t>(parsed, 4096);
     }();
-    static const bool timedTrace = std::getenv("APS5_TRACE_SECONDS") != nullptr;
+    static const bool timedTrace = PerformanceTrace::Windowed() && std::getenv("APS5_TRACE_FRAMES") == nullptr;
     static std::atomic<std::uint64_t> ordinal{0}, emitted{0};
     const auto draw = ordinal.fetch_add(1, std::memory_order_relaxed) + 1;
     if (draw <= skip || limit == 0 || (timedTrace && !PerformanceTrace::CapturingRawWindow())) return 0;
