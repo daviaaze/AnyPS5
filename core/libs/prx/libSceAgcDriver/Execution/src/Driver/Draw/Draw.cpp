@@ -910,8 +910,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     return finishDraw(tailHolder, timing);
 }
 
-DrawVerdict Driver::finishDraw(const std::shared_ptr<DrawTail>& holder, PerformanceTimer& timing) {
-    auto& tail = *holder;
+DrawVerdict Driver::finishDraw(const std::shared_ptr<DrawTail>& tailHolder, PerformanceTimer& timing) {
+    auto& tail = *tailHolder;
     using Stage = ShaderRecompiler::ShaderStage;
     using Role = ShaderRecompiler::ProgramRole;
     const bool profile = tail.profile;
