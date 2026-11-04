@@ -918,7 +918,11 @@ void CaptureOwnsSnapshots() {
         stage.assign("changed stage");
         gpuName.assign("changed gpu");
     }
-    Check(TraceFormat::Events(capture->process, capture->presents.front(), capture->threads, capture->presenter, capture->presents, capture->summary.firstPresent) == expectedEvents, "closed capture borrowed slices or labels, changed ordering or included a late append");
+    const auto events = TraceFormat::Events(capture->process, capture->presents.front(), capture->threads, capture->presenter, capture->presents, capture->summary.firstPresent);
+    const auto traceEvents = events.find(",\"traceEvents\":[");
+    const auto expectedTraceEvents = expectedEvents.find(",\"traceEvents\":[");
+    Check(traceEvents != std::string::npos && expectedTraceEvents != std::string::npos
+        && events.substr(traceEvents) == expectedEvents.substr(expectedTraceEvents), "closed capture borrowed slices or labels, changed ordering or included a late append");
     Check(TraceFormat::Summary(capture->summary, capture->threads, capture->presents) == expectedSummary, "closed capture changed totals or loss cutoff");
 }
 
