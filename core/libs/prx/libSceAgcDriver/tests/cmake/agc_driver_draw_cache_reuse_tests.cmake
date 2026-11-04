@@ -22,11 +22,11 @@ if(BUILD_TESTING)
     set_tests_properties(agc_driver_draw_cache_reuse agc_driver_draw_cache_reuse_off agc_driver_draw_cache_reuse_verify agc_driver_draw_cache_reuse_inline agc_driver_draw_cache_reuse_indirect agc_driver_draw_cache_reuse_push_word agc_driver_draw_cache_reuse_push_word_verify PROPERTIES FAIL_REGULAR_EXPRESSION "FATAL:")
     add_test(NAME agc_driver_draw_cache_reuse_cpu_record_recipes COMMAND agc_driver_draw_cache_reuse_tests)
     set_tests_properties(agc_driver_draw_cache_reuse_cpu_record_recipes PROPERTIES
-        ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_DRAW_CACHE_INDIRECT=1;APS5_DRAW_CACHE_PUSH_WORD=1;APS5_NO_INDIRECT_INPUT_ROUTES=1;APS5_TEST_RECORD_RECIPE_REGRESSIONS=1"
+        ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_DRAW_CACHE_INDIRECT=1;APS5_DRAW_CACHE_PUSH_WORD=1;APS5_NO_INDIRECT_INPUT_ROUTES=1;APS5_TEST_RECORD_RECIPE_REGRESSIONS=1;APS5_VERIFY_DRAW_PUSH_WORD=1"
         SKIP_RETURN_CODE 77 FAIL_REGULAR_EXPRESSION "FATAL:")
     add_test(NAME agc_driver_draw_cache_reuse_cpu_record_recipes_no_recipe COMMAND agc_driver_draw_cache_reuse_tests)
     set_tests_properties(agc_driver_draw_cache_reuse_cpu_record_recipes_no_recipe PROPERTIES
-        ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_DRAW_CACHE_INDIRECT=1;APS5_DRAW_CACHE_PUSH_WORD=1;APS5_NO_INDIRECT_INPUT_ROUTES=1;APS5_TEST_RECORD_RECIPE_REGRESSIONS=1;APS5_NO_DRAW_RECIPE=1"
+        ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_DRAW_CACHE_INDIRECT=1;APS5_DRAW_CACHE_PUSH_WORD=1;APS5_NO_INDIRECT_INPUT_ROUTES=1;APS5_TEST_RECORD_RECIPE_REGRESSIONS=1;APS5_NO_DRAW_RECIPE=1;APS5_VERIFY_DRAW_PUSH_WORD=1"
         SKIP_RETURN_CODE 77 FAIL_REGULAR_EXPRESSION "FATAL:")
     if(WIN32)
         set_tests_properties(agc_driver_draw_cache_reuse_push_word agc_driver_draw_cache_reuse_push_word_verify agc_driver_draw_cache_reuse_cpu_record_recipes agc_driver_draw_cache_reuse_cpu_record_recipes_no_recipe PROPERTIES ENVIRONMENT_MODIFICATION

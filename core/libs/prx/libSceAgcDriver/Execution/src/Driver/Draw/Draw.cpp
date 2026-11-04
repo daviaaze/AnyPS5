@@ -273,6 +273,8 @@ struct DrawTail {
     std::unique_ptr<ShaderMemory> shaderMemory;
     std::vector<ShaderRecompiler::RecompileResult> results;
     std::vector<std::shared_ptr<const ShaderRecompiler::RecompileResult>> compiledStages;
+    std::vector<Graphics::ShaderRuntimeData> runtimeData;
+    std::vector<std::shared_ptr<const ShaderRecompiler::RecompileResult>> recordResults;
     std::vector<Graphics::CompiledShader> stages;
     std::uint32_t pushCursorBytes = 0;
     std::vector<const ShaderRecompiler::RecompileResult*> programResults;
@@ -1045,7 +1047,6 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     bool routedVertexBase = false;
     std::vector<std::uint32_t> pushOffsets(programs.size(), 0);
     std::optional<ShaderRecompiler::MeshBarycentricLayout> meshBarycentrics;
-    std::vector<std::size_t> resultIndex(programs.size(), 0);
     for (std::size_t i = 0; i < programs.size(); ++i) {
         if (roles[i] == Role::GeometryBack) continue;
         const auto& program = programs[i];
@@ -1373,16 +1374,6 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     if (drawParameters.indirect && indirectCpu) {
 
         const auto indirect = *drawParameters.indirect;
-        results.reserve(programs.size() + 2u);
-        for (std::size_t i = 0; i < programs.size(); ++i) {
-            if (programResults[i] == nullptr) continue;
-            resultIndex[i] = results.size();
-            results.push_back(ShaderRecompiler::RecompileResult(*programResults[i]));
-            for (auto& stage : stages) {
-                if (stage.program == programResults[i]) stage.program = &results[resultIndex[i]];
-            }
-            programResults[i] = &results[resultIndex[i]];
-        }
         recordQueuedLabelsBeforeRead(submission.queue);
         const auto readStart = std::chrono::steady_clock::now();
         const auto count = std::min(indirect.countIndirect ? Pm4::ReadDrawCount(indirect) : indirect.count, indirect.count);
@@ -1403,6 +1394,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             if (std::any_of(indirectRecipeStages.begin(), indirectRecipeStages.end(), [](const auto& variant) { return variant == nullptr; })) indirectRecipeStages.clear();
         }
         const auto drawable = [&](const Pm4::DrawArguments& arguments) { return arguments.count != 0 && arguments.instances != 0 && (!drawParameters.indexed || !indirect.indexLimitKnown || arguments.firstVertexOrIndex < drawParameters.indexCount); };
+        tail.runtimeData.resize(programs.size());
         std::size_t lastDrawable = records.size();
         for (std::size_t record = 0; record < records.size(); ++record) {
             if (drawable(records[record])) lastDrawable = record;
@@ -1424,33 +1416,55 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             drawEntryCounters.recordWordsVerified += wordsVerified;
         };
         const auto sameInfo = [&](const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& a, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& b) { return a.has_value() == b.has_value() && (!a || sameVertexInfo(*a, *b)); };
-        const auto forwardRecordWords = [&](std::size_t programIndex, ShaderRecompiler::RecompileResult& result, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& previousInfo) {
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> forwardingSlots;
+        forwardingSlots.reserve(ShaderRecompiler::SrtUserDataUse::TrackedWords * 3u);
+        const auto forwardRecordWords = [&](std::size_t programIndex, Graphics::ShaderRuntimeData& runtime, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& previousInfo) {
             std::uint64_t walked = 0;
             if (stageCaptures[programIndex].capture != nullptr) walked = stageCaptures[programIndex].userDataUse.asBase | stageCaptures[programIndex].userDataUse.asValue;
             else if (matched[programIndex] != nullptr) walked = matched[programIndex]->userWordsWalked;
             else return false;
             if ((graphics.stages.mesh && programIndex == 0) || !sameInfo(previousInfo, vertexInfos[programIndex])) return false;
-            std::vector<std::pair<std::uint32_t, std::uint32_t>> slots;
+            forwardingSlots.clear();
             bool any = false;
             for (const auto& word : recordWords) {
                 if (word.program != programIndex) continue;
                 any = true;
                 if (word.index >= ShaderRecompiler::SrtUserDataUse::TrackedWords || (walked >> word.index & 1u) != 0) return false;
-                const auto& forwarded = result.shaderDataUserWords;
+                const auto& forwarded = programResults[programIndex]->shaderDataUserWords;
                 const auto slot = std::find(forwarded.begin(), forwarded.end(), static_cast<std::uint32_t>(word.index));
-                if (slot != forwarded.end()) slots.emplace_back(static_cast<std::uint32_t>(slot - forwarded.begin()), word.value);
+                if (slot != forwarded.end()) forwardingSlots.emplace_back(static_cast<std::uint32_t>(slot - forwarded.begin()), word.value);
             }
             if (!any) return false;
-            patchForwardedWords(result, slots);
+            runtime.Reset(*programResults[programIndex]);
+            for (auto& stage : stages) if (stage.program == programResults[programIndex]) stage.runtimeData = &runtime;
+            runtime.Patch(forwardingSlots);
             return true;
         };
-        const auto verifyForwardedWords = [&](std::size_t programIndex, const ShaderRecompiler::RecompileResult& forwarded, const ShaderRecompiler::RecompileResult& fresh) {
-            const bool sameBindings = forwarded.bindings.size() == fresh.bindings.size() && std::equal(forwarded.bindings.begin(), forwarded.bindings.end(), fresh.bindings.begin(), [](const auto& a, const auto& b) { return a.kind == b.kind && a.role == b.role && a.binding == b.binding && a.count == b.count && a.guestDescriptor == b.guestDescriptor; });
+        const auto verifyForwardedWords = [&](std::size_t programIndex, const Graphics::ShaderRuntimeData& forwarded, const ShaderRecompiler::RecompileResult& fresh) {
+            const auto& base = *programResults[programIndex];
+            auto expectedResult = fresh;
+            std::vector<std::pair<std::uint32_t, std::uint32_t>> expectedPatches;
+            for (const auto& word : recordWords) {
+                if (word.program != programIndex) continue;
+                const auto slot = std::find(expectedResult.shaderDataUserWords.begin(), expectedResult.shaderDataUserWords.end(), static_cast<std::uint32_t>(word.index));
+                if (slot != expectedResult.shaderDataUserWords.end()) expectedPatches.emplace_back(static_cast<std::uint32_t>(slot - expectedResult.shaderDataUserWords.begin()), word.value);
+            }
+            patchForwardedWords(expectedResult, expectedPatches);
+            bool sameBindings = base.bindings.size() == expectedResult.bindings.size();
+            for (std::size_t i = 0; sameBindings && i < base.bindings.size(); ++i) {
+                const auto& a = base.bindings[i];
+                const auto& b = expectedResult.bindings[i];
+                sameBindings = a.kind == b.kind && a.role == b.role && a.binding == b.binding && a.count == b.count;
+                if (!sameBindings) break;
+                if (a.role == ShaderRecompiler::DescriptorRole::ShaderData) sameBindings = std::ranges::equal(forwarded.DataWords(base, a), b.guestDescriptor.Span());
+                else sameBindings = a.guestDescriptor == b.guestDescriptor;
+            }
             std::uint64_t walked = 0;
             for (const auto& word : recordWords) {
                 if (word.program == programIndex && word.index < ShaderRecompiler::SrtUserDataUse::TrackedWords) walked |= (stageCaptures[programIndex].userDataUse.asBase | stageCaptures[programIndex].userDataUse.asValue) >> word.index & 1u;
             }
-            const char* what = forwarded.variantId != fresh.variantId ? "variant" : forwarded.pushConstants != fresh.pushConstants ? "push constants" : !sameBindings ? "bindings" : forwarded.shaderDataUserWords != fresh.shaderDataUserWords ? "forwarded words" : walked != 0 ? "walked user word" : nullptr;
+            const Graphics::ShaderRuntimeData expected(expectedResult);
+            const char* what = base.variantId != expectedResult.variantId ? "variant" : forwarded.pushConstants != expected.pushConstants ? "push constants" : !sameBindings ? "bindings" : base.shaderDataUserWords != expectedResult.shaderDataUserWords ? "forwarded words" : walked != 0 ? "walked user word" : nullptr;
             ++wordsVerified;
             if (what == nullptr) return;
             char message[256];
@@ -1464,6 +1478,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             if (arguments.count == 0 || arguments.instances == 0) continue;
             std::set<std::size_t> patched;
             recordWords.clear();
+            for (auto& stage : stages) stage.runtimeData = nullptr;
             const auto patch = [&](const std::vector<std::pair<std::size_t, std::size_t>>& words, std::uint32_t value) {
                 for (const auto& [program, word] : words) {
                     writablePrograms[program].userData[word] = value;
@@ -1501,26 +1516,32 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             }
             bool recipeSafe = !indirectRecipeStages.empty();
             for (const auto programIndex : patched) {
-                auto& result = results[resultIndex[programIndex]];
-                const auto pushBytes = result.pushConstants.size();
+                auto& runtime = tail.runtimeData[programIndex];
+                const auto pushBytes = programResults[programIndex]->pushConstants.size();
                 const auto previousInfo = vertexInfos[programIndex];
                 decodeVertexInfo(programIndex);
-                if (pushWord && forwardRecordWords(programIndex, result, previousInfo)) {
+                if (pushWord && forwardRecordWords(programIndex, runtime, previousInfo)) {
                     wordsForwarded += static_cast<std::uint64_t>(std::count_if(recordWords.begin(), recordWords.end(), [&](const RecordWord& word) { return word.program == programIndex; }));
                     if (!verifyPushWord) continue;
                     const auto fresh = materializeDrawStage(programIndex, pushOffsets[programIndex], queue, submission, packetOffset, trace.token, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, *shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected, meshBarycentrics);
                     if (!rejected.empty()) return DrawVerdict::Rejected;
-                    verifyForwardedWords(programIndex, result, *fresh);
-                    // Verification replaces the capture's view owner; queued stages must follow it.
-                    for (auto& stage : stages) if (stage.program == &result) stage.registeredImageViews = stageCaptures[programIndex].registeredViews.get();
+                    verifyForwardedWords(programIndex, runtime, *fresh);
+                    for (auto& stage : stages) if (stage.program == programResults[programIndex]) stage.registeredImageViews = stageCaptures[programIndex].registeredViews.get();
                     continue;
                 }
                 if (pushWord) wordsRefused += static_cast<std::uint64_t>(std::count_if(recordWords.begin(), recordWords.end(), [&](const RecordWord& word) { return word.program == programIndex; }));
                 recipeSafe = false;
-                result = *materializeDrawStage(programIndex, pushOffsets[programIndex], queue, submission, packetOffset, trace.token, programs, graphics, pixel, vertexInfos, memory, linked, programs[programIndex].binary.stage == Stage::TessellationControl || programs[programIndex].binary.stage == Stage::TessellationEvaluation ? direct : drawParameters, localDevice, *shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected, meshBarycentrics);
-                for (auto& stage : stages) if (stage.program == &result) stage.registeredImageViews = stageCaptures[programIndex].registeredViews.get();
+                auto fresh = materializeDrawStage(programIndex, pushOffsets[programIndex], queue, submission, packetOffset, trace.token, programs, graphics, pixel, vertexInfos, memory, linked, programs[programIndex].binary.stage == Stage::TessellationControl || programs[programIndex].binary.stage == Stage::TessellationEvaluation ? direct : drawParameters, localDevice, *shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected, meshBarycentrics);
                 if (!rejected.empty()) return DrawVerdict::Rejected;
-                require(result.pushConstants.size() == pushBytes, "patched program changed its push constant layout");
+                require(fresh->pushConstants.size() == pushBytes, "patched program changed its push constant layout");
+                const auto* previousProgram = programResults[programIndex];
+                if (tail.recordResults.empty()) tail.recordResults.resize(programs.size());
+                tail.recordResults[programIndex] = std::move(fresh);
+                programResults[programIndex] = tail.recordResults[programIndex].get();
+                for (auto& stage : stages) if (stage.program == previousProgram) {
+                    stage.program = programResults[programIndex];
+                    stage.registeredImageViews = stageCaptures[programIndex].registeredViews.get();
+                }
                 ++stagesRecompiled;
             }
             fold(*programResults[0], direct);
@@ -1548,7 +1569,9 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                 const auto commitQueue = submission.queue;
                 const auto commitPacket = tail.packetOpcode;
                 const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
-                auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), direct, stages = std::move(stages), snapshots = std::move(snapshots), commitQueue, commitPacket, epoch, trace = trace, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData), recipe = std::move(recordRecipe), recipeStages = recipeSafe ? std::move(indirectRecipeStages) : std::vector<std::shared_ptr<DispatchVariant>>{}, drawKey, shape = tail.shapeKey] {
+                auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), direct, runtimeData = std::move(tail.runtimeData), recordResults = std::move(tail.recordResults), stages = std::move(stages), snapshots = std::move(snapshots), commitQueue, commitPacket, epoch, trace = trace, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData), recipe = std::move(recordRecipe), recipeStages = recipeSafe ? std::move(indirectRecipeStages) : std::vector<std::shared_ptr<DispatchVariant>>{}, drawKey, shape = tail.shapeKey] {
+                    (void)runtimeData;
+                    (void)recordResults;
                     DrawPipeline::FollowEpoch(epoch);
                     GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
                     commitDraw(localDevice, commitQueue, decode->state, direct, stages, snapshots, recipe, recipeStages, drawKey, trace, shape);

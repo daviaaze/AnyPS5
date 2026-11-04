@@ -4,8 +4,12 @@
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "IntermediateRepresentation/IrMetadata/ResourcePlan.hpp"
 #include "Recompiler.hpp"
+#include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstring>
+#include <utility>
+#include <vector>
 #include <span>
 
 namespace AgcDriver::Graphics {
@@ -34,11 +38,65 @@ inline std::uint32_t StagePushOffset(std::uint32_t cursor, ShaderRecompiler::Sha
     return fixedSlots && stage == ShaderRecompiler::ShaderStage::Fragment ? PipelinePushSlotBytes : cursor;
 }
 
+// Per-record scalar bytes only; compiled reflection and module identity stay immutable.
+struct ShaderRuntimeData {
+    struct BindingWords {
+        std::size_t bindingIndex;
+        std::vector<std::uint32_t> words;
+    };
+    std::vector<std::byte> pushConstants;
+    std::vector<BindingWords> bindingWords;
+
+    explicit ShaderRuntimeData(const ShaderRecompiler::RecompileResult& program) { Reset(program); }
+    ShaderRuntimeData() = default;
+
+    void Patch(std::span<const std::pair<std::uint32_t, std::uint32_t>> patches) {
+        for (const auto& [slot, value] : patches) {
+            const auto at = static_cast<std::size_t>(slot) * sizeof(value);
+            if (at + sizeof(value) <= pushConstants.size()) std::memcpy(pushConstants.data() + at, &value, sizeof(value));
+            for (auto& binding : bindingWords) if (slot < binding.words.size()) binding.words[slot] = value;
+        }
+    }
+
+    void Reset(const ShaderRecompiler::RecompileResult& program) {
+        pushConstants.assign(program.pushConstants.begin(), program.pushConstants.end());
+        const auto count = static_cast<std::size_t>(std::count_if(program.bindings.begin(), program.bindings.end(), [](const auto& binding) { return binding.role == ShaderRecompiler::DescriptorRole::ShaderData; }));
+        if (count == 0u) {
+            std::vector<BindingWords>{}.swap(bindingWords);
+            return;
+        }
+        bindingWords.clear();
+        bindingWords.reserve(count);
+        for (std::size_t i = 0; i < program.bindings.size(); ++i) {
+            const auto& binding = program.bindings[i];
+            if (binding.role != ShaderRecompiler::DescriptorRole::ShaderData) continue;
+            bindingWords.push_back({i, std::vector<std::uint32_t>(binding.guestDescriptor.begin(), binding.guestDescriptor.end())});
+        }
+    }
+
+    std::span<const std::uint32_t> DataWords(const ShaderRecompiler::RecompileResult& program, const ShaderRecompiler::DescriptorBinding& binding) const {
+        if (binding.role != ShaderRecompiler::DescriptorRole::ShaderData) return binding.guestDescriptor.Span();
+        const auto index = static_cast<std::size_t>(&binding - program.bindings.data());
+        for (const auto& candidate : bindingWords) if (candidate.bindingIndex == index) return candidate.words;
+        return binding.guestDescriptor.Span();
+    }
+
+};
+
 struct CompiledShader {
     ShaderRecompiler::ShaderStage stage;
     const ShaderRecompiler::RecompileResult* program;
     std::uint32_t pushConstantOffset;
     const std::vector<ShaderRecompiler::RegisteredImageView>* registeredImageViews = nullptr;
+    const ShaderRuntimeData* runtimeData = nullptr;
+
+    std::span<const std::byte> PushConstants() const {
+        return runtimeData != nullptr ? std::span<const std::byte>(runtimeData->pushConstants) : std::span<const std::byte>(program->pushConstants);
+    }
+
+    std::span<const std::uint32_t> DataWords(const ShaderRecompiler::DescriptorBinding& binding) const {
+        return runtimeData != nullptr ? runtimeData->DataWords(*program, binding) : binding.guestDescriptor.Span();
+    }
 };
 
 inline VkShaderStageFlagBits VulkanStage(ShaderRecompiler::ShaderStage stage) {
@@ -85,7 +143,7 @@ inline std::array<std::byte, PipelinePushConstantBytes> AssemblePushConstants(st
     std::array<bool, PipelinePushConstantBytes> occupied{};
     for (const auto& shader : shaders) {
         Require(shader.program != nullptr, "missing compiled shader");
-        const auto& bytes = shader.program->pushConstants;
+        const auto bytes = shader.PushConstants();
         if (bytes.empty()) continue;
         Require(bytes.size() % 4 == 0 && shader.pushConstantOffset % 4 == 0, "shader push constant range is not DWORD aligned");
         Require(shader.pushConstantOffset < PipelinePushConstantBytes && bytes.size() <= PipelinePushConstantBytes - shader.pushConstantOffset, "shader push constant range lies outside the pipeline push constant block");

@@ -6,7 +6,9 @@
 #include "VulkanTestDevice.hpp"
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -15,6 +17,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace AgcDriver {
@@ -237,15 +240,116 @@ void Run(AgcDriver::VulkanDevice& device, Context context, PipelineTrace& trace,
     std::printf("pipeline readback passed: fast draws %u, optimized draws %u, optimized creations %zu, libraries %u (%u retaining link-time optimization info)\n", optimize ? 1u : 2u, optimize ? 1u : 0u, trace.optimized.size(), trace.libraries, trace.retaining);
 }
 
+void ShaderDataScalarStorageReadback(AgcDriver::VulkanDevice& device, Context context, PipelineTrace& trace, std::uint32_t waveSize) {
+    using namespace ShaderRecompiler;
+    context.pipelineLinkTimeOptimization = false;
+    const auto target = device.Target();
+    const auto vertexBuffer = BufferDescriptor(Triangle.data(), sizeof(Triangle[0]), static_cast<std::uint32_t>(Triangle.size()));
+    const std::vector<std::uint32_t> vertexUserData(vertexBuffer.begin(), vertexBuffer.end());
+    const std::array<MemoryRegion, 1> vertexMemory{{{reinterpret_cast<std::uintptr_t>(VertexCode.data()), std::as_bytes(std::span(VertexCode))}}};
+    RecompileRequest vertex{
+        {ShaderStage::Vertex, reinterpret_cast<std::uintptr_t>(VertexCode.data()), VertexCode, 0, {}},
+        {waveSize, 0, vertexUserData, std::nullopt, std::nullopt, ShaderVertexStageInfo{}, vertexMemory},
+        target,
+        {0, 0, 0, 64}
+    };
+    vertex.useCache = false;
+    const auto vertexResult = Recompile(vertex);
+    const auto vertexPush = static_cast<std::uint32_t>(vertexResult.pushConstants.size());
+
+    alignas(256) static constexpr std::array<std::uint32_t, 5> ScalarPixelCode{
+        0xbf800000u, 0x7e000200u, 0xf800180fu, 0u, 0xbf810000u,
+    };
+    std::array<std::uint32_t, 1> pixelUserData{std::bit_cast<std::uint32_t>(0.25f)};
+    ShaderPixelStageInfo pixel{};
+    pixel.wave32 = waveSize == 32u;
+    pixel.targetOutputMode[0] = 9u;
+    pixel.targetExportMapping.fill(0xe4u);
+    const std::array<MemoryRegion, 1> pixelMemory{{{reinterpret_cast<std::uintptr_t>(ScalarPixelCode.data()), std::as_bytes(std::span(ScalarPixelCode))}}};
+    RecompileRequest fragment{
+        {ShaderStage::Fragment, reinterpret_cast<std::uintptr_t>(ScalarPixelCode.data()), ScalarPixelCode, 0, {}},
+        {waveSize, 0, pixelUserData, std::nullopt, pixel, std::nullopt, pixelMemory},
+        target,
+        PixelPushLayout(vertexPush, target)
+    };
+    fragment.layout.pushConstantSizeBytes = 0u;
+    fragment.useCache = false;
+    const auto pixelResult = Recompile(fragment);
+    Require(std::find(pixelResult.shaderDataUserWords.begin(), pixelResult.shaderDataUserWords.end(), 0u) != pixelResult.shaderDataUserWords.end(),
+            "zero-push fragment shader did not route scalar user word 0 through ShaderData");
+    Require(std::any_of(pixelResult.bindings.begin(), pixelResult.bindings.end(), [](const auto& binding) {
+                return binding.role == ShaderRecompiler::DescriptorRole::ShaderData;
+            }),
+            "zero-push fragment shader did not compile a ShaderData storage binding");
+
+    State state{};
+    state.stages = {ShaderPath::Vertex, 0u, waveSize, waveSize, std::nullopt, std::nullopt};
+    state.color = {reinterpret_cast<std::uintptr_t>(Pixels.data()), {Width, Height}, VK_FORMAT_R8G8B8A8_UNORM, Pixels.size(), 0xe4u};
+    state.colors = {state.color};
+    state.hasColorTarget = true;
+    state.renderExtent = {Width, Height};
+    state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    state.viewport = {0, static_cast<float>(Height), static_cast<float>(Width), -static_cast<float>(Height), 0, 1};
+    state.negativeOneToOne = false;
+    state.scissor = {{0, 0}, {Width, Height}};
+    state.cullMode = VK_CULL_MODE_NONE;
+    state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    state.blend.colorWriteMask = 15;
+    state.blends = {state.blend};
+    const AgcDriver::Pm4::DrawParameters draw{0, static_cast<std::uint32_t>(Triangle.size()), 0, 1, 0, false};
+
+    const auto check = [&](std::uint32_t value, unsigned expected) {
+        const std::array<std::pair<std::uint32_t, std::uint32_t>, 1> patch{{{0u, value}}};
+        ShaderRuntimeData runtime(pixelResult);
+        runtime.Patch(patch);
+        const std::array<CompiledShader, 2> shaders{{
+            {ShaderStage::Vertex, &vertexResult, 0u},
+            {ShaderStage::Fragment, &pixelResult, PixelPushOffset(vertexPush, target), nullptr, &runtime}
+        }};
+        Pixels.fill(Kept);
+        trace.drawn.clear();
+        trace.boundCommands = VK_NULL_HANDLE;
+        trace.bound = VK_NULL_HANDLE;
+        AgcDriver::Graphics::Draw(context, state, draw, shaders);
+        device.WaitIdle();
+        CheckDrawn(trace, false);
+        for (std::uint32_t pixelIndex = 0; pixelIndex < Width * Height; ++pixelIndex) {
+            const auto actual = static_cast<unsigned>(std::to_integer<std::uint8_t>(Pixels[pixelIndex * 4u]));
+            Require(actual == expected, "ShaderData scalar overlay produced red byte " + std::to_string(actual) + " at pixel " + std::to_string(pixelIndex) + ", expected " + std::to_string(expected));
+        }
+    };
+    check(std::bit_cast<std::uint32_t>(0.75f), 191u);
+    check(std::bit_cast<std::uint32_t>(0.25f), 64u);
+    check(std::bit_cast<std::uint32_t>(0.75f), 191u);
+    const std::array<CompiledShader, 2> baseShaders{{
+        {ShaderStage::Vertex, &vertexResult, 0u},
+        {ShaderStage::Fragment, &pixelResult, PixelPushOffset(vertexPush, target)}
+    }};
+    Pixels.fill(Kept);
+    trace.drawn.clear();
+    trace.boundCommands = VK_NULL_HANDLE;
+    trace.bound = VK_NULL_HANDLE;
+    AgcDriver::Graphics::Draw(context, state, draw, baseShaders);
+    device.WaitIdle();
+    CheckDrawn(trace, false);
+    for (std::uint32_t pixelIndex = 0; pixelIndex < Width * Height; ++pixelIndex) {
+        const auto actual = static_cast<unsigned>(std::to_integer<std::uint8_t>(Pixels[pixelIndex * 4u]));
+        Require(actual == 64u, "ShaderData scalar overlays changed the immutable compiled result at pixel " + std::to_string(pixelIndex));
+    }
+}
+
+
 }
 
 int main(int argc, char** argv) {
     try {
         std::string_view mode = "d32";
         bool force = false;
+        bool shaderDataStorage = false;
         for (int index = 1; index < argc; ++index) {
             const std::string_view argument = argv[index];
             if (argument == "--force-lto") force = true;
+            else if (argument == "--shader-data-storage") shaderDataStorage = true;
             else {
                 Require(argument == "color32" || argument == "color64" || argument == "d32" || argument == "d16", "unknown pipeline readback case");
                 mode = argument;
@@ -261,13 +365,15 @@ int main(int argc, char** argv) {
             return VulkanTestSkipped;
         }
         const bool masked = mode == "color32" || mode == "color64";
-        if (masked && device->Target().subgroupSize < 32u) {
+        if (!shaderDataStorage && masked && device->Target().subgroupSize < 32u) {
             std::puts("skipped, the masked pixel shader requires at least 32 subgroup lanes");
             return VulkanTestSkipped;
         }
         if (force) context.pipelineLinkTimeOptimization = true;
+        if (shaderDataStorage) context.pipelineLinkTimeOptimization = false;
         const bool optimize = context.pipelineLinkTimeOptimization && std::getenv("APS5_NO_PIPELINE_LTO") == nullptr;
-        std::printf("pipeline readback: %s, %.*s, LTO %s%s\n", device->DeviceName().c_str(), static_cast<int>(mode.size()), mode.data(), optimize ? "enabled" : "disabled", force ? " (explicit test override)" : " (production policy)");
+        const auto caseName = shaderDataStorage ? std::string_view("shader data storage") : mode;
+        std::printf("pipeline readback: %s, %.*s, LTO %s%s\n", device->DeviceName().c_str(), static_cast<int>(caseName.size()), caseName.data(), optimize ? "enabled" : "disabled", force ? " (explicit test override)" : " (production policy)");
         trace.resolve = context.deviceProc;
         trace.create = context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines");
         trace.bind = context.Function<PFN_vkCmdBindPipeline>("vkCmdBindPipeline");
@@ -279,7 +385,11 @@ int main(int argc, char** argv) {
         context.deviceProc = Resolve;
         OptimizationDrain drain{context.device};
         std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
-        Run(*device, context, trace, mode == "color32" ? 32u : 64u, masked ? VK_FORMAT_UNDEFINED : (mode == "d16" ? VK_FORMAT_D16_UNORM : VK_FORMAT_D32_SFLOAT), optimize);
+        if (shaderDataStorage) {
+            ShaderDataScalarStorageReadback(*device, context, trace, device->Target().subgroupSize);
+        } else {
+            Run(*device, context, trace, mode == "color32" ? 32u : 64u, masked ? VK_FORMAT_UNDEFINED : (mode == "d16" ? VK_FORMAT_D16_UNORM : VK_FORMAT_D32_SFLOAT), optimize);
+        }
         if (optimize) Require(AgcDriver::Graphics::PipelineLibraryWorkers() == 1, "the optimized pipeline was not built on the pipeline library worker");
         AgcDriver::Graphics::StopPipelineLibraryWorker();
         Require(AgcDriver::Graphics::PipelineLibraryWorkers() == 0, "stopping the pipeline library left its worker running");
