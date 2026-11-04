@@ -607,6 +607,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         }
         maybeReportDrawCache(profile);
     }
+    timing.Mark("draw_key_lookup");
     if (decode != nullptr && !DecodeProgramsCurrent(*decode, *submission.shaders)) {
         userPatches.clear();
         std::lock_guard cacheLock(drawCacheMutex);
@@ -616,6 +617,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         decode = nullptr;
     }
     if (dataEntry != nullptr && !DecodeProgramsCurrent(*dataEntry->decode, *submission.shaders)) dataEntry = nullptr;
+    timing.Mark("decode_validate");
     phaseTiming.Phase(DrawRowKeyLookupValidate);
 
     if (dataEntry != nullptr) {
@@ -636,6 +638,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         }
         decode = std::move(refreshed);
     }
+    timing.Mark("data_hit_refresh");
     if (decode != nullptr && !userPatches.empty() && verifyDrawRecipe()) {
         auto patched = std::make_shared<DrawDecode>(*decode);
         for (const auto& patch : userPatches) patched->programs.at(patch.program).userData.at(patch.index) = patch.value;
@@ -647,6 +650,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         TraceDrawAttemptFailure(traceToken, "decode", "exception", submission.serial, submission.queue, packetOffset, ExceptionReason(std::current_exception()));
         throw;
     }
+    timing.Mark("decode_resolve");
     const auto& graphics = decode->state;
     auto& pixel = tail.pixel;
     pixel = decode->pixel;
@@ -658,6 +662,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     const auto& programs = *tail.programs;
     tail.spatialDiagnosticOrdinal = LogDrawStateDiagnostic(queue, graphics, programs, decode->roles);
     if (drawPayloadEnabled && tail.spatialDiagnosticOrdinal != 0 && traceToken == 0) traceToken = NextDrawTraceToken().fetch_add(1, std::memory_order_relaxed) + 1;
+    timing.Mark("decode_program_setup");
     if (std::any_of(programs.begin(), programs.end(), [](const DrawProgram& program) { return SkippedShader(program.binary.codeAddress); })) return drawn();
     const bool emptyIndirectSkip = EmptyIndirectSkip();
     auto& cpuIndirectPrograms = CpuIndirectPrograms();
@@ -678,6 +683,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             }
         }
     }
+    timing.Mark("empty_indirect_check");
     const auto setMeshIndexBuffer = [&](const Pm4::DrawParameters& parameters) {
         if (!graphics.stages.mesh) return;
         auto& words = writablePrograms.front().userData;
@@ -698,6 +704,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         const auto line = FormatDrawProgramTrace(submission.serial, submission.queue, identities);
         std::fprintf(stderr, "%s\n", line.c_str());
     }
+    timing.Mark("decode_finalize");
     phaseTiming.Phase(DrawRowDecode);
 
     const auto locate = [&](std::uint32_t location) -> std::optional<std::pair<std::size_t, std::size_t>> {
@@ -721,6 +728,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         if (drain) DrawFinisher::Get().Drain();
         else DrawFinisher::NoteDrain(DrawFinisher::DrainSite::Reads, false);
     }
+    timing.Mark("indirect_sgpr_resolve");
     auto& memory = tail.memory;
     auto& linked = tail.linked;
     memory.reserve(2 * programs.size() + 32);
@@ -737,6 +745,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     vertexInfos.resize(programs.size());
     auto& decodeReads = tail.decodeReads;
     decodeReads.resize(programs.size());
+    timing.Mark("vertex_info_setup");
     const auto decodeVertexInfo = [&](std::size_t i) {
         const auto& program = programs[i];
         if (program.binary.stage == Stage::Fragment || roles[i] == Role::GeometryBack) return;
@@ -796,6 +805,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         TraceDrawAttemptException(traceToken, "lookup", submission.serial, submission.queue, packetOffset, std::current_exception());
         throw;
     }
+    timing.Mark("variant_lookup");
     for (std::size_t i = 0; i < matched.size(); ++i) {
         if (matched[i] != nullptr) stageCaptures[i].registeredViews = matched[i]->registeredViews;
         if (matched[i] == nullptr || (matched[i]->shaderDataPatches.empty() && matched[i]->descriptorPatches.empty())) continue;
@@ -843,6 +853,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                     drawHit ? 1u : 0u, matched[i] != nullptr ? 1u : 0u, static_cast<unsigned long long>(target));
         }
     }
+    timing.Mark("stage_capture_setup");
 
     if (registerKey) {
 
@@ -866,6 +877,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         }
         phaseTiming.Phase(DrawRowDecode);
     }
+    timing.Mark("stage_capture_validate");
 
     tail.submission = &submission;
     tail.submissionQueue = submission.queue;
@@ -903,6 +915,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         DrawFinisher::Get().Drain();
         if (DrawFinisher::Overlap()) DrawFinisher::NoteDrain(DrawFinisher::DrainSite::Kept, true);
     }
+    timing.Mark("finisher_prep");
     tail.queue = &queue;
     tail.packet = packet;
     tail.rejected = &rejected;
@@ -1247,12 +1260,15 @@ DrawVerdict Driver::finishDraw(const std::shared_ptr<DrawTail>& tailHolder, Perf
         return lastData[shapeKey % lastData.size()].exchange(data, std::memory_order_relaxed) == data;
     };
     const bool shapeNeedsEntry = shapeRefresh && registerKey && shapeKey != 0 && drawDataHits() && !drawParameters.indirect && dataEntry != nullptr && dataStagesCompiled != 0 && refreshSeenTwice();
+    timing.Mark("recipe_gate");
+    timing.Mark("pre_cache_draw_stages");
     cacheDrawStages(stageEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, stageData, fresh, drawKey, registerKey, decode, phaseTiming, reused, entry, shapeKey, shapeNeedsEntry);
     timing.Mark("shader_compile_and_link");
 
     for (const auto& reads : decodeReads) {
         for (const auto& read : reads) memory.push_back({read.address, read.Bytes()});
     }
+    timing.Mark("resource_capture");
 
     if (tail.queue != nullptr && pipelined && !deferredLabels().labels.empty()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Labels);
     if (recordQueuedLabelsAfterCapture(submission.queue, memory)) return draw(*tail.queue, packet, submission, packetOffset, rejected);
@@ -1286,6 +1302,7 @@ DrawVerdict Driver::finishDraw(const std::shared_ptr<DrawTail>& tailHolder, Perf
         }
     };
     if (graphics.rectList) buildRectList();
+    timing.Mark("draw_recipe_setup");
     if (graphics.stages.tessellationGeometry) {
         static std::mutex captureMutex;
         static std::map<std::pair<std::uint32_t, std::uint32_t>, ShaderRecompiler::RecompileResult> captureShaders;
@@ -1360,6 +1377,7 @@ DrawVerdict Driver::finishDraw(const std::shared_ptr<DrawTail>& tailHolder, Perf
     const bool indirectGpuCandidate = drawParameters.indirect.has_value() && !indirectCpu.has_value();
     snapshot();
     if (tail.trace.payloadOrdinal != 0 && !drawParameters.indirect) CaptureSelectedDrawRequests(programs, stageCaptures, matched, memory, linked, tail.trace, 0);
+    timing.Mark("device_setup_prepare");
     timing.Mark("post_compile_prepare");
     const auto lockForDraw = [&] {
         require(tail.queue != nullptr, "the draw finisher reached a draw it cannot commit through the pipeline");
