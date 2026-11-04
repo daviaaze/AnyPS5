@@ -1063,7 +1063,7 @@ void copiedWriteBackTests(const Device& device, Recorder& recorder) {
     binding.descriptorSet = 0;
     binding.binding = 0;
     binding.count = 1;
-    binding.guestDescriptor = {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u) & 0xffffu, 1024, 0x31000000u};
+    setDescriptor(binding, {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u) & 0xffffu, 1024, 0x31000000u});
     binding.bufferWritten = {true};
     program.bindings.push_back(binding);
     const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
@@ -1773,27 +1773,6 @@ void afterRecordedWorkTests(const Device& device, Recorder& recorder) {
     Require(ran == std::vector<int>{1, 2, 3} && Recorder::PendingCompletionLabels() == 0 && recorder.Idle(), "actions behind recorded work did not run once each, in order");
     Require(seen == 1, "an action ran before the completion label recorded ahead of it");
 }
-void completionWaitTests(const Device& device, Recorder& recorder) {
-    alignas(64) static std::uint32_t memory[16];
-    const auto base = reinterpret_cast<std::uint64_t>(memory);
-    recorder.Sync();
-    const std::array<std::byte, 4> gpuValue{std::byte{5}, std::byte{0}, std::byte{0}, std::byte{0}};
-    auto ran = std::make_shared<bool>(false);
-    recorder.NotePendingWrite(base, sizeof(memory));
-    recorder.AfterCompletions(base, gpuValue, 7, 0, true);
-    Require(recorder.AfterRecordedWork([ran] { *ran = true; }) && Recorder::PendingCompletionLabels() != 0, "completion wait: the action behind the open batch is not pending");
-    CompletePendingCpuWrites(device.GetContext(), base, sizeof(memory));
-    Require(!*ran && !recorder.Idle(), "completion wait: a GPU-stored label forced a CPU wait");
-    recorder.Sync();
-    Require(*ran && recorder.Idle(), "completion wait: the action did not run at sync");
-    const std::array<std::byte, 4> cpuValue{std::byte{9}, std::byte{0}, std::byte{0}, std::byte{0}};
-    recorder.NotePendingWrite(base, sizeof(memory));
-    recorder.AfterCompletions(base + 4u, cpuValue, 8, 0, false);
-    CompletePendingCpuWrites(device.GetContext(), base, sizeof(memory));
-    Require(memory[1] == 9u && Recorder::PendingCompletionLabels() == 0, "completion wait: CPU completion bytes were not published");
-}
-
-
 void completionWaitTests(const Device& device, Recorder& recorder) {
     alignas(64) static std::uint32_t memory[16];
     const auto base = reinterpret_cast<std::uint64_t>(memory);
@@ -4297,9 +4276,8 @@ bool bdaStagingTests(const Device& device, Recorder& recorder) {
         std::size_t wrong = 0;
         for (std::size_t index = 0; index < bytes / 4u; ++index) {
             const auto at = index >= first ? index - first : bytes;
-            const auto expected = at == 8 ? 0x33333333u : at == 656 / 4 ? 0x55555555u :
+            auto expected = at == 8 ? 0x33333333u : at == 656 / 4 ? 0x55555555u :
                 (at >= 64 && at < 80 ? 0x22222222u : 0x11111111u);
-            auto expected = at >= 64 && at < 80 ? 0x22222222u : 0x11111111u;
             if (at == 70 && changedCopy) expected = 0x22222233u;
             if (at == 100 && changedCopy) expected = 0x44444444u;
             if (words[index] != expected && wrong++ < 8) std::cout << "address-based staging copy-back dword " << index << " holds 0x" << std::hex << words[index] << ", expected 0x" << expected << std::dec << "\n";
@@ -7548,6 +7526,89 @@ bool storageHoleCopyBarrierTests(const Device& device, Recorder& previous) {
     GuestTextureResource resource{};
     resource.width = 1000;
     resource.height = 700;
+    resource.mipCount = 1;
+    resource.tileMode = TextureTileMode::kR64KBX;
+    resource.dimension = TextureDimension::k2D;
+    resource.format = 56;
+    resource.dstSelX = 4;
+    resource.dstSelY = 5;
+    resource.dstSelZ = 6;
+    resource.dstSelW = 7;
+    const auto geometry = DescribeSurface(resource);
+    const auto surfaceBytes = static_cast<std::size_t>(geometry.guestBytes);
+    const auto bytes = (surfaceBytes + 65535) / 65536 * 65536 + 65536;
+    struct Release {
+        const Context& context;
+        void* block = nullptr;
+        std::uint64_t address = 0;
+        std::size_t bytes;
+        std::int64_t physical = -1;
+        ~Release() {
+#ifdef __linux__
+            if (block != nullptr) sceKernelMunmap(reinterpret_cast<std::uint64_t>(block), bytes);
+            if (physical >= 0) sceKernelReleaseDirectMemory(physical, bytes);
+#else
+            if (block == nullptr) return;
+            GuestAllocations::Mutation().Remove(block);
+            HostImportFor(context, address, bytes);
+            ReleaseWatched(block, bytes);
+#endif
+        }
+    } release{base, nullptr, 0, bytes};
+#ifdef __linux__
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, bytes, 65536, 0, &release.physical) == 0, "cannot allocate hole-copy direct memory");
+    Require(sceKernelMapDirectMemory(&release.block, bytes, 0x33, 0, release.physical, 65536) == 0, "cannot map hole-copy direct memory for the GPU");
+#else
+    release.block = AllocateWatched(bytes, 65536);
+    if (release.block == nullptr) return false;
+    GuestAllocations::Mutation().Add(release.block, bytes, true, true, true);
+#endif
+    void* block = release.block;
+    auto* memory = static_cast<std::uint8_t*>(block);
+    for (std::size_t i = 0; i < bytes; ++i) memory[i] = static_cast<std::uint8_t>(i * 131u + 7u);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    release.address = address;
+    const auto* import = HostImportFor(base, address, bytes);
+    if (import == nullptr || !AgcDriver::GuestMemory::Watched(address, bytes)) return false;
+    auto destination = ShadowDestinationFor(base, *import, address, address + surfaceBytes);
+    Require(destination.has_value() && destination->seedUnits.empty() && SlabBoundary(*import, address) >= address + surfaceBytes, "storage hole-copy test did not allocate an unseeded slab");
+    auto context = base;
+    StorageReadyProbe probe(context);
+    TextureDetiler detiler(context);
+    context.detiler = &detiler;
+    resource.baseAddress = address;
+    bool retiled = false;
+    std::weak_ptr<StorageTexture> lifetime;
+    {
+        Recorder recorder(context);
+        recorder.Activate();
+        auto image = StorageTexture::Create(context, detiler, resource, 0);
+        lifetime = image;
+        const auto commands = recorder.Commands();
+        recorder.Keep(image);
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, resource.mipCount, 0, 1};
+        const VkClearColorValue value{{1.0f, 0.0f, 0.0f, 1.0f}};
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image->Image(), VK_IMAGE_LAYOUT_GENERAL, &value, 1, &range);
+        image->MarkDirty();
+        constexpr VkAccessFlags covered = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, covered | VK_ACCESS_HOST_WRITE_BIT, covered);
+        recorder.MarkCovered(covered);
+        const auto before = StorageTexture::SlabRetiles();
+        probe.Begin(import->buffer, destination->buffer);
+        image->WriteBack();
+        probe.End();
+        recorder.Sync();
+        retiled = StorageTexture::SlabRetiles() > before;
+    }
+    previous.Activate();
+    Require(lifetime.expired(), "storage hole-copy test image outlived its recorder");
+    Require(retiled, "storage hole-copy test did not retile into a slab");
+    Require(probe.Copies() != 0 && probe.Dispatches() != 0, "storage hole-copy test did not record import-to-slab hole copies followed by a retile dispatch");
+    std::cout << "storage hole-copy barrier: " << probe.Copies() << " hole copies, " << probe.Dispatches() << " retile dispatches, " << probe.ReadyBarriers() << " ready barriers, " << probe.UnorderedDispatches() << " unordered dispatches" << std::endl;
+    Require(probe.ReadyBarriers() != 0 && probe.UnorderedDispatches() == 0, "storage retile reads slab hole copies without a following ready barrier");
+    return true;
+}
 #ifdef _WIN32
 bool FailPendingCollect(std::uintptr_t, std::size_t, void (*)(void*, std::uintptr_t, std::uintptr_t), void*) {
     return false;
@@ -8310,81 +8371,6 @@ bool unwatchHookLockOrderTests(const Device& device, Recorder& recorder) {
     resource.dstSelY = 5;
     resource.dstSelZ = 6;
     resource.dstSelW = 7;
-    const auto geometry = DescribeSurface(resource);
-    const auto surfaceBytes = static_cast<std::size_t>(geometry.guestBytes);
-    const auto bytes = (surfaceBytes + 65535) / 65536 * 65536 + 65536;
-    struct Release {
-        const Context& context;
-        void* block = nullptr;
-        std::uint64_t address = 0;
-        std::size_t bytes;
-        std::int64_t physical = -1;
-        ~Release() {
-#ifdef __linux__
-            if (block != nullptr) sceKernelMunmap(reinterpret_cast<std::uint64_t>(block), bytes);
-            if (physical >= 0) sceKernelReleaseDirectMemory(physical, bytes);
-#else
-            if (block == nullptr) return;
-            GuestAllocations::Mutation().Remove(block);
-            HostImportFor(context, address, bytes);
-            ReleaseWatched(block, bytes);
-#endif
-        }
-    } release{base, nullptr, 0, bytes};
-#ifdef __linux__
-    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, bytes, 65536, 0, &release.physical) == 0, "cannot allocate hole-copy direct memory");
-    Require(sceKernelMapDirectMemory(&release.block, bytes, 0x33, 0, release.physical, 65536) == 0, "cannot map hole-copy direct memory for the GPU");
-#else
-    release.block = AllocateWatched(bytes, 65536);
-    if (release.block == nullptr) return false;
-    GuestAllocations::Mutation().Add(release.block, bytes, true, true, true);
-#endif
-    void* block = release.block;
-    auto* memory = static_cast<std::uint8_t*>(block);
-    for (std::size_t i = 0; i < bytes; ++i) memory[i] = static_cast<std::uint8_t>(i * 131u + 7u);
-    const auto address = reinterpret_cast<std::uint64_t>(block);
-    release.address = address;
-    const auto* import = HostImportFor(base, address, bytes);
-    if (import == nullptr || !AgcDriver::GuestMemory::Watched(address, bytes)) return false;
-    auto destination = ShadowDestinationFor(base, *import, address, address + surfaceBytes);
-    Require(destination.has_value() && destination->seedUnits.empty() && SlabBoundary(*import, address) >= address + surfaceBytes, "storage hole-copy test did not allocate an unseeded slab");
-    auto context = base;
-    StorageReadyProbe probe(context);
-    TextureDetiler detiler(context);
-    context.detiler = &detiler;
-    resource.baseAddress = address;
-    bool retiled = false;
-    std::weak_ptr<StorageTexture> lifetime;
-    {
-        Recorder recorder(context);
-        recorder.Activate();
-        auto image = StorageTexture::Create(context, detiler, resource, 0);
-        lifetime = image;
-        const auto commands = recorder.Commands();
-        recorder.Keep(image);
-        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, resource.mipCount, 0, 1};
-        const VkClearColorValue value{{1.0f, 0.0f, 0.0f, 1.0f}};
-        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
-        context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image->Image(), VK_IMAGE_LAYOUT_GENERAL, &value, 1, &range);
-        image->MarkDirty();
-        constexpr VkAccessFlags covered = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
-        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, covered | VK_ACCESS_HOST_WRITE_BIT, covered);
-        recorder.MarkCovered(covered);
-        const auto before = StorageTexture::SlabRetiles();
-        probe.Begin(import->buffer, destination->buffer);
-        image->WriteBack();
-        probe.End();
-        recorder.Sync();
-        retiled = StorageTexture::SlabRetiles() > before;
-    }
-    previous.Activate();
-    Require(lifetime.expired(), "storage hole-copy test image outlived its recorder");
-    Require(retiled, "storage hole-copy test did not retile into a slab");
-    Require(probe.Copies() != 0 && probe.Dispatches() != 0, "storage hole-copy test did not record import-to-slab hole copies followed by a retile dispatch");
-    std::cout << "storage hole-copy barrier: " << probe.Copies() << " hole copies, " << probe.Dispatches() << " retile dispatches, " << probe.ReadyBarriers() << " ready barriers, " << probe.UnorderedDispatches() << " unordered dispatches" << std::endl;
-    Require(probe.ReadyBarriers() != 0 && probe.UnorderedDispatches() == 0, "storage retile reads slab hole copies without a following ready barrier");
-    return true;
-}
 
 
     Require(DescribeSurface(resource).guestBytes == surfaceBytes, "(l) unexpected surface size");
@@ -14500,7 +14486,6 @@ void Run(Context context) {
 }
 #endif
 
-namespace {
 void rawCaptureWindowTests() {
     using AgcDriver::PerformanceTrace;
     struct TraceFixture {
@@ -14793,6 +14778,7 @@ void smallElementDetileTests(Device& device) {
     }
     std::cout << "small element detile tests passed\n";
 }
+
 
 int main(int argc, char** argv) {
     _ZSt13set_terminatePFvvE_nid_postfix([] {
