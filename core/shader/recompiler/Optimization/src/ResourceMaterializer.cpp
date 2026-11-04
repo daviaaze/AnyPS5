@@ -3123,18 +3123,15 @@ void ResourceMaterializer::Materialize(const IrResourcePlan& program, const SrtR
                 TableSnapshotter(plan, runtime, walker, activeSources, nextSnapshot.tables).Run();
                 const auto afterTables = runtime.descriptorScope != nullptr ? runtime.descriptorScope(runtime.userContext, 0u) : 0u;
                 const auto afterImageGeneration = runtime.imageViewGeneration != nullptr ? runtime.imageViewGeneration(runtime.userContext) : 0u;
-                // Normalizer calls record an identity even for absence or failed normalization.
-                // Without such a query, unrelated allocation churn is not a snapshot dependency.
-                const bool consultedRegisteredView = !nextSnapshot.registeredImages.empty() ||
-                    std::ranges::any_of(nextSnapshot.tables.tables, [](const auto& table) {
-                        return std::ranges::any_of(table.resourceViews, [](const auto& view) { return !view.identities.empty(); });
-                    });
-                if ((runtime.descriptorScope != nullptr && (afterTables != afterSnapshot || (plan.uniformFill.fill.kind != UniformFillKind::None && afterSnapshot != beforeSnapshot))) || (consultedRegisteredView && afterImageGeneration != beforeImageGeneration)) {
+                if (runtime.descriptorScope != nullptr && (afterTables != afterSnapshot || (plan.uniformFill.fill.kind != UniformFillKind::None && afterSnapshot != beforeSnapshot))) {
                     continue;
                 }
                 for (const auto& table : nextSnapshot.tables.tables) {
                     for (const auto& view : table.resourceViews) nextSnapshot.registeredImages.insert(nextSnapshot.registeredImages.end(), view.identities.begin(), view.identities.end());
                 }
+                // Allocation churn alone does not invalidate a selected view. The runtime
+                // re-proves every collected identity (including absence) and descriptor
+                // page backing before accepting a snapshot across a generation change.
                 if (afterImageGeneration != beforeImageGeneration && (runtime.snapshotCurrent == nullptr || !runtime.snapshotCurrent(runtime.userContext, nextSnapshot.registeredImages))) {
                     continue;
                 }

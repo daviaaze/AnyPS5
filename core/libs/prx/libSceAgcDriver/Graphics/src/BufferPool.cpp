@@ -279,7 +279,7 @@ void BufferPool::PutImageMemory(VkDeviceMemory memory, VkDeviceSize bytes, std::
             }
             // Images have a budget of their own under size classes (not the staging tier's bytes).
             while (deviceTier.slots != 0 && ((!ImageSizeClasses() && deviceTier.retainedBytes + bytes > deviceTier.budget) || deviceTier.slots >= maxSlots)) evictOldest(deviceTier, evicted);
-            const SlotKey imageKey{allocation.bytes, 0, allocation.properties, memoryType};
+            const SlotKey imageKey{allocation.bytes, 0, allocation.properties, allocation.memoryType};
             auto& slots = deviceTier.free[imageKey];
             slots.push_back({allocation, ++clock, presentEpoch->load(std::memory_order_relaxed), {}});
             try {
@@ -841,7 +841,9 @@ while (tier.slots != 0 && (exceedsBudget() || tier.slots >= maxSlots)) {
             if (exceedsBudget()) {
                 evicted.push_back(allocation);
             } else {
-                tier.free[{allocation.bytes, allocation.usage, allocation.properties, allocation.memoryType, allocation.hostPlaced}].push_back({allocation, ++clock, presentEpoch->load(std::memory_order_relaxed), {}});
+                // Buffer lookup is keyed by requested properties, not the selected Vulkan
+                // type; the actual type remains in the allocation for binding checks.
+                tier.free[{allocation.bytes, allocation.usage, allocation.properties, 0, allocation.hostPlaced}].push_back({allocation, ++clock, presentEpoch->load(std::memory_order_relaxed), {}});
                 ++tier.slots;
                 tier.retainedBytes += retainedCharge(allocation);
                 if (allocation.slab) MemoryAccounting::RetainPart(device, allocation.memory, allocation.allocationBytes, true);

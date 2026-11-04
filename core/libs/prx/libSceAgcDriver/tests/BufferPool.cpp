@@ -71,7 +71,6 @@ struct MockDevice {
     VkDeviceSize requirementAlignment = 256;
     std::uint32_t requirementTypes = 3;
     std::map<VkBuffer, VkMemoryRequirements> requirements;
-    std::uint32_t typeBits = 3;
 };
 
 MockDevice mock;
@@ -87,7 +86,6 @@ VKAPI_ATTR VkResult VKAPI_CALL mockCreateBuffer(VkDevice, const VkBufferCreateIn
 VKAPI_ATTR void VKAPI_CALL mockGetBufferMemoryRequirements(VkDevice, VkBuffer buffer, VkMemoryRequirements* requirements) {
     *requirements = {mock.sizes.at(buffer) + mock.requirementExtra, mock.requirementAlignment, mock.requirementTypes};
     mock.requirements[buffer] = *requirements;
-    *requirements = {mock.sizes.at(buffer), 256, mock.typeBits};
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL mockAllocateMemory(VkDevice, const VkMemoryAllocateInfo* info, const VkAllocationCallbacks*, VkDeviceMemory* memory) {
@@ -394,7 +392,7 @@ void StagingHeadroom() {
         constexpr auto usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
         reportedBudget = 2048 * MiB;
         reportedSecondBudget = 2048 * MiB;
-        mock.typeBits = 6;
+        mock.requirementTypes = 6;
         const auto make = [&](const char* what, VkDeviceSize firstUsage, VkDeviceSize secondUsage, std::size_t bytes, bool expected) {
             reportedUsage = firstUsage;
             reportedSecondUsage = secondUsage;
