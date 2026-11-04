@@ -174,7 +174,7 @@ int main() {
         }};
         for (const auto topology : {VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP}) Run(*device, topology, guestShaders, true, "guest P0");
         auto exporting = vertex;
-        exporting.parameterExports = {0};
+        exporting.parameterExports = ShaderRecompiler::SharedValues<std::uint32_t>(std::vector<std::uint32_t>{0});
         RunRectangle(*device, exporting, guestPixel);
         std::puts("provoking vertex rendering tests passed: GLSL and guest P0, triangle list and strip, guest P0 rect list, first/last/first");
         return 0;

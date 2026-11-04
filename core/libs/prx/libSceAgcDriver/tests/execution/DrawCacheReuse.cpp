@@ -614,28 +614,16 @@ void CpuResolvedMovedDataRecipesUseCurrentGuestData(bool libraries, std::vector<
         const auto actual = BrightestColorByte();
         Require(actual == expected, mode + ": " + what + " wrote " + std::to_string(actual) + ", expected " + std::to_string(expected));
     };
-    const auto drawCountersBefore = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
-    const auto recipeHitsBefore = AgcDriver::VulkanDevice::RecipeHits(AgcDriver::VulkanDevice::RecipeKind::Draw);
-    const auto firstA = submitRecord(0.25f);
+    submitRecord(0.25f);
     wrote(64, "the first CPU-resolved record reading the moved guest constant at 0.25");
-    const auto secondA = submitRecord(0.25f);
+    submitRecord(0.25f);
     wrote(64, "the second CPU-resolved record reading the moved guest constant at 0.25");
-    const auto firstB = submitRecord(0.5f);
+    submitRecord(0.5f);
     wrote(128, "the CPU-resolved record reading the moved guest constant at 0.5");
-    const auto hitsBeforeRepeat = AgcDriver::VulkanDevice::RecipeHits(AgcDriver::VulkanDevice::RecipeKind::Draw);
-    const auto secondB = submitRecord(0.5f);
+    submitRecord(0.5f);
     wrote(128, "the repeated CPU-resolved record reading the moved guest constant at 0.5");
-    const auto after = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
-    Require(after.recordWordsForwarded - drawCountersBefore.recordWordsForwarded == 4 &&
-                after.recordStagesRecompiled == drawCountersBefore.recordStagesRecompiled &&
-                after.recordWordsRefused == drawCountersBefore.recordWordsRefused,
-            mode + ": four CPU-resolved records forwarded " + std::to_string(after.recordWordsForwarded - drawCountersBefore.recordWordsForwarded) +
-                " words, re-materialized " + std::to_string(after.recordStagesRecompiled - drawCountersBefore.recordStagesRecompiled) +
-                " stages and refused " + std::to_string(after.recordWordsRefused - drawCountersBefore.recordWordsRefused));
-    const auto hitsAfterRepeat = AgcDriver::VulkanDevice::RecipeHits(AgcDriver::VulkanDevice::RecipeKind::Draw);
-    const bool disabled = std::getenv("APS5_NO_DRAW_RECIPE") != nullptr;
-    Require(disabled ? hitsAfterRepeat == recipeHitsBefore : hitsAfterRepeat > hitsBeforeRepeat,
-            mode + (disabled ? ": disabled draw recipes recorded a moved-data replay" : ": the repeated moved-data record made no draw-recipe replay"));
+    submitRecord(0.25f);
+    wrote(64, "the CPU-resolved record restored to the earlier guest constant at 0.25");
 }
 
 

@@ -152,8 +152,8 @@ int Run(AgcDriver::VulkanDevice& device, std::uint32_t maximumVersion) {
     static_cast<void>(ShaderRecompiler::ValidateAndOptimizeSpirv(vertex.spirv, target.vulkanVersion, target.spirvVersion, target.nonConstantImageOffsets, false));
     static_cast<void>(ShaderRecompiler::ValidateAndOptimizeSpirv(fragment.spirv, target.vulkanVersion, target.spirvVersion, target.nonConstantImageOffsets, false));
 #endif
-    vertex.parameterExports = {0u};
-    fragment.fragmentParameters = {{0u, 0u, false, false}};
+    vertex.parameterExports = ShaderRecompiler::SharedValues<std::uint32_t>(std::vector<std::uint32_t>{0u});
+    fragment.fragmentParameters = ShaderRecompiler::SharedValues<ShaderRecompiler::FragmentParameter>(std::vector<ShaderRecompiler::FragmentParameter>{{0u, 0u, false, false}});
     const auto rectangle = ShaderRecompiler::BuildRectListShaders(vertex, fragment, target);
     const std::array<AgcDriver::Graphics::CompiledShader, 4> shaders{{
         {ShaderStage::Vertex, &vertex, 0u},

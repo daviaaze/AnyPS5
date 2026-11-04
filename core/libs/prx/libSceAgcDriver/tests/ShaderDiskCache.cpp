@@ -278,12 +278,14 @@ RecompileResult sampleResult() {
     result.hostSubgroupSize = 32;
     result.fullSubgroups = true;
     result.workgroupMemoryDwords = 32769u;
-    result.vertexInputs = {{1, 4, 2}, {5, 2, 0}};
-    result.vertexInputPatches = {{1, 20, {7, 8, 9}}, {5, 40, {10, 11, 12}}};
+    result.vertexInputs = SharedValues<VertexInput>(std::vector<VertexInput>{{1, 4, 2}, {5, 2, 0}});
+    result.vertexInputPatches = SharedValues<VertexInputPatch>(std::vector<VertexInputPatch>{{1, 20, {7, 8, 9}}, {5, 40, {10, 11, 12}}});
     result.registrationModule = true;
     result.specialization = {{512, 4}, {516, 0x3f800000u}, {517, 0}};
     result.vertexAttributes = {{1, 4, {{0x1000u, 0x20000u, 0x30u, 0x4u}}, 2}, {5, 2, {{9u, 8u, 7u, 6u}}, 0}};
-    result.vertexInputs[0].outputMask = 5u;
+    auto vertexInputs = result.vertexInputs.Copy();
+    vertexInputs[0].outputMask = 5u;
+    result.vertexInputs = SharedValues<VertexInput>(std::move(vertexInputs));
     result.vertexAttributes[0].formatComponents = 3u;
     result.vertexOffsetSgpr = 12;
     result.instanceOffsetSgpr = -1;
@@ -291,9 +293,9 @@ RecompileResult sampleResult() {
     result.instanceOffsetShared = false;
     result.vertexOffsetConflict = false;
     result.instanceOffsetConflict = true;
-    result.parameterExports = {0, 3, 7};
-    result.fragmentParameters = {{0, 1, true, false, true, true, false, true}, {2, 3, false, true, false, false, true, false}};
-    result.stencilReferences = {0u, 17u, 255u};
+    result.parameterExports = SharedValues<std::uint32_t>(std::vector<std::uint32_t>{0, 3, 7});
+    result.fragmentParameters = SharedValues<FragmentParameter>(std::vector<FragmentParameter>{{0, 1, true, false, true, true, false, true}, {2, 3, false, true, false, false, true, false}});
+    result.stencilReferences = SharedValues<std::uint32_t>(std::vector<std::uint32_t>{0u, 17u, 255u});
     result.stencilReplaySafe = true;
     result.bdaWrites = true;
     result.layerReplaySafe = true;
@@ -801,7 +803,9 @@ void verifyArtifactStorageIsolation() {
     result.vertexAttributes[0].resource.fields[0] ^= 0x10000u;
     variant.artifact = result;
     require(ShaderDiskCache::EncodeEntry(key, variant) == before, "invocation data changed the stored artifact");
-    result.vertexInputs[0].components = 2;
+    auto vertexInputs = result.vertexInputs.Copy();
+    vertexInputs[0].components = 2;
+    result.vertexInputs = SharedValues<VertexInput>(std::move(vertexInputs));
     variant.artifact = result;
     require(ShaderDiskCache::EncodeEntry(key, variant) != before, "the stored artifact ignores vertex input metadata");
 }
@@ -1568,7 +1572,7 @@ void verifyBindingPlanSelection() {
 
 void verifyVertexTypeSpecialization() {
     CompiledShaderArtifact artifact;
-    artifact.vertexInputs = {{0, 4, 0, 1}, {1, 4, 0, 1}};
+    artifact.vertexInputs = SharedValues<VertexInput>(std::vector<VertexInput>{{0, 4, 0, 1}, {1, 4, 0, 1}});
     artifact.spirv = std::vector<std::uint32_t>{
         spv::MagicNumber, 0x00010000u, 0, 28, 0,
         (2u << 16u) | spv::OpCapability, spv::CapabilityShader,
@@ -1626,7 +1630,9 @@ void verifyVertexTypeSpecialization() {
         }
     }
     auto invalid = artifact;
-    invalid.vertexInputPatches.front().word = static_cast<std::uint32_t>(original.size());
+    auto invalidPatches = invalid.vertexInputPatches.Copy();
+    invalidPatches.front().word = static_cast<std::uint32_t>(original.size());
+    invalid.vertexInputPatches = SharedValues<VertexInputPatch>(std::move(invalidPatches));
     bool rejected = false;
     try { static_cast<void>(SpecializeVertexInputTypes(invalid, std::array{0u, 0u})); }
     catch (const std::runtime_error&) { rejected = true; }

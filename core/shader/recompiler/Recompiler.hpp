@@ -766,19 +766,19 @@ struct VertexInputPatch {
 };
 
 struct CompiledShaderArtifact {
-    std::vector<VertexInputPatch> vertexInputPatches;
+    SharedValues<VertexInputPatch> vertexInputPatches;
     SharedSpirv spirv;
     std::uint32_t memoryOffsetDword = 0;
     std::uint32_t shaderDataDwords = 0;
     std::uint32_t imageMetadataDword = 0;
     std::uint32_t runtimeImageCount = 0;
-    std::vector<std::uint32_t> runtimeImageResources;
+    SharedValues<std::uint32_t> runtimeImageResources;
     bool registrationModule = false;
     std::uint32_t bdaAbiVersion = 0;
     std::uint32_t windowLaneGuards = 0;
     std::uint32_t descriptorFaults = 0;
     std::uint32_t runtimeAbiVersion = RuntimeAbi::Version;
-    std::vector<VertexInput> vertexInputs;
+    SharedValues<VertexInput> vertexInputs;
     std::int32_t vertexOffsetSgpr = -1;
     std::int32_t instanceOffsetSgpr = -1;
     bool vertexOffsetShared = false;
@@ -790,11 +790,11 @@ struct CompiledShaderArtifact {
     bool functionLdsBuffer = false;
     bool meshWindowBuffer = false;
     std::uint32_t scratchPoolSlotDwords = 0;
-    std::vector<std::uint32_t> parameterExports;
-    std::vector<FragmentParameter> fragmentParameters;
+    SharedValues<std::uint32_t> parameterExports;
+    SharedValues<FragmentParameter> fragmentParameters;
     BarycentricEmulation barycentricEmulation;
     std::optional<MeshBarycentricLayout> meshBarycentrics;
-    std::vector<std::uint32_t> stencilReferences;
+    SharedValues<std::uint32_t> stencilReferences;
     bool stencilReplaySafe = false;
     bool bdaWrites = false;
     bool layerReplaySafe = false;

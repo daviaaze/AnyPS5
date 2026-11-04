@@ -3525,7 +3525,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     for (const auto& shader : shaders) {
         if (shader.program != nullptr && !shader.program->stencilReferences.empty()) {
             Require(shader.stage == ShaderRecompiler::ShaderStage::Fragment && stencilReferences.empty(), "stencil replay requires exactly one fragment stage");
-            stencilReferences = shader.program->stencilReferences;
+            stencilReferences = shader.program->stencilReferences.Copy();
         }
     }
     if (!stencilReferences.empty()) {

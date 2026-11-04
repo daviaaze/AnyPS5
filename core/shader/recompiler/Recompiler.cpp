@@ -715,6 +715,7 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
 
     constexpr SpirvEmitter spirvEmitter;
     CompiledShaderArtifact result;
+    std::vector<std::uint32_t> stencilReferences;
     result.variantId = nextVariantId();
     SpirvEmitInfo emitted;
     try {
@@ -737,15 +738,17 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
     result.stencilReplaySafe = (request.shader.stage == ShaderStage::Vertex || stencilReplay) && StencilReplaySafe(program);
     result.bdaWrites = program.Info().bdaWrites;
     if (stencilReplay) {
-        result.stencilReferences = StencilReferenceValues(program, request.context.pixel.has_value() && request.context.pixel->stencilOperationValueExport ? 8u : 0u);
+        stencilReferences = StencilReferenceValues(program, request.context.pixel.has_value() && request.context.pixel->stencilOperationValueExport ? 8u : 0u);
         result.stencilReferenceDword = bindings.layout.stencilReferenceDword;
     }
+    result.stencilReferences = SharedValues<std::uint32_t>(std::move(stencilReferences));
 
     result.bdaAbiVersion = program.Info().usesDma || program.Info().usesFaultBuffer ? request.target.bdaAbiVersion : 0u;
     result.windowLaneGuards = 0;
     for (const auto& block : program.Blocks()) result.windowLaneGuards += static_cast<std::uint32_t>(std::ranges::count_if(block->Instructions(), [](const IrValue* value) { return value->Opcode() == IrOpcode::WindowLaneGuard; }));
     result.descriptorFaults = 0;
-    for (const auto& block : program.Blocks()) result.descriptorFaults += static_cast<std::uint32_t>(std::ranges::count_if(block->Instructions(), [](const IrValue* value) { return value->Opcode() == IrOpcode::DescriptorFault; }));    result.memoryOffsetDword = bindings.layout.memoryOffsetDword;
+    for (const auto& block : program.Blocks()) result.descriptorFaults += static_cast<std::uint32_t>(std::ranges::count_if(block->Instructions(), [](const IrValue* value) { return value->Opcode() == IrOpcode::DescriptorFault; }));
+    result.memoryOffsetDword = bindings.layout.memoryOffsetDword;
     result.shaderDataDwords = bindings.layout.ShaderDataDwords();
     result.imageMetadataDword = bindings.layout.ImageMetadataDword();
     result.runtimeImageCount = bindings.layout.runtimeImageCount;
@@ -760,29 +763,33 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
     result.instanceOffsetShared = program.Info().instanceOffsetShared;
     result.vertexOffsetConflict = program.Info().vertexOffsetConflict;
     result.instanceOffsetConflict = program.Info().instanceOffsetConflict;
+    std::vector<std::uint32_t> parameterExports;
     for (const auto& output : program.Info().outputs) {
-        if (output.kind == StageOutputKind::Parameter) result.parameterExports.push_back(output.location);
+        if (output.kind == StageOutputKind::Parameter) parameterExports.push_back(output.location);
     }
+    result.parameterExports = SharedValues<std::uint32_t>(std::move(parameterExports));
     if (request.shader.stage == ShaderStage::Fragment) {
-        result.fragmentParameters = DescribeFragmentParameters(program, inputInfo);
+        result.fragmentParameters = SharedValues<FragmentParameter>(DescribeFragmentParameters(program, inputInfo));
         const auto& inputs = program.Info().inputs;
         const auto reads = [&](StageInputKind kind) { return std::any_of(inputs.begin(), inputs.end(), [&](const auto& input) { return input.kind == kind; }); };
         if (program.Metadata().barycentricEmulation) result.barycentricEmulation = {true, reads(StageInputKind::BaryCoordSmooth), reads(StageInputKind::BaryCoordNoPerspective), program.Info().smoothOffsetBarycentrics};
     }
     if (request.shader.stage == ShaderStage::Vertex || request.shader.stage == ShaderStage::Local) {
+        std::vector<VertexInput> vertexInputs;
         if (inputInfo.vertex == nullptr) throw std::runtime_error("vertex input metadata is missing");
         for (const auto& input : program.Info().inputs) {
             if (input.kind != StageInputKind::Parameter) continue;
             if (input.location >= static_cast<std::uint32_t>(inputInfo.vertex->resourcesNum)) throw std::runtime_error("vertex attribute location exceeds resource count");
-            result.vertexInputs.push_back({input.location, input.componentCount, inputInfo.vertex->resourcesDst[input.location].fetchIndex});
+            vertexInputs.push_back({input.location, input.componentCount, inputInfo.vertex->resourcesDst[input.location].fetchIndex});
             if (inputInfo.vertex->fetchEmbedded) {
                 for (const auto& block : program.Blocks()) {
                     for (const auto* instruction : block->Instructions()) {
-                        if (instruction->Opcode() == IrOpcode::GetAttribute && instruction->Argument(0)->Resolve()->ImmediateU32() == input.location) result.vertexInputs.back().outputMask |= 1u << instruction->Argument(1)->Resolve()->ImmediateU32();
+                        if (instruction->Opcode() == IrOpcode::GetAttribute && instruction->Argument(0)->Resolve()->ImmediateU32() == input.location) vertexInputs.back().outputMask |= 1u << instruction->Argument(1)->Resolve()->ImmediateU32();
                     }
                 }
             }
         }
+        result.vertexInputs = SharedValues<VertexInput>(std::move(vertexInputs));
     }
 
     const bool embedded = !result.vertexInputs.empty() && inputInfo.vertex != nullptr && inputInfo.vertex->fetchEmbedded;

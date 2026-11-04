@@ -9269,7 +9269,7 @@ void barycentricEmulationTests() {
 
     RecompileResult vertex;
     vertex.spirv = makeModule({.parameterOutput = true});
-    vertex.parameterExports = {0u};
+    vertex.parameterExports = SharedValues<std::uint32_t>(std::vector<std::uint32_t>{0u});
     const std::array<std::uint32_t, 2> capabilities{spv::CapabilityShader, spv::CapabilityGeometry};
     SpirvTarget target{};
     target.vulkanVersion = VK_API_VERSION_1_1;
@@ -9343,7 +9343,9 @@ void barycentricEmulationTests() {
         ValidateProvokingVertex(context, lastState, patchShaders);
         expectFailure([&] { ValidateProvokingVertex(context, lastState, shaders); }, "last provoking vertex requires VK_EXT_provoking_vertex");
         RecompileResult flatVertices = fragment;
-        for (auto& parameter : flatVertices.fragmentParameters) parameter.flat = true;
+        auto flatParameters = flatVertices.fragmentParameters.Copy();
+        for (auto& parameter : flatParameters) parameter.flat = true;
+        flatVertices.fragmentParameters = ShaderRecompiler::SharedValues<ShaderRecompiler::FragmentParameter>(std::move(flatParameters));
         const std::array<CompiledShader, 4> flatPatchShaders{{{ShaderStage::Vertex, &vertex, 0}, {ShaderStage::TessellationControl, &patches.control, 0}, {ShaderStage::TessellationEvaluation, &patches.evaluation, 0}, {ShaderStage::Fragment, &flatVertices, 0}}};
         expectFailure([&] { ValidateProvokingVertex(context, lastState, flatPatchShaders); }, "explicit per-vertex flat interpolation");
     }
@@ -9367,7 +9369,7 @@ void barycentricEmulationTests() {
 
     RecompileResult clipped;
     clipped.spirv = makeModule({.parameterOutput = true, .clipDistanceLength = 2});
-    clipped.parameterExports = {0u};
+    clipped.parameterExports = SharedValues<std::uint32_t>(std::vector<std::uint32_t>{0u});
     expectFailure([&] { static_cast<void>(BuildBarycentricTessellationShaders(clipped, fragment, tessellationTarget, 128u, 0u)); }, "need shaderClipDistance");
     const std::array<std::uint32_t, 3> clipCapabilities{spv::CapabilityShader, spv::CapabilityTessellation, spv::CapabilityClipDistance};
     auto clipTarget = tessellationTarget;
@@ -9396,7 +9398,7 @@ void barycentricEmulationTests() {
     Require(memberBuiltIn(clippedPatches.evaluation, spv::BuiltInClipDistance) && !variableBuiltIn(clippedPatches.evaluation, spv::BuiltInClipDistance), "the generated evaluation stage does not keep the clip distances in its per-vertex blocks");
     const std::array<CompiledShader, 4> clippedShaders{{{ShaderStage::Vertex, &clipped, 0}, {ShaderStage::TessellationControl, &clippedPatches.control, 0}, {ShaderStage::TessellationEvaluation, &clippedPatches.evaluation, 0}, {ShaderStage::Fragment, &fragment, 0}}};
     ValidateShaders(clippedShaders, state, subgroup, false, false, false, false, false, false, true);
-    vertex.parameterExports.clear();
+    vertex.parameterExports = SharedValues<std::uint32_t>{};
     expectFailure([&] { static_cast<void>(BuildBarycentricTessellationShaders(vertex, fragment, tessellationTarget, 128u, 0u)); }, "not exported by the vertex shader");
     expectFailure([&] { static_cast<void>(BuildBarycentricGeometryShader(vertex, fragment, target, limits)); }, "not exported by the vertex shader");
 }
@@ -9595,8 +9597,8 @@ void rectListTests() {
     }
     vertex.spirv = makeModule({.parameterOutput = true});
     fragment.spirv = makeModule({.fragment = true, .rectParameters = true});
-    vertex.parameterExports = {0};
-    fragment.fragmentParameters = {{0, 0, false, false}, {1, 0, true, false}};
+    vertex.parameterExports = SharedValues<std::uint32_t>(std::vector<std::uint32_t>{0u});
+    fragment.fragmentParameters = SharedValues<FragmentParameter>(std::vector<FragmentParameter>{{0, 0, false, false}, {1, 0, true, false}});
     auto auxiliary = BuildRectListShaders(vertex, fragment, target);
     Require(!auxiliary.control.spirv.empty() && !auxiliary.evaluation.spirv.empty(), "rect-list parameter shaders are empty");
     Require(faultAuxiliary.lastVertexControl.Identity() == faultAuxiliary.control.Identity() && auxiliary.lastVertexControl.Identity() != auxiliary.control.Identity() && auxiliary.lastVertexControl.bindings.size() == 1 && auxiliary.lastVertexControl.bdaAbiVersion == auxiliary.control.bdaAbiVersion, "the last-vertex rect-list control shader does not differ from the first-vertex one exactly when a flat parameter is present");
@@ -9607,17 +9609,23 @@ void rectListTests() {
         const std::array<CompiledShader, 4> parameterShaders{{{ShaderStage::Vertex, &vertex, 0}, {ShaderStage::TessellationControl, control, 0}, {ShaderStage::TessellationEvaluation, &auxiliary.evaluation, 0}, {ShaderStage::Fragment, &fragment, 0}}};
         ValidateShaders(parameterShaders, parameterState, VkPhysicalDeviceSubgroupProperties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES}, false);
     }
-    fragment.fragmentParameters[0].perVertex = true;
+    auto parameters = fragment.fragmentParameters.Copy();
+    parameters[0].perVertex = true;
+    fragment.fragmentParameters = SharedValues<FragmentParameter>(std::move(parameters));
     auto explicitInterpolation = BuildRectListShaders(vertex, fragment, target);
     Require(!explicitInterpolation.control.spirv.empty() && !explicitInterpolation.evaluation.spirv.empty(), "rect-list shaders for an explicitly interpolated parameter are empty");
-    fragment.fragmentParameters[0].custom = true;
+    parameters = fragment.fragmentParameters.Copy();
+    parameters[0].custom = true;
+    fragment.fragmentParameters = SharedValues<FragmentParameter>(std::move(parameters));
     expectFailure([&] { static_cast<void>(BuildRectListShaders(vertex, fragment, target)); }, "per-vertex interpolation");
-    fragment.fragmentParameters[0].perVertex = false;
-    fragment.fragmentParameters[0].custom = false;
-    vertex.parameterExports.clear();
+    parameters = fragment.fragmentParameters.Copy();
+    parameters[0].perVertex = false;
+    parameters[0].custom = false;
+    fragment.fragmentParameters = SharedValues<FragmentParameter>(std::move(parameters));
+    vertex.parameterExports = SharedValues<std::uint32_t>{};
     auto unexported = BuildRectListShaders(vertex, fragment, target);
     Require(!unexported.control.spirv.empty() && !unexported.evaluation.spirv.empty(), "rect-list shaders with an unexported parameter are empty");
-    fragment.fragmentParameters.clear();
+    fragment.fragmentParameters = SharedValues<FragmentParameter>{};
     target.tessellation->maxPatchSize = 3;
     expectFailure([&] { static_cast<void>(BuildRectListShaders(vertex, fragment, target)); }, "device limits");
     target.tessellation.reset();
@@ -10743,7 +10751,7 @@ void ProvokingVertexTests() {
             for (const auto perVertex : {false, true}) {
                 for (const auto vertexOrder : {false, true}) {
                     if (vertexOrder && !perVertex) continue;
-                    fragment.fragmentParameters = {{0, 0, flat, perVertex, false, false, vertexOrder}};
+                    fragment.fragmentParameters = ShaderRecompiler::SharedValues<ShaderRecompiler::FragmentParameter>(std::vector<ShaderRecompiler::FragmentParameter>{{0, 0, flat, perVertex, false, false, vertexOrder}});
                     auto firstState = state;
                     firstState.provokingVertexMode = VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT;
                     ValidateProvokingVertex(unsupported, firstState, shaders);
@@ -10781,7 +10789,7 @@ void ProvokingVertexTests() {
     }
     meshDraw.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
     for (const auto& drawn : {std::span<const CompiledShader>{}, std::span<const CompiledShader>(flatShaders), std::span<const CompiledShader>(flatP10Shaders), std::span<const CompiledShader>(smoothShaders)}) ValidateProvokingVertex(supported, meshDraw, drawn);
-    fragment.fragmentParameters = {{0, 0, false, true, false, false, false}, {1, 1, false, true, false, false, false}, {2, 2, false, true, false, false, false}, {3, 3, false, true, false, false, false}};
+    fragment.fragmentParameters = ShaderRecompiler::SharedValues<ShaderRecompiler::FragmentParameter>(std::vector<ShaderRecompiler::FragmentParameter>{{0, 0, false, true, false, false, false}, {1, 1, false, true, false, false, false}, {2, 2, false, true, false, false, false}, {3, 3, false, true, false, false, false}});
     ValidateProvokingVertex(supported, meshDraw, shaders);
     expectFailure([&] { ValidateProvokingVertex(supported, meshDraw, slotShaders); }, "last provoking vertex with explicit per-vertex triangle-strip interpolation is unsupported");
     meshDraw.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
@@ -10794,7 +10802,7 @@ void ProvokingVertexTests() {
     }
     meshDraw.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
     expectFailure([&] { ValidateProvokingVertex(unsupported, meshDraw, flatShaders); }, "last provoking vertex requires VK_EXT_provoking_vertex with provokingVertexLast enabled");
-    fragment.fragmentParameters = {{0, 0, true, true, false, false, false}};
+    fragment.fragmentParameters = ShaderRecompiler::SharedValues<ShaderRecompiler::FragmentParameter>(std::vector<ShaderRecompiler::FragmentParameter>{{0, 0, true, true, false, false, false}});
     expectFailure([&] { ValidateProvokingVertex(supported, meshDraw, shaders); }, "last provoking vertex with explicit per-vertex flat interpolation is unsupported");
     meshDraw.stages.tessellation.emplace();
     expectFailure([&] { ValidateProvokingVertex(supported, meshDraw, flatShaders); }, "last provoking vertex is unsupported for generated primitive pipelines");
@@ -10826,18 +10834,18 @@ void UnobservedProvokingVertexTests() {
         auto state = last;
         state.topology = topology;
         ValidateProvokingVertex(unsupported, state);
-        fragment.fragmentParameters.clear();
+        fragment.fragmentParameters = ShaderRecompiler::SharedValues<ShaderRecompiler::FragmentParameter>{};
         fragment.spirv = module({});
         ValidateProvokingVertex(unsupported, state, shaders);
-        fragment.fragmentParameters = {smooth};
+        fragment.fragmentParameters = ShaderRecompiler::SharedValues<ShaderRecompiler::FragmentParameter>(std::vector<ShaderRecompiler::FragmentParameter>{smooth});
         fragment.spirv = module({(4u << 16u) | spv::OpDecorate, 1u, spv::DecorationLocation, 0u});
         ValidateProvokingVertex(unsupported, state, shaders);
         for (std::uint32_t read = 0; read < 4; ++read) {
             const ShaderRecompiler::FragmentParameter observed{1, 1, read == 0, read == 1, read == 2, read == 3, false};
-            fragment.fragmentParameters = {smooth, observed};
+            fragment.fragmentParameters = ShaderRecompiler::SharedValues<ShaderRecompiler::FragmentParameter>(std::vector<ShaderRecompiler::FragmentParameter>{smooth, observed});
             refused(state);
         }
-        fragment.fragmentParameters = {smooth};
+        fragment.fragmentParameters = ShaderRecompiler::SharedValues<ShaderRecompiler::FragmentParameter>(std::vector<ShaderRecompiler::FragmentParameter>{smooth});
         for (const std::uint32_t decoration : {static_cast<std::uint32_t>(spv::DecorationFlat), static_cast<std::uint32_t>(spv::DecorationPerVertexKHR)}) {
             fragment.spirv = module({(3u << 16u) | spv::OpDecorate, 1u, decoration});
             refused(state);
@@ -10849,7 +10857,7 @@ void UnobservedProvokingVertexTests() {
         fragment.spirv = std::vector<std::uint32_t>{};
         refused(state);
     }
-    fragment.fragmentParameters = {smooth};
+    fragment.fragmentParameters = ShaderRecompiler::SharedValues<ShaderRecompiler::FragmentParameter>(std::vector<ShaderRecompiler::FragmentParameter>{smooth});
     for (const std::uint32_t generated : {static_cast<std::uint32_t>(spv::BuiltInSampleId), static_cast<std::uint32_t>(spv::BuiltInFrontFacing), static_cast<std::uint32_t>(spv::BuiltInSubgroupLocalInvocationId)}) {
         fragment.spirv = module({(4u << 16u) | spv::OpDecorate, 1u, spv::DecorationBuiltIn, generated, (3u << 16u) | spv::OpDecorate, 1u, spv::DecorationFlat});
         ValidateProvokingVertex(unsupported, last, shaders);
@@ -10869,9 +10877,9 @@ void UnobservedProvokingVertexTests() {
         refused(last);
     }
     ShaderRecompiler::RecompileResult vertex{};
-    vertex.fragmentParameters = {{0, 0, true, true, true, true, true}};
+    vertex.fragmentParameters = ShaderRecompiler::SharedValues<ShaderRecompiler::FragmentParameter>(std::vector<ShaderRecompiler::FragmentParameter>{{0, 0, true, true, true, true, true}});
     vertex.spirv = module({(3u << 16u) | spv::OpDecorate, 1u, spv::DecorationFlat});
-    fragment.fragmentParameters = {smooth};
+    fragment.fragmentParameters = ShaderRecompiler::SharedValues<ShaderRecompiler::FragmentParameter>(std::vector<ShaderRecompiler::FragmentParameter>{smooth});
     fragment.spirv = module({});
     const std::array<CompiledShader, 2> stages{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}}};
     ValidateProvokingVertex(unsupported, last, stages);

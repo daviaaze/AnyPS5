@@ -102,7 +102,9 @@ void CheckValidator(AgcDriver::VulkanDevice& device, const AgcDriver::Pm4::DrawP
     unreserved.barycentricEmulation.active = false;
     rejected(meshResult, unreserved, "per-primitive");
     auto shifted = pixelResult;
-    shifted.fragmentParameters.push_back({0u, 0u, false, false});
+    auto shiftedParameters = shifted.fragmentParameters.Copy();
+    shiftedParameters.push_back({0u, 0u, false, false});
+    shifted.fragmentParameters = ShaderRecompiler::SharedValues<ShaderRecompiler::FragmentParameter>(std::move(shiftedParameters));
     rejected(meshResult, shifted, "per-primitive");
     auto plain = pixelResult;
     const auto decorate = DecorationWord(plain, spv::DecorationPerPrimitiveEXT);

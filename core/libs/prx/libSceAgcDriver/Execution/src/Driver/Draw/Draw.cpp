@@ -1091,7 +1091,7 @@ DrawVerdict Driver::finishDraw(const std::shared_ptr<DrawTail>& tailHolder, Perf
                 if (program.binary.stage == ShaderRecompiler::ShaderStage::Fragment) {
                     for (auto previous = i; previous-- > 0;) {
                         if (programResults[previous] == nullptr) continue;
-                        pixel = Graphics::DefaultUnexportedInputs(decode->pixel, programResults[previous]->parameterExports);
+                        pixel = Graphics::DefaultUnexportedInputs(decode->pixel, programResults[previous]->parameterExports.Span());
                         break;
                     }
                 }

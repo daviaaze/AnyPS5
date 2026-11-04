@@ -85,12 +85,12 @@ std::filesystem::path ShaderCacheDirectory() {
 namespace ShaderRecompiler::ShaderDiskCache {
 
 #if defined(__linux__) && defined(__x86_64__) && defined(__GLIBCXX__)
-static_assert(sizeof(CompiledShaderArtifact) == 288, "CompiledShaderArtifact changed: update the artifact encoder");
+static_assert(sizeof(CompiledShaderArtifact) == 240, "CompiledShaderArtifact changed: update the artifact encoder");
 static_assert(sizeof(ShaderInvocation) == 216, "ShaderInvocation changed: update the invocation encoder");
 // Result audit: both bases are encoded below; workgroupMemoryDwords and shaderDataUserWords
 // follow them. drawKeyMemo (AtomicSharedPtr storage), cacheHit and both lifetime owners
 // are process-local, as are artifact.variantId and invocation.specializationId.
-static_assert(sizeof(RecompileResult) == 584, "RecompileResult changed: audit runtime-only cache owners and the explicit result encoder");
+static_assert(sizeof(RecompileResult) == 536, "RecompileResult changed: audit runtime-only cache owners and the explicit result encoder");
 static_assert(sizeof(DescriptorBinding) == 664, "DescriptorBinding changed: update the binding encoder");
 static_assert(sizeof(VertexAttribute) == 32, "VertexAttribute changed: update the attribute encoder");
 static_assert(sizeof(VertexInput) == 16, "VertexInput changed: update the vertex input encoder");
@@ -335,6 +335,11 @@ public:
         Value<std::uint64_t>(values.size());
         for (const auto& value : values) encode(*this, value);
     }
+    template<typename TValue, typename TEncode>
+    void List(const SharedValues<TValue>& values, TEncode&& encode) {
+        Value<std::uint64_t>(values.size());
+        for (const auto& value : values) encode(*this, value);
+    }
 
 private:
     template<typename TValue>
@@ -569,7 +574,7 @@ void encodeArtifact(Writer& writer, const CompiledShaderArtifact& result) {
     writer.Value(result.shaderDataDwords);
     writer.Value(result.imageMetadataDword);
     writer.Value(result.runtimeImageCount);
-    writer.Values(std::span<const std::uint32_t>(result.runtimeImageResources));
+    writer.Values(result.runtimeImageResources.Span());
     writer.Value(result.registrationModule);
     writer.List(result.vertexInputPatches, [](Writer& out, const VertexInputPatch& patch) {
         out.Value(patch.location);
@@ -593,7 +598,7 @@ void encodeArtifact(Writer& writer, const CompiledShaderArtifact& result) {
     writer.Value(result.functionLdsBuffer);
     writer.Value(result.meshWindowBuffer);
     writer.Value(result.scratchPoolSlotDwords);
-    writer.Values(std::span<const std::uint32_t>(result.parameterExports));
+    writer.Values(result.parameterExports.Span());
     writer.List(result.fragmentParameters, [](Writer& out, const FragmentParameter& parameter) {
         out.Value(parameter.location);
         out.Value(parameter.sourceLocation);
@@ -625,7 +630,7 @@ void encodeArtifact(Writer& writer, const CompiledShaderArtifact& result) {
             out.Value(parameter.flatP20);
         });
     }
-    writer.Values(std::span<const std::uint32_t>(result.stencilReferences));
+    writer.Values(result.stencilReferences.Span());
     writer.Value(result.stencilReplaySafe);
     writer.Value(result.bdaWrites);
     writer.Value(result.layerReplaySafe);
@@ -642,19 +647,25 @@ void decodeArtifact(Reader& reader, CompiledShaderArtifact& result) {
     reader.Value(result.shaderDataDwords);
     reader.Value(result.imageMetadataDword);
     reader.Value(result.runtimeImageCount);
-    reader.Values(result.runtimeImageResources);
+    std::vector<std::uint32_t> runtimeImageResources;
+    reader.Values(runtimeImageResources);
+    result.runtimeImageResources = SharedValues<std::uint32_t>(std::move(runtimeImageResources));
     reader.Value(result.registrationModule);
-    reader.List(result.vertexInputPatches, 20, [](Reader& in, VertexInputPatch& patch) {
+    std::vector<VertexInputPatch> vertexInputPatches;
+    reader.List(vertexInputPatches, 20, [](Reader& in, VertexInputPatch& patch) {
         in.Value(patch.location);
         in.Value(patch.word);
         for (auto& value : patch.values) in.Value(value);
     });
-    reader.List(result.vertexInputs, 16, [](Reader& in, VertexInput& attribute) {
+    result.vertexInputPatches = SharedValues<VertexInputPatch>(std::move(vertexInputPatches));
+    std::vector<VertexInput> vertexInputs;
+    reader.List(vertexInputs, 16, [](Reader& in, VertexInput& attribute) {
         in.Value(attribute.location);
         in.Value(attribute.components);
         in.Value(attribute.fetchIndex);
         in.Value(attribute.outputMask);
     });
+    result.vertexInputs = SharedValues<VertexInput>(std::move(vertexInputs));
     reader.Value(result.vertexOffsetSgpr);
     reader.Value(result.instanceOffsetSgpr);
     reader.Value(result.vertexOffsetShared);
@@ -666,8 +677,11 @@ void decodeArtifact(Reader& reader, CompiledShaderArtifact& result) {
     reader.Value(result.functionLdsBuffer);
     reader.Value(result.meshWindowBuffer);
     reader.Value(result.scratchPoolSlotDwords);
-    reader.Values(result.parameterExports);
-    reader.List(result.fragmentParameters, 10, [](Reader& in, FragmentParameter& parameter) {
+    std::vector<std::uint32_t> parameterExports;
+    reader.Values(parameterExports);
+    result.parameterExports = SharedValues<std::uint32_t>(std::move(parameterExports));
+    std::vector<FragmentParameter> fragmentParameters;
+    reader.List(fragmentParameters, 10, [](Reader& in, FragmentParameter& parameter) {
         in.Value(parameter.location);
         in.Value(parameter.sourceLocation);
         in.Value(parameter.flat);
@@ -677,6 +691,7 @@ void decodeArtifact(Reader& reader, CompiledShaderArtifact& result) {
         in.Value(parameter.vertexOrder);
         in.Value(parameter.flatP20);
     });
+    result.fragmentParameters = SharedValues<FragmentParameter>(std::move(fragmentParameters));
     reader.Value(result.barycentricEmulation.active);
     reader.Value(result.barycentricEmulation.smooth);
     reader.Value(result.barycentricEmulation.linear);
@@ -702,7 +717,9 @@ void decodeArtifact(Reader& reader, CompiledShaderArtifact& result) {
         });
         result.meshBarycentrics = std::move(layout);
     }
-    reader.Values(result.stencilReferences);
+    std::vector<std::uint32_t> stencilReferences;
+    reader.Values(stencilReferences);
+    result.stencilReferences = SharedValues<std::uint32_t>(std::move(stencilReferences));
     reader.Value(result.stencilReplaySafe);
     reader.Value(result.bdaWrites);
     reader.Value(result.layerReplaySafe);

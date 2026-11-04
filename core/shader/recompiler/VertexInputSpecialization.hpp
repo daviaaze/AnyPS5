@@ -88,11 +88,11 @@ inline void PrepareVertexInputSpecialization(CompiledShaderArtifact& artifact) {
     std::vector<std::uint32_t> result(source.begin(), source.begin() + 5);
     result[3] = bound;
     bool inserted = false;
+    std::vector<VertexInputPatch> vertexInputPatches;
     const auto patch = [&](std::uint32_t location, std::size_t word, const std::array<std::uint32_t, 3>& values) {
         if (word > std::numeric_limits<std::uint32_t>::max()) throw std::runtime_error("vertex specialization offset overflow");
-        artifact.vertexInputPatches.push_back({location, static_cast<std::uint32_t>(word), values});
+        vertexInputPatches.push_back({location, static_cast<std::uint32_t>(word), values});
     };
-    artifact.vertexInputPatches.clear();
     for (std::size_t cursor = 5; cursor < source.size();) {
         const auto count = source[cursor] >> 16u;
         const auto op = static_cast<spv::Op>(source[cursor] & 0xffffu);
@@ -124,6 +124,7 @@ inline void PrepareVertexInputSpecialization(CompiledShaderArtifact& artifact) {
     }
     if (!inserted) throw std::runtime_error("vertex specialization module has no function");
     artifact.spirv = std::move(result);
+    artifact.vertexInputPatches = SharedValues<VertexInputPatch>(std::move(vertexInputPatches));
 }
 
 }
