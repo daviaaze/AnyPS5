@@ -356,7 +356,7 @@ int main() {
         PrefetchedVariants(*device);
         Run(*device, true);
         Run(*device, false, true);
-        Run(*device, true, true)
+        Run(*device, true, true);
         ScalarReads(*device);
         DisabledDescriptors(*device);
         std::puts("buffer descriptor runtime tests passed");
