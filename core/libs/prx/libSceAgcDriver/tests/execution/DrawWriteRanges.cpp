@@ -97,7 +97,9 @@ int main() {
         typeOne[3] |= 1u << 28u;
         const std::array<std::uint32_t, 8> reported{0x04efd000u, 0x00040011u, 0x00017a00u, 0x00005204u, 0x0af00000u, 0u, 0x00000612u, 0x00fff000u};
         for (const auto& [words, base] : {std::pair{typeZero, 0x500000000ull}, std::pair{typeOne, 0x500000000ull}, std::pair{reported, 0x1104efd00000ull}}) {
-            std::copy(words.begin(), words.end(), program.bindings[0].guestDescriptor.begin() + 8);
+            auto typedDescriptorWords = program.bindings[0].guestDescriptor.Copy();
+            std::copy(words.begin(), words.end(), typedDescriptorWords.begin() + 8);
+            program.bindings[0].guestDescriptor = ShaderRecompiler::SharedValues<std::uint32_t>(std::move(typedDescriptorWords));
             for (const bool exact : {false, true}) {
                 const auto ranges = DrawWriteRanges(state, stages, exact);
                 Require(Contains(ranges, written, written + surfaceBytes), "a written image next to a TYPE 0 or 1 one is not a write range");
