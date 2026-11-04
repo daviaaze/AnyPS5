@@ -166,7 +166,8 @@ public:
     using Clock = std::chrono::steady_clock;
     static constexpr std::size_t DefaultCapacity = 262144;
     static constexpr std::size_t MaximumCapacity = 4194304;
-    static constexpr std::size_t MaximumSnapshotEvents = 1048576;
+    // Shared serialization cap only; per-thread and GPU recording capacities stay independent.
+    static constexpr std::size_t MaximumSnapshotEvents = 2097152;
     static constexpr Clock::duration MinimumSlice = std::chrono::microseconds(20);
 
     static std::size_t ParseCapacity(const char* events) {
