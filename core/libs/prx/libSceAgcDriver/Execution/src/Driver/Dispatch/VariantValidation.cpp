@@ -39,24 +39,25 @@ void Driver::appendEntryRegions(const DispatchVariant& variant, std::vector<Shad
 
 std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::patchDataWords(const DispatchVariant& variant, const std::vector<std::uint32_t>& words) {
     const auto& descriptor = variant.compiled->bindings[variant.flatBinding].guestDescriptor;
-    bool changed = false;
+    std::size_t firstChanged = variant.dataPositions.size();
     for (std::size_t k = 0; k < variant.dataPositions.size(); ++k) {
         const auto slot = variant.dataSlots[k];
         if (slot < descriptor.size() && descriptor[slot] != words[variant.dataPositions[k]]) {
-            changed = true;
+            firstChanged = k;
             break;
         }
     }
-    if (!changed) return variant.compiled;
+    if (firstChanged == variant.dataPositions.size()) return variant.compiled;
 
     auto patched = std::make_shared<ShaderRecompiler::RecompileResult>(*variant.compiled);
     auto patchedDescriptor = patched->bindings[variant.flatBinding].guestDescriptor.Copy();
-    for (std::size_t k = 0; k < variant.dataPositions.size(); ++k) {
+    for (std::size_t k = firstChanged; k < variant.dataPositions.size(); ++k) {
         if (variant.dataSlots[k] < patchedDescriptor.size()) patchedDescriptor[variant.dataSlots[k]] = words[variant.dataPositions[k]];
     }
     patched->bindings[variant.flatBinding].guestDescriptor = ShaderRecompiler::SharedValues<std::uint32_t>(std::move(patchedDescriptor));
     return patched;
 }
+
 
 bool Driver::syncPendingRuns(std::uint64_t program, std::uint32_t queue, const ShaderRecompiler::RecompileResult& compiled, std::span<const ShaderRecompiler::MemoryRegion> regions, std::uint64_t& synced, PendingView& pending, std::optional<SampledReadScope>& sampling, std::span<const VouchedRegions> skipped) {
     using Policy = ShaderMemory::PendingWrite;
