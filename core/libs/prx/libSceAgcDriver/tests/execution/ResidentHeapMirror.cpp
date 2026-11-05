@@ -16,6 +16,10 @@
 #else
 #include <sys/mman.h>
 #endif
+#ifdef __linux__
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 #ifdef __APPLE__
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
@@ -253,6 +257,128 @@ void CheckStores(const GuestHeap& written, const std::string& step) {
         Require(value == thread * 4u, "resident heap mirror: " + step + ": the GPU store of thread " + std::to_string(thread) + " into a never-written heap block reached the guest as " + Hex(value) + ", expected " + Hex(thread * 4u));
     }
 }
+
+void GuestNonzeroBlockTests() {
+    GuestHeap heap(true, 3, Block);
+    const auto base = heap.Address();
+    const AgcDriver::Graphics::GuestRuns candidate{{base + 17, base + 3 * Block - 23}};
+    heap.Store(17, 0x12345678u);
+    auto runs = AgcDriver::Graphics::GuestNonzeroBlocks(candidate);
+    Require(runs == AgcDriver::Graphics::GuestRuns{{base + 17, base + Block}}, "resident heap mirror: GNB did not clip its first nonzero block to the candidate start");
+    heap.Store(17, 0);
+    heap.Store(Block + 29, 0xabcdef01u);
+    runs = AgcDriver::Graphics::GuestNonzeroBlocks(candidate);
+    Require(runs == AgcDriver::Graphics::GuestRuns{{base + Block, base + 2 * Block}}, "resident heap mirror: GNB retained stale data or missed a CPU write after an earlier call");
+    heap.Store(Block + 29, 0);
+    heap.Store(2 * Block + 41, 0x76543210u);
+    runs = AgcDriver::Graphics::GuestNonzeroBlocks(candidate);
+    Require(runs == AgcDriver::Graphics::GuestRuns{{base + 2 * Block, base + 3 * Block - 23}}, "resident heap mirror: GNB did not clip its last nonzero block to the candidate end");
+    heap.Store(2 * Block + 41, 0);
+    runs = AgcDriver::Graphics::GuestNonzeroBlocks(candidate);
+    Require(runs.empty(), "resident heap mirror: GNB reported nonzero blocks after CPU writes returned them to zero");
+}
+
+#ifdef __linux__
+struct NonzeroSharedFixture {
+    std::uintptr_t base = 0;
+    int file = -1;
+} nonzeroSharedFixture;
+
+bool ResolveNonzeroSharedBacking(std::uintptr_t address, std::size_t bytes,
+                                GuestArena::SharedBackingVisitor visitor, void* context) {
+    if (visitor == nullptr || nonzeroSharedFixture.file < 0 || bytes == 0 ||
+        address < nonzeroSharedFixture.base) return false;
+    const auto offset = address - nonzeroSharedFixture.base;
+    if (offset >= Block || bytes > Block - offset) return false;
+    return visitor(context, nonzeroSharedFixture.file, offset, bytes);
+}
+
+struct NonzeroSharedBackingScope {
+    NonzeroSharedBackingScope(std::uintptr_t base, int file) {
+        nonzeroSharedFixture = {base, file};
+        GuestArena::GuestArenaSetSharedBacking_nid_postfix(ResolveNonzeroSharedBacking);
+    }
+    ~NonzeroSharedBackingScope() {
+        GuestArena::GuestArenaSetSharedBacking_nid_postfix(nullptr);
+        nonzeroSharedFixture = {};
+    }
+};
+
+void GuestNonzeroMappingBoundaryTests() {
+    constexpr auto bytes = 5 * Block;
+    void* const raw = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    Require(raw != MAP_FAILED, "nonzero mappings: cannot reserve fixture memory");
+    const auto start = reinterpret_cast<std::uintptr_t>(raw);
+    const auto base = (start + Block - 1) / Block * Block;
+    struct MappingOwner {
+        std::uintptr_t start, base;
+        bool gap = false, restored = false;
+        ~MappingOwner() {
+            if (gap && !restored) {
+                munmap(reinterpret_cast<void*>(start), base + Block - start);
+                munmap(reinterpret_cast<void*>(base + 2 * Block), start + bytes - base - 2 * Block);
+            } else {
+                munmap(reinterpret_cast<void*>(start), bytes);
+            }
+        }
+    } owner{start, base};
+    auto* const data = reinterpret_cast<std::uint8_t*>(base);
+    data[32] = 0x31;
+    data[2 * Block + 32] = 0x53;
+    Require(munmap(data + Block, Block) == 0, "nonzero mappings: cannot create the unmapped gap");
+    owner.gap = true;
+    const AgcDriver::Graphics::GuestRuns candidate{{base + 17, base + 3 * Block - 23}};
+    const AgcDriver::Graphics::GuestRuns split{{base + 17, base + Block}, {base + 2 * Block, base + 3 * Block - 23}};
+    Require(AgcDriver::Graphics::GuestNonzeroBlocks(candidate) == split,
+        "nonzero mappings: an unmapped gap hid a later VMA or became a candidate");
+
+    const int file = memfd_create("nonzero-mapping-boundaries", MFD_CLOEXEC);
+    Require(file >= 0, "nonzero mappings: cannot create shared backing");
+    struct FileOwner { int file; ~FileOwner() { close(file); } } fileOwner{file};
+    Require(ftruncate(file, Block) == 0, "nonzero mappings: cannot size shared backing");
+    void* const shared = mmap(data + Block, Block, PROT_READ | PROT_WRITE,
+        MAP_SHARED | MAP_FIXED_NOREPLACE, file, 0);
+    Require(shared == data + Block, "nonzero mappings: cannot fill the gap with a shared VMA");
+    owner.restored = true;
+    const NonzeroSharedBackingScope backingScope(base + Block, file);
+    Require(AgcDriver::Graphics::GuestNonzeroBlocks(candidate) == split,
+        "nonzero mappings: a zero shared mapping changed private neighbors");
+    std::memset(shared, 0, Block);
+    const std::uint8_t value = 0x75;
+    Require(pwrite(file, &value, sizeof(value), 32) == sizeof(value),
+        "nonzero mappings: cannot write through the shared backing");
+    Require(AgcDriver::Graphics::GuestNonzeroBlocks(candidate) ==
+        AgcDriver::Graphics::GuestRuns{{base + 17, base + 3 * Block - 23}},
+        "nonzero mappings: a backing-file write was not visible in the shared VMA");
+    data[Block + 32] = 0;
+    Require(AgcDriver::Graphics::GuestNonzeroBlocks(candidate) == split,
+        "nonzero mappings: a shared CPU store returning data to zero was not observed");
+    Require(pwrite(file, &value, sizeof(value), 32) == sizeof(value),
+        "nonzero mappings: cannot restore the value before punching a hole");
+    const auto page = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+    Require(fallocate(file, FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE, 0, page) == 0,
+        "nonzero mappings: cannot punch a shared-backing hole");
+    Require(AgcDriver::Graphics::GuestNonzeroBlocks(candidate) == split,
+        "nonzero mappings: a punched hole retained stale nonzero data");
+    Require(pwrite(file, &value, sizeof(value), 32) == sizeof(value),
+        "nonzero mappings: cannot write into the punched hole");
+    Require(AgcDriver::Graphics::GuestNonzeroBlocks(candidate) ==
+        AgcDriver::Graphics::GuestRuns{{base + 17, base + 3 * Block - 23}},
+        "nonzero mappings: a write into a previous hole was missed");
+
+    void* const privateCopy = mmap(data + Block, Block, PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_FIXED, file, 0);
+    Require(privateCopy == data + Block, "nonzero mappings: cannot create the private COW alias");
+    data[Block + 32] = 0x42;
+    const std::uint8_t zero = 0;
+    Require(pwrite(file, &zero, sizeof(zero), 32) == sizeof(zero),
+        "nonzero mappings: cannot clear backing independently of the private COW alias");
+    Require(AgcDriver::Graphics::GuestNonzeroBlocks(candidate) ==
+        AgcDriver::Graphics::GuestRuns{{base + 17, base + 3 * Block - 23}},
+        "nonzero mappings: current private COW data was pruned using shared-file bytes");
+}
+#endif
+
 
 void CheckHeld(std::uint64_t before, std::uint64_t written, const std::string& step) {
     const auto held = AgcDriver::Graphics::MirrorCounters().heapBytes - before;
@@ -559,6 +685,9 @@ void BudgetEvictionTests(AgcDriver::VulkanDevice& device, bool sparse) {
 
 int main() {
     try {
+#ifdef __linux__
+        GuestNonzeroMappingBoundaryTests();
+#endif
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
 #ifdef _WIN32
@@ -581,6 +710,7 @@ int main() {
             std::puts("the device has no sparseBinding, sparseResidencyBuffer and sparseResidencyAliased, so every heap mirror is a whole copy; the resident heap mirror tests are skipped");
         }
         CopiedTests(*device);
+        GuestNonzeroBlockTests();
         BudgetEvictionTests(*device, sparse);
         StorageImageTests(*device);
         for (const bool copied : {false, true}) {

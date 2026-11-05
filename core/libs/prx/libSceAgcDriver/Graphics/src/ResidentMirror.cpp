@@ -5,6 +5,11 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#ifdef __linux__
+#include "prx/libc/include/specifics/linux/HostMapping.hpp"
+#include <sys/mman.h>
+#include <sys/stat.h>
+#endif
 #ifndef _WIN32
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BatchTimeline.hpp"
@@ -218,6 +223,7 @@ struct Mapping {
     std::uint64_t end = 0;
     bool readable = false;
     bool privateAnonymous = false;
+    bool shared = false;
 };
 
 // Opt-in thread CPU accounting for nonzero-discovery phases; scopes may be nested.
@@ -305,6 +311,13 @@ private:
 
 std::vector<Mapping> mappings(std::uint64_t begin, std::uint64_t end) {
     NonzeroCpuScope cpuScope(begin, end);
+#ifdef __linux__
+    std::vector<Mapping> found;
+    HostMapping::Walk(begin, end, "ResidentMirror", [&](const HostMapping::Mapping& mapping) {
+        found.push_back({std::max(mapping.start, begin), std::min(mapping.end, end), mapping.readable, mapping.inode == 0 && !mapping.shared, mapping.shared});
+    });
+    return found;
+#else
     std::ifstream maps("/proc/self/maps");
     Require(static_cast<bool>(maps), "cannot read /proc/self/maps for a heap mirror's pages");
     std::vector<Mapping> found;
@@ -322,6 +335,7 @@ std::vector<Mapping> mappings(std::uint64_t begin, std::uint64_t end) {
         found.push_back({std::max<std::uint64_t>(first, begin), std::min<std::uint64_t>(last, end), permissions[0] == 'r', inode == 0 && permissions[3] == 'p'});
     }
     return found;
+#endif
 }
 
 struct SharedSegment {
@@ -353,7 +367,7 @@ void sharedFileData(std::vector<Candidate>& maybe, const Mapping& mapping, const
     std::uint64_t virtualOffset = mapping.begin;
     for (const auto& segment : backing.segments) {
         const auto segmentEnd = virtualOffset + segment.bytes;
-        const Mapping part{virtualOffset, segmentEnd, mapping.readable, mapping.privateAnonymous};
+        const Mapping part{virtualOffset, segmentEnd, mapping.readable, mapping.privateAnonymous, mapping.shared};
         fileData(maybe, part, segment.file, segment.offset);
         virtualOffset = segmentEnd;
     }
@@ -365,8 +379,42 @@ bool sharedBacking(const Mapping& mapping, SharedBacking& backing) {
     return GuestArena::GuestArenaSharedBacking_nid_postfix(static_cast<std::uintptr_t>(mapping.begin),
         static_cast<std::size_t>(backing.expected), &SharedBacking::record, &backing) && backing.covered == backing.expected;
 }
+#ifdef __linux__
+bool residentSharedPages(const Mapping& mapping, int file) {
+    if (!mapping.readable || !mapping.shared || mapping.begin >= mapping.end) return false;
+    struct stat status;
+    if (fstat(file, &status) != 0 || status.st_uid != geteuid()) return false;
+    static const auto pageSize = sysconf(_SC_PAGESIZE);
+    if (pageSize <= 0) return false;
+    const auto page = static_cast<std::uint64_t>(pageSize);
+    auto at = mapping.begin - mapping.begin % page;
+    const auto remainder = mapping.end % page;
+    if (remainder != 0 && mapping.end > UINT64_MAX - (page - remainder)) return false;
+    const auto end = mapping.end + (remainder == 0 ? 0 : page - remainder);
+    unsigned char residency[4096];
+    while (at < end) {
+        const auto count = std::min<std::uint64_t>(sizeof(residency), (end - at) / page);
+        const auto bytes = count * page;
+        if (mincore(reinterpret_cast<void*>(static_cast<std::uintptr_t>(at)),
+                    static_cast<std::size_t>(bytes), residency) != 0) return false;
+        for (std::size_t index = 0; index < count; ++index) {
+            if ((residency[index] & 1u) == 0) return false;
+        }
+        at += bytes;
+    }
+    return true;
+}
+#endif
+
 void fileData(std::vector<Candidate>& maybe, const Mapping& mapping, int file, std::uint64_t offset) {
     NonzeroCpuScope cpuScope(mapping.begin, mapping.end, "guest_nonzero_file_data");
+#ifdef __linux__
+    // Residency only admits candidates: the final byte scan still proves nonzero content.
+    if (residentSharedPages(mapping, file)) {
+        maybe.push_back({mapping.begin, mapping.end, true});
+        return;
+    }
+#endif
     const auto end = offset + (mapping.end - mapping.begin);
     auto at = static_cast<off_t>(offset);
     while (static_cast<std::uint64_t>(at) < end) {
