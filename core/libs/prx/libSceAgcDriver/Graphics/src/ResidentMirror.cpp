@@ -6,7 +6,11 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #ifndef _WIN32
+#include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BatchTimeline.hpp"
 #include <fcntl.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <unistd.h>
 #endif
@@ -216,7 +220,76 @@ struct Mapping {
     bool privateAnonymous = false;
 };
 
+// Lifetime encloses the maps stream, including its cleanup on exceptional exits.
+class MappingsCpuScope {
+public:
+    MappingsCpuScope(std::uint64_t begin, std::uint64_t end) noexcept
+        : enabled(AgcDriver::BatchTimeline::Enabled()) {
+        if (!enabled) return;
+        const int savedErrno = errno;
+        rangeBegin = begin;
+        rangeEnd = end;
+        origin = AgcDriver::BatchTimeline::currentOrigin;
+        const auto thread = ::syscall(SYS_gettid);
+        tid = thread > 0 ? static_cast<std::uint64_t>(thread) : 0;
+        cpuBegin = AgcDriver::BatchTimeline::CpuNanos();
+        beginValid = ::getrusage(RUSAGE_THREAD, &usageBegin) == 0;
+        errno = savedErrno;
+    }
+
+    ~MappingsCpuScope() noexcept {
+        if (!enabled) return;
+        const int savedErrno = errno;
+        rusage usageEnd{};
+        const bool endValid = ::getrusage(RUSAGE_THREAD, &usageEnd) == 0;
+        const auto cpuEnd = AgcDriver::BatchTimeline::CpuNanos();
+        std::uint64_t userBegin = 0, userEnd = 0, systemBegin = 0, systemEnd = 0;
+        const bool valid = beginValid && endValid && tid != 0 && cpuEnd >= cpuBegin &&
+            nanos(usageBegin.ru_utime, userBegin) && nanos(usageEnd.ru_utime, userEnd) &&
+            nanos(usageBegin.ru_stime, systemBegin) && nanos(usageEnd.ru_stime, systemEnd) &&
+            userEnd >= userBegin && systemEnd >= systemBegin;
+        char userCpu[32] = "null";
+        char systemCpu[32] = "null";
+        if (valid) {
+            std::snprintf(userCpu, sizeof(userCpu), "%llu", static_cast<unsigned long long>(userEnd - userBegin));
+            std::snprintf(systemCpu, sizeof(systemCpu), "%llu", static_cast<unsigned long long>(systemEnd - systemBegin));
+        }
+        try {
+            AgcDriver::ProfilePrint_nid_no_patch(
+                "[batch-timeline] {\"event\":\"guest_nonzero_mappings\",\"cpu_begin_ns\":%llu,\"cpu_end_ns\":%llu,\"wall_ns\":%llu,\"user_cpu_ns\":%s,\"system_cpu_ns\":%s,\"tid\":%llu,\"begin\":%llu,\"end\":%llu,\"queue\":%u,\"submission\":%llu,\"valid\":%s}\n",
+                static_cast<unsigned long long>(cpuBegin), static_cast<unsigned long long>(cpuEnd),
+                static_cast<unsigned long long>(cpuEnd >= cpuBegin ? cpuEnd - cpuBegin : 0),
+                userCpu, systemCpu, static_cast<unsigned long long>(tid),
+                static_cast<unsigned long long>(rangeBegin), static_cast<unsigned long long>(rangeEnd),
+                origin.queue, static_cast<unsigned long long>(origin.submission), valid ? "true" : "false");
+        } catch (...) {
+            // Diagnostics must not alter mapping results or exception propagation.
+        }
+        errno = savedErrno;
+    }
+
+    MappingsCpuScope(const MappingsCpuScope&) = delete;
+    MappingsCpuScope& operator=(const MappingsCpuScope&) = delete;
+
+private:
+    static bool nanos(const timeval& value, std::uint64_t& result) noexcept {
+        if (value.tv_sec < 0 || value.tv_usec < 0 || value.tv_usec >= 1000000) return false;
+        const auto seconds = static_cast<std::uint64_t>(value.tv_sec);
+        const auto fraction = static_cast<std::uint64_t>(value.tv_usec) * 1000;
+        if (seconds > (UINT64_MAX - fraction) / 1000000000) return false;
+        result = seconds * 1000000000 + fraction;
+        return true;
+    }
+
+    bool enabled;
+    bool beginValid = false;
+    rusage usageBegin{};
+    AgcDriver::BatchTimeline::Origin origin;
+    std::uint64_t rangeBegin = 0, rangeEnd = 0, tid = 0, cpuBegin = 0;
+};
+
 std::vector<Mapping> mappings(std::uint64_t begin, std::uint64_t end) {
+    MappingsCpuScope cpuScope(begin, end);
     std::ifstream maps("/proc/self/maps");
     Require(static_cast<bool>(maps), "cannot read /proc/self/maps for a heap mirror's pages");
     std::vector<Mapping> found;
