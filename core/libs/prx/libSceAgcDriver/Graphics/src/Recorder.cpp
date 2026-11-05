@@ -26,12 +26,14 @@
 #include "prx/libc/include/CpuTopology.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libSceAgcDriver/Graphics/shaders/DispatchArguments_spv.h"
+#include "prx/libSceAgcDriver/Graphics/include/BatchTimeline.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
 #if defined(__linux__)
 #include <time.h>
+#include <sys/syscall.h>
 #endif
 #include <condition_variable>
 #include <cstdio>
@@ -83,6 +85,29 @@ std::optional<std::chrono::nanoseconds> threadCpuNow() {
 #endif
 }
 
+std::uint64_t batchTimelineTid() {
+#if defined(__linux__) && defined(SYS_gettid)
+    return static_cast<std::uint64_t>(::syscall(SYS_gettid));
+#elif defined(_WIN32)
+    return static_cast<std::uint64_t>(GetCurrentThreadId());
+#else
+    return 0;
+#endif
+}
+
+void batchTimelineEvent(const char* event, std::uint64_t cpuNs, std::uint64_t recorder,
+                        std::uint64_t batch, std::uint64_t serial, std::uint32_t queue,
+                        std::uint64_t tid) {
+    if (!AgcDriver::BatchTimeline::Enabled()) return;
+    AgcDriver::ProfilePrint_nid_no_patch(
+        "[batch-timeline] {\"event\":\"%s\",\"cpu_ns\":%llu,\"tid\":%llu,\"recorder\":%llu,\"batch_id\":%llu,\"serial\":%llu,\"queue\":%u}\n",
+        event, static_cast<unsigned long long>(cpuNs), static_cast<unsigned long long>(tid),
+        static_cast<unsigned long long>(recorder), static_cast<unsigned long long>(batch),
+        static_cast<unsigned long long>(serial), queue);
+}
+std::uint64_t recorderTimelineId(const Recorder* recorder) {
+    return recorder->TimelineId();
+}
 void recordVkSubmitWindow(double wallUs, std::optional<double> threadCpuUs) {
     static std::mutex mutex;
     static auto lastReport = std::chrono::steady_clock::now();
@@ -1915,15 +1940,33 @@ void Recorder::ensureOpen() {
             throw;
         }
         batch->queue = GuestMemory::GpuLockThreadTag();
+        static std::atomic<std::uint64_t> timelineBatchIds{0};
+        if (AgcDriver::BatchTimeline::Enabled()) {
+            batch->traceId = timelineBatchIds.fetch_add(1, std::memory_order_relaxed) + 1;
+            batch->timelineOrigin = AgcDriver::BatchTimeline::currentOrigin;
+            batch->timelineOriginKnown = batch->timelineOrigin.submission != 0;
+        }
+        batch->gpuStartNs = batch->gpuEndNs = 0;
         if (countingSamples && !segmentMode()) beginSamples(*batch);
         dropStaleHoldKept();
         batch->kept.insert(batch->kept.end(), holdKept.begin(), holdKept.end());
         open = std::move(batch);
-        if (PerformanceTrace::Recording()) {
+        if (PerformanceTrace::Recording() && !AgcDriver::BatchTimeline::Enabled()) {
             static std::atomic<std::uint64_t> traceIds{0};
             open->traceId = traceIds.fetch_add(1, std::memory_order_relaxed) + 1;
         }
         TraceBatchTag = open->traceId;
+        if (AgcDriver::BatchTimeline::Enabled()) {
+            batchTimelineEvent("batch_open", AgcDriver::BatchTimeline::CpuNanos(), recorderTimelineId(this),
+                               open->traceId, 0, open->queue, batchTimelineTid());
+            AgcDriver::ProfilePrint_nid_no_patch(
+                "[batch-timeline] {\"event\":\"batch_origin\",\"cpu_ns\":%llu,\"tid\":%llu,\"recorder\":%llu,\"batch_id\":%llu,\"submission\":%llu,\"queue\":%u}\n",
+                static_cast<unsigned long long>(AgcDriver::BatchTimeline::CpuNanos()),
+                static_cast<unsigned long long>(batchTimelineTid()),
+                static_cast<unsigned long long>(recorderTimelineId(this)),
+                static_cast<unsigned long long>(open->traceId),
+                static_cast<unsigned long long>(open->timelineOrigin.submission), open->timelineOrigin.queue);
+        }
         // The whole-batch range: its start stamp waits for the previous batches like any
         // bottom-of-pipe stamp, so it marks when this batch's execution began.
         if (BatchStampsEnabled()) open->batchTiming = beginTiming(BatchTimingKey);
@@ -2265,7 +2308,8 @@ bool Recorder::GpuTimingEnabled() {
 }
 
 bool Recorder::BatchStampsEnabled() {
-    return GpuTimingEnabled() || DrawProfiled() || PerformanceTrace::Configured() || batchStampsRequested.load(std::memory_order_relaxed);
+    return GpuTimingEnabled() || DrawProfiled() || PerformanceTrace::Configured() ||
+           batchStampsRequested.load(std::memory_order_relaxed) || AgcDriver::BatchTimeline::Enabled();
 }
 
 void Recorder::CountBarriers(CommandClass which, std::uint32_t count) {
@@ -3049,11 +3093,29 @@ void Recorder::readSamples(Batch& batch) {
 }
 
 void Recorder::readGpuTiming(Batch& batch) {
-    if (batch.queries == VK_NULL_HANDLE || batch.timedKeys.empty()) return;
+    const auto emitTimeline = [&](bool valid) {
+        if (!AgcDriver::BatchTimeline::Enabled()) return;
+        AgcDriver::ProfilePrint_nid_no_patch(
+            "[batch-timeline] {\"event\":\"gpu_batch\",\"cpu_ns\":%llu,\"device\":%llu,\"recorder\":%llu,\"batch_id\":%llu,\"serial\":%llu,\"gpu_begin_ns\":%.0f,\"gpu_end_ns\":%.0f,\"valid\":%s,\"domain\":\"device_timestamp\",\"measurement\":\"bottom_of_pipe_span\"}\n",
+            static_cast<unsigned long long>(AgcDriver::BatchTimeline::CpuNanos()),
+            static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(context.device)),
+            static_cast<unsigned long long>(recorderTimelineId(this)),
+            static_cast<unsigned long long>(batch.traceId),
+            static_cast<unsigned long long>(batch.serial),
+            valid ? batch.gpuStartNs : 0.0, valid ? batch.gpuEndNs : 0.0,
+            valid ? "true" : "false");
+    };
+    if (batch.queries == VK_NULL_HANDLE || batch.timedKeys.empty()) {
+        emitTimeline(false);
+        return;
+    }
     auto& stamps = gpuTimingStamps;
     stamps.resize(batch.timedKeys.size() * 2);
     const auto result = context.Function<PFN_vkGetQueryPoolResults>("vkGetQueryPoolResults")(context.device, batch.queries, 0, static_cast<std::uint32_t>(stamps.size()), stamps.size() * sizeof(std::uint64_t), stamps.data(), sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT);
-    if (result != VK_SUCCESS) return;
+    if (result != VK_SUCCESS) {
+        emitTimeline(false);
+        return;
+    }
     const auto period = context.limits.timestampPeriod;
     if (!GpuTimingEnabled()) {
         if (batch.batchTiming == 0 && stamps[1] >= stamps[0]) {
@@ -3061,6 +3123,7 @@ void Recorder::readGpuTiming(Batch& batch) {
             batch.gpuEndNs = static_cast<double>(stamps[1]) * period;
             PerformanceTrace::GpuRange("batch", batch.gpuStartNs, batch.gpuEndNs, batch.traceId);
         }
+        emitTimeline(batch.batchTiming == 0 && stamps[1] >= stamps[0]);
         return;
     }
     static auto lastReport = std::chrono::steady_clock::now();
@@ -4026,13 +4089,25 @@ void Recorder::AfterCompletions(std::uint64_t address, std::span<const std::byte
         std::lock_guard ringLock(writtenBackMutex);
         return writtenBackSequence;
     }();
-    batch.completions.push_back([this, address, copy = std::move(copy), sequence, storedOnGpu] {
+    batch.completions.push_back([this, address, copy = std::move(copy), sequence, storedOnGpu,
+                                 recorderId = recorderTimelineId(this), batchId = batch.traceId,
+                                 batchSerial = batch.serial, queue, stamp] {
         if (storedOnGpu && !always && !writtenBackSince(sequence, address, address + copy.size())) {
             completionStoresSkipped.fetch_add(1, std::memory_order_relaxed);
             return;
         }
         completionStoresRun.fetch_add(1, std::memory_order_relaxed);
         GuestMemory::CheckRange(reinterpret_cast<const void*>(address), copy.size(), 4, true);
+        if (AgcDriver::BatchTimeline::Enabled()) {
+            AgcDriver::ProfilePrint_nid_no_patch(
+                "[batch-timeline] {\"event\":\"label_cpu_publish\",\"cpu_ns\":%llu,\"recorder\":%llu,\"batch_id\":%llu,\"serial\":%llu,\"queue\":%u,\"address\":%llu,\"value\":%llu,\"sequence\":%llu}\n",
+                static_cast<unsigned long long>(AgcDriver::BatchTimeline::CpuNanos()),
+                static_cast<unsigned long long>(recorderId),
+                static_cast<unsigned long long>(batchId), static_cast<unsigned long long>(batchSerial),
+                queue, static_cast<unsigned long long>(address),
+                static_cast<unsigned long long>(copy.size() >= 4 ? *reinterpret_cast<const std::uint32_t*>(copy.data()) : 0),
+                static_cast<unsigned long long>(stamp));
+        }
         GuestMemory::StoreOwnBytes(address, copy);
     });
     // Counted per batch and counted down when the batch finishes, on every exit path of finish()
@@ -4204,7 +4279,15 @@ void Recorder::Submit() {
         const auto cpuStart = profile ? threadCpuNow() : std::nullopt;
         target->submitStarted.store(true, std::memory_order_release);
         const auto pureSubmitStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        if (AgcDriver::BatchTimeline::Enabled()) {
+            batchTimelineEvent("submit_begin", AgcDriver::BatchTimeline::CpuNanos(), recorderTimelineId(this),
+                               target->traceId, target->serial, target->queue, batchTimelineTid());
+        }
         const auto result = submitFunction(context.queue, 1, &submission, target->fence);
+        if (AgcDriver::BatchTimeline::Enabled()) {
+            batchTimelineEvent("submit_end", AgcDriver::BatchTimeline::CpuNanos(), recorderTimelineId(this),
+                               target->traceId, target->serial, target->queue, batchTimelineTid());
+        }
         if (profile) {
             const auto returnedAt = std::chrono::steady_clock::now();
             const auto cpuEnd = threadCpuNow();
@@ -4263,6 +4346,10 @@ void Recorder::Submit() {
     Check(result, "vkQueueSubmit recorder");
     batch->submitted = true;
     batch->serial = ++submissions;
+    if (AgcDriver::BatchTimeline::Enabled()) {
+        batchTimelineEvent("batch_submitted", AgcDriver::BatchTimeline::CpuNanos(), recorderTimelineId(this),
+                           batch->traceId, batch->serial, batch->queue, batchTimelineTid());
+    }
     publishedSubmissions.store(batch->serial, std::memory_order_release);
     batch->submittedAt = std::chrono::steady_clock::now();
     CaptureTrace::Log("submit-confirmed batch=%llu tokens=%s", static_cast<unsigned long long>(batch->serial), tokensStr.c_str());
@@ -4906,6 +4993,10 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             Check(result, "vkWaitForFences recorder");
         }
     }
+    if (AgcDriver::BatchTimeline::Enabled()) {
+        batchTimelineEvent("fence_seen", AgcDriver::BatchTimeline::CpuNanos(), recorderTimelineId(this),
+                           batch->traceId, batch->serial, batch->queue, batchTimelineTid());
+    }
     readGpuTiming(*batch);
     readSamples(*batch);
     if (batch->serial != 0) {
@@ -4927,6 +5018,10 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
     // reaped or synced the batch. Inside them the flush hook makes no pending-write wait (SyncThrough).
     const bool profile = DrawProfiled();
     const auto completionStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if (AgcDriver::BatchTimeline::Enabled()) {
+        batchTimelineEvent("completion_begin", AgcDriver::BatchTimeline::CpuNanos(), recorderTimelineId(this),
+                           batch->traceId, batch->serial, batch->queue, batchTimelineTid());
+    }
     {
         struct InCompletion {
             InCompletion() { ++completionDepth; }
@@ -4949,6 +5044,10 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
                 AgcDriver::LogCoalescedStderr_nid_no_patch("[gpu] deferred write-back failed: %s\n", error.what());
             }
         }
+    }
+    if (AgcDriver::BatchTimeline::Enabled()) {
+        batchTimelineEvent("completion_end", AgcDriver::BatchTimeline::CpuNanos(), recorderTimelineId(this),
+                           batch->traceId, batch->serial, batch->queue, batchTimelineTid());
     }
     if (!batch->completions.empty()) KernelWakeSleepers_nid_no_patch();
     if (profile) holdCounters.completions += batch->completions.size();

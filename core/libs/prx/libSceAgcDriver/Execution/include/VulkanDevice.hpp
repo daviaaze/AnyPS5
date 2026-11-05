@@ -89,6 +89,7 @@ public:
     bool BdaAtomicsUsable() const;
     bool RasterOrderGroupUsable() const;
     bool CalibrateClock(double& gpuNs, std::chrono::steady_clock::time_point& cpu) const;
+    bool CalibrateClock(double& gpuNs, std::chrono::steady_clock::time_point& cpu, std::uint64_t* maxDeviationNs) const;
     ShaderRecompiler::SpirvTarget Target() const;
     Graphics::SampleOrder HostSampleOrder(const Graphics::State& graphics) const;
     std::optional<ShaderRecompiler::GeometryStageLimits> GeometryLimits() const;

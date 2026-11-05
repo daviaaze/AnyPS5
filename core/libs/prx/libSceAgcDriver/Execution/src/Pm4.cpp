@@ -1,4 +1,6 @@
 #include "prx/libkernel/include/Api.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BatchTimeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/General.hpp"
@@ -1114,16 +1116,42 @@ void Execute(std::span<const std::uint32_t> packet, QueueState& queue) {
             return;
         case 0x59: break;
         case 0x3c: case 0x93: {
-            // The waited-on value is written by the CPU or another queue; poll it like the CP would.
             const auto start = std::chrono::steady_clock::now();
+            const bool timeline = AgcDriver::BatchTimeline::Enabled();
+            WaitFields waitFields{};
+            if (timeline) waitFields = DecodeWait(packet);
+            const bool waited = !WaitSatisfied(packet);
+            bool waiting = waited;
+            if (waiting && timeline) {
+                AgcDriver::ProfilePrint_nid_no_patch(
+                    "[batch-timeline] {\"event\":\"wait_reg_mem_begin\",\"cpu_ns\":%llu,\"queue\":%u,\"submission\":%llu,\"address\":%llu,\"reference\":%llu,\"mask\":%llu,\"producer\":\"unknown\"}\n",
+                    static_cast<unsigned long long>(AgcDriver::BatchTimeline::CpuNanos()),
+                    AgcDriver::BatchTimeline::currentOrigin.queue,
+                    static_cast<unsigned long long>(AgcDriver::BatchTimeline::currentOrigin.submission),
+                    static_cast<unsigned long long>(waitFields.address),
+                    static_cast<unsigned long long>(waitFields.reference),
+                    static_cast<unsigned long long>(waitFields.mask));
+            }
             bool warned = false;
-            while (!WaitSatisfied(packet)) {
+            while (waiting) {
                 PreciseSleepUs(50);
                 if (!warned && std::chrono::steady_clock::now() - start > std::chrono::seconds(5)) {
                     warned = true;
                     std::fprintf(stderr, "[gpu] WAIT_REG_MEM at 0x%llx still waiting after 5s (function %u ref 0x%x mask 0x%x)\n",
                                  static_cast<unsigned long long>(address(packet[2] & (WaitAwaitedBytes(packet) == 8 ? ~7u : ~3u), packet[3])), packet[1] & 7u, packet[4], packet[5]);
                 }
+                waiting = !WaitSatisfied(packet);
+            }
+            if (!waited) return;
+            if (timeline) {
+                AgcDriver::ProfilePrint_nid_no_patch(
+                    "[batch-timeline] {\"event\":\"wait_reg_mem_end\",\"cpu_ns\":%llu,\"queue\":%u,\"submission\":%llu,\"address\":%llu,\"reference\":%llu,\"mask\":%llu,\"producer\":\"unknown\"}\n",
+                    static_cast<unsigned long long>(AgcDriver::BatchTimeline::CpuNanos()),
+                    AgcDriver::BatchTimeline::currentOrigin.queue,
+                    static_cast<unsigned long long>(AgcDriver::BatchTimeline::currentOrigin.submission),
+                    static_cast<unsigned long long>(waitFields.address),
+                    static_cast<unsigned long long>(waitFields.reference),
+                    static_cast<unsigned long long>(waitFields.mask));
             }
             return;
         }

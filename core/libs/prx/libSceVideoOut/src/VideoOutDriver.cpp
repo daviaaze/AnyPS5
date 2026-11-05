@@ -10,6 +10,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <functional>
 
 #include "SDL.h"
 #include "SDL_vulkan.h"
@@ -30,6 +31,8 @@
 #include "prx/libSceVideoOut/include/FrameTimingLog.hpp"
 #endif
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BatchTimeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HostHdr.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Presentation.hpp"
 #include "prx/libSceIme/include/ImeKeyboardView.hpp"
@@ -719,6 +722,19 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
     req.cfg->vblankCond.notify_all();
     KernelWakeSleepers_nid_no_patch();
     timing.Mark("notify_game");
+    if (AgcDriver::BatchTimeline::Enabled()) {
+        const auto* frameTiming = req.timing.get();
+        const auto frameId = frameTiming != nullptr ? frameTiming->Id() : 0;
+        const auto submission = frameTiming != nullptr ? frameTiming->TimelineSubmission() : 0;
+        const auto queue = frameTiming != nullptr ? frameTiming->TimelineQueue() : 0;
+        AgcDriver::ProfilePrint_nid_no_patch(
+            "[batch-timeline] {\"event\":\"guest_frame_complete\",\"cpu_ns\":%llu,\"tid\":%llu,\"frame_id\":%llu,\"frame_known\":%s,\"origin_known\":%s,\"submission\":%llu,\"queue\":%u,\"flip_arg\":%lld}\n",
+            static_cast<unsigned long long>(AgcDriver::BatchTimeline::CpuNanos()),
+            static_cast<unsigned long long>(std::hash<std::thread::id>{}(std::this_thread::get_id())),
+            static_cast<unsigned long long>(frameId), frameTiming != nullptr ? "true" : "false",
+            frameTiming != nullptr && submission != 0 ? "true" : "false",
+            static_cast<unsigned long long>(submission), queue, static_cast<long long>(req.flipArg));
+    }
 }
 
 std::optional<AgcDriver::DisplayBuffer> VideoOutDriver::overlayPlane() {

@@ -7,7 +7,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
-#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BatchTimeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/SubmissionCapture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadPriority.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
@@ -21,6 +21,18 @@
 #include <cstdlib>
 #include <exception>
 #include <optional>
+
+
+namespace {
+
+void submissionTimelineEvent(const char* event, std::uint64_t cpuNs, std::uint64_t submission, std::uint32_t queue) {
+    if (!AgcDriver::BatchTimeline::Enabled()) return;
+    AgcDriver::ProfilePrint_nid_no_patch(
+        "[batch-timeline] {\"event\":\"%s\",\"cpu_ns\":%llu,\"submission\":%llu,\"queue\":%u}\n",
+        event, static_cast<unsigned long long>(cpuNs), static_cast<unsigned long long>(submission), queue);
+}
+
+}
 
 namespace AgcDriver::DriverDetail {
 
@@ -551,8 +563,15 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue, bool cpuFlip) {
             auto frame = std::make_shared<FrameTiming>(++frameSerial);
             frame->IncludeSubmission(accepted, now, now, now, true);
             frame->SetFlip(accepted, 0, now, now);
+            if (AgcDriver::BatchTimeline::Enabled()) frame->SetTimelineOrigin(accepted, queue);
             countFlip();
+            if (AgcDriver::BatchTimeline::Enabled()) {
+                AgcDriver::ProfilePrint_nid_no_patch("[batch-timeline] {\"event\":\"flip_request\",\"cpu_ns\":%llu,\"frame\":%llu,\"flip_offset\":0,\"submission\":%llu,\"queue\":%u,\"dependency_known\":false}\n",
+                    static_cast<unsigned long long>(AgcDriver::BatchTimeline::CpuNanos()), static_cast<unsigned long long>(frame->Id()), static_cast<unsigned long long>(accepted), queue);
+            }
             submission.flips.begin()->second->GpuReady(frame);
+            if (AgcDriver::BatchTimeline::Enabled()) AgcDriver::ProfilePrint_nid_no_patch("[batch-timeline] {\"event\":\"flip_callback_return\",\"cpu_ns\":%llu,\"frame\":%llu,\"flip_offset\":0,\"submission\":%llu,\"queue\":%u}\n",
+                static_cast<unsigned long long>(AgcDriver::BatchTimeline::CpuNanos()), static_cast<unsigned long long>(frame->Id()), static_cast<unsigned long long>(accepted), queue);
             lock.unlock();
             Graphics::NoteHostImportFrame();
             AgcDriverDeliverEopInterrupt(0);
@@ -579,6 +598,7 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue, bool cpuFlip) {
         if (!submission.flips.empty()) ++flipSubmissionsOfThread();
         enqueue(std::move(submission));
         ++accepted;
+        if (AgcDriver::BatchTimeline::Enabled()) submissionTimelineEvent("submission_accept", AgcDriver::BatchTimeline::CpuNanos(), accepted, queue);
     }
     changed.notify_all();
     if (capture != nullptr) writeCaptured(*this, *capture, captured);

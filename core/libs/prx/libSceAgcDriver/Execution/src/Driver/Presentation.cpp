@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BatchTimeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
@@ -125,6 +126,7 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
         bool submitted = false;
         bool presentable = false;
         bool trailing = false;
+        bool queuedPresent = false;
         bool queueUnlocked = false;
         double waitedMs = 0;
         {
@@ -178,6 +180,7 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
                     queueUnlocked = true;
                 } else {
                     presenting->QueuePresent();
+                    queuedPresent = true;
                     timing.Mark("queue_present");
                 }
                 trailing = !syncFlip;
@@ -186,6 +189,7 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
         }
         if (queueUnlocked) {
             presenting->QueuePresent();
+            queuedPresent = true;
             timing.Mark("queue_present");
         }
         if (trailing) {
@@ -203,9 +207,21 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
                 std::lock_guard lock(GuestMemory::GpuMutex());
                 presenting->QueuePresent();
             }
+            queuedPresent = true;
             timing.Mark("queue_present");
         }
         gpuReady(context);
+        if (queuedPresent && AgcDriver::BatchTimeline::Enabled()) {
+            const bool originKnown = window.timing != nullptr && window.timing->TimelineSubmission() != 0;
+            AgcDriver::ProfilePrint_nid_no_patch(
+                "[batch-timeline] {\"event\":\"present_queue\",\"cpu_ns\":%llu,\"frame\":%llu,\"flip_offset\":%zu,\"submission\":%llu,\"queue\":%u,\"origin_known\":%s,\"dependency_known\":false,\"physical_present_known\":false}\n",
+                static_cast<unsigned long long>(AgcDriver::BatchTimeline::CpuNanos()),
+                static_cast<unsigned long long>(originKnown ? window.timing->Id() : 0),
+                originKnown ? window.timing->TimelineFlipOffset() : 0,
+                static_cast<unsigned long long>(originKnown ? window.timing->TimelineSubmission() : 0),
+                originKnown ? window.timing->TimelineQueue() : 0,
+                originKnown ? "true" : "false");
+        }
         timing.Mark("release_and_callback");
         TracyZone::MarkFrame();
         if (profile) reportPresents(waitedMs, inFlight);

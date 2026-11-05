@@ -13,6 +13,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BatchTimeline.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <atomic>
@@ -270,6 +271,7 @@ struct DrawTail {
     std::uint64_t shapeKey = 0;
     ShaderRecompiler::ShaderPixelStageInfo pixel{};
     std::vector<DrawProgram> writablePrograms;
+    AgcDriver::BatchTimeline::Origin origin{};
     const std::vector<DrawProgram>* programs = nullptr;
     std::vector<ShaderRecompiler::MemoryRegion> memory;
     std::vector<ShaderRecompiler::LinkedProgram> linked;
@@ -446,6 +448,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto tailHolder = std::make_shared<DrawTail>();
     auto& tail = *tailHolder;
+    tail.origin = {submission.serial, submission.queue};
     auto& phaseMs = tail.phaseMs;
     auto& captures = tail.captures;
     auto& phaseLap = tail.phaseLap;
@@ -899,6 +902,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         DrawFinisher::Pending held;
         if (DrawFinisher::Overlap()) held = heldWrites(tail);
         DrawFinisher::Get().Enqueue([this, tailHolder] {
+            AgcDriver::BatchTimeline::Scope originScope(tailHolder->origin);
             auto& job = *tailHolder;
             DrawPipeline::FollowEpoch(job.epoch);
             AgcDriver::P0Metrics::Scope p0(job.submissionQueue, AgcDriver::P0Metrics::Layer::Finisher, AgcDriver::P0Metrics::Operation::Draw);
@@ -1600,6 +1604,7 @@ DrawVerdict Driver::finishDraw(const std::shared_ptr<DrawTail>& tailHolder, Perf
                 const auto commitPacket = tail.packetOpcode;
                 const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
                 auto commit = [this, tailHolder, direct, snapshots = std::move(snapshots), commitQueue, commitPacket, epoch, trace = trace, recipe = std::move(recordRecipe), recipeStages = recipeSafe ? std::move(indirectRecipeStages) : std::vector<std::shared_ptr<DispatchVariant>>{}, drawKey, shape = tail.shapeKey] {
+                    AgcDriver::BatchTimeline::Scope originScope(tailHolder->origin);
                     const auto& commitTail = *tailHolder;
                     (void)commitTail.runtimeData;
                     (void)commitTail.recordResults;
@@ -1681,6 +1686,7 @@ DrawVerdict Driver::finishDraw(const std::shared_ptr<DrawTail>& tailHolder, Perf
         const auto epoch = DrawFinisher::OnFinisherThread() ? tail.epoch : DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         auto reads = QueuedDrawReadRanges(drawParameters, stages);
         auto commit = [this, tailHolder, drawParameters, snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, shape = tail.shapeKey, commitQueue, commitPacket, epoch, trace = trace] {
+            AgcDriver::BatchTimeline::Scope originScope(tailHolder->origin);
             const auto& commitTail = *tailHolder;
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(commitPacket, commitQueue);

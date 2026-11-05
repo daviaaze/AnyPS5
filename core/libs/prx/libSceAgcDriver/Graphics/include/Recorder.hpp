@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PassHazards.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BatchTimeline.hpp"
 #include <unordered_map>
 #include <atomic>
 #include <chrono>
@@ -281,6 +282,9 @@ public:
     void SyncThrough(std::uint64_t address, std::size_t bytes, bool waitUnlocked = false);
     // Completes batches that already finished; returns whether nothing is in flight.
     bool Reap();
+    // Stable process-unique recorder identity and highest serial accepted for submission.
+    std::uint64_t TimelineId() const { return id; }
+    std::uint64_t LastSubmittedSerial() const { return publishedSubmissions.load(std::memory_order_acquire); }
     std::uint64_t Submissions() const { return submissions; }
     // Batches submitted and not yet finished (what a full Sync() waits for); under GuestMemory::GpuMutex.
     std::size_t InFlightBatches() const { return inFlight.size(); }
@@ -630,6 +634,8 @@ private:
         // Submission number (1-based): identifies a batch after its allocation may have been reused.
         std::uint64_t serial = 0;
         std::uint64_t traceId = 0;
+        AgcDriver::BatchTimeline::Origin timelineOrigin{};
+        bool timelineOriginKnown = false;
         bool submitted = false;
         std::atomic<bool> submitting{false};
         std::atomic<bool> submitComplete{false};

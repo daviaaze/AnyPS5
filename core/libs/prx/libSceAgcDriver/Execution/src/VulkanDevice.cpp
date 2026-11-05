@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineJournal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DeferredDestruction.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BatchTimeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FloatFlushProbe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
@@ -552,6 +553,7 @@ struct VulkanDevice::State {
     bool individuallyFreeDescriptorSets = false;
     bool tessellationPipelineCache = true;
     PFN_vkGetCalibratedTimestampsKHR calibratedTimestamps = nullptr;
+    std::chrono::steady_clock::time_point lastTimelineCalibration{};
     PFN_vkCmdSetCheckpointNV checkpointMarker = nullptr;
     PFN_vkCmdWriteBufferMarkerAMD bufferMarker = nullptr;
     VkBuffer markerBuffer = VK_NULL_HANDLE;
@@ -777,6 +779,8 @@ struct VulkanDevice::State {
         // in between ran ahead of this blit.
         std::uint64_t recorderSerial = 0;
         std::uint64_t previousSerial = 0;
+        std::uint64_t timelineFrameId = 0;
+        bool timelineFrameKnown = false;
         std::chrono::steady_clock::time_point submittedAt{};
         // APS5_PROFILE_GPU: the blit's own two timestamps (the [gputime] present-blit class), read
         // when the slot retires, and the swapchain bytes it wrote.
@@ -1029,11 +1033,25 @@ struct VulkanDevice::State {
             slot.dumpRecorded = false;
             WriteFrameDump(slot);
         }
-        if (slot.queries != VK_NULL_HANDLE) {
-            std::uint64_t stamps[2] = {};
-            if (DeviceFunction<PFN_vkGetQueryPoolResults>("vkGetQueryPoolResults")(device, slot.queries, 0, 2, sizeof(stamps), stamps, sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && stamps[1] > stamps[0]) {
-                Graphics::Recorder::AddGpuTiming(Graphics::Recorder::CommandClass::PresentBlit, static_cast<double>(stamps[1] - stamps[0]) * properties.limits.timestampPeriod, slot.blitBytes);
-            }
+        std::uint64_t stamps[2] = {};
+        const bool queryValid = slot.queries != VK_NULL_HANDLE &&
+            DeviceFunction<PFN_vkGetQueryPoolResults>("vkGetQueryPoolResults")(
+                device, slot.queries, 0, 2, sizeof(stamps), stamps, sizeof(std::uint64_t),
+                VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && stamps[1] > stamps[0];
+        if (queryValid) {
+            Graphics::Recorder::AddGpuTiming(Graphics::Recorder::CommandClass::PresentBlit,
+                static_cast<double>(stamps[1] - stamps[0]) * properties.limits.timestampPeriod, slot.blitBytes);
+        }
+        if (AgcDriver::BatchTimeline::Enabled()) {
+            AgcDriver::ProfilePrint_nid_no_patch(
+                "[batch-timeline] {\"event\":\"present_gpu_batch\",\"device\":%llu,\"frame_id\":%llu,\"frame_known\":%s,\"image\":%u,\"slot\":%zu,\"through_serial\":%llu,\"gpu_begin_ns\":%.0f,\"gpu_end_ns\":%.0f,\"gpu_valid\":%s,\"domain\":\"device_timestamp\",\"measurement\":\"bottom_of_pipe_span\"}\n",
+                static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(device)),
+                static_cast<unsigned long long>(slot.timelineFrameId), slot.timelineFrameKnown ? "true" : "false",
+                slot.imageIndex, static_cast<std::size_t>(&slot - presentSlots.data()),
+                static_cast<unsigned long long>(slot.recorderSerial),
+                queryValid ? static_cast<double>(stamps[0]) * properties.limits.timestampPeriod : 0.0,
+                queryValid ? static_cast<double>(stamps[1]) * properties.limits.timestampPeriod : 0.0,
+                queryValid ? "true" : "false");
         }
         if (!recorder) return;
         const auto afterFlip = recorder->NewestSubmitted() - slot.recorderSerial;
@@ -2245,7 +2263,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     state->samplerAnisotropy = true;
     state->textureCompressionBC = true;
     deviceInfo.pEnabledFeatures = &enabled;
-    const char* calibratedTimestamps = !PerformanceTrace::Configured() ? nullptr : hasExtension(VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) ? VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME : hasExtension(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) ? VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME : nullptr;
+    const char* calibratedTimestamps = !(PerformanceTrace::Configured() || AgcDriver::BatchTimeline::Enabled()) ? nullptr : hasExtension(VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) ? VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME : hasExtension(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) ? VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME : nullptr;
     if (calibratedTimestamps != nullptr) deviceExtensions.push_back(calibratedTimestamps);
     deviceInfo.enabledExtensionCount = static_cast<std::uint32_t>(deviceExtensions.size());
     deviceInfo.ppEnabledExtensionNames = deviceExtensions.data();
@@ -2506,6 +2524,20 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             state->hostTimeDomain = *host;
             state->calibratedTimestamps = state->DeviceFunction<PFN_vkGetCalibratedTimestampsKHR>(khr ? "vkGetCalibratedTimestampsKHR" : "vkGetCalibratedTimestampsEXT");
         }
+    }
+    if (AgcDriver::BatchTimeline::Enabled()) {
+        double gpuNs = 0.0;
+        std::chrono::steady_clock::time_point cpu{};
+        std::uint64_t deviation = 0;
+        const bool valid = CalibrateClock(gpuNs, cpu, &deviation);
+        const auto cpuNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            cpu.time_since_epoch()).count());
+        AgcDriver::ProfilePrint_nid_no_patch(
+            "[batch-timeline] {\"event\":\"calib\",\"device\":%llu,\"cpu_ns\":%llu,\"gpu_ns\":%.0f,\"max_deviation_ns\":%llu,\"valid\":%s}\n",
+            static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(state->device)),
+            static_cast<unsigned long long>(cpuNs), gpuNs,
+            static_cast<unsigned long long>(deviation), valid ? "true" : "false");
+        state->lastTimelineCalibration = std::chrono::steady_clock::now();
     }
     state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, family, 0, &state->queue);
     state->queueFamily = family;
@@ -4117,6 +4149,9 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
     if (state->presentSlots[state->presentCursor].inFlight) RetirePresents(state->presentSlots.size() - 1);
     auto& slot = state->presentSlots[state->presentCursor];
     require(!slot.inFlight, "presentation slot is still in flight");
+    const auto* timelineFrame = AgcDriver::BatchTimeline::Enabled() ? PerformanceContext::Current() : nullptr;
+    slot.timelineFrameKnown = timelineFrame != nullptr;
+    slot.timelineFrameId = timelineFrame != nullptr ? timelineFrame->Id() : 0;
     const bool overlay = PerformanceOverlay::Visible();
     if (plane != nullptr && state->surfaceColorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT) {
         static std::once_flag reported;
@@ -4132,6 +4167,24 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
     if (display != nullptr && resident == nullptr) {
         static_cast<void>(DisplayBufferSize(*display));
         state->colorTransfer->Upload(display->address, width, height, Graphics::ColorTileMode::RenderTarget, DisplayTexelBytes(display->pixelFormat));
+    }
+    if (AgcDriver::BatchTimeline::Enabled()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (state->lastTimelineCalibration == std::chrono::steady_clock::time_point{} ||
+            now - state->lastTimelineCalibration >= std::chrono::seconds(1)) {
+            double gpuNs = 0.0;
+            std::chrono::steady_clock::time_point cpu{};
+            std::uint64_t deviation = 0;
+            const bool valid = CalibrateClock(gpuNs, cpu, &deviation);
+            const auto cpuNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                cpu.time_since_epoch()).count());
+            AgcDriver::ProfilePrint_nid_no_patch(
+                "[batch-timeline] {\"event\":\"calib\",\"device\":%llu,\"cpu_ns\":%llu,\"gpu_ns\":%.0f,\"max_deviation_ns\":%llu,\"valid\":%s}\n",
+                static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(state->device)),
+                static_cast<unsigned long long>(cpuNs), gpuNs,
+                static_cast<unsigned long long>(deviation), valid ? "true" : "false");
+            state->lastTimelineCalibration = now;
+        }
     }
     if (!pixels.empty()) state->Upload(pixels);
     // The frame's recorded work (and a refresh of the resident image) must reach the queue before the
@@ -4152,7 +4205,7 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
     APS5_LOG_OUT_DEBUG("Presentation command buffer begin commands=%p image=%p", reinterpret_cast<void*>(commands), reinterpret_cast<void*>(state->images[index]));
     using CommandClass = Graphics::Recorder::CommandClass;
     Graphics::Recorder::CountPresent();
-    if (Graphics::Recorder::GpuTimingEnabled()) {
+    if (Graphics::Recorder::GpuTimingEnabled() || AgcDriver::BatchTimeline::Enabled()) {
         if (slot.queries == VK_NULL_HANDLE) {
             VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
             info.queryType = VK_QUERY_TYPE_TIMESTAMP;
@@ -4336,6 +4389,16 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
         [] { GuestMemory::GpuMutex().unlock(); }, [] { GuestMemory::GpuMutex().lock(); },
         [&] { return state->DeviceFunction<PFN_vkQueueSubmit>("vkQueueSubmit")(state->queue, 1, &submit, slot.fence); });
     check(submitResult, "vkQueueSubmit clear");
+    if (AgcDriver::BatchTimeline::Enabled()) {
+        const auto* frame = PerformanceContext::Current();
+        AgcDriver::ProfilePrint_nid_no_patch(
+            "[batch-timeline] {\"event\":\"frame_present_dependency\",\"device\":%llu,\"frame_id\":%llu,\"frame_known\":%s,\"recorder_id\":%llu,\"recorder_known\":%s,\"through_serial\":%llu,\"slot\":%zu,\"image\":%u,\"edge\":\"recorder_prefix_before_blit_submit\",\"present_edge\":\"rendered_semaphore_to_QueuePresent\"}\n",
+            static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(state->device)),
+            static_cast<unsigned long long>(frame != nullptr ? frame->Id() : 0), frame != nullptr ? "true" : "false",
+            static_cast<unsigned long long>(state->recorder ? state->recorder->TimelineId() : 0),
+            state->recorder ? "true" : "false", static_cast<unsigned long long>(batchesAtBlit),
+            static_cast<std::size_t>(&slot - state->presentSlots.data()), index);
+    }
     const auto submittedAt = std::chrono::steady_clock::now();
     timing.Mark("queue_submit");
     APS5_LOG_CHARS_OUT_DEBUG("Presentation vkQueueSubmit OK");
@@ -4506,8 +4569,15 @@ bool VulkanDevice::RasterOrderGroupUsable() const {
 }
 
 bool VulkanDevice::CalibrateClock(double& gpuNs, std::chrono::steady_clock::time_point& cpu) const {
+    return CalibrateClock(gpuNs, cpu, nullptr);
+}
+
+bool VulkanDevice::CalibrateClock(double& gpuNs, std::chrono::steady_clock::time_point& cpu,
+                                  std::uint64_t* maxDeviationNs) const {
     if (state->calibratedTimestamps == nullptr) return false;
-    const std::array<VkCalibratedTimestampInfoKHR, 2> domains{VkCalibratedTimestampInfoKHR{VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR, nullptr, VK_TIME_DOMAIN_DEVICE_KHR}, VkCalibratedTimestampInfoKHR{VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR, nullptr, state->hostTimeDomain}};
+    const std::array<VkCalibratedTimestampInfoKHR, 2> domains{
+        VkCalibratedTimestampInfoKHR{VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR, nullptr, VK_TIME_DOMAIN_DEVICE_KHR},
+        VkCalibratedTimestampInfoKHR{VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR, nullptr, state->hostTimeDomain}};
     std::array<std::uint64_t, 2> stamps{};
     std::uint64_t deviation = 0;
     if (state->calibratedTimestamps(state->device, static_cast<std::uint32_t>(domains.size()), domains.data(), stamps.data(), &deviation) != VK_SUCCESS) return false;
@@ -4526,6 +4596,7 @@ bool VulkanDevice::CalibrateClock(double& gpuNs, std::chrono::steady_clock::time
 #endif
     gpuNs = static_cast<double>(stamps[0]) * state->properties.limits.timestampPeriod;
     cpu = now - std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double, std::nano>(sinceNs));
+    if (maxDeviationNs != nullptr) *maxDeviationNs = deviation;
     return true;
 }
 

@@ -1,4 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BatchTimeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/SubmissionRing.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
@@ -278,8 +280,11 @@ void Driver::run(std::uint32_t id) noexcept {
                 running.Start();
                 if (profile && submission.enqueuedAt != std::chrono::steady_clock::time_point{}) costs.dequeueNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - submission.enqueuedAt).count());
             }
+            AgcDriver::BatchTimeline::Scope originScope({submission.serial, submission.queue});
+            if (AgcDriver::BatchTimeline::Enabled()) AgcDriver::ProfilePrint_nid_no_patch("[batch-timeline] {\"event\":\"worker_begin\",\"cpu_ns\":%llu,\"queue\":%u,\"submission\":%llu}\n", static_cast<unsigned long long>(AgcDriver::BatchTimeline::CpuNanos()), id, static_cast<unsigned long long>(submission.serial));
             retireLabelTakes(id, submission.received);
             execute(submission);
+            if (AgcDriver::BatchTimeline::Enabled()) AgcDriver::ProfilePrint_nid_no_patch("[batch-timeline] {\"event\":\"worker_end\",\"cpu_ns\":%llu,\"queue\":%u,\"submission\":%llu}\n", static_cast<unsigned long long>(AgcDriver::BatchTimeline::CpuNanos()), id, static_cast<unsigned long long>(submission.serial));
             if (submission.progress && submission.rewindTail == nullptr && !completionDeferred()) submitOpenWork(submission.progress);
             if (traceGpu) std::fprintf(stderr, "[gpu] %.1f done serial=%llu queue=0x%x\n", TraceMs(), static_cast<unsigned long long>(submission.serial), id);
             const auto completeStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};

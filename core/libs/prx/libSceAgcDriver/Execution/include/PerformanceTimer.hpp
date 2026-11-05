@@ -93,6 +93,7 @@ public:
     };
 
     explicit FrameTiming(std::uint64_t id, bool localMetrics = false) : localMetrics(localMetrics), id(id), workerStart(Clock::now()) {}
+    std::uint64_t Id() const { return id; }
 
     static FrameTiming* Preparation() {
         if (!APS5_ENABLE_TIMING_LOG) return nullptr;
@@ -175,6 +176,14 @@ public:
         flipReached = reached;
         localMetrics = false;
     }
+    void SetTimelineOrigin(std::uint64_t submission, std::uint32_t queue) {
+        timelineSubmission = submission;
+        timelineQueue = queue;
+    }
+
+    std::uint64_t TimelineSubmission() const { return timelineSubmission; }
+    std::uint32_t TimelineQueue() const { return timelineQueue; }
+    std::size_t TimelineFlipOffset() const { return flipOffset; }
 
     Clock::time_point FlipReached() {
         std::lock_guard lock(mutex);
@@ -284,6 +293,8 @@ private:
     std::uint64_t flipSerial = 0;
     std::size_t flipOffset = 0;
     Clock::time_point workerStart{};
+    std::uint64_t timelineSubmission = 0;
+    std::uint32_t timelineQueue = 0;
     Clock::time_point start{};
     Clock::time_point executionStart{};
     Clock::time_point flipReceived{};

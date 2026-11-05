@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BatchTimeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
@@ -456,9 +457,12 @@ void Driver::execute(const Submission& submission) {
             frame->SetFlip(submission.serial, cursor, queueTiming ? submission.receivedAt : now, now);
             if (queueTiming) frame->CollectBackground();
             frame->NoteFlipBatches(batchesAtFlip, unsignaledAtFlip);
+            if (AgcDriver::BatchTimeline::Enabled()) frame->SetTimelineOrigin(submission.serial, submission.queue);
+            if (AgcDriver::BatchTimeline::Enabled()) AgcDriver::ProfilePrint_nid_no_patch("[batch-timeline] {\"event\":\"flip_request\",\"cpu_ns\":%llu,\"frame\":%llu,\"flip_offset\":%zu,\"submission\":%llu,\"queue\":%u,\"dependency_known\":false}\n", static_cast<unsigned long long>(AgcDriver::BatchTimeline::CpuNanos()), static_cast<unsigned long long>(frame->Id()), cursor, static_cast<unsigned long long>(submission.serial), submission.queue);
             CaptureTrace::Log("flip frame=%llu submission=%llu offset=%zu batch=%llu unsignaled=%llu", static_cast<unsigned long long>(frameSerial.load()), static_cast<unsigned long long>(submission.serial), cursor, static_cast<unsigned long long>(batchesAtFlip), static_cast<unsigned long long>(unsignaledAtFlip));
             flipHold.Release();
             submission.flips.at(cursor)->GpuReady(frame);
+            if (AgcDriver::BatchTimeline::Enabled()) AgcDriver::ProfilePrint_nid_no_patch("[batch-timeline] {\"event\":\"flip_callback_return\",\"cpu_ns\":%llu,\"frame\":%llu,\"flip_offset\":%zu,\"submission\":%llu,\"queue\":%u}\n", static_cast<unsigned long long>(AgcDriver::BatchTimeline::CpuNanos()), static_cast<unsigned long long>(frame->Id()), cursor, static_cast<unsigned long long>(submission.serial), submission.queue);
         } else if (opcode == 0x15 || opcode == 0x16) {
             packetCounters.CountDispatch();
             landPendingWaits(submission.queue);
