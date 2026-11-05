@@ -220,11 +220,12 @@ struct Mapping {
     bool privateAnonymous = false;
 };
 
-// Lifetime encloses the maps stream, including its cleanup on exceptional exits.
-class MappingsCpuScope {
+// Opt-in thread CPU accounting for nonzero-discovery phases; scopes may be nested.
+class NonzeroCpuScope {
 public:
-    MappingsCpuScope(std::uint64_t begin, std::uint64_t end) noexcept
-        : enabled(AgcDriver::BatchTimeline::Enabled()) {
+    NonzeroCpuScope(std::uint64_t begin, std::uint64_t end,
+                    const char* event = "guest_nonzero_mappings") noexcept
+        : enabled(AgcDriver::BatchTimeline::Enabled()), eventName(event) {
         if (!enabled) return;
         const int savedErrno = errno;
         rangeBegin = begin;
@@ -237,7 +238,7 @@ public:
         errno = savedErrno;
     }
 
-    ~MappingsCpuScope() noexcept {
+    ~NonzeroCpuScope() noexcept {
         if (!enabled) return;
         const int savedErrno = errno;
         rusage usageEnd{};
@@ -247,19 +248,32 @@ public:
         const bool valid = beginValid && endValid && tid != 0 && cpuEnd >= cpuBegin &&
             nanos(usageBegin.ru_utime, userBegin) && nanos(usageEnd.ru_utime, userEnd) &&
             nanos(usageBegin.ru_stime, systemBegin) && nanos(usageEnd.ru_stime, systemEnd) &&
-            userEnd >= userBegin && systemEnd >= systemBegin;
+            userEnd >= userBegin && systemEnd >= systemBegin &&
+            usageBegin.ru_minflt >= 0 && usageEnd.ru_minflt >= usageBegin.ru_minflt &&
+            usageBegin.ru_majflt >= 0 && usageEnd.ru_majflt >= usageBegin.ru_majflt &&
+            usageBegin.ru_nvcsw >= 0 && usageEnd.ru_nvcsw >= usageBegin.ru_nvcsw &&
+            usageBegin.ru_nivcsw >= 0 && usageEnd.ru_nivcsw >= usageBegin.ru_nivcsw;
         char userCpu[32] = "null";
         char systemCpu[32] = "null";
+        char minorFaults[32] = "null";
+        char majorFaults[32] = "null";
+        char voluntarySwitches[32] = "null";
+        char involuntarySwitches[32] = "null";
         if (valid) {
             std::snprintf(userCpu, sizeof(userCpu), "%llu", static_cast<unsigned long long>(userEnd - userBegin));
             std::snprintf(systemCpu, sizeof(systemCpu), "%llu", static_cast<unsigned long long>(systemEnd - systemBegin));
+            std::snprintf(minorFaults, sizeof(minorFaults), "%ld", usageEnd.ru_minflt - usageBegin.ru_minflt);
+            std::snprintf(majorFaults, sizeof(majorFaults), "%ld", usageEnd.ru_majflt - usageBegin.ru_majflt);
+            std::snprintf(voluntarySwitches, sizeof(voluntarySwitches), "%ld", usageEnd.ru_nvcsw - usageBegin.ru_nvcsw);
+            std::snprintf(involuntarySwitches, sizeof(involuntarySwitches), "%ld", usageEnd.ru_nivcsw - usageBegin.ru_nivcsw);
         }
         try {
             AgcDriver::ProfilePrint_nid_no_patch(
-                "[batch-timeline] {\"event\":\"guest_nonzero_mappings\",\"cpu_begin_ns\":%llu,\"cpu_end_ns\":%llu,\"wall_ns\":%llu,\"user_cpu_ns\":%s,\"system_cpu_ns\":%s,\"tid\":%llu,\"begin\":%llu,\"end\":%llu,\"queue\":%u,\"submission\":%llu,\"valid\":%s}\n",
-                static_cast<unsigned long long>(cpuBegin), static_cast<unsigned long long>(cpuEnd),
+                "[batch-timeline] {\"event\":\"%s\",\"cpu_begin_ns\":%llu,\"cpu_end_ns\":%llu,\"wall_ns\":%llu,\"user_cpu_ns\":%s,\"system_cpu_ns\":%s,\"minor_faults\":%s,\"major_faults\":%s,\"voluntary_switches\":%s,\"involuntary_switches\":%s,\"tid\":%llu,\"begin\":%llu,\"end\":%llu,\"queue\":%u,\"submission\":%llu,\"valid\":%s}\n",
+                eventName, static_cast<unsigned long long>(cpuBegin), static_cast<unsigned long long>(cpuEnd),
                 static_cast<unsigned long long>(cpuEnd >= cpuBegin ? cpuEnd - cpuBegin : 0),
-                userCpu, systemCpu, static_cast<unsigned long long>(tid),
+                userCpu, systemCpu, minorFaults, majorFaults, voluntarySwitches, involuntarySwitches,
+                static_cast<unsigned long long>(tid),
                 static_cast<unsigned long long>(rangeBegin), static_cast<unsigned long long>(rangeEnd),
                 origin.queue, static_cast<unsigned long long>(origin.submission), valid ? "true" : "false");
         } catch (...) {
@@ -268,8 +282,8 @@ public:
         errno = savedErrno;
     }
 
-    MappingsCpuScope(const MappingsCpuScope&) = delete;
-    MappingsCpuScope& operator=(const MappingsCpuScope&) = delete;
+    NonzeroCpuScope(const NonzeroCpuScope&) = delete;
+    NonzeroCpuScope& operator=(const NonzeroCpuScope&) = delete;
 
 private:
     static bool nanos(const timeval& value, std::uint64_t& result) noexcept {
@@ -282,6 +296,7 @@ private:
     }
 
     bool enabled;
+    const char* eventName;
     bool beginValid = false;
     rusage usageBegin{};
     AgcDriver::BatchTimeline::Origin origin;
@@ -289,7 +304,7 @@ private:
 };
 
 std::vector<Mapping> mappings(std::uint64_t begin, std::uint64_t end) {
-    MappingsCpuScope cpuScope(begin, end);
+    NonzeroCpuScope cpuScope(begin, end);
     std::ifstream maps("/proc/self/maps");
     Require(static_cast<bool>(maps), "cannot read /proc/self/maps for a heap mirror's pages");
     std::vector<Mapping> found;
@@ -345,11 +360,13 @@ void sharedFileData(std::vector<Candidate>& maybe, const Mapping& mapping, const
 }
 
 bool sharedBacking(const Mapping& mapping, SharedBacking& backing) {
+    NonzeroCpuScope cpuScope(mapping.begin, mapping.end, "guest_nonzero_backing");
     backing.expected = mapping.end - mapping.begin;
     return GuestArena::GuestArenaSharedBacking_nid_postfix(static_cast<std::uintptr_t>(mapping.begin),
         static_cast<std::size_t>(backing.expected), &SharedBacking::record, &backing) && backing.covered == backing.expected;
 }
 void fileData(std::vector<Candidate>& maybe, const Mapping& mapping, int file, std::uint64_t offset) {
+    NonzeroCpuScope cpuScope(mapping.begin, mapping.end, "guest_nonzero_file_data");
     const auto end = offset + (mapping.end - mapping.begin);
     auto at = static_cast<off_t>(offset);
     while (static_cast<std::uint64_t>(at) < end) {
@@ -368,6 +385,7 @@ void fileData(std::vector<Candidate>& maybe, const Mapping& mapping, int file, s
 }
 
 void populatedPages(std::vector<Candidate>& maybe, const Mapping& mapping) {
+    NonzeroCpuScope cpuScope(mapping.begin, mapping.end, "guest_nonzero_populated_pages");
     static const auto page = static_cast<std::uint64_t>(sysconf(_SC_PAGESIZE));
     const int file = open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
     Require(file >= 0, "cannot open /proc/self/pagemap for a heap mirror's pages");
@@ -424,10 +442,16 @@ bool GuestBytesZero(std::uint64_t begin, std::uint64_t end) {
 }
 
 GuestRuns GuestNonzeroBlocks(const GuestRuns& candidates) {
+#ifndef _WIN32
+    NonzeroCpuScope cpuScope(0, 0, "guest_nonzero_blocks");
+#endif
     GuestRuns runs;
     for (const auto& [first, last] : candidates) {
         if (first >= last) continue;
         const auto maybe = possiblyNonzero(first, last);
+#ifndef _WIN32
+        NonzeroCpuScope scanScope(first, last, "guest_nonzero_scan");
+#endif
         std::size_t at = 0;
         for (auto block = first / BlockSize * BlockSize; block < last; block += BlockSize) {
             const auto from = std::max(first, block);
