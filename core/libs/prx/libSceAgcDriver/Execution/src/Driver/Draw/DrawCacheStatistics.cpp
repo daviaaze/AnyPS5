@@ -17,10 +17,16 @@ void Driver::traceInsert(std::unordered_set<std::uint64_t>& set, std::uint64_t k
 
 void Driver::maybeReportDrawCache(bool profile) {
     auto& counters = drawEntryCounters;
-    if (!profile && !traceDrawCache()) return;
+    static const bool fpsDiagnostics = std::getenv("APS5_FPS_LOG") != nullptr && std::string_view(std::getenv("APS5_FPS_LOG")) == "1";
+    const bool fpsOnly = fpsDiagnostics && !profile && !traceDrawCache();
+    if (!profile && !traceDrawCache() && !fpsDiagnostics) return;
+    if (fpsOnly) {
+        static thread_local std::uint64_t fpsReportCalls = 0;
+        if ((++fpsReportCalls & 1023u) != 0u) return;
+    }
     const auto now = std::chrono::steady_clock::now();
     if (now - counters.lastReport < std::chrono::seconds(10)) return;
-    reportDrawCache(counters, profile);
+    reportDrawCache(counters, profile || fpsDiagnostics);
     counters.lastReport = now;
 }
 

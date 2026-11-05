@@ -319,9 +319,12 @@ namespace {
 void noteFinisherHandOff(bool handed) {
     static std::atomic<std::uint64_t> handedOff{0}, kept{0};
     static std::atomic<std::int64_t> reportedAt{0};
-    (handed ? handedOff : kept).fetch_add(1, std::memory_order_relaxed);
+    const auto count = (handed ? handedOff : kept).fetch_add(1, std::memory_order_relaxed) + 1;
     static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr || std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    if (!stats) return;
+    static const bool fpsDiagnostics = std::getenv("APS5_FPS_LOG") != nullptr && std::string_view(std::getenv("APS5_FPS_LOG")) == "1";
+    if (!stats && !fpsDiagnostics) return;
+    // FPS-only reporting samples each outcome counter before touching the clock.
+    if (!stats && (count & 1023u) != 0u) return;
     const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
     if (reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
     AgcDriver::ProfilePrint_nid_no_patch("[finisher] draws (10 s): %llu handed to the draw finisher, %llu finished on the worker%s\n", static_cast<unsigned long long>(handedOff.exchange(0)), static_cast<unsigned long long>(kept.exchange(0)), DrawFinisher::DrainText().c_str());
@@ -337,7 +340,8 @@ std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(HeldReason::Coun
 void noteHeld(HeldReason reason) {
     heldReasons[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
     static const bool profile = std::getenv("APS5_PIPELINE_STATS") != nullptr || std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    if (!profile) return;
+    static const bool fpsDiagnostics = std::getenv("APS5_FPS_LOG") != nullptr && std::string_view(std::getenv("APS5_FPS_LOG")) == "1";
+    if (!profile && !fpsDiagnostics) return;
     static std::atomic<std::uint64_t> total{0};
     const auto count = ++total;
     if (count % 262144u != 0u && (count > 262144u || (count & (count - 1u)) != 0u)) return;

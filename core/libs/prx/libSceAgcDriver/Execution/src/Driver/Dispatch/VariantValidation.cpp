@@ -38,12 +38,23 @@ void Driver::appendEntryRegions(const DispatchVariant& variant, std::vector<Shad
 }
 
 std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::patchDataWords(const DispatchVariant& variant, const std::vector<std::uint32_t>& words) {
-    auto patched = std::make_shared<ShaderRecompiler::RecompileResult>(*variant.compiled);
-    auto descriptor = patched->bindings[variant.flatBinding].guestDescriptor.Copy();
+    const auto& descriptor = variant.compiled->bindings[variant.flatBinding].guestDescriptor;
+    bool changed = false;
     for (std::size_t k = 0; k < variant.dataPositions.size(); ++k) {
-        if (variant.dataSlots[k] < descriptor.size()) descriptor[variant.dataSlots[k]] = words[variant.dataPositions[k]];
+        const auto slot = variant.dataSlots[k];
+        if (slot < descriptor.size() && descriptor[slot] != words[variant.dataPositions[k]]) {
+            changed = true;
+            break;
+        }
     }
-    patched->bindings[variant.flatBinding].guestDescriptor = ShaderRecompiler::SharedValues<std::uint32_t>(std::move(descriptor));
+    if (!changed) return variant.compiled;
+
+    auto patched = std::make_shared<ShaderRecompiler::RecompileResult>(*variant.compiled);
+    auto patchedDescriptor = patched->bindings[variant.flatBinding].guestDescriptor.Copy();
+    for (std::size_t k = 0; k < variant.dataPositions.size(); ++k) {
+        if (variant.dataSlots[k] < patchedDescriptor.size()) patchedDescriptor[variant.dataSlots[k]] = words[variant.dataPositions[k]];
+    }
+    patched->bindings[variant.flatBinding].guestDescriptor = ShaderRecompiler::SharedValues<std::uint32_t>(std::move(patchedDescriptor));
     return patched;
 }
 
