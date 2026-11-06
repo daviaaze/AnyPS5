@@ -1,5 +1,8 @@
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include "Recompiler.hpp"
 #include "VulkanTestDevice.hpp"
 #include <algorithm>
@@ -8,8 +11,15 @@
 #include <cstdio>
 #include <iostream>
 #include <span>
+#include <mutex>
 #include <string>
 #include <vector>
+
+namespace AgcDriver {
+struct VulkanDeviceTestAccess {
+    static Graphics::Context ContextOf(const VulkanDevice& device) { return device.graphicsContext(); }
+};
+}
 
 namespace {
 
@@ -21,8 +31,55 @@ constexpr std::uint32_t Inputs = 4;
 constexpr std::uint32_t Results = 128;
 constexpr std::uint32_t SharedWords = 16;
 constexpr std::uint32_t Checked = 33;
-alignas(256) std::array<std::uint32_t, MaxThreads * Inputs + SharedWords> Input{};
-alignas(256) std::array<std::uint32_t, MaxThreads * Results> Output{};
+// Own every byte of the import granules, independently of the logical descriptors.
+constexpr std::size_t BackingBytes = 65536;
+constexpr std::size_t BackingWords = BackingBytes / sizeof(std::uint32_t);
+static_assert(BackingWords >= MaxThreads * Inputs + SharedWords);
+static_assert(BackingWords >= MaxThreads * Results);
+alignas(BackingBytes) std::array<std::uint32_t, BackingWords> Input{};
+alignas(BackingBytes) std::array<std::uint32_t, BackingWords> Output{};
+
+class ImportedBuffers {
+public:
+    explicit ImportedBuffers(AgcDriver::VulkanDevice& device)
+        : device(device), context(AgcDriver::VulkanDeviceTestAccess::ContextOf(device)) {}
+
+    bool Setup() {
+        if (context.hostImportAlignment == 0 || BackingBytes % context.hostImportAlignment != 0) return false;
+        GuestAllocations::Mutation().Add(Input.data(), sizeof(Input), true, true, true);
+        inputRegistered = true;
+        GuestAllocations::Mutation().Add(Output.data(), sizeof(Output), true, true, true);
+        outputRegistered = true;
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        using AgcDriver::Graphics::HostImportFor;
+        const auto* input = HostImportFor(context, reinterpret_cast<std::uintptr_t>(Input.data()), sizeof(Input));
+        if (input == nullptr) return false;
+        const auto* output = HostImportFor(context, reinterpret_cast<std::uintptr_t>(Output.data()), sizeof(Output));
+        return output != nullptr;
+    }
+
+    ~ImportedBuffers() {
+        if (!inputRegistered && !outputRegistered) return;
+        // Also settle work if dispatch or a result check throws.
+        device.WaitIdle();
+        {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            AgcDriver::Graphics::ClearHostImports(context.device);
+        }
+        GuestAllocations::Mutation mutation;
+        if (outputRegistered) mutation.Remove(Output.data());
+        if (inputRegistered) mutation.Remove(Input.data());
+    }
+
+    ImportedBuffers(const ImportedBuffers&) = delete;
+    ImportedBuffers& operator=(const ImportedBuffers&) = delete;
+
+private:
+    AgcDriver::VulkanDevice& device;
+    AgcDriver::Graphics::Context context;
+    bool inputRegistered = false;
+    bool outputRegistered = false;
+};
 
 alignas(256) constexpr std::array<std::uint32_t, 195> Wave32Code{
     0x34020084, 0x34060089, 0xe0381000, 0x80000401, 0xbf8c3f70, 0xe0701100, 0x80010403, 0xe0701104,
@@ -295,6 +352,12 @@ void Run(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> code, s
     const auto result = ShaderRecompiler::Recompile(request);
     device.Dispatch(result, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(code.data()));
     device.WaitIdle();
+    Require(std::all_of(Input.begin() + waveSize * Inputs + SharedWords, Input.end(),
+                        [](std::uint32_t word) { return word == 0u; }),
+            "buffer integer atomics: input descriptor padding overwritten");
+    Require(std::all_of(Output.begin() + waveSize * Results, Output.end(),
+                        [](std::uint32_t word) { return word == 0xdeadbeefu; }),
+            "buffer integer atomics: output descriptor padding overwritten");
 }
 
 template <std::size_t Lanes>
@@ -328,10 +391,17 @@ void CheckShared(const std::uint32_t (&expected)[Words], const char* const (&nam
 
 }
 
-int main() {
+int main(int argc, char** argv) {
     try {
+        const bool hostImported = argc == 2 && std::string(argv[1]) == "--host-imported";
+        Require(argc == 1 || hostImported, "usage: buffer_integer_atomics [--host-imported]");
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
+        ImportedBuffers imports(*device);
+        if (hostImported && !imports.Setup()) {
+            std::puts("buffer integer atomics: host imports unavailable");
+            return VulkanTestSkipped;
+        }
         Run(*device, Wave32Code, 32, device->Target());
         Check(Expected32, Names, "wave32");
         CheckShared(SharedExpected32, SharedNames, 32, "wave32");

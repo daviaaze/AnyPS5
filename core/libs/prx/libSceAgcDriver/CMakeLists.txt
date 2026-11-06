@@ -758,6 +758,18 @@ if(BUILD_TESTING)
         endif()
         agc_add_default_test(${agcTest})
     endforeach()
+    add_test(NAME agc_driver_buffer_integer_atomics_host_imported_atomic_staged
+            COMMAND ${CMAKE_COMMAND} -E env APS5_NO_WRITTEN_SHADOW=1
+            "$<TARGET_FILE:agc_driver_buffer_integer_atomics_tests>" --host-imported)
+    set_tests_properties(agc_driver_buffer_integer_atomics_host_imported_atomic_staged PROPERTIES
+            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_PIPELINE_JOURNAL=1"
+            SKIP_RETURN_CODE 77 TIMEOUT 60 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    add_test(NAME agc_driver_buffer_integer_atomics_host_imported_atomic_direct
+            COMMAND ${CMAKE_COMMAND} -E env APS5_NO_WRITTEN_SHADOW=1 APS5_NO_ATOMIC_STAGING=1
+            "$<TARGET_FILE:agc_driver_buffer_integer_atomics_tests>" --host-imported)
+    set_tests_properties(agc_driver_buffer_integer_atomics_host_imported_atomic_direct PROPERTIES
+            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_PIPELINE_JOURNAL=1"
+            SKIP_RETURN_CODE 77 TIMEOUT 60 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 endif()
 
 foreach(agcExecutionTestName IN LISTS ANYPS5_AGC_EXECUTION_TESTS)
