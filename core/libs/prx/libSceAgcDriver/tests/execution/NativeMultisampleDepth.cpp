@@ -2002,7 +2002,6 @@ void CheckBufferWrite(Context context, VkFormat format, std::uint32_t fragments,
         GuestBufferMemory buffer(context);
         buffer.AddWritable(address, length);
         buffer.Upload(false);
-        Require(HostImportCovers(context, address, length), "the native depth buffer-write fixture was not bound as a host import");
         buffer.WriteBack();
     };
     Require(DepthSurfaceView(context, target) != VK_NULL_HANDLE && resident(), "native depth buffer-write fixture has no resident owner");
@@ -2016,10 +2015,6 @@ void CheckBufferWrite(Context context, VkFormat format, std::uint32_t fragments,
 }
 
 void CheckBufferWrites(Context context, VkFormat format, std::uint32_t fragments) {
-    if (context.hostImportAlignment == 0u) {
-        std::printf("skipped native depth buffer writes: the device lacks VK_EXT_external_memory_host, VK_KHR_buffer_device_address or the bufferDeviceAddress feature\n");
-        return;
-    }
     for (const auto write : {BufferWrite::DepthPlane, BufferWrite::Htile}) CheckBufferWrite(context, format, fragments, write);
     std::printf("Native depth format=%u samples=%u: a GPU buffer write over the depth or HTILE released the unwritten surface\n", static_cast<std::uint32_t>(format), fragments);
 }

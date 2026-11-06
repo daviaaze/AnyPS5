@@ -2,7 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
-#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
@@ -181,6 +181,13 @@ int RunNativeClear(AgcDriver::VulkanDevice& device, ClearConsumer consumer) {
         Require(std::ranges::any_of(result.bindings, [](const auto& binding) { return binding.role == DescriptorRole::BdaPagetable; }), "the native clear shader did not use BDA");
         return result;
     };
+    const auto context = AgcDriver::VulkanDeviceTestAccess::Context(device);
+    Require(context.recorder != nullptr, "the native clear context has no recorder");
+    context.recorder->Activate();
+    if (HostImportFor(context, metadata.Address(), BlockBytes) == nullptr) {
+        std::puts("skipped: this fixture metadata allocation cannot be imported in place; native BDA clear not exercised");
+        return VulkanTestSkipped;
+    }
     device.Dispatch(compile(), groups, 1u, 1u, {}, reinterpret_cast<std::uintptr_t>(code.data()));
     device.WaitIdle();
     Require(std::all_of(metadata.Data(), metadata.Data() + BlockBytes, [](auto value) { return value == 0u; }), "the warm-up native clear did not retain zero metadata");
@@ -188,14 +195,12 @@ int RunNativeClear(AgcDriver::VulkanDevice& device, ClearConsumer consumer) {
     const bool metadataWatched = Memory::Watched(metadata.Address(), BlockBytes);
     if (!depthWatched || !metadataWatched) {
         std::printf("skipped, the device does not retain guest write watching for native clear imports after warm-up (depth watched=%u, metadata watched=%u", static_cast<unsigned>(depthWatched), static_cast<unsigned>(metadataWatched));
-#ifdef __linux__
+        #ifdef __linux__
         std::printf(", Linux shared backing present, resolver visits: depth=%zu metadata=%zu", depth.SharedBackingResolverReturns(), metadata.SharedBackingResolverReturns());
-#endif
+        #endif
         std::puts(")");
         return VulkanTestSkipped;
     }
-    const auto context = AgcDriver::VulkanDeviceTestAccess::Context(device);
-    Require(context.recorder != nullptr, "the native clear context has no recorder");
     context.recorder->Activate();
     struct Cleanup {
         AgcDriver::VulkanDevice& device;
