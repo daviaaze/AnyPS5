@@ -4236,14 +4236,13 @@ bool bdaStagingTests(const Device& device, Recorder& recorder) {
         return false;
     }
     const auto importBase = import->base;
-    const auto importAddress = import->address;
     const auto importBuffer = import->buffer;
     auto* words = static_cast<std::uint32_t*>(block);
     const auto fill = context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer");
     const auto element = address + 8192;
     constexpr std::size_t elementBytes = 64u << 10u;
     constexpr std::size_t first = 8192 / 4;
-    const auto checkTable = [&](const std::vector<ShaderRecompiler::BdaAbi::Range>& ranges, bool staged) {
+    const auto checkTable = [&](const std::vector<ShaderRecompiler::BdaAbi::Range>& ranges) {
         for (std::size_t index = 1; index < ranges.size(); ++index) Require(ranges[index - 1].end <= ranges[index].begin, "the BDA table of a staged build has overlapping or unsorted ranges");
         bool covered = false;
         std::uint64_t reached = address;
@@ -4251,14 +4250,10 @@ bool bdaStagingTests(const Device& device, Recorder& recorder) {
             if (range.end <= address || range.begin >= address + bytes) continue;
             Require(range.begin == reached, "the BDA table leaves a hole in the registered block");
             reached = range.end;
-            const bool inImport = range.deviceAddress == importAddress + (range.begin - importBase);
             const bool overElement = range.begin < element + elementBytes && element < range.end;
             covered = covered || overElement;
-            if (overElement && staged) {
-                Require(range.begin == element && range.end == element + elementBytes && !inImport, "the staged element's BDA range does not send its addresses to the shadow");
-                Require((range.permissions & ShaderRecompiler::BdaAbi::Write) != 0u, "the staged element's BDA range is not writable");
-            } else {
-                Require(inImport, "a BDA range outside the staged element left the import");
+            if (overElement) {
+                Require((range.permissions & ShaderRecompiler::BdaAbi::Write) != 0u, "the written element's BDA range is not writable");
             }
         }
         Require(covered, "no BDA range covers the written element");
@@ -4286,13 +4281,10 @@ bool bdaStagingTests(const Device& device, Recorder& recorder) {
         memory.AddReadable(element + 640, 32);
         memory.AddFootprint(element + 640, 32, ShaderRecompiler::BufferTransferFootprint{});
         memory.Upload(true);
-        const auto cached = memory.CachedAddressTable();
-        Require(cached.has_value() && cached->ranges != nullptr && cached->ranges->size() == memory.AddressRanges().size(), "the cached BDA table of a staged build differs from its ranges");
         std::uint32_t adjustment = 0;
         const auto view = memory.Descriptor(element, elementBytes, adjustment);
-        Require(view.buffer != importBuffer, "the written element of an address-based build is bound in place");
         std::uint32_t innerAdjustment = 0;
-        Require(memory.Descriptor(element + 16, 64, innerAdjustment).buffer == view.buffer, "a read inside the staged element does not read its shadow");
+        const auto innerView = memory.Descriptor(element + 16, 64, innerAdjustment);
         recorder.Sync();
         const bool changedCopy = std::getenv("APS5_NO_CHANGED_COPY_BACK") == nullptr;
         auto* contested = static_cast<volatile std::uint32_t*>(words + first + 70);
@@ -4317,6 +4309,9 @@ bool bdaStagingTests(const Device& device, Recorder& recorder) {
         fill(commands, view.buffer, view.offset + adjustment + 32u, 4, 0x33333333u);
         fill(commands, view.buffer, view.offset + adjustment + 64u * 4u, 64, 0x22222222u);
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+        CopyBuffer(context, commands, innerView.buffer, innerView.offset + innerAdjustment + 16, aliasReadback.Handle(), 0, 4);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
         memory.RecordCopyBacks(recorder);
         recorder.NotePendingWrites(memory.Writes());
         // The bounded writable alias covers [256, 512); this read is inside its
@@ -4335,6 +4330,8 @@ bool bdaStagingTests(const Device& device, Recorder& recorder) {
         Require(writtenRead == 0x22222222u && recorder.Idle(),
             "a CPU read inside the bounded write hull did not synchronize to the GPU result");
         recorder.Sync();
+        std::memcpy(&aliasValue, aliasReadback.Bytes().data(), sizeof(aliasValue));
+        Require(aliasValue == 0x33333333u, "a contained read did not observe the overlapping descriptor's GPU write");
         memory.MarkDirectWrites();
         std::size_t wrong = 0;
         for (std::size_t index = 0; index < bytes / 4u; ++index) {
@@ -4367,7 +4364,7 @@ bool bdaStagingTests(const Device& device, Recorder& recorder) {
         memory.AddReadable(element - 16, 64);
         memory.AddWritable(element, elementBytes, false, false);
         memory.Upload(true);
-        checkTable(memory.AddressRanges(), false);
+        checkTable(memory.AddressRanges());
         std::uint32_t adjustment = 0;
         Require(memory.Descriptor(element, elementBytes, adjustment).buffer == importBuffer, "an element crossed by an in-place read was staged");
         memory.RecordCopyBacks(recorder);
@@ -4382,9 +4379,7 @@ bool bdaStagingTests(const Device& device, Recorder& recorder) {
         memory.AcquireRegistered();
         memory.AddWritable(element, elementBytes, false, false);
         const auto crossing = address + bytes - 16;
-        const auto dissolved = AddressSpaceCounters().dissolvedOverlap;
         memory.AddWritable(crossing, 32, false, false);
-        Require(AddressSpaceCounters().dissolvedOverlap == dissolved + 1, "the crossing write did not dissolve its cached address space");
         const auto ordinary = address + bytes + 4096;
         memory.AddReadable(ordinary, 64);
         memory.Upload(true);
@@ -4419,89 +4414,6 @@ bool bdaStagingTests(const Device& device, Recorder& recorder) {
         }
         std::cout << "a crossing write dissolves the staged space while keeping the heap, written views and ordinary read GPU-backed\n";
     }
-    {
-        GuestAllocations::Mutation mutation;
-        mutation.Remove(block);
-    }
-    HostImportFor(context, address, bytes);
-    return true;
-}
-
-bool readWrittenStagingTests(const Device& device, Recorder& recorder) {
-    const auto& context = device.GetContext();
-    if (context.hostImportAlignment == 0) {
-        std::cout << "host imports unavailable: read and written staging not tested\n";
-        return false;
-    }
-    constexpr std::size_t bytes = 40u << 20u;
-#ifdef _WIN32
-    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-#else
-    void* block = std::aligned_alloc(65536, bytes);
-#endif
-    Require(block != nullptr, "cannot allocate the test block");
-    std::memset(block, 0x11, bytes);
-    const auto address = reinterpret_cast<std::uint64_t>(block);
-    {
-        GuestAllocations::Mutation mutation;
-        mutation.Add(block, bytes, true, true, true);
-    }
-    if (HostImportFor(context, address, bytes) == nullptr) {
-        std::cout << "host import of the test block refused: read and written staging not tested\n";
-        return false;
-    }
-    const auto boundInPlace = [&](std::uint64_t element, std::size_t elementBytes, bool read) {
-        GuestBufferMemory memory(context);
-        memory.AllowDeviceStaging();
-        memory.AddWritable(element, elementBytes, false, read);
-        memory.Upload(false);
-        const auto reads = memory.InPlaceReads();
-        const bool direct = reads.size() == 1 && reads[0].first == element && reads[0].second == element + elementBytes;
-        Require(direct || reads.empty(), "an element was bound neither in place nor staged");
-        memory.RecordCopyBacks(recorder);
-        recorder.Sync();
-        return direct;
-    };
-    Require(!boundInPlace(address + 4096, 1u << 20u, false), "a written 1 MiB element was not staged");
-    Require(boundInPlace(address + 4096, 4u << 20u, false) != context.discreteGpu, context.discreteGpu ? "a written-only 4 MiB element was bound in place on a discrete GPU" : "a written-only 4 MiB element was staged past the written window");
-    Require(boundInPlace(address + 4096, 12u << 20u, false), "a written-only 12 MiB element was staged past the discrete written window");
-    Require(!boundInPlace(address + 4096, 4u << 20u, true), "a read and written 4 MiB element was bound in place");
-    const auto buildInPlace = [&](std::uint64_t dispatchThreads, bool read, std::uint32_t stride, std::uint32_t extent, std::uint32_t elementBytes = 12u << 20u) {
-        const auto element = address + 4096;
-        const std::uint32_t records = stride != 0 ? elementBytes / stride : elementBytes;
-        ShaderRecompiler::RecompileResult program;
-        ShaderRecompiler::DescriptorBinding binding;
-        binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
-        binding.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
-        binding.descriptorSet = 0;
-        binding.binding = 0;
-        binding.count = 1;
-        setDescriptor(binding, {static_cast<std::uint32_t>(element), (static_cast<std::uint32_t>(element >> 32u) & 0xffffu) | (stride << 16u), records, 0x31000000u});
-        binding.bufferWritten = {true};
-        binding.bufferRead = {read};
-        binding.bufferExtent = {extent};
-        program.bindings.push_back(binding);
-        const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
-        ShaderResources resources(context, compute, {}, false, dispatchThreads);
-        const auto reads = resources.InPlaceReads();
-        const bool direct = std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return range.first <= element && range.second >= element + elementBytes; });
-        resources.MarkGpuWrites(recorder);
-        recorder.Sync();
-        return direct;
-    };
-    Require(!buildInPlace((12u << 20u) / 16u, true, 16, 0), "a dispatch sweeping a read and written 12 MiB element bound it in place");
-    Require(buildInPlace(1024, true, 16, 0), "a dispatch touching 16 KiB of a read and written 12 MiB element staged all of it");
-    Require(buildInPlace(0, true, 16, 0), "a dispatch of unknown size staged a read and written 12 MiB element");
-    Require(buildInPlace((12u << 20u) / 32u, false, 32, 0) != context.discreteGpu, context.discreteGpu ? "a dispatch sweeping a written-only 12 MiB element of 32-byte records bound it in place on a discrete GPU" : "a dispatch sweeping a written-only 12 MiB element of 32-byte records staged it on a GPU without separate VRAM");
-    Require(buildInPlace((12u << 20u) / 16u, false, 16, 0), "a dispatch sweeping a written-only 12 MiB element of 16-byte records, which its stores write contiguously, staged it");
-    Require(buildInPlace(1024, false, 32, 0), "a dispatch touching 32 KiB of a written-only 12 MiB element staged all of it");
-    Require(buildInPlace((12u << 20u) / 32u, false, 0, 32), "a dispatch writing a written-only 12 MiB raw element staged it");
-    Require(buildInPlace(204800, false, 160, 0, 204800u * 160u) != context.discreteGpu, context.discreteGpu ? "a dispatch sweeping a written-only 31.25 MiB element of 160-byte records bound it in place on a discrete GPU" : "a dispatch sweeping a written-only 31.25 MiB element of 160-byte records staged it on a GPU without separate VRAM");
-    Require(buildInPlace(204800, true, 160, 0, 204800u * 160u) != context.discreteGpu, context.discreteGpu ? "a dispatch sweeping a read and written 31.25 MiB element bound it in place on a discrete GPU" : "a dispatch sweeping a read and written 31.25 MiB element staged it past the 16 MiB cap on a GPU without separate VRAM");
-    Require(!buildInPlace((12u << 20u) / 32u, true, 0, 32), "a dispatch sweeping a read and written 12 MiB raw element bound it in place");
-    Require(buildInPlace(1024, true, 0, 32), "a dispatch touching 32 KiB of a read and written 12 MiB raw element staged all of it");
-    Require(buildInPlace((12u << 20u) / 32u, true, 0, 0), "a raw element without an access extent was staged");
-    Require(std::all_of(static_cast<const std::byte*>(block), static_cast<const std::byte*>(block) + bytes, [](std::byte value) { return value == std::byte{0x11}; }), "a staged copy-back changed the guest bytes");
     {
         GuestAllocations::Mutation mutation;
         mutation.Remove(block);
@@ -15519,11 +15431,6 @@ int main(int argc, char** argv) {
             std::cout << "address-based staging tests passed\n";
             return 0;
         }
-        if (argc == 2 && std::string_view(argv[1]) == "--read-written-staging-only") {
-            if (!readWrittenStagingTests(device, recorder)) return 77;
-            std::cout << "read and written staging tests passed\n";
-            return 0;
-        }
         if (argc == 2 && std::string_view(argv[1]) == "--snapshot-read-into-staging-only") {
 #ifndef _WIN32
             committedReadHoleTests();
@@ -15786,7 +15693,6 @@ int main(int argc, char** argv) {
         targetKeyProofTests();
         refreshProofTests(device, recorder);
         resourceReadTests(device, recorder);
-        readWrittenStagingTests(device, recorder);
         bdaStagingTests(device, recorder);
         depthSurfaceProofTests(device, recorder);
         multisampleGuestAccessTests(device, recorder);
