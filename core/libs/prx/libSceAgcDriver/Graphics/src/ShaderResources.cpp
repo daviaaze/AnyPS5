@@ -603,7 +603,7 @@ std::atomic<std::uint64_t> preparedSnapshotStagingCount{0};
 std::atomic<std::uint64_t> usedSnapshotStagingCount{0};
 std::atomic<std::uint64_t>& PreparedStagingUsed() { return usedSnapshotStagingCount; }
 
-void NoteTableElement(std::chrono::steady_clock::time_point begin, std::chrono::steady_clock::time_point middle, std::chrono::steady_clock::time_point end) {
+void NoteTableElement(std::chrono::steady_clock::time_point begin, std::chrono::steady_clock::time_point middle, std::chrono::steady_clock::time_point end, const GuestTextureResource& resource, std::uint64_t guestBytes) {
     auto& counters = TextureCounts();
     const auto pending = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(middle - begin).count());
     const auto lookup = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(end - middle).count());
@@ -612,13 +612,21 @@ void NoteTableElement(std::chrono::steady_clock::time_point begin, std::chrono::
     if (pending + lookup >= 20'000'000u) {
         counters.tableSlowCount.fetch_add(1, std::memory_order_relaxed);
         counters.tableSlowNs.fetch_add(pending + lookup, std::memory_order_relaxed);
+        if (AgcDriver::PerformanceTrace::CapturingRawWindow()) {
+            AgcDriver::ProfilePrint_nid_no_patch("[table-element-slow] mono_begin_ns=%llu mono_end_ns=%llu address=0x%llx bytes=%llu dims=%ux%u format=%u tile=%u pending_ms=%.3f lookup_ms=%.3f\n",
+                static_cast<unsigned long long>(std::chrono::duration_cast<std::chrono::nanoseconds>(begin.time_since_epoch()).count()),
+                static_cast<unsigned long long>(std::chrono::duration_cast<std::chrono::nanoseconds>(end.time_since_epoch()).count()),
+                static_cast<unsigned long long>(resource.baseAddress), static_cast<unsigned long long>(guestBytes),
+                resource.width, resource.height, static_cast<unsigned int>(resource.format), static_cast<unsigned int>(resource.tileMode),
+                pending / 1e6, lookup / 1e6);
+        }
     }
     auto largest = counters.tableMaxNs.load(std::memory_order_relaxed);
     while (pending + lookup > largest && !counters.tableMaxNs.compare_exchange_weak(largest, pending + lookup, std::memory_order_relaxed)) {}
 }
 
 void reportTextureCounters() {
-    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PROFILE_GPU") != nullptr;
     if (!profile) return;
     auto& counters = TextureCounts();
     const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -6127,7 +6135,7 @@ void ShaderResources::resolveImageTables() {
                 resource = DecodeTextureResource(sampledWords);
                 guestBytes = DescribeSurface(resource).guestBytes;
             }
-            static const bool timed = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+            static const bool timed = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PROFILE_GPU") != nullptr;
             const auto t0 = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             CompletePendingCpuWrites(context, resource.baseAddress, static_cast<std::size_t>(guestBytes));
             if (resource.dccAddress != 0) CompletePendingCpuWrites(context, resource.dccAddress, DccKeyBytes(guestBytes));
@@ -6139,7 +6147,7 @@ void ShaderResources::resolveImageTables() {
             try {
                 Require(context.imageViewMinLod || EffectiveMinLod(resource) == 0.0f, "a sampled image table entry has a minimum LOD clamp, which needs VK_EXT_image_view_min_lod");
                 texture = cachedTexture(context, sampledWords, resource, components, guestBytes, depthCompare, multisampleViewType);
-                if (timed) NoteTableElement(t0, t1, std::chrono::steady_clock::now());
+                if (timed) NoteTableElement(t0, t1, std::chrono::steady_clock::now(), resource, guestBytes);
             } catch (const std::runtime_error& error) {
                 table.SetMapValue(faults + element, rejectTableElement(table, words, error.what()));
                 if (reusable) fresh.elements.push_back({{}, {}, {}, 0, false, true, error.what()});
