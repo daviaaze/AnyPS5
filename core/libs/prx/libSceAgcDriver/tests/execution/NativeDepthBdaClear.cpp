@@ -58,18 +58,15 @@ struct SharedBacking {
 };
 std::map<std::uintptr_t, SharedBacking> sharedBlocks;
 
-bool ResolveSharedBlock(std::uintptr_t address, std::size_t bytes, int* file, std::uint64_t* offset) {
-    if (bytes == 0) return false;
+bool ResolveSharedBlock(std::uintptr_t address, std::size_t bytes, GuestArena::SharedBackingVisitor visitor, void* context) {
+    if (bytes == 0 || visitor == nullptr) return false;
     const auto next = sharedBlocks.upper_bound(address);
     if (next == sharedBlocks.begin()) return false;
     const auto entry = std::prev(next);
     const auto lead = address - entry->first;
     if (lead >= BlockBytes || bytes > BlockBytes - lead) return false;
-    *file = fcntl(entry->second.file, F_DUPFD_CLOEXEC, 0);
-    *offset = entry->second.offset + lead;
-    if (*file < 0) return false;
     ++entry->second.resolverReturns;
-    return true;
+    return visitor(context, entry->second.file, entry->second.offset + lead, bytes);
 }
 
 struct SharedBackingScope {
@@ -192,7 +189,7 @@ int RunNativeClear(AgcDriver::VulkanDevice& device, ClearConsumer consumer) {
     if (!depthWatched || !metadataWatched) {
         std::printf("skipped, the device does not retain guest write watching for native clear imports after warm-up (depth watched=%u, metadata watched=%u", static_cast<unsigned>(depthWatched), static_cast<unsigned>(metadataWatched));
 #ifdef __linux__
-        std::printf(", Linux shared backing present, resolver fd returns: depth=%zu metadata=%zu", depth.SharedBackingResolverReturns(), metadata.SharedBackingResolverReturns());
+        std::printf(", Linux shared backing present, resolver visits: depth=%zu metadata=%zu", depth.SharedBackingResolverReturns(), metadata.SharedBackingResolverReturns());
 #endif
         std::puts(")");
         return VulkanTestSkipped;

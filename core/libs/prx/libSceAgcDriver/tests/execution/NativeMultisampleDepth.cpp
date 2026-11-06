@@ -243,16 +243,14 @@ struct SharedBacking {
 };
 std::map<std::uintptr_t, SharedBacking> sharedBlocks;
 
-bool ResolveSharedBlock(std::uintptr_t address, std::size_t bytes, int* file, std::uint64_t* offset) {
-    if (bytes == 0) return false;
+bool ResolveSharedBlock(std::uintptr_t address, std::size_t bytes, GuestArena::SharedBackingVisitor visitor, void* context) {
+    if (!visitor || bytes == 0) return false;
     const auto next = sharedBlocks.upper_bound(address);
     if (next == sharedBlocks.begin()) return false;
     const auto entry = std::prev(next);
     const auto lead = address - entry->first;
     if (lead >= entry->second.bytes || bytes > entry->second.bytes - lead) return false;
-    *file = fcntl(entry->second.file, F_DUPFD_CLOEXEC, 0);
-    *offset = entry->second.offset + lead;
-    return *file >= 0;
+    return visitor(context, entry->second.file, entry->second.offset + lead, bytes);
 }
 
 struct SharedBackingScope {
