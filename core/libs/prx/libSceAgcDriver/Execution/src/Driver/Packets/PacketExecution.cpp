@@ -15,6 +15,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -248,6 +249,7 @@ void Driver::execute(const Submission& submission) {
     PacketHistory recent{submission.commands};
 
     static const bool profilePackets = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static const bool gpuPacketTiming = std::getenv("APS5_PROFILE_GPU") != nullptr && !profilePackets;
 
     thread_local PacketProfile* packetProfileSlot = nullptr;
     auto& packetProfile = ShaderRecompiler::ThreadOwned(packetProfileSlot);
@@ -346,26 +348,47 @@ void Driver::execute(const Submission& submission) {
             cursor = nextCursor;
             continue;
         }
-
         const auto flushStart = profilePackets ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         flushBetweenPackets(submission.queue, header, opcode == 0x49 || opcode == 0x37);
         timing.Mark("flush_between_packets");
         PacketTimer packetTimer{profilePackets, header == FlipPacketHeader ? 0xffffu : opcode, submission.queue, packetProfile, profilePackets ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}};
-
-        if (profilePackets) {
-            packetStartedAt() = packetTimer.start;
+        const bool measureComputePacket = gpuPacketTiming && (opcode == 0x15 || opcode == 0x16);
+        const auto packetStartTime = measureComputePacket ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        std::uint64_t packetCpuStart = 0;
+        const bool packetCpuStartValid = measureComputePacket && P0Metrics::CpuNow(packetCpuStart);
+        if (profilePackets || measureComputePacket) {
+            packetStartedAt() = profilePackets ? packetTimer.start : packetStartTime;
             pendingDispatchPhases() = {};
             pendingDrawPhases() = {};
         }
         const auto finishDispatchPacket = [&](bool indirect) {
-            if (!profilePackets) return;
-            const auto now = std::chrono::steady_clock::now();
+            if (!profilePackets && !measureComputePacket) return;
             auto& pending = pendingDispatchPhases();
-            if (pending.phases) {
-                pending.ms[PhaseEpilogue] = std::chrono::duration<double, std::milli>(now - pending.tailAt).count();
-                addDriverPhases(submission.queue != 0 ? OtherQueues : indirect ? Queue0Indirect : Queue0Direct, pending.ms, pending.hit, pending.validated);
+            std::chrono::steady_clock::time_point now;
+            if (measureComputePacket) {
+                std::uint64_t packetCpuEnd = 0;
+                const bool packetCpuEndValid = P0Metrics::CpuNow(packetCpuEnd);
+                now = std::chrono::steady_clock::now();
+                pending.zeroDirect = opcode == 0x15 && (packet[1] == 0 || packet[2] == 0 || packet[3] == 0);
+                pending.startNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(packetStartTime.time_since_epoch()).count());
+                pending.endNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count());
+                pending.cpuValid = packetCpuStartValid && packetCpuEndValid && packetCpuEnd >= packetCpuStart;
+                pending.cpuNs = pending.cpuValid ? packetCpuEnd - packetCpuStart : 0;
+            } else {
+                now = std::chrono::steady_clock::now();
+                if (profilePackets) {
+                    pending.zeroDirect = opcode == 0x15 && (packet[1] == 0 || packet[2] == 0 || packet[3] == 0);
+                    pending.startNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(packetTimer.start.time_since_epoch()).count());
+                    pending.endNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count());
+                }
             }
-            if (indirect) return;
+            if (pending.phases && (profilePackets || measureComputePacket)) {
+                pending.ms[PhaseEpilogue] = std::chrono::duration<double, std::milli>(now - pending.tailAt).count();
+            }
+            if (measureComputePacket || (profilePackets && pending.phases)) {
+                addDriverPhases(submission.queue != 0 ? OtherQueues : indirect ? Queue0Indirect : Queue0Direct, pending);
+            }
+            if (!profilePackets || indirect) return;
             auto& row = packetProfile.dispatchOutcomes[static_cast<std::size_t>(pending.outcome)];
             ++row.first;
             row.second += std::chrono::duration<double, std::milli>(now - packetTimer.start).count();

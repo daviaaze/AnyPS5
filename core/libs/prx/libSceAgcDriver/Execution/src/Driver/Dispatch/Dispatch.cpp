@@ -211,8 +211,10 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
 
     std::array<double, DriverPhaseCount> phaseMs{};
     auto phaseLap = lap;
-    DispatchPhaseTiming phaseTiming{profile, lap, phaseMs, phaseLap};
-    if (profile && packetStartedAt() != std::chrono::steady_clock::time_point{}) phaseMs[PhasePrologue] = std::chrono::duration<double, std::milli>(lap - packetStartedAt()).count();
+    static const bool gpuTiming = std::getenv("APS5_PROFILE_GPU") != nullptr && std::getenv("APS5_PROFILE_DRAW") == nullptr;
+    const bool phaseProfile = profile || (gpuTiming && !resolving);
+    DispatchPhaseTiming phaseTiming{phaseProfile, lap, phaseMs, phaseLap};
+    if (phaseProfile && packetStartedAt() != std::chrono::steady_clock::time_point{}) phaseMs[PhasePrologue] = std::chrono::duration<double, std::milli>(lap - packetStartedAt()).count();
 
     static const bool noDispatchCacheEnv = std::getenv("APS5_NO_DISPATCH_CACHE") != nullptr;
 
@@ -593,6 +595,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                 throw std::runtime_error(where + std::string(error.what()));
             }
         }, std::move(itemWrites));
+        pendingDispatchPhases().outcome = DispatchOutcome::Enqueued;
         timing.Mark("pipelined_enqueue");
         ReportDispatchItems(profile);
         timing.Mark("pipelined_report");
@@ -637,7 +640,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             } catch (const std::exception& error) {
                 if (rethrow(error)) { timing.Mark("prepare_rethrow_redispatch"); return; }
             }
-            if (profile) {
+            if (phaseProfile) {
                 const auto now = std::chrono::steady_clock::now();
                 const auto prepareMs = std::chrono::duration<double, std::milli>(now - phaseLap).count();
                 phaseLap = now;
@@ -730,7 +733,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     timing.Mark("note_written_buffers");
     if (profile) deviceMs.fetch_add(phaseTiming.Elapsed(), std::memory_order_relaxed);
     phaseTiming.Phase(PhaseTail);
-    if (profile) {
+    if (phaseProfile) {
         auto& pending = pendingDispatchPhases();
         pending.outcome = DispatchOutcome::Real;
         pending.phases = true;

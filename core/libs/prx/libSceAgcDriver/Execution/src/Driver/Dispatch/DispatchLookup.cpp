@@ -31,7 +31,7 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
             std::vector<ShaderRecompiler::MemoryRegion> regions;
 
             std::vector<std::pair<std::uint32_t, std::uint32_t>> liveData;
-            const auto waitedBeforeValidate = profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
+            const auto waitedBeforeValidate = phaseTiming.profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
             if (!stampValidate()) {
                 const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::DispatchCache);
 
@@ -92,7 +92,7 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
                 if (current) outcome = EntryOutcome::Equal;
             }
             phaseTiming.Phase(PhaseValidate);
-            if (profile) {
+            if (phaseTiming.profile) {
                 const auto waited = std::min(Graphics::Recorder::ThreadWaitedMs() - waitedBeforeValidate, phaseMs[PhaseValidate]);
                 phaseMs[PhaseValidate] -= waited;
                 phaseMs[PhaseValidateWait] += waited;
