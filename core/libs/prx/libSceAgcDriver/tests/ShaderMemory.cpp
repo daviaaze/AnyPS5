@@ -11654,6 +11654,58 @@ void verifyDecodeMemoAddressCanonicalization() {
                 "memoized image mode: FMASK poison lost its current raw descriptor words");
     }
 
+    const auto acceptedMode = [&](const DescriptorValue& words, std::uint64_t key) -> const ImageResource& {
+        const auto resolved = resolve({words}, key);
+        const auto flags = recordFlags(resolved, 0u);
+        require(flags != Abi::NullCode && (flags & Abi::PoisonFlag) == 0u &&
+                selectedWords(resolved, 0u) == words.dwords,
+                "memoized image mode: supported geometry lost its binding or current words");
+        return info.runtimeImageModes.front().at(flags >> Abi::ModeShift);
+    };
+    const auto rejectedMode = [&](const DescriptorValue& words, std::uint64_t key, Abi::PoisonReason reason) {
+        const auto resolved = resolve({words}, key);
+        const auto flags = recordFlags(resolved, 0u);
+        require((flags & Abi::PoisonFlag) != 0u && resolved.faults == 1u,
+                "memoized image mode: unsupported geometry reused a valid binding");
+        const auto& poison = resolved.poison.at(flags & ~Abi::PoisonFlag);
+        require(poison.reason == reason && poison.words == words.dwords,
+                "memoized image mode: geometry fault lost its reason or current words");
+    };
+    auto geometry = first;
+    geometry.dwords[4] = 8191u | (17u << 16u);
+    geometry.dwords[5] = 0x00700003u;
+    require(acceptedMode(geometry, 0xdec0deu).dimension == RdnaImageDimension::Dim2D,
+            "memoized image mode: ordinary 2D geometry changed dimension");
+    geometry.dwords[4] = 1u | (1u << 16u);
+    geometry.dwords[5] = 0x00300007u;
+    require(acceptedMode(geometry, 0xdec0deu).dimension == RdnaImageDimension::Dim2D,
+            "memoized image mode: replacement 2D geometry changed dimension");
+
+    require(acceptedMode(volume, 0xdec0deu).dimension == RdnaImageDimension::Dim3D,
+            "memoized image mode: a one-slice volume was rejected");
+    auto extraSlice = volume;
+    extraSlice.dwords[4] = 1u;
+    rejectedMode(extraSlice, 0xdec0deu, Abi::PoisonReason::Dimension);
+    auto extraMip = volume;
+    extraMip.dwords[5] = 1u << 4u;
+    rejectedMode(extraMip, 0xdec0deu, Abi::PoisonReason::Dimension);
+    require(acceptedMode(volume, 0xdec0deu).dimension == RdnaImageDimension::Dim3D,
+            "memoized image mode: a restored one-slice volume remained poisoned");
+
+    auto cubeImage = image;
+    cubeImage.dimension = RdnaImageDimension::Dim2DArray;
+    cubeImage.singleMipPlaneBiasCompatible = false;
+    cubeImage.sampledOnly = false;
+    info.images.front() = cubeImage;
+    info.runtimeImageModes.front() = ResourceMaterializer::RuntimeImageModes(cubeImage);
+    DescriptorValue cube{{0x02143930u, 71u << 20u, 0u, 0xb1b00facu, 7u | (2u << 16u), 0u, 0u, 0u}, 8u, 0xffu};
+    require(acceptedMode(cube, 0xdec0dfu).cube, "memoized image mode: a complete cube was rejected");
+    auto shortCube = cube;
+    shortCube.dwords[4] = 6u | (2u << 16u);
+    rejectedMode(shortCube, 0xdec0dfu, Abi::PoisonReason::Dimension);
+    require(acceptedMode(cube, 0xdec0dfu).cube, "memoized image mode: a restored complete cube remained poisoned");
+
+
 
 }
 

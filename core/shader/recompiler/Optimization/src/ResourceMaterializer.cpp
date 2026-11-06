@@ -2042,6 +2042,11 @@ std::uint32_t decodeTableEntry(const ImageResource& image, std::span<const Image
     // Extent/pitch word 2 does not participate in runtime mode or poison selection.
     // Keep the original descriptor untouched for emitted records and element identity.
     key.words[2] = 0u;
+    // Geometry affects mode selection only through these predicates and maxMip.
+    key.words[4] = (descriptorIsShortCube(words) ? 1u : 0u) |
+                   (viewsPastLayerLimit(words, image.maxArrayLayers) ? 2u : 0u) |
+                   ((words.dwords[4] & 0x1fffu) != 0u ? 4u : 0u);
+    key.words[5] = words.dwords[5] & 0xf0u;
     // Mode-only metadata predicates need flags and address presence, not raw addresses.
     // Normalize only the key; decoding and emitted records retain the original words.
     key.words[6] = (words.dwords[6] & ((1u << 20u) | (1u << 21u))) | ((words.dwords[6] >> 24u) != 0u ? (1u << 24u) : 0u);
