@@ -83,7 +83,9 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     PerformanceTimer timing("Driver.Dispatch");
     const auto address = (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20c)) << 8u) | (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20d) & 0xffu) << 40u);
     if (SkippedShader(address)) { timing.Mark("skipped_shader"); return; }
+    static const bool gpuTiming = std::getenv("APS5_PROFILE_GPU") != nullptr && std::getenv("APS5_PROFILE_DRAW") == nullptr;
     auto registeredShader = RegisteredProgram(*submission.shaders, address, {0});
+    const bool registeredSource = gpuTiming && registeredShader != nullptr;
     if (!registeredShader) registeredShader = ReadRawShader(address);
     const auto& snapshot = *registeredShader;
     require(snapshot.type == 0, "compute program refers to a non-compute shader");
@@ -94,6 +96,13 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     }
     auto compute = Graphics::DecodeComputeStageInfo(queue.shader, snapshot.header);
     const bool resolving = resolvingAhead();
+    // Only the GPU-only observer tracks recursive retry calls, not PM4 packet counts.
+    static thread_local unsigned observerDepth = 0;
+    struct ObserverScope {
+        unsigned* depth;
+        explicit ObserverScope(unsigned* value) : depth(value) { if (depth) ++*depth; }
+        ~ObserverScope() { if (depth) --*depth; }
+    } observerScope{gpuTiming && !resolving ? &observerDepth : nullptr};
     std::vector<ShaderRecompiler::MemoryRegion> memory{{snapshot.codeAddress, std::as_bytes(std::span(snapshot.code))}};
     if (!snapshot.header.empty()) memory.push_back({snapshot.headerAddress, snapshot.header});
 
@@ -211,7 +220,6 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
 
     std::array<double, DriverPhaseCount> phaseMs{};
     auto phaseLap = lap;
-    static const bool gpuTiming = std::getenv("APS5_PROFILE_GPU") != nullptr && std::getenv("APS5_PROFILE_DRAW") == nullptr;
     const bool phaseProfile = profile || (gpuTiming && !resolving);
     DispatchPhaseTiming phaseTiming{phaseProfile, lap, phaseMs, phaseLap};
     if (phaseProfile && packetStartedAt() != std::chrono::steady_clock::time_point{}) phaseMs[PhasePrologue] = std::chrono::duration<double, std::milli>(lap - packetStartedAt()).count();
@@ -315,6 +323,123 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     }
 
     mix(reinterpret_cast<std::uintptr_t>(registeredShader.get()));
+    if (gpuTiming && !resolving && !profile) {
+        std::lock_guard observerLock(dispatchCacheMutex);
+        struct LastCandidate {
+            std::uint64_t address = 0, config = 0, key = 0;
+            std::uintptr_t owner = 0;
+            std::array<std::uint32_t, 31> roots{};
+            std::uint32_t count = 0;
+        };
+        struct Window {
+            std::uint64_t observed = 0, first = 0, compared = 0, roots = 0, config = 0;
+            std::uint64_t owner = 0, registered = 0, raw = 0, unchanged = 0, repeat = 0, untracked = 0, retries = 0;
+            std::uint32_t changedRootMask = 0;
+            std::array<std::uint64_t, 31> changedRootIndex{};
+        };
+        static std::array<LastCandidate, 512> states{};
+        static std::array<std::uint16_t, 1024> index{};
+        static std::size_t used = 0;
+        static Window window;
+        static auto start = std::chrono::steady_clock::time_point{};
+        static auto firstPacket = std::chrono::steady_clock::time_point{};
+        const auto now = std::chrono::steady_clock::now();
+        if (start == std::chrono::steady_clock::time_point{}) start = now;
+        if (window.observed == 0) firstPacket = packetStartedAt();
+        ++window.observed;
+        if (observerDepth > 1) ++window.retries;
+        if (registeredSource) ++window.registered; else ++window.raw;
+        // Diagnostic signature is intentionally non-authoritative, excluding roots and owner.
+        std::uint64_t config = 0xcbf29ce484222325ull;
+        const auto configMix = [&](std::uint64_t value) { config ^= value; config *= 0x100000001b3ull; };
+        configMix(address);
+        configMix(packet[4] & 0x8000u);
+        for (const auto threads : compute.partialThreads) configMix(threads);
+        configMix(userCount);
+        if (keyHygiene) {
+            for (const auto offset : {0x207u, 0x208u, 0x209u, 0x212u, 0x213u}) {
+                const auto found = queue.shader.find(offset);
+                configMix(found == queue.shader.end() ? (1ull << 32u) : found->second);
+            }
+        } else {
+            for (const auto& [offset, value] : queue.shader) {
+                if (offset >= 0x240u && offset < 0x240u + 31u) continue;
+                configMix(offset);
+                configMix(value);
+            }
+        }
+        const auto owner = reinterpret_cast<std::uintptr_t>(registeredShader.get());
+        auto slot = static_cast<std::size_t>(((address >> 8u) * 0x9e3779b97f4a7c15ull) >> 54u);
+        while (index[slot] != 0 && states[index[slot] - 1].address != address) slot = (slot + 1) % index.size();
+        const bool first = index[slot] == 0;
+        if (first && used == states.size()) {
+            ++window.untracked;
+        } else {
+            if (first) {
+                index[slot] = static_cast<std::uint16_t>(++used);
+                ++window.first;
+            }
+            auto& previous = states[index[slot] - 1];
+            if (!first) {
+                ++window.compared;
+                bool rootsChanged = previous.count != userCount;
+                const auto sharedCount = std::min<std::size_t>(previous.count, userCount);
+                for (std::size_t i = 0; i < sharedCount; ++i) {
+                    if (previous.roots[i] != userData[i]) {
+                        rootsChanged = true;
+                        window.changedRootMask |= 1u << i;
+                        ++window.changedRootIndex[i];
+                    }
+                }
+                for (std::size_t i = sharedCount; i < userCount; ++i) {
+                    rootsChanged = true;
+                    window.changedRootMask |= 1u << i;
+                    ++window.changedRootIndex[i];
+                }
+                for (std::size_t i = userCount; i < previous.count; ++i) {
+                    rootsChanged = true;
+                    window.changedRootMask |= 1u << i;
+                    ++window.changedRootIndex[i];
+                }
+                const bool configChanged = previous.config != config;
+                const bool ownerChanged = previous.owner != owner;
+                window.roots += rootsChanged;
+                window.config += configChanged;
+                window.owner += ownerChanged;
+                window.unchanged += !rootsChanged && !configChanged && !ownerChanged;
+                window.repeat += previous.key == key;
+            }
+            previous.address = address;
+            previous.config = config;
+            previous.key = key;
+            previous.owner = owner;
+            previous.count = userCount;
+            std::copy(userData.begin(), userData.end(), previous.roots.begin());
+        }
+        if (now - start >= std::chrono::seconds(10)) {
+            const auto seconds = [](auto point) { return std::chrono::duration<double>(point.time_since_epoch()).count(); };
+            using U = unsigned long long;
+            char rootCounts[512]{};
+            std::size_t rootCountsLength = 0;
+            for (std::size_t i = 0; i < window.changedRootIndex.size(); ++i) {
+                if (window.changedRootIndex[i] == 0) continue;
+                const int written = std::snprintf(rootCounts + rootCountsLength, sizeof(rootCounts) - rootCountsLength, " %zu:%llu", i, static_cast<unsigned long long>(window.changedRootIndex[i]));
+                if (written > 0) rootCountsLength = std::min<std::size_t>(sizeof(rootCounts) - 1, rootCountsLength + static_cast<std::size_t>(written));
+            }
+            AgcDriver::ProfilePrint_nid_no_patch(
+                "[gpu-key-observed] steady_s=[%.6f,%.6f] first_packet_start_s=%.6f (0=unavailable) candidates=%llu retry_calls=%llu first=%llu compared=%llu root_values_changed=%llu root_index_mask=0x%08x root_index_counts=%s config_shape_changed=%llu owner_pointer_value_changed=%llu registered=%llu raw_fallback=%llu unchanged=%llu full_key_repeat=%llu untracked=%llu tracked=%llu/512; overlapping transitions, not miss causes; config=hash only, pointer!=generation; core_cumulative_as_observed lookups=%llu absent=%llu equal=%llu differing=%llu inaccessible=%llu queuedLabel=%llu flushingImage=%llu publishMoved=%llu pendingMoved=%llu forgetMoved=%llu inserts=%llu variantsEvicted=%llu\n",
+                seconds(start), seconds(now), seconds(firstPacket),
+                U(window.observed), U(window.retries), U(window.first), U(window.compared), U(window.roots), window.changedRootMask, rootCounts, U(window.config), U(window.owner),
+                U(window.registered), U(window.raw), U(window.unchanged), U(window.repeat), U(window.untracked), U(used),
+                U(entryCounters.lookups), U(entryCounters.absent), U(entryCounters.equal), U(entryCounters.differing),
+                U(entryCounters.inaccessible), U(entryCounters.queuedLabel), U(entryCounters.flushingImage),
+                U(entryCounters.publishMoved), U(entryCounters.pendingMoved), U(entryCounters.forgetMoved),
+                U(entryCounters.inserts), U(entryCounters.variantsEvicted));
+            window = {};
+            start = now;
+            firstPacket = {};
+        }
+    }
     if (fromAhead && key != ahead.key) {
         fromAhead = false;
         ++groupStats.keyMismatches;
