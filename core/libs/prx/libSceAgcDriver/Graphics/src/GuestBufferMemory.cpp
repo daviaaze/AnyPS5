@@ -5890,8 +5890,8 @@ VkMemoryPropertyFlags copyBufferProperties(bool deviceLocal) {
 constexpr auto StagingCopyInKey = Recorder::CommandClass::StagingIn;
 constexpr auto StagingCopyBackKey = Recorder::CommandClass::StagingOut;
 
-// APS5_PROFILE_DRAW: the GPU copies, reported in the [buffers] uploads line (cumulative), and the
-// device-local staging counts, reported as [buffers] staging every 10 s (see reportStaging).
+// GPU copy counters are collected with DRAW or GPU profiling. DRAW reports cumulative uploads;
+// both modes report device-local staging counts every 10 s (see reportStaging).
 struct CopyStats {
     std::atomic<std::uint64_t> gpuCopies{0};
     std::atomic<std::uint64_t> gpuCopyBytes{0};
@@ -6714,7 +6714,7 @@ void GuestBufferMemory::copyRegion(Region& region, bool addressable) {
 }
 
 void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool addressable) {
-    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PROFILE_GPU") != nullptr;
     static const bool capture = std::getenv("APS5_CAPTURE_GPU_COPIES") != nullptr;
     Require(!capture || CaptureTrace::Enabled(), "GPU copy capture requires APS5_CAPTURE_TRACE");
     auto* recorder = Recorder::Active();
@@ -6871,7 +6871,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
 
 void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
     if (!uploaded || committed) return;
-    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PROFILE_GPU") != nullptr;
     // The written ranges, merged: a V# bound twice would otherwise copy the same bytes twice.
     std::vector<std::pair<std::uint64_t, std::uint64_t>> merged;
     bool recording = false;
@@ -7593,7 +7593,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::DeviceRe
 void GuestBufferMemory::RecordStagingCopies(Recorder& recorder) {
     ResidentBuffer::FlushChanged(context);
     if (!uploaded || committed) return;
-    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PROFILE_GPU") != nullptr;
     std::vector<Region*> copies;
     if (std::any_of(regions.begin(), regions.end(), [](const Region& region) { return region.gpuCopy && region.deviceLocal && !region.copiedBack; })) recorder.CloseRunOwing(this);
     for (auto& region : regions) {
