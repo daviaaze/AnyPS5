@@ -492,7 +492,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
     }
     residentGpuInput = gpuInput.buffer != nullptr;
 
-    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PROFILE_GPU") != nullptr;
     TextureImageTiming imageTiming{};
     auto* imageTimingOutput = profile ? &imageTiming : nullptr;
     const auto constructorStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};

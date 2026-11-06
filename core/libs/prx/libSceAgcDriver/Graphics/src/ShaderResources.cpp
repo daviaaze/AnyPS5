@@ -1361,7 +1361,8 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         p0Read.Set(pending ? AgcDriver::P0Metrics::ReadReason::PendingGpuOverlapObserved : AgcDriver::P0Metrics::ReadReason::AbsentOriginUnknown);
         // Snapshot preparation is profile-only: the clocks bracket the read and constructor
         // independently, while the constructor emits its own disjoint allocation-stage record.
-        const auto readStarted = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        static const bool snapshotProfiled = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PROFILE_GPU") != nullptr;
+        const auto readStarted = snapshotProfiled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         constexpr std::size_t SnapshotCompareBytes = 256u << 10u;
         const bool dropped = *keys == DccKeys::Uncompressed && bytes > SnapshotCompareBytes && (entry.generation != 0 || (!pending && untracked[0] != 0));
         std::shared_ptr<Buffer> staging;
@@ -1381,7 +1382,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         if (staging != nullptr) ReadTextureSurface(resource, *keys, *staging);
         else ReadTextureSurface(resource, *keys, std::span<std::byte>(entry.bytes));
         const auto read = staging != nullptr ? std::as_const(*staging).Bytes() : std::span<const std::byte>(entry.bytes);
-        const auto readMs = profile ? std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - readStarted).count() : 0.0;
+        const auto readMs = snapshotProfiled ? std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - readStarted).count() : 0.0;
         if (!pending) entry.untracked = untracked;
         static const bool traceTextures = std::getenv("APS5_TRACE_TEXTURES") != nullptr;
         if (traceTextures) {
@@ -1389,8 +1390,8 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             for (std::size_t i = 0; i < read.size(); i += 64) nonzero += read[i] != std::byte{0};
             std::fprintf(stderr, "[texture] 0x%llx %ux%u format %u tile %d: %zu of %zu sampled bytes nonzero\n", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, static_cast<int>(resource.tileMode), nonzero, read.size() / 64);
         }
-        if (staging != nullptr) entry.texture = createTexture(*context.detiler, resource, components, std::move(staging), depthCompare, layerRows, nullptr, profile ? readMs : 0.0, 0.0, gpuInputRefusal);
-        else entry.texture = createTexture(*context.detiler, resource, components, entry.bytes, depthCompare, layerRows, nullptr, profile ? readMs : 0.0, gpuInputRefusal);
+        if (staging != nullptr) entry.texture = createTexture(*context.detiler, resource, components, std::move(staging), depthCompare, layerRows, nullptr, snapshotProfiled ? readMs : 0.0, 0.0, gpuInputRefusal);
+        else entry.texture = createTexture(*context.detiler, resource, components, entry.bytes, depthCompare, layerRows, nullptr, snapshotProfiled ? readMs : 0.0, gpuInputRefusal);
         entry.accounted = entry.texture->AllocationBytes();
         if (entry.bytes.size() > SnapshotCompareBytes && (entry.generation != 0 || entry.untracked[0] != 0)) parkSnapshot(cache, entry.bytes);
         }

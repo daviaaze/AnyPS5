@@ -8,10 +8,10 @@
 #include <cstdint>
 #include <cstdlib>
 
-// APS5_PROFILE_DRAW: wall time the thread resolving sampled image tables
+// APS5_PROFILE_DRAW or APS5_PROFILE_GPU: wall time the thread resolving sampled image tables
 // (ShaderResources::resolveImageTables) spends in blocking primitives, by site, printed as
 // [table-waits] next to [table-element-time]. ShaderResources::resolveImageTables opens a Scope
-// (only when APS5_PROFILE_DRAW is set); a Timer outside a Scope reads no clock. Sites are inclusive
+// (when either profiling mode is set); a Timer outside a Scope reads no clock. Sites are inclusive
 // where they nest (a pending flush that syncs the recorder is charged to both); a site's mutex
 // timers suppress the generic contended-mutex site beneath them.
 namespace AgcDriver::TableWaits {
@@ -60,7 +60,7 @@ inline Totals& Get() {
 inline thread_local bool inside = false;
 
 inline bool Enabled() {
-    static const bool enabled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static const bool enabled = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PROFILE_GPU") != nullptr;
     return enabled;
 }
 
