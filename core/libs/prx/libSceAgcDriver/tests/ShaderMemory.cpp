@@ -11621,6 +11621,40 @@ void verifyDecodeMemoAddressCanonicalization() {
                 poison.words == (index == 0u ? invalidVolume.dwords : invalidExtent.dwords),
                 "memoized image mode: shared invalid mode decision lost fresh poison descriptor geometry");
     }
+    // Same-predicate metadata addresses share a key; successful native records retain each descriptor.
+    auto metadataNative = first;
+    metadataNative.dwords[6] = (1u << 24u) | 0x1234u;
+    metadataNative.dwords[7] = 0x1000u;
+    auto metadataNativeAgain = first;
+    metadataNativeAgain.dwords[6] = (2u << 24u) | 0x5678u;
+    metadataNativeAgain.dwords[7] = 0x2000u;
+    const auto nativeMetadata = resolve({metadataNative, metadataNativeAgain}, 0xdec0deu);
+    const auto nativeFlags = recordFlags(nativeMetadata, 0u);
+    const auto expectedNativeMode = ResourceMaterializer::RuntimeImageMode(image, metadataNative, modes);
+    require((nativeFlags & Abi::PoisonFlag) == 0u &&
+            (nativeFlags >> Abi::ModeShift) == expectedNativeMode &&
+            recordFlags(nativeMetadata, 1u) == nativeFlags &&
+            selectedWords(nativeMetadata, 0u) == metadataNative.dwords &&
+            selectedWords(nativeMetadata, 1u) == metadataNativeAgain.dwords,
+            "memoized image mode: equivalent metadata predicates changed mode or lost current descriptor words");
+
+    // Table-backed FMASK is rejected before metadata inspection; retain raw poison words for distinct addresses.
+    auto metadataFmask = first;
+    metadataFmask.dwords[1] = (metadataFmask.dwords[1] & ~(0xffu << 20u)) | (166u << 20u);
+    metadataFmask.dwords[6] = (1u << 21u) | (0x11u << 24u);
+    metadataFmask.dwords[7] = 0x1000u;
+    auto metadataFmaskAgain = metadataFmask;
+    metadataFmaskAgain.dwords[6] = (1u << 21u) | (0x22u << 24u);
+    metadataFmaskAgain.dwords[7] = 0x2000u;
+    const auto fmaskMetadata = resolve({metadataFmask, metadataFmaskAgain}, 0xdec0deu);
+    for (std::uint32_t index = 0u; index < 2u; ++index) {
+        const auto flags = recordFlags(fmaskMetadata, index);
+        require((flags & Abi::PoisonFlag) != 0u &&
+                fmaskMetadata.poison.at(flags & ~Abi::PoisonFlag).reason == Abi::PoisonReason::Fmask &&
+                fmaskMetadata.poison.at(flags & ~Abi::PoisonFlag).words ==
+                    (index == 0u ? metadataFmask.dwords : metadataFmaskAgain.dwords),
+                "memoized image mode: FMASK poison lost its current raw descriptor words");
+    }
 
 
 }
