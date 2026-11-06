@@ -1607,6 +1607,7 @@ void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, 
             value = source.value;
             return true;
         case BufferUniformSource::Kind::UserData:
+            if (runtime.userDataUse != nullptr) runtime.userDataUse->asValue |= source.value < SrtUserDataUse::TrackedWords && source.value < snapshot.userData.size() ? std::uint64_t {1} << source.value : ~std::uint64_t {0};
             if (source.value >= snapshot.userData.size()) return false;
             value = snapshot.userData[source.value];
             return true;

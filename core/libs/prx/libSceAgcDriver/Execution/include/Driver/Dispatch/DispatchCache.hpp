@@ -52,6 +52,7 @@ struct DispatchVariant {
 
     std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
     std::vector<std::uint32_t> words;
+    std::shared_ptr<DispatchVariant> wordSource;
     std::vector<SharedWords> shared;
     std::uint64_t forgetSerial = 0;
     std::shared_ptr<const ShaderRecompiler::RecompileResult> compiled;
@@ -69,6 +70,8 @@ struct DispatchVariant {
 
     std::uint32_t pushOffset = 0;
     std::vector<std::int8_t> runBases;
+    std::vector<std::uint32_t> userDataRoots;
+    std::uint64_t relocatableRootMask = 0;
     std::uint64_t relocatableWords = 0;
     std::uint64_t userWordsWalked = 0;
     std::uint64_t valueWords = 0;
@@ -87,6 +90,9 @@ struct DispatchVariant {
     std::atomic<std::uint64_t> generation{0};
     std::shared_ptr<const SelectedRequestBacking> selectedRequest;
 };
+inline std::span<const std::uint32_t> DispatchVariantWords(const DispatchVariant& variant) {
+    return variant.wordSource != nullptr ? std::span<const std::uint32_t>(variant.wordSource->words) : std::span<const std::uint32_t>(variant.words);
+}
 
 struct DispatchEntry {
     std::vector<std::shared_ptr<DispatchVariant>> variants;

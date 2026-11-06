@@ -2,7 +2,9 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <cstdlib>
+#include <algorithm>
 #include <cstring>
+#include <limits>
 
 namespace AgcDriver::DriverDetail {
 
@@ -18,17 +20,47 @@ void Driver::verifyDataHit(const ShaderSnapshot& snapshot, std::size_t codeOffse
     const auto regions = verifyMemory->Regions();
     request.context.memory = regions;
     const auto result = invocation.Materialize(*capture);
-    std::size_t position = 0, run = 0;
+    std::vector<std::size_t> coveredBytes(variant.runs.size());
+    std::size_t expectedBytes = 0;
+    for (const auto& [begin, end] : variant.runs) {
+        if (end <= begin) fail("the read set", expectedBytes, 0);
+        const auto length = end - begin;
+        if (length % sizeof(std::uint32_t) != 0 || length > std::numeric_limits<std::size_t>::max() || expectedBytes > std::numeric_limits<std::size_t>::max() - static_cast<std::size_t>(length)) fail("the read set", expectedBytes, 0);
+        expectedBytes += static_cast<std::size_t>(length);
+    }
+    if (expectedBytes / sizeof(std::uint32_t) != liveWords.size()) fail("the read set", expectedBytes, 0);
     for (const auto& region : regions) {
         const bool registered = std::any_of(memory.begin(), memory.end(), [&](const auto& known) { return region.guestAddress >= known.guestAddress && region.guestAddress < known.guestAddress + known.bytes.size(); });
         if (registered) continue;
-        if (run >= variant.runs.size() || variant.runs[run].first != region.guestAddress || variant.runs[run].second != region.guestAddress + region.bytes.size()) fail("the read set", position, run);
-        const auto count = region.bytes.size() / sizeof(std::uint32_t);
-        if (position + count > liveWords.size() || std::memcmp(region.bytes.data(), liveWords.data() + position, region.bytes.size()) != 0) fail("the captured bytes", position, run);
-        position += count;
-        ++run;
+        if (region.guestAddress % sizeof(std::uint32_t) != 0 || region.bytes.size() % sizeof(std::uint32_t) != 0 || region.guestAddress > UINT64_MAX - region.bytes.size()) fail("the read set", 0, 0);
+        std::size_t consumed = 0;
+        while (consumed < region.bytes.size()) {
+            const auto current = region.guestAddress + consumed;
+            std::size_t matched = variant.runs.size();
+            for (std::size_t run = 0; run < variant.runs.size(); ++run) {
+                if (current >= variant.runs[run].first && current < variant.runs[run].second) {
+                    if (matched != variant.runs.size()) fail("the read set", 0, run);
+                    matched = run;
+                }
+            }
+            if (matched == variant.runs.size()) fail("the read set", 0, 0);
+            const auto [begin, end] = variant.runs[matched];
+            const auto offset = current - begin;
+            if (offset != coveredBytes[matched] || offset % sizeof(std::uint32_t) != 0) fail("the read set", matched, 0);
+            const auto bytes = std::min(static_cast<std::size_t>(end - current), region.bytes.size() - consumed);
+            if (bytes == 0 || bytes % sizeof(std::uint32_t) != 0) fail("the read set", matched, 0);
+            std::size_t wordOffset = 0;
+            for (std::size_t run = 0; run < matched; ++run) wordOffset += static_cast<std::size_t>((variant.runs[run].second - variant.runs[run].first) / sizeof(std::uint32_t));
+            wordOffset += static_cast<std::size_t>(offset / sizeof(std::uint32_t));
+            const auto count = bytes / sizeof(std::uint32_t);
+            if (wordOffset > liveWords.size() || count > liveWords.size() - wordOffset || std::memcmp(region.bytes.data() + consumed, liveWords.data() + wordOffset, bytes) != 0) fail("the captured bytes", wordOffset, matched);
+            coveredBytes[matched] += bytes;
+            consumed += bytes;
+        }
     }
-    if (run != variant.runs.size()) fail("the read set", position, run);
+    for (std::size_t run = 0; run < variant.runs.size(); ++run) {
+        if (coveredBytes[run] != variant.runs[run].second - variant.runs[run].first) fail("the read set", run, run);
+    }
     if (result->variantId != patched.variantId) fail("the variant", 0, 0);
     if (result->bindings.size() != patched.bindings.size() || result->pushConstants != patched.pushConstants) fail("the bindings", 0, 0);
     for (std::size_t b = 0; b < result->bindings.size(); ++b) {

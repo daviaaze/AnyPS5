@@ -79,6 +79,8 @@ bool Driver::pipelineDispatch() {
 }
 
 void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments) {
+    const auto submittedPacket = packet;
+    const auto submittedIndirectArguments = indirectArguments;
     AgcDriver::P0Metrics::Scope p0(submission.queue, AgcDriver::P0Metrics::Layer::Packet, AgcDriver::P0Metrics::Operation::Dispatch);
     PerformanceTimer timing("Driver.Dispatch");
     const auto address = (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20c)) << 8u) | (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20d) & 0xffu) << 40u);
@@ -134,6 +136,12 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         resolved = ahead.packet;
         packet = resolved;
         indirectArguments = ahead.indirectArguments;
+        if (ahead.registeredShader != registeredShader || ahead.userDataRoots.size() != userData.size() || !std::equal(ahead.userDataRoots.begin(), ahead.userDataRoots.end(), userData.begin())) {
+            fromAhead = false;
+            packet = submittedPacket;
+            indirectArguments = submittedIndirectArguments;
+            ++groupStats.keyMismatches;
+        }
     } else if (indirectArguments != 0 && !resolving && matchesFillKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute)) {
         indirectSource().path = IndirectFillKernel;
         const auto readStart = std::chrono::steady_clock::now();
@@ -256,8 +264,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     mix(address);
     mix(packet[4] & 0x8000u);
     for (const auto threads : compute.partialThreads) mix(threads);
-    for (const auto word : userData) mix(word);
-
+    mix(userData.size());
+    if (registeredShader == nullptr) for (const auto word : userData) mix(word);
     static const bool keyHygiene = std::getenv("APS5_NO_DISPATCH_KEY_HYGIENE") == nullptr;
     if (keyHygiene) {
         for (const auto offset : {0x207u, 0x208u, 0x209u, 0x212u, 0x213u}) {
@@ -267,6 +275,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         }
     } else {
         for (const auto& [offset, value] : queue.shader) {
+            if (offset >= 0x240u && offset < 0x240u + userData.size()) continue;
             mix(offset);
             mix(value);
         }
@@ -441,16 +450,18 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         }
     }
     if (fromAhead && key != ahead.key) {
-        fromAhead = false;
         ++groupStats.keyMismatches;
+        dispatch(queue, submittedPacket, submission, submittedIndirectArguments);
+        return;
     }
     if (fromAhead) {
         if (const auto hook = aheadAdoptHook.load(std::memory_order_acquire)) hook();
         const auto* aheadViews = ahead.capture != nullptr ? &ahead.capture->snapshot.registeredImages : ahead.keepVariant != nullptr && ahead.keepVariant->registeredViews != nullptr ? ahead.keepVariant->registeredViews.get() : nullptr;
         if (!CapturedCurrent(ahead.captured, snapshot) || (aheadViews != nullptr && !CaptureRegisteredViewsCurrent(*aheadViews))) {
-            fromAhead = false;
             ++dispatchesRejectedAhead;
             ++groupStats.memoryMismatches;
+            dispatch(queue, submittedPacket, submission, submittedIndirectArguments);
+            return;
         }
     }
     phaseTiming.Phase(PhaseKey);
@@ -496,7 +507,13 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         phaseTiming.Phase(PhaseLookup);
         timing.Mark("lookup_ahead_adopt");
     } else {
-        lookupDispatch(address, submission, key, noDispatchCache, traceCache, profile, memory, phaseTiming, phaseMs, compiledResult, keepVariant, captured, liveWords, dataHit, cached, validated, missedEntry, missedDiffering);
+        lookupDispatch(address, submission, registeredShader, key, userData, noDispatchCache, traceCache, profile, memory, phaseTiming, phaseMs, compiledResult, keepVariant, captured, liveWords, dataHit, cached, validated, missedEntry, missedDiffering);
+    }
+    if (readsClear && !fromAhead && keepVariant != nullptr && keepVariant->wordSource != nullptr) {
+        readsClear = std::none_of(keepVariant->runs.begin(), keepVariant->runs.end(), [](const auto& run) {
+            return DrawPipeline::Queue0().Overlaps(run.first, static_cast<std::size_t>(run.second - run.first));
+        });
+        if (!readsClear) NoteItemFallback(ItemFallback::Reads);
     }
     timing.Mark("lookup_cache");
     std::vector<DrawPipeline::Range> itemWrites;
@@ -569,7 +586,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         }
         if (profile) recompileMs.fetch_add(phaseTiming.Elapsed(), std::memory_order_relaxed);
         phaseTiming.Phase(PhaseRecompile);
-        if (!resolving) insertDispatch(address, key, noDispatchCache || !CacheableResult(*compiledResult), profile, registeredShader, forgetAtCapture, memory, shaderMemory, captured, capture, compiledResult, missedEntry, missedDiffering, attachVariant, phaseTiming);
+        if (!resolving) insertDispatch(address, key, userData, noDispatchCache || !CacheableResult(*compiledResult), profile, registeredShader, forgetAtCapture, memory, shaderMemory, captured, capture, compiledResult, missedEntry, missedDiffering, attachVariant, phaseTiming);
         timing.Mark("insert_dispatch");
     }
     const auto* registeredViews = capture != nullptr ? &capture->snapshot.registeredImages : keepVariant != nullptr && keepVariant->registeredViews != nullptr ? keepVariant->registeredViews.get() : nullptr;
@@ -578,6 +595,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         parked = ResolvedDispatch{};
         parked.address = address;
         parked.key = key;
+        parked.userDataRoots.assign(userData.begin(), userData.end());
         parked.indirectArguments = indirectArguments;
         parked.forgetAtCapture = forgetAtCapture;
         std::copy_n(packet.begin(), std::min(packet.size(), parked.packet.size()), parked.packet.begin());
@@ -653,6 +671,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         std::snprintf(where, sizeof(where), "compute shader 0x%llx: ", static_cast<unsigned long long>(address));
         throw std::runtime_error(where + std::string(error.what()) + describeIndirectSource());
     };
+    auto recipeOwner = keepVariant != nullptr && keepVariant->wordSource != nullptr ? keepVariant->wordSource : keepVariant;
     phaseTiming.Phase(PhaseSnapshots);
     timing.Mark("snapshots_prepare");
 
@@ -664,11 +683,11 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             dispatch(queue, packet, submission, indirectArguments);
             return;
         }
-        const auto recipe = keepVariant->recipe.load(std::memory_order_acquire);
+        const auto recipe = recipeOwner != nullptr ? recipeOwner->recipe.load(std::memory_order_acquire) : nullptr;
         const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         const auto queueId = submission.queue;
         itemCommits.fetch_add(1, std::memory_order_relaxed);
-        DrawPipeline::Queue0().Enqueue([this, localDevice = std::move(localDevice), result = compiledResult, capture, registeredViews, snapshots = std::move(snapshots), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, dataHit, epoch, htileClearCompletion, htileMask, origin = AgcDriver::BatchTimeline::Origin{submission.serial, submission.queue}] {
+        DrawPipeline::Queue0().Enqueue([this, localDevice = std::move(localDevice), result = compiledResult, capture, registeredViews, snapshots = std::move(snapshots), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, recipeOwner, dataHit, epoch, htileClearCompletion, htileMask, origin = AgcDriver::BatchTimeline::Origin{submission.serial, submission.queue}] {
             AgcDriver::BatchTimeline::Scope originScope(origin);
             DrawPipeline::FollowEpoch(epoch);
             AgcDriver::P0Metrics::Scope p0(queueId, AgcDriver::P0Metrics::Layer::Committer, AgcDriver::P0Metrics::Operation::Dispatch);
@@ -711,7 +730,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                         own->dataWordsHash = Graphics::ShaderResources::DataWordsHash({ShaderRecompiler::ShaderStage::Compute, keepVariant->compiled.get(), 0});
                         builtRecipe = std::move(own);
                     }
-                    keepVariant->recipe.store(std::move(builtRecipe), std::memory_order_release);
+                    recipeOwner->recipe.store(std::move(builtRecipe), std::memory_order_release);
                     VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Attach, false);
                 }
             } catch (const std::exception& error) {
@@ -729,13 +748,13 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
 
     std::shared_ptr<RecipeHit> recipeHit;
     if (cached && keepVariant != nullptr && !stampValidate()) {
-        recipeHit = htileClearCompletion.has_value() ? nullptr : localDevice->PrepareRecipe(keepVariant->recipe.load(std::memory_order_acquire), indirectArguments != 0);
+        recipeHit = htileClearCompletion.has_value() || recipeOwner == nullptr ? nullptr : localDevice->PrepareRecipe(recipeOwner->recipe.load(std::memory_order_acquire), indirectArguments != 0);
         phaseTiming.Phase(PhaseRecipePrecheck);
     }
     timing.Mark("recipe_precheck");
 
     std::shared_ptr<const Recipe> builtRecipe;
-    auto* const attachTo = stampValidate() ? nullptr : keepVariant != nullptr ? keepVariant.get() : attachVariant.get();
+    auto* const attachTo = stampValidate() ? nullptr : recipeOwner != nullptr ? recipeOwner.get() : attachVariant.get();
     bool writersNoted = false;
     const bool noteWrites = writeEvidenceEnabled() || traceCapSync();
     const auto keysFill = indirectArguments == 0 && !partialLastGroup ? MatchSgprPatternFill(packet, std::span(snapshot.code).subspan(codeOffset), userData, compute) : std::nullopt;

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 
 namespace AgcDriver::DriverDetail {
 
@@ -14,10 +15,11 @@ bool CacheableResult(const ShaderRecompiler::RecompileResult& compiled) {
     });
 }
 
-void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDispatchCache, bool profile, const std::shared_ptr<const ShaderSnapshot>& registeredShader, std::uint64_t forgetAtCapture, std::span<const ShaderRecompiler::MemoryRegion> memory, const std::shared_ptr<ShaderMemory>& shaderMemory, const std::vector<ShaderRecompiler::MemoryRegion>& captured, const std::shared_ptr<const ShaderRecompiler::ResourceCapture>& capture, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, const std::shared_ptr<DispatchEntry>& missedEntry, bool missedDiffering, std::shared_ptr<DispatchVariant>& attachVariant, DispatchPhaseTiming& phaseTiming) {
+void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, std::span<const std::uint32_t> userData, bool noDispatchCache, bool profile, const std::shared_ptr<const ShaderSnapshot>& registeredShader, std::uint64_t forgetAtCapture, std::span<const ShaderRecompiler::MemoryRegion> memory, const std::shared_ptr<ShaderMemory>& shaderMemory, const std::vector<ShaderRecompiler::MemoryRegion>& captured, const std::shared_ptr<const ShaderRecompiler::ResourceCapture>& capture, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, const std::shared_ptr<DispatchEntry>& missedEntry, bool missedDiffering, std::shared_ptr<DispatchVariant>& attachVariant, DispatchPhaseTiming& phaseTiming) {
     if (!noDispatchCache) {
         auto fresh = std::make_shared<DispatchVariant>();
         fresh->compiled = compiledResult;
+        fresh->userDataRoots.assign(userData.begin(), userData.end());
         if (capture != nullptr && !capture->snapshot.registeredImages.empty()) fresh->registeredViews = std::make_shared<const std::vector<ShaderRecompiler::RegisteredImageView>>(capture->snapshot.registeredImages);
         fresh->shader = registeredShader;
         fresh->forgetSerial = forgetAtCapture;
@@ -30,20 +32,29 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
             srtRegions.push_back(region);
             capturedWords += region.bytes.size() / sizeof(std::uint32_t);
         }
+        const bool srtRangesSafe = std::all_of(srtRegions.begin(), srtRegions.end(), [](const auto& region) {
+            return region.guestAddress % alignof(std::uint32_t) == 0 && region.bytes.size() % sizeof(std::uint32_t) == 0 && region.guestAddress <= std::numeric_limits<std::uint64_t>::max() - region.bytes.size();
+        });
+        const bool taggable = capture != nullptr && !srtRegions.empty() && srtRangesSafe;
         const auto supplied = shaderMemory->SuppliedBlocks();
-        fresh->runs.reserve(srtRegions.size());
-        fresh->words.reserve(capturedWords);
-        for (const auto& region : srtRegions) {
-            fresh->runs.emplace_back(region.guestAddress, region.guestAddress + region.bytes.size());
-            const auto count = region.bytes.size() / sizeof(std::uint32_t);
-            const auto offset = fresh->words.size();
-            fresh->words.resize(offset + count);
-            std::memcpy(fresh->words.data() + offset, region.bytes.data(), count * sizeof(std::uint32_t));
-            AppendSharedWords(fresh->shared, fresh->runs.size() - 1u, offset, region.bytes, supplied);
+        if (taggable) {
+            tagVariantRuns(*fresh, srtRegions, capture->userDataUse, true, 0, supplied);
+            fresh->relocatableRootMask = fresh->relocatableWords & ~compiledResult->userDataRegisterReads;
+        } else if (srtRangesSafe) {
+            fresh->runs.reserve(srtRegions.size());
+            fresh->words.reserve(capturedWords);
+            for (const auto& region : srtRegions) {
+                fresh->runs.emplace_back(region.guestAddress, region.guestAddress + region.bytes.size());
+                const auto count = region.bytes.size() / sizeof(std::uint32_t);
+                const auto offset = fresh->words.size();
+                fresh->words.resize(offset + count);
+                std::memcpy(fresh->words.data() + offset, region.bytes.data(), count * sizeof(std::uint32_t));
+                AppendSharedWords(fresh->shared, fresh->runs.size() - 1u, offset, region.bytes, supplied);
+            }
         }
 
         DataWordPositionCounts dataCounts;
-        if (dataHits() && !stampValidate() && capture != nullptr && !capture->readTrace.leaves.empty()) {
+        if (srtRangesSafe && dataHits() && !stampValidate() && capture != nullptr && !capture->readTrace.leaves.empty()) {
             for (std::size_t b = 0; b < compiledResult->bindings.size(); ++b) {
                 if (compiledResult->bindings[b].role != ShaderRecompiler::DescriptorRole::FlattenedSrt) continue;
                 fresh->flatBinding = static_cast<std::uint32_t>(b);
@@ -51,8 +62,8 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
                 break;
             }
         }
-        bool stable = true;
-        if (stampValidate()) {
+        bool stable = srtRangesSafe;
+        if (stable && stampValidate()) {
 
             fresh->memory = shaderMemory;
             fresh->captured = captured;
@@ -74,7 +85,7 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
                 stable = captureStable(captured);
             }
             fresh->generation.store(generation, std::memory_order_release);
-        } else if (insertCompare()) {
+        } else if (stable && insertCompare()) {
             const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::DispatchCache);
             stable = captureStable(srtRegions);
         }
@@ -100,7 +111,7 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
                 dispatchOrder.push_front(key);
                 created->order = dispatchOrder.begin();
                 dispatchCache.emplace(key, std::move(created));
-            } else if (found->second != missedEntry && !found->second->variants.empty() && found->second->variants.front()->runs == fresh->runs && SameCapturedWords(found->second->variants.front()->words, found->second->variants.front()->shared, fresh->words, fresh->shared)) {
+            } else if (found->second != missedEntry && !found->second->variants.empty() && found->second->variants.front()->shader == fresh->shader && found->second->variants.front()->userDataRoots == fresh->userDataRoots && found->second->variants.front()->relocatableRootMask == fresh->relocatableRootMask && found->second->variants.front()->runBases == fresh->runBases && found->second->variants.front()->dataPositions == fresh->dataPositions && found->second->variants.front()->dataSlots == fresh->dataSlots && found->second->variants.front()->flatBinding == fresh->flatBinding && found->second->variants.front()->runs == fresh->runs && SameCapturedWords(found->second->variants.front()->words, found->second->variants.front()->shared, fresh->words, fresh->shared)) {
 
                 attachVariant = found->second->variants.front();
             } else {

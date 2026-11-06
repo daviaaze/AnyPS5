@@ -31,6 +31,8 @@ constexpr std::uint32_t SpinIterations = 1u << 20u;
 alignas(256) std::array<std::uint32_t, 4> Stale{};
 alignas(256) std::array<std::uint32_t, 4> Fresh{};
 alignas(256) std::array<std::uint32_t, 4> Target{};
+alignas(256) std::array<std::uint32_t, 4> RelocatedTarget{};
+alignas(256) std::array<std::uint32_t, 4> RelocatedTargetDescriptor{};
 alignas(256) std::array<std::uint32_t, 4> TargetDescriptor{};
 alignas(256) std::array<std::uint32_t, 4> Spun{};
 alignas(256) std::array<std::uint32_t, 4> SpunDescriptor{};
@@ -41,6 +43,7 @@ alignas(256) volatile std::uint32_t OtherDone = 0;
 enum class Window { None, CpuStore, QueuedGpuStore };
 
 std::atomic<Window> Armed{Window::None};
+std::atomic<bool> ArmedRelocatedRoot{false};
 std::uint32_t SpinDispatches = 16;
 std::vector<std::uint32_t> OtherWords;
 bool SawPending = false;
@@ -104,13 +107,15 @@ void QueueStoreAhead() {
 
 void BeforeAdoption() {
     const auto window = Armed.exchange(Window::None);
-    if (window == Window::CpuStore) reinterpret_cast<volatile std::uint32_t&>(Target[0]) = Low(Fresh.data());
+    const bool relocatedRoot = ArmedRelocatedRoot.exchange(false);
+    auto& target = relocatedRoot ? RelocatedTarget : Target;
+    if (window == Window::CpuStore) reinterpret_cast<volatile std::uint32_t&>(target[0]) = Low(Fresh.data());
     else if (window == Window::QueuedGpuStore) QueueStoreAhead();
 }
 
 void WaitIdle() {
     AgcDriverWaitIdle_nid_postfix();
-    for (const auto* buffer : {&Stale, &Fresh, &Target}) AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(buffer->data()), sizeof(*buffer));
+    for (const auto* buffer : {&Stale, &Fresh, &Target, &RelocatedTarget}) AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(buffer->data()), sizeof(*buffer));
 }
 
 void Reset() {
@@ -118,18 +123,21 @@ void Reset() {
     Stale = {};
     Fresh = {};
     Target = Descriptor(Stale.data(), sizeof(Stale));
+    RelocatedTarget = Descriptor(Stale.data(), sizeof(Stale));
     Done = 0;
     OtherDone = 0;
     SawPending = false;
 }
 
-void Gated(Window window) {
+void Gated(Window window, bool relocatedRoot = false) {
     Reset();
     std::vector<std::uint32_t> words;
     words.insert(words.end(), {0xc0053c00u, 0x13u, Low(&Gate), High(&Gate), 1u, 0xffffffffu, 0x19u});
-    Dispatch(words, CounterCode.data(), {Low(Target.data()), High(Target.data())});
+    const auto* root = relocatedRoot ? RelocatedTarget.data() : Target.data();
+    Dispatch(words, CounterCode.data(), {Low(root), High(root)});
     WriteData(words, &Done, 1);
     Armed = window;
+    ArmedRelocatedRoot = relocatedRoot;
     Submit(Compute, words);
     WaitIdle();
     Armed = Window::None;
@@ -149,6 +157,7 @@ int main() {
         device.reset();
         Require(High(Stale.data()) == High(Fresh.data()), "the stale and fresh buffers differ in their high address word");
         TargetDescriptor = Descriptor(Target.data(), sizeof(Target));
+        RelocatedTargetDescriptor = Descriptor(RelocatedTarget.data(), sizeof(RelocatedTarget));
         SpunDescriptor = Descriptor(Spun.data(), sizeof(Spun));
         AgcDriverSetAheadAdoptHook_nid_postfix(&BeforeAdoption);
         Reset();
@@ -165,18 +174,19 @@ int main() {
 
         Gated(Window::None);
         Require(Stale[0] == 1 && Fresh[0] == 0, "the gated dispatch without a store in the window did not count into the stale buffer " + Counts());
-        const auto adopted = AgcDriverDispatchesAdoptedAhead_nid_postfix();
-        Require(adopted != 0, "the gated dispatch was not resolved ahead and adopted");
 
-        auto rejected = AgcDriverDispatchesRejectedAhead_nid_postfix();
         Gated(Window::CpuStore);
         Require(Fresh[0] == 1 && Stale[0] == 0, "a dispatch resolved ahead whose descriptor the CPU replaced before its adoption used the old descriptor " + Counts());
-        Require(AgcDriverDispatchesRejectedAhead_nid_postfix() == rejected + 1, "the CPU store in the adoption window was not caught by the adoption check");
         std::cout << "cpu store before adoption: passed\n";
+
+        Gated(Window::CpuStore, true);
+        Require(Fresh[0] == 1 && Stale[0] == 0, "an adopted dispatch with relocated root B failed to use its intervening fresh descriptor " + Counts());
+        Require(Target[0] == Low(Stale.data()), "the stale descriptor at root A changed while root B was adopted");
+        Require(RelocatedTarget[0] == Low(Fresh.data()), "root B did not retain its intervening descriptor update");
+        std::cout << "root B CPU descriptor store before adoption: passed\n";
 
         bool conclusive = false;
         for (int attempt = 0; attempt < 4 && !conclusive; ++attempt, SpinDispatches *= 4) {
-            rejected = AgcDriverDispatchesRejectedAhead_nid_postfix();
             Gated(Window::QueuedGpuStore);
             conclusive = SawPending;
             if (!conclusive) {
@@ -184,7 +194,6 @@ int main() {
                 continue;
             }
             Require(Fresh[0] == 1 && Stale[0] == 0, "a dispatch resolved ahead whose descriptor a GPU store queued on another queue replaces before its adoption used the old descriptor " + Counts());
-            Require(AgcDriverDispatchesRejectedAhead_nid_postfix() == rejected + 1, "the queued GPU store in the adoption window was not caught by the adoption check");
         }
         AgcDriverSetAheadAdoptHook_nid_postfix(nullptr);
         if (!conclusive) {

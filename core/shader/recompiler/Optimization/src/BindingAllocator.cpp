@@ -13,11 +13,56 @@ namespace {
     throw std::runtime_error(message);
 }
 
+bool hasGpuUserDataUse(const IrProgram& program, const IrValue& value) {
+    const auto externallyUsed = [&](const IrValue& candidate) {
+        const auto* resolved = candidate.Resolve();
+        for (const auto& block : program.Metadata().blockInfo) {
+            if ((block.condition != nullptr && block.condition->Resolve() == resolved) ||
+                (block.indirectTarget != nullptr && block.indirectTarget->Resolve() == resolved)) return true;
+        }
+        return std::ranges::any_of(program.Metadata().dynamicReads, [&](const IrValue* read) {
+            return read != nullptr && read->Resolve() == resolved;
+        });
+    };
+    const auto planningLoad = [&](const IrValue* load) {
+        if (load == nullptr || externallyUsed(*load)) return false;
+        const auto opcode = load->Opcode();
+        if (opcode != IrOpcode::LoadAddressU32 && opcode != IrOpcode::ReadConstBuffer) return false;
+        const auto index = load->Flags<MemoryFlags>().index;
+        const auto& memory = program.Resources().memoryInfo;
+        if (index >= memory.size() || !memory[index].planningOnly) return false;
+        if ((opcode == IrOpcode::LoadAddressU32 && memory[index].kind != ResourceKind::ScalarAddress) ||
+            (opcode == IrOpcode::ReadConstBuffer && memory[index].kind != ResourceKind::ScalarBuffer)) return false;
+        for (const auto& use : load->OperandUses()) {
+            const auto* anchor = use.user;
+            if (anchor == nullptr || (anchor->Opcode() != IrOpcode::Reference &&
+                anchor->Opcode() != IrOpcode::ReferenceU32) || anchor->HasUses() || externallyUsed(*anchor)) return false;
+        }
+        return true;
+    };
+    if (externallyUsed(value)) return true;
+    // These planning reads emit no GPU load; their references retain the host
+    // SRT graph only. Keep every other use, including real BDA reads and opaque
+    // anchors. Only one explicit address/resource constructor is transparent.
+    for (const auto& use : value.OperandUses()) {
+        const auto* user = use.user;
+        if (planningLoad(user)) continue;
+        if (user == nullptr || externallyUsed(*user)) return true;
+        const auto opcode = user->Opcode();
+        if (opcode != IrOpcode::GetAddressResource && opcode != IrOpcode::GetBufferResource &&
+            opcode != IrOpcode::CompositeConstructU64) return true;
+        for (const auto& consumer : user->OperandUses()) {
+            if (!planningLoad(consumer.user)) return true;
+        }
+    }
+    return false;
+}
+
 std::vector<std::uint32_t> collectUserData(const IrProgram& program) {
     std::array<bool, NumScalarRegs> registers {};
     for (const auto& block : program.Blocks()) {
         for (const IrValue* inst : block->Instructions()) {
-            if (inst->Opcode() != IrOpcode::GetUserData || !inst->HasUses()) {
+            if (inst->Opcode() != IrOpcode::GetUserData || !hasGpuUserDataUse(program, *inst)) {
                 continue;
             }
             const IrValue* operand = inst->Argument(0);

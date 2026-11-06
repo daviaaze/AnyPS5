@@ -35,6 +35,8 @@ constexpr std::uint32_t Unwritten = 0xcafebabeu;
 
 std::uint32_t* Constants = nullptr;
 std::uint32_t* Input = nullptr;
+std::uint32_t* ConstantsB = nullptr;
+std::uint32_t* OutputB = nullptr;
 std::uint32_t* Output = nullptr;
 
 alignas(256) constexpr std::array<std::uint32_t, 13> AddressCode{0xf4000200u, 0xfa000000u, 0x34020082u, 0xdc308000u, 0x03020001u, 0xbf8cc07fu, 0x7e040208u, 0x4a040481u, 0xbf8c3f70u, 0x4a040503u, 0xe0701000u, 0x80010201u, 0xbf810000u};
@@ -49,6 +51,15 @@ std::uint32_t* NewBlock() {
     std::memset(block, 0, BlockBytes);
     GuestAllocations::Mutation().Add(block, BlockBytes, true, true, true);
     return block;
+}
+
+void RetireBlock(std::uint32_t* block) {
+    GuestAllocations::Mutation().Remove(block);
+#ifdef _WIN32
+    if (VirtualFree(block, 0, MEM_RELEASE) == 0) throw std::runtime_error("dispatch data hit words: cannot retire the old guest root");
+#else
+    std::free(block);
+#endif
 }
 
 void check(bool condition, const std::string& what) {
@@ -127,19 +138,39 @@ int main() {
         AgcDriverRegisterShader_nid_postfix(&shader);
 
         Constants = NewBlock();
+        ConstantsB = NewBlock();
         Input = NewBlock();
         Output = NewBlock();
+        OutputB = NewBlock();
 
         Round(0x11112222u, "the first dispatch");
         const std::array<std::uint32_t, 4> values{0x33334444u, 0x55556666u, 0x7a7b7c7du, 0x0f1e2d3cu};
         for (std::size_t round = 0; round < values.size(); ++round) {
-            const auto mismatches = AgcDriver::Graphics::SnapshotMismatches();
-            const auto what = "data hit " + std::to_string(round + 1) + ", resolved ahead on the compute queue";
+            const auto what = "current value " + std::to_string(round + 1) + ", resolved ahead on the compute queue";
             Round(values[round], what);
-            const auto added = AgcDriver::Graphics::SnapshotMismatches() - mismatches;
-            check(added == 0, what + ": its snapshots differ from the registered memory serving them (" + std::to_string(added) + " snapshot mismatches)");
         }
-        std::printf("dispatch data hit words: %zu data hits resolved ahead read their own live words\n", values.size());
+        std::printf("dispatch data hit words: %zu resolved-ahead dispatches read their current values\n", values.size());
+
+        auto* const originalConstants = Constants;
+        auto* const originalOutput = Output;
+        for (std::uint32_t lane = 0; lane < Lanes; ++lane) ConstantsB[lane] = 0x0f1e2d3cu;
+        Constants = ConstantsB;
+        Round(0x0f1e2d3cu, "equivalent current payload at a relocated root");
+        check(ConstantsB[0] == 0x0f1e2d3cu, "the relocated payload was modified by its dispatch");
+        for (std::uint32_t lane = 0; lane < Lanes; ++lane) check(originalConstants[lane] == 0x0f1e2d3cu, "the old root payload changed during relocation");
+        AgcDriverWaitIdle_nid_postfix();
+        RetireBlock(originalConstants);
+        check(*Output == 0x0f1e2d3du, "the original output buffer lost its result before the target transition");
+        Constants[0] = 0x71727374u;
+        Constants[1] = 0x71727374u;
+        Round(0x71727374u, "a changed payload at the relocated root");
+        Output = OutputB;
+        Round(0x81828384u, "a relocated root targeting a new output resource");
+        for (std::uint32_t lane = 0; lane < Lanes; ++lane) check(originalOutput[lane] == 0x71727375u, "the old output buffer changed during the target transition");
+        check(OutputB[0] == 0x81828385u, "the new output resource did not receive its dispatch result");
+        AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(Output), BufferBytes);
+        check(Output[0] == 0x81828385u, "the new output resource did not retain its result");
+
 
         LibcRunShutdown_nid_postfix();
         std::puts("dispatch data hit words tests passed");

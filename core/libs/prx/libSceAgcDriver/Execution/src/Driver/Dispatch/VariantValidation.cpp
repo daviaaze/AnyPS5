@@ -27,12 +27,12 @@ QueuedOverlap QueuedWritesOver(DrawPipeline& pipeline, std::span<const ShaderRec
 }
 
 void Driver::appendEntryRegions(const DispatchVariant& variant, std::vector<ShaderRecompiler::MemoryRegion>& regions, const std::vector<std::uint32_t>* words) {
-    const auto& source = words != nullptr ? *words : variant.words;
+    const auto source = words != nullptr ? std::span<const std::uint32_t>(*words) : DispatchVariantWords(variant);
     regions.reserve(regions.size() + variant.runs.size());
     std::size_t offset = 0;
     for (const auto& [begin, end] : variant.runs) {
         const auto count = static_cast<std::size_t>((end - begin) / sizeof(std::uint32_t));
-        regions.push_back({begin, std::as_bytes(std::span<const std::uint32_t>(source).subspan(offset, count))});
+        regions.push_back({begin, std::as_bytes(source.subspan(offset, count))});
         offset += count;
     }
 }
