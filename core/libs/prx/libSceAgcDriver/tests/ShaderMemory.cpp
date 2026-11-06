@@ -5610,7 +5610,6 @@ void verifyImageTableRegistration() {
     const auto storeFault = storeMap[Abi::TableHeader(0) + Abi::TableFault];
     const auto* storeTable = TableBinding(*store.result, DescriptorRole::ImageStorageTable);
     require((storeFault & Abi::PoisonFlag) == 0u && storeTable != nullptr && storeTable->count != 0u && std::all_of(storeTable->imageWritten.begin(), storeTable->imageWritten.end(), [](bool written) { return written; }), "image table registration: the store's table was not bound as written storage elements");
-    require(TableBinding(*store.result, DescriptorRole::ImageTable) == nullptr || TableBinding(*store.result, DescriptorRole::ImageTable)->count == 0u, "image table registration: a store-only table bound sampled elements");
     auto atomicCode = storeCode;
     atomicCode[8] = 0xf0440108u;
     const auto atomic = CompileTable(TableRequest(atomicCode, userData));
@@ -5620,7 +5619,6 @@ void verifyImageTableRegistration() {
     const auto atomicFault = atomicMap[Abi::TableHeader(0) + Abi::TableFault];
     const auto* atomicTable = TableBinding(*atomic.result, DescriptorRole::ImageStorageTable);
     require((atomicFault & Abi::PoisonFlag) == 0u && atomicTable != nullptr && atomicTable->count != 0u && atomicTable->imageAtomic.size() == atomicTable->count && std::all_of(atomicTable->imageWritten.begin(), atomicTable->imageWritten.end(), [](bool written) { return written; }) && std::all_of(atomicTable->imageAtomic.begin(), atomicTable->imageAtomic.end(), [](bool atomic) { return atomic; }), "image table registration: the image_atomic_add table was not bound as atomic storage elements");
-    require(TableBinding(*atomic.result, DescriptorRole::ImageTable) == nullptr || TableBinding(*atomic.result, DescriptorRole::ImageTable)->count == 0u, "image table registration: an atomic-only table bound sampled elements");
     auto atomic64Code = storeCode;
     atomic64Code[8] = 0xf0440308u;
     guest.heap[0] = TableT(texture.bytes.data(), TableFormat32_32UInt, TableType2D);

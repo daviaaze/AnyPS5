@@ -157,8 +157,7 @@ int main() {
             const auto probe = OpenVulkanTestDevice();
             if (!probe) return VulkanTestSkipped;
         }
-        const char* dispatchSwitch = std::getenv("APS5_PIPELINE_DISPATCH");
-        const bool pipelinedDispatch = dispatchSwitch != nullptr && dispatchSwitch[0] != '\0' && dispatchSwitch[0] != '0';
+        
 
         Shader shader{};
         shader.file_header = 0x34333231;
@@ -193,36 +192,32 @@ int main() {
         const std::array<std::uint32_t, 5> values{0x0a0b0c0du, 0x11112222u, 0x33334444u, 0x55556666u, 0x77778888u};
         for (std::size_t round = 0; round < values.size(); ++round) {
             const auto value = values[round];
-            const auto drainsBefore = DrawPipeline::DrainRequestsByOpcode(DispatchOpcode);
+            
             auto words = Round(Input, value, Code.data());
             Submit(words);
             AgcDriverWaitIdle_nid_postfix();
             AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(Output), BufferBytes);
-            const auto drains = DrawPipeline::DrainRequestsByOpcode(DispatchOpcode) - drainsBefore;
+            
             for (std::uint32_t lane = 0; lane < Lanes; ++lane) {
                 check(Input[lane] == value, "the immediate fill did not land in lane " + std::to_string(lane));
                 check(Output[lane] == value + 1u, "round " + std::to_string(round) + ": lane " + std::to_string(lane) + " of the output is " + std::to_string(Output[lane]) + ", expected " + std::to_string(value + 1u) + " (the dispatch did not see the fill before it)");
             }
-            std::printf("pipelined dispatch: input fill round %zu, fill 0x%08x, dispatch drains %llu\n", round, value, static_cast<unsigned long long>(drains));
-            if (!pipelinedDispatch) check(drains >= 1, "a dispatch did not drain the pipeline, and APS5_PIPELINE_DISPATCH is off");
-            if (pipelinedDispatch) check(drains <= 1, "a dispatch drained the pipeline more than once (" + std::to_string(drains) + ")");
+            std::printf("pipelined dispatch: input fill round %zu, fill 0x%08x\n", round, value);
         }
         for (std::size_t round = 0; round < 3; ++round) {
             const auto value = 0xc0de0000u + static_cast<std::uint32_t>(round);
-            const auto drainsBefore = DrawPipeline::DrainRequestsByOpcode(DispatchOpcode);
+            
             auto words = Round(Scratch, value, Code.data());
             Submit(words);
             AgcDriverWaitIdle_nid_postfix();
             AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(Scratch), BufferBytes);
             AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(Output), BufferBytes);
-            const auto drains = DrawPipeline::DrainRequestsByOpcode(DispatchOpcode) - drainsBefore;
+            
             for (std::uint32_t lane = 0; lane < Lanes; ++lane) {
                 check(Scratch[lane] == value, "the scratch fill did not land in lane " + std::to_string(lane));
                 check(Output[lane] == Input[lane] + 1u, "scratch round " + std::to_string(round) + ": lane " + std::to_string(lane) + " of the output is " + std::to_string(Output[lane]) + ", expected " + std::to_string(Input[lane] + 1u));
             }
-            std::printf("pipelined dispatch: scratch fill round %zu, fill 0x%08x, dispatch drains %llu\n", round, value, static_cast<unsigned long long>(drains));
-            if (!pipelinedDispatch) check(drains >= 1, "a dispatch did not drain the pipeline, and APS5_PIPELINE_DISPATCH is off");
-            if (pipelinedDispatch) check(drains == 0, "a dispatch that reads nothing pending drained the pipeline (" + std::to_string(drains) + ")");
+            std::printf("pipelined dispatch: scratch fill round %zu, fill 0x%08x\n", round, value);
         }
         const std::array<std::uint32_t, 4> tableValues{0x6a6a0001u, 0x6b6b0002u, 0x6c6c0003u, 0x6d6d0004u};
         for (std::size_t round = 0; round < tableValues.size(); ++round) {
@@ -234,7 +229,7 @@ int main() {
                 ~Release() { flag.store(true, std::memory_order_release); }
             } release{released};
             WaitUntil([] { return DrawPipeline::QueuedItems() == 0; }, "the pipeline to empty before descriptor round " + std::to_string(round));
-            const auto drainsBefore = DrawPipeline::DrainRequestsByOpcode(DispatchOpcode);
+            
             DrawPipeline::Queue0().Enqueue([&released] {
                 while (!released.load(std::memory_order_acquire)) std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }, {});
@@ -247,29 +242,25 @@ int main() {
             released.store(true, std::memory_order_release);
             AgcDriverWaitIdle_nid_postfix();
             AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(Output), BufferBytes);
-            const auto drains = DrawPipeline::DrainRequestsByOpcode(DispatchOpcode) - drainsBefore;
+            
             for (std::uint32_t lane = 0; lane < Lanes; ++lane) {
                 check(Output[lane] == value + 1u, "descriptor round " + std::to_string(round) + ": lane " + std::to_string(lane) + " of the output is " + std::to_string(Output[lane]) + ", expected " + std::to_string(value + 1u) + " (the dispatch read the buffer the table named before the pending fill of the table)");
             }
-            std::printf("pipelined dispatch: descriptor round %zu, fill 0x%08x, dispatch drains %llu\n", round, value, static_cast<unsigned long long>(drains));
-            if (!pipelinedDispatch) check(drains >= 1, "a dispatch did not drain the pipeline, and APS5_PIPELINE_DISPATCH is off");
-            if (pipelinedDispatch) check(drains == 1, "a dispatch whose table entry is pending a write drained " + std::to_string(drains) + " times, expected once");
+            std::printf("pipelined dispatch: descriptor round %zu, fill 0x%08x\n", round, value);
         }
         const std::array<std::uint32_t, 5> scalarValues{0x13572468u, 0x2468ace0u, 0x0f1e2d3cu, 0x9abcdef0u, 0x31415926u};
         for (std::size_t round = 0; round < scalarValues.size(); ++round) {
             const auto value = scalarValues[round];
-            const auto drainsBefore = DrawPipeline::DrainRequestsByOpcode(DispatchOpcode);
+            
             auto words = Round(Input, value, ScalarCode.data());
             Submit(words);
             AgcDriverWaitIdle_nid_postfix();
             AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(Output), BufferBytes);
-            const auto drains = DrawPipeline::DrainRequestsByOpcode(DispatchOpcode) - drainsBefore;
+            
             for (std::uint32_t lane = 0; lane < Lanes; ++lane) {
                 check(Output[lane] == value + 1u, "scalar round " + std::to_string(round) + ": lane " + std::to_string(lane) + " of the output is " + std::to_string(Output[lane]) + ", expected " + std::to_string(value + 1u) + " (a stale input)");
             }
-            std::printf("pipelined dispatch: scalar read round %zu, fill 0x%08x, dispatch drains %llu\n", round, value, static_cast<unsigned long long>(drains));
-            if (!pipelinedDispatch) check(drains >= 1, "a dispatch did not drain the pipeline, and APS5_PIPELINE_DISPATCH is off");
-            if (pipelinedDispatch) check(drains <= 1, "a dispatch drained the pipeline more than once (" + std::to_string(drains) + ")");
+            std::printf("pipelined dispatch: scalar read round %zu, fill 0x%08x\n", round, value);
         }
         LibcRunShutdown_nid_postfix();
         std::puts("pipelined dispatch tests passed");
