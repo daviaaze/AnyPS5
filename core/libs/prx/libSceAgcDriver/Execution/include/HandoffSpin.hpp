@@ -34,7 +34,9 @@ inline std::chrono::nanoseconds HandoffSpinWindowFor(const char* configured, uns
 }
 
 inline std::chrono::nanoseconds HandoffSpinWindow() {
-    static const std::chrono::nanoseconds window = HandoffSpinWindowFor(std::getenv("APS5_HANDOFF_SPIN_US"), UsableProcessors());
+    static const std::chrono::nanoseconds window = std::getenv("APS5_NO_HANDOFF_SPIN") != nullptr
+        ? std::chrono::nanoseconds::zero()
+        : HandoffSpinWindowFor(std::getenv("APS5_HANDOFF_SPIN_US"), UsableProcessors());
     return window;
 }
 

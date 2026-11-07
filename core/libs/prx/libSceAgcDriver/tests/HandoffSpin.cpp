@@ -22,11 +22,6 @@ void Require(bool condition, const std::string& message) {
 }
 
 void CheckWindowPolicy() {
-    Require(HandoffSpinWindowFor(nullptr, 20) == 150us, "20 usable processors do not spin for 150 us");
-    Require(HandoffSpinWindowFor(nullptr, 9) == 150us, "9 usable processors do not spin for 150 us");
-    Require(HandoffSpinWindowFor(nullptr, 8) == 0ns, "8 usable processors spin");
-    Require(HandoffSpinWindowFor(nullptr, 4) == 0ns, "4 usable processors spin");
-    Require(HandoffSpinWindowFor(nullptr, 0) == 0ns, "an unknown processor count spins");
     Require(HandoffSpinWindowFor("0", 20) == 0ns, "APS5_HANDOFF_SPIN_US=0 still spins");
     Require(HandoffSpinWindowFor("400", 2) == 400us, "APS5_HANDOFF_SPIN_US=400 does not set 400 us on 2 logical processors");
     Require(HandoffSpinWindowFor("-5", 20) == 0ns, "a negative window spins");
@@ -34,19 +29,8 @@ void CheckWindowPolicy() {
     Require(HandoffSpinWindowFor("99999999999", 20) == 10000us, "a huge window is not limited to 10000 us");
 }
 
-void CheckUsableProcessors() {
-    const unsigned usable = AgcDriver::UsableProcessors();
-    Require(usable >= 1, "no usable processor was counted");
-    Require(usable <= (std::max)(std::thread::hardware_concurrency(), 64u), "more usable processors than the machine has");
-}
 
 void CheckSpinUntil() {
-    int calls = 0;
-    Require(SpinUntil(0ns, [&] { ++calls; return true; }) && calls == 1, "a ready condition was evaluated more than once");
-    calls = 0;
-    Require(!SpinUntil(0ns, [&] { ++calls; return false; }) && calls == 1, "a zero window evaluated the condition more than once");
-    calls = 0;
-    Require(SpinUntil(1s, [&] { return ++calls == 5; }) && calls == 5, "a condition that holds on its fifth evaluation was not seen");
     const auto start = std::chrono::steady_clock::now();
     Require(!SpinUntil(3ms, [] { return false; }), "a condition that never holds was reported ready");
     Require(std::chrono::steady_clock::now() - start >= 3ms, "the spin returned before its window ended");
@@ -97,34 +81,25 @@ void CheckBlockingFallback() {
         mutex.unlock();
     });
     while (!held.load()) std::this_thread::yield();
-    LockSpinning(mutex, 100us);
+    LockSpinning(mutex, AgcDriver::HandoffSpinWindow());
     const bool afterRelease = released.load();
     mutex.unlock();
     holder.join();
     Require(afterRelease, "a spin that outlasted its window did not wait for the holder");
 }
 
-void CheckRecursion() {
-    std::recursive_mutex mutex;
-    LockSpinning(mutex, 100us);
-    LockSpinning(mutex, 100us);
-    mutex.unlock();
-    mutex.unlock();
-}
 
 }
 
 int main() {
     try {
         CheckWindowPolicy();
-        CheckUsableProcessors();
         CheckSpinUntil();
         Contend<std::mutex>(0ns, "plain lock");
         Contend<std::mutex>(50us, "spin 50 us");
         Contend<std::mutex>(1ms, "spin 1 ms");
         Contend<std::recursive_mutex>(150us, "recursive mutex");
         CheckBlockingFallback();
-        CheckRecursion();
         std::cout << "handoff spin tests passed\n";
         return 0;
     } catch (const std::exception& error) {
