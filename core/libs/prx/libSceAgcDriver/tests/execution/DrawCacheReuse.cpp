@@ -627,6 +627,113 @@ void CpuResolvedMovedDataRecipesUseCurrentGuestData(bool libraries, std::vector<
 }
 
 
+void CpuResolvedQueuedRecordsKeepTheirOutput(bool libraries, std::vector<std::unique_ptr<WatchedGuestBlock>>& owned) {
+    const auto mode = std::string(libraries ? "with" : "without") + " graphics pipeline libraries";
+    Registered(OffsetTriangleVertexHeader, OffsetTriangleVertexCode.data(), sizeof(OffsetTriangleVertexCode), 2);
+    Registered(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
+    auto* const originalTarget = ColorTargetAddress;
+    const auto allocate = [&]() {
+        auto block = std::make_unique<WatchedGuestBlock>();
+        auto* const data = block->Data();
+        owned.emplace_back(std::move(block));
+        AgcDriver::GuestMemory::Write(reinterpret_cast<std::uintptr_t>(data), std::span<const std::byte>(ResidentTargetZeros));
+        return data;
+    };
+    const auto image = [&](std::byte* target) {
+        std::array<std::byte, 1024> pixels{};
+        AgcDriver::GuestMemory::ReadCommitted(reinterpret_cast<std::uintptr_t>(target), ResidentTargetReadback);
+        const AgcDriver::Graphics::ColorTargetLayout layout(64, 4, AgcDriver::Graphics::ColorTileMode::Standard64KB, 4);
+        for (std::uint32_t y = 0; y < 4; ++y) {
+            for (std::uint32_t x = 0; x < 64; ++x) {
+                std::copy_n(ResidentTargetReadback.data() + layout.Offset(x, y), 4, pixels.data() + (y * 64 + x) * 4);
+            }
+        }
+        return pixels;
+    };
+    const auto setup = [&](std::byte* target) {
+        ColorTargetAddress = target;
+        auto commands = Draws(8.0f, OffsetTriangleVertexCode.data(), 1, PixelCode.data(), 1, {});
+        Append(commands, 0x69, {0x110, std::bit_cast<std::uint32_t>(16.0f)});
+        Append(commands, 0x76, {0x00c, std::bit_cast<std::uint32_t>(0.75f)});
+        return commands;
+    };
+    const auto laterDraw = [&](std::vector<std::uint32_t>& commands) {
+        Append(commands, 0x76, {0x8c, 1});
+        Append(commands, 0x76, {0x00c, std::bit_cast<std::uint32_t>(0.25f)});
+        Append(commands, 0x2d, {3, 2});
+    };
+    for (const bool indexed : {false, true}) {
+        auto* const reference = allocate();
+        auto referenceCommands = setup(reference);
+        for (std::uint32_t offset = 0; offset < 3; ++offset) {
+            Append(referenceCommands, 0x76, {0x8c, offset});
+            Append(referenceCommands, 0x2d, {3, 2});
+        }
+        laterDraw(referenceCommands);
+        Submit(std::move(referenceCommands));
+        const auto expected = image(reference);
+        Require(std::find(expected.begin(), expected.end(), std::byte{191}) != expected.end() &&
+                    std::find(expected.begin(), expected.end(), std::byte{64}) != expected.end(),
+                mode + ": the queued-record reference must contain both earlier and later draw colors");
+
+        auto* const actual = allocate();
+        auto* const decoy = allocate();
+        auto* const arguments = allocate();
+        auto* const indexData = allocate();
+        auto* const labelData = allocate();
+        const std::array<std::uint32_t, 16> records{
+            3, 1, 0, 0, 3, 1, 0, 1, 3, 1, 0, 2, 0, 1, 0, 3};
+        const std::array<std::uint32_t, 20> indexedRecords{
+            3, 1, 0, 0, 0, 3, 1, 3, 0, 1, 3, 1, 6, 0, 2, 0, 1, 9, 0, 3};
+        const std::array<std::uint16_t, 12> indices{0, 1, 2, 1, 2, 0, 2, 0, 1, 0, 1, 2};
+        const auto address = reinterpret_cast<std::uintptr_t>(arguments);
+        const auto indicesAddress = reinterpret_cast<std::uintptr_t>(indexData);
+        const auto labelAddress = reinterpret_cast<std::uintptr_t>(labelData);
+        if (indexed) {
+            AgcDriver::GuestMemory::Write(address, std::as_bytes(std::span<const std::uint32_t>(indexedRecords)));
+        } else {
+            AgcDriver::GuestMemory::Write(address, std::as_bytes(std::span<const std::uint32_t>(records)));
+        }
+        AgcDriver::GuestMemory::Write(indicesAddress, std::as_bytes(std::span<const std::uint16_t>(indices)));
+        auto commands = setup(actual);
+        Append(commands, 0x79, {0x24a, 0});
+        Append(commands, 0x11, {1, static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u)});
+        if (indexed) {
+            Append(commands, 0x2a, {0});
+            Append(commands, 0x26, {static_cast<std::uint32_t>(indicesAddress), static_cast<std::uint32_t>(indicesAddress >> 32u)});
+            Append(commands, 0x13, {12});
+            Append(commands, 0x38, {0, 0, 0x8c, 0, 4, 0, 0, 20, 0});
+        } else {
+            Append(commands, 0x2c, {0, 0, 0x8c, 0, 4, 0, 0, 16, 2});
+        }
+        laterDraw(commands);
+        Append(commands, 0x37, {0x00100200u, static_cast<std::uint32_t>(labelAddress), static_cast<std::uint32_t>(labelAddress >> 32u), 0x13579bdfu});
+        SubmitQueued(commands);
+
+        // Replace q0's target, user words, index binding and argument base while
+        // the earlier submission and every original guest owner remain live.
+        auto changed = setup(decoy);
+        Append(changed, 0x76, {0x8c, 4});
+        Append(changed, 0x76, {0x00c, std::bit_cast<std::uint32_t>(1.0f)});
+        const auto decoyAddress = reinterpret_cast<std::uintptr_t>(decoy);
+        Append(changed, 0x11, {1, static_cast<std::uint32_t>(decoyAddress), static_cast<std::uint32_t>(decoyAddress >> 32u)});
+        Append(changed, 0x26, {static_cast<std::uint32_t>(decoyAddress), static_cast<std::uint32_t>(decoyAddress >> 32u)});
+        Append(changed, 0x2d, {3, 2});
+        SubmitQueued(changed);
+        AgcDriverWaitIdle_nid_postfix();
+        const auto observed = image(actual);
+        for (std::size_t byte = 0; byte < expected.size(); ++byte) {
+            Require(observed[byte] == expected[byte],
+                    mode + (indexed ? ": queued indexed" : ": queued nonindexed") +
+                        " CPU records or later draw changed output byte " + std::to_string(byte));
+        }
+        std::uint32_t label = 0;
+        AgcDriver::GuestMemory::ReadCommitted(labelAddress, std::as_writable_bytes(std::span<std::uint32_t>(&label, 1)));
+        Require(label == 0x13579bdfu, mode + ": the label following queued CPU records and their later draw did not land");
+    }
+    ColorTargetAddress = originalTarget;
+}
+
 void CpuResolvedRecordRecipeRegressions(bool libraries, std::vector<std::unique_ptr<WatchedGuestBlock>>& owned) {
     Require(std::getenv("APS5_DRAW_CACHE_INDIRECT") != nullptr, "record recipe regressions require APS5_DRAW_CACHE_INDIRECT");
     Require(std::getenv("APS5_DRAW_CACHE_PUSH_WORD") != nullptr, "record recipe regressions require APS5_DRAW_CACHE_PUSH_WORD");
@@ -636,6 +743,7 @@ void CpuResolvedRecordRecipeRegressions(bool libraries, std::vector<std::unique_
     CpuResolvedScalarRecordsKeepTheirValues(libraries, owned);
     CpuResolvedRecordRecipesRefreshCurrentResources(libraries);
     CpuResolvedMovedDataRecipesUseCurrentGuestData(libraries, owned);
+    CpuResolvedQueuedRecordsKeepTheirOutput(libraries, owned);
 }
 
 

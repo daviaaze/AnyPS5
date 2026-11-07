@@ -28,6 +28,19 @@ if(BUILD_TESTING)
     set_tests_properties(agc_driver_draw_cache_reuse_cpu_record_recipes_no_recipe PROPERTIES
         ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_DRAW_CACHE_INDIRECT=1;APS5_DRAW_CACHE_PUSH_WORD=1;APS5_NO_INDIRECT_INPUT_ROUTES=1;APS5_TEST_RECORD_RECIPE_REGRESSIONS=1;APS5_NO_DRAW_RECIPE=1;APS5_VERIFY_DRAW_PUSH_WORD=1"
         SKIP_RETURN_CODE 77 FAIL_REGULAR_EXPRESSION "FATAL:")
+    foreach(recordFinisherDepth IN ITEMS 8 32)
+        add_test(NAME agc_driver_draw_cache_reuse_cpu_record_finisher_${recordFinisherDepth}
+            COMMAND agc_driver_draw_cache_reuse_tests)
+        set_tests_properties(agc_driver_draw_cache_reuse_cpu_record_finisher_${recordFinisherDepth} PROPERTIES
+            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_DRAW_CACHE_INDIRECT=1;APS5_DRAW_CACHE_PUSH_WORD=1;APS5_NO_INDIRECT_INPUT_ROUTES=1;APS5_TEST_RECORD_RECIPE_REGRESSIONS=1;APS5_VERIFY_DRAW_PUSH_WORD=1;APS5_DRAW_PIPELINE=1;APS5_PIPELINED_DRAWS=${recordFinisherDepth}"
+            SKIP_RETURN_CODE 77 TIMEOUT 90)
+        set_property(TEST agc_driver_draw_cache_reuse_cpu_record_finisher_${recordFinisherDepth}
+            APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_PROFILE_DRAW=unset:")
+        if(WIN32)
+            set_property(TEST agc_driver_draw_cache_reuse_cpu_record_finisher_${recordFinisherDepth}
+                APPEND PROPERTY ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
     if(WIN32)
         set_tests_properties(agc_driver_draw_cache_reuse_push_word agc_driver_draw_cache_reuse_push_word_verify agc_driver_draw_cache_reuse_cpu_record_recipes agc_driver_draw_cache_reuse_cpu_record_recipes_no_recipe PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")

@@ -122,6 +122,8 @@ struct SrtRuntime {
     SrtImageViewNormalizer normalizeImageView = nullptr;
     SrtImageViewGeneration imageViewGeneration = nullptr;
     SrtSnapshotCurrent snapshotCurrent = nullptr;
+    // Guest execution wave size, distinct from host subgroup width. Zero means unknown.
+    std::uint32_t guestWaveSize = 0u;
 };
 
 struct SrtForceSyncScope {

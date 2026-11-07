@@ -1636,8 +1636,14 @@ void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, 
         const std::uint32_t stride = (descriptor.dwords[1] >> 16u) & 0x3fffu;
         const std::uint32_t records = descriptor.dwords[2];
         const std::uint32_t word3 = descriptor.dwords[3];
-        if (stride == 0u || records == 0u || (word3 & (1u << 23u)) != 0u ||
-            (word3 & (3u << 28u)) != 0u || (word3 & (3u << 21u)) != 0u) continue;
+        const bool addTid = (word3 & (1u << 23u)) != 0u;
+        const std::uint32_t waveSize = runtime.guestWaveSize;
+        // Modes 0/1 have provable linear bounds here: mode 1 checks the record
+        // index only, while our per-record local-range check additionally bounds
+        // bytes. Raw/OOB-zero modes require a different proof.
+        if (stride == 0u || records == 0u || (addTid && (plan.stage != IrShaderStage::Compute || (waveSize != 32u && waveSize != 64u))) ||
+            ((word3 >> 28u) & 3u) > 1u || (word3 & (3u << 21u)) != 0u) continue;
+        if (addTid && (records < waveSize || !accessPlan.complete)) continue;
         const std::uint64_t extent = static_cast<std::uint64_t>(stride) * records;
         if (extent > UINT32_MAX) continue;
         BufferTransferFootprint footprint;
@@ -1647,20 +1653,26 @@ void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, 
         for (const auto& access : accessPlan.accesses) {
             std::uint32_t index = 0, offset = 0, soffset = 0;
             if (!resolveSource(access.index, index) || !resolveSource(access.offset, offset) ||
-                !resolveSource(access.soffset, soffset) || index >= records || access.byteWidth == 0u ||
+                !resolveSource(access.soffset, soffset) || access.byteWidth == 0u ||
                 access.byteWidth > 16u || (access.byteWidth & 3u) != 0u) {
                 footprint.bounded = false;
                 break;
             }
-            const std::uint64_t indexBase = static_cast<std::uint64_t>(index) * stride;
+            const std::uint64_t laneLastIndex = static_cast<std::uint64_t>(index) + (addTid ? waveSize - 1u : 0u);
             const std::uint64_t local = static_cast<std::uint64_t>(offset) + access.immediateOffset + soffset;
-            if (indexBase > UINT32_MAX || local > UINT32_MAX || indexBase + local > UINT32_MAX ||
-                local + access.byteWidth > stride || indexBase + local + access.byteWidth > extent) {
+            if (index >= records || laneLastIndex >= records || laneLastIndex > UINT32_MAX) {
+                footprint.bounded = false;
+                break;
+            }
+            const std::uint64_t indexBase = static_cast<std::uint64_t>(index) * stride;
+            const std::uint64_t lastBase = laneLastIndex * stride;
+            if (indexBase > UINT32_MAX || lastBase > UINT32_MAX || local > UINT32_MAX ||
+                local + access.byteWidth > stride || lastBase + local + access.byteWidth > extent) {
                 footprint.bounded = false;
                 break;
             }
             const std::uint64_t begin = indexBase + local;
-            const std::uint64_t end = begin + access.byteWidth;
+            const std::uint64_t end = lastBase + local + access.byteWidth;
             if ((begin & 3u) != 0u || (end & 3u) != 0u) {
                 footprint.bounded = false;
                 break;

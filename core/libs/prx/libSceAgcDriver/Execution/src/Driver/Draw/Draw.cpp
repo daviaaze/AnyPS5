@@ -240,9 +240,9 @@ std::string_view TrimmedReason(std::string_view reason) {
     return reason;
     }
 
+
+
 }
-
-
 struct DrawTail {
     using GpuLock = std::unique_lock<std::remove_reference_t<decltype(GuestMemory::GpuMutex())>>;
     DrawTail() : scratchResource(scratch.data(), scratch.size()),
@@ -258,6 +258,7 @@ struct DrawTail {
     DrawPhaseTiming phaseTiming{false, phaseMs, phaseLap};
     Pm4::DrawParameters drawParameters{};
     bool pipelined = false;
+    bool finishHandoffAllowed = false;
     bool traceIndirect = false;
     std::uint64_t dumpTarget = 0;
     std::uint64_t dumpSlot1 = 0;
@@ -314,6 +315,14 @@ struct DrawTail {
     std::string ownRejected;
     GpuLock* gpuLock = nullptr;
     GpuLock ownLock{GuestMemory::GpuMutex(), std::defer_lock};
+    struct IndirectRecordState {
+        Graphics::IndirectDrawPath path{};
+        std::vector<Pm4::DrawArguments> records;
+        std::vector<std::uint32_t> pushOffsets;
+        std::optional<ShaderRecompiler::MeshBarycentricLayout> meshBarycentrics;
+    };
+    std::unique_ptr<IndirectRecordState> indirectWork;
+    std::unique_ptr<QueueState> ownedQueue;
 };
 
 namespace {
@@ -897,7 +906,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     tail.dumpTarget = dumpTarget;
     tail.dumpSlot1 = dumpSlot1;
     tail.packetOffset = packetOffset;
-    const bool handOff = pipelined && !drawParameters.indirect && !profile && !lockedPrepare && dumpTarget == 0 && dumpSlot1 == 0 && !tracePrograms && !verifyDrawDataHits() && deferredLabels().labels.empty() && DrawFinisher::Enabled();
+    tail.finishHandoffAllowed = pipelined && !profile && !lockedPrepare && dumpTarget == 0 && dumpSlot1 == 0 && !tracePrograms && !verifyDrawDataHits() && deferredLabels().labels.empty() && DrawFinisher::Enabled();
+    const bool handOff = tail.finishHandoffAllowed && !drawParameters.indirect;
     if (handOff) {
         tail.epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         tail.submissionSerial = submission.serial;
@@ -937,6 +947,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
 
 DrawVerdict Driver::finishDraw(const std::shared_ptr<DrawTail>& tailHolder, PerformanceTimer& timing) {
     auto& tail = *tailHolder;
+    const bool resumingIndirect = tail.indirectWork != nullptr;
     using Stage = ShaderRecompiler::ShaderStage;
     using Role = ShaderRecompiler::ProgramRole;
     const bool profile = tail.profile;
@@ -1074,13 +1085,13 @@ DrawVerdict Driver::finishDraw(const std::shared_ptr<DrawTail>& tailHolder, Perf
         std::snprintf(message, sizeof(message), "APS5_VERIFY_DRAW_DATA_HITS: stage %zu (program 0x%llx) of a stage data hit differs from its full build in its %s (%zu data positions refreshed)", i, static_cast<unsigned long long>(programs[i].binary.codeAddress), what, kept.dataPositions.size());
         throw std::runtime_error(message);
     };
-    std::optional<Graphics::IndirectDrawPath> indirectCpu;
+    std::optional<Graphics::IndirectDrawPath> indirectCpu = resumingIndirect ? std::optional{tail.indirectWork->path} : std::nullopt;
     std::size_t completedSubdraws = 0;
     std::int32_t instanceInputSgpr = -1;
     bool routedVertexBase = false;
-    std::vector<std::uint32_t> pushOffsets(programs.size(), 0);
-    std::optional<ShaderRecompiler::MeshBarycentricLayout> meshBarycentrics;
-    for (std::size_t i = 0; i < programs.size(); ++i) {
+    std::vector<std::uint32_t> pushOffsets = resumingIndirect ? std::move(tail.indirectWork->pushOffsets) : std::vector<std::uint32_t>(programs.size(), 0);
+    std::optional<ShaderRecompiler::MeshBarycentricLayout> meshBarycentrics = resumingIndirect ? tail.indirectWork->meshBarycentrics : std::nullopt;
+    for (std::size_t i = 0; !resumingIndirect && i < programs.size(); ++i) {
         if (roles[i] == Role::GeometryBack) continue;
         const auto& program = programs[i];
         pushCursorBytes = Graphics::StagePushOffset(pushCursorBytes, program.binary.stage, localDevice->GraphicsPipelineLibraries());
@@ -1245,7 +1256,7 @@ DrawVerdict Driver::finishDraw(const std::shared_ptr<DrawTail>& tailHolder, Perf
         std::lock_guard cacheLock(drawCacheMutex);
         drawEntryCounters.stageDataVerified += stageDataVerified;
     }
-    if (dataEntry != nullptr) {
+    if (!resumingIndirect && dataEntry != nullptr) {
         std::lock_guard cacheLock(drawCacheMutex);
         drawEntryCounters.dataStagesReused += dataStagesReused;
         drawEntryCounters.dataStagesCompiled += dataStagesCompiled;
@@ -1274,16 +1285,18 @@ DrawVerdict Driver::finishDraw(const std::shared_ptr<DrawTail>& tailHolder, Perf
     const bool shapeNeedsEntry = shapeRefresh && registerKey && shapeKey != 0 && drawDataHits() && !drawParameters.indirect && dataEntry != nullptr && dataStagesCompiled != 0 && refreshSeenTwice();
     timing.Mark("recipe_gate");
     timing.Mark("pre_cache_draw_stages");
-    cacheDrawStages(stageEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, stageData, fresh, drawKey, registerKey, decode, phaseTiming, reused, entry, shapeKey, shapeNeedsEntry);
+    if (!resumingIndirect) cacheDrawStages(stageEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, stageData, fresh, drawKey, registerKey, decode, phaseTiming, reused, entry, shapeKey, shapeNeedsEntry);
     timing.Mark("shader_compile_and_link");
 
-    for (const auto& reads : decodeReads) {
-        for (const auto& read : reads) memory.push_back({read.address, read.Bytes()});
+    if (!resumingIndirect) {
+        for (const auto& reads : decodeReads) {
+            for (const auto& read : reads) memory.push_back({read.address, read.Bytes()});
+        }
     }
     timing.Mark("resource_capture");
 
-    if (tail.queue != nullptr && pipelined && !deferredLabels().labels.empty()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Labels);
-    if (recordQueuedLabelsAfterCapture(submission.queue, memory)) return draw(*tail.queue, packet, submission, packetOffset, rejected);
+    if (!resumingIndirect && tail.queue != nullptr && pipelined && !deferredLabels().labels.empty()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Labels);
+    if (!resumingIndirect && recordQueuedLabelsAfterCapture(submission.queue, memory)) return draw(*tail.queue, packet, submission, packetOffset, rejected);
 
     bool rectListBuilt = false;
 
@@ -1412,12 +1425,65 @@ DrawVerdict Driver::finishDraw(const std::shared_ptr<DrawTail>& tailHolder, Perf
     if (drawParameters.indirect && indirectCpu) {
 
         const auto indirect = *drawParameters.indirect;
-        recordQueuedLabelsBeforeRead(submission.queue);
-        const auto readStart = std::chrono::steady_clock::now();
-        const auto count = std::min(indirect.countIndirect ? Pm4::ReadDrawCount(indirect) : indirect.count, indirect.count);
         std::vector<Pm4::DrawArguments> records;
-        for (std::uint32_t record = 0; record < count; ++record) records.push_back(Pm4::ReadDrawArguments(indirect, record));
-        Graphics::CountIndirectDraw(*indirectCpu, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - readStart).count());
+        if (resumingIndirect) {
+            records = std::move(tail.indirectWork->records);
+        } else {
+            recordQueuedLabelsBeforeRead(submission.queue);
+            const auto readStart = std::chrono::steady_clock::now();
+            const auto count = std::min(indirect.countIndirect ? Pm4::ReadDrawCount(indirect) : indirect.count, indirect.count);
+            for (std::uint32_t record = 0; record < count; ++record) records.push_back(Pm4::ReadDrawArguments(indirect, record));
+            Graphics::CountIndirectDraw(*indirectCpu, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - readStart).count());
+            const bool hasDrawable = std::any_of(records.begin(), records.end(), [&](const auto& arguments) {
+                return arguments.count != 0 && arguments.instances != 0 &&
+                    (!drawParameters.indexed || !indirect.indexLimitKnown || arguments.firstVertexOrIndex < drawParameters.indexCount);
+            });
+            const bool ordinaryStages = !graphics.rectList && !graphics.stages.mesh && !graphics.stages.tessellation &&
+                !graphics.stages.tessellationGeometry &&
+                std::none_of(programResults.begin(), programResults.end(), [](const auto* program) {
+                    return program != nullptr && program->barycentricEmulation.active;
+                });
+            const bool readOnlyPrograms = std::all_of(programs.begin(), programs.end(), [](const auto& program) {
+                return program.snapshot != nullptr && !ProgramWritesMemory(*program.snapshot, program.codeOffset) &&
+                    (program.tailContinuation == nullptr || !ProgramWritesMemory(*program.tailContinuation, 0));
+            });
+            if (tail.finishHandoffAllowed && hasDrawable && ordinaryStages && readOnlyPrograms && tail.queue != nullptr &&
+                !gpuLock.owns_lock() && !DrawFinisher::OnFinisherThread() && deferredLabels().labels.empty()) {
+                auto held = heldWrites(tail);
+                if (!held.unknown) {
+                    auto work = std::make_unique<DrawTail::IndirectRecordState>();
+                    work->path = *indirectCpu;
+                    work->records = std::move(records);
+                    work->pushOffsets = std::move(pushOffsets);
+                    work->meshBarycentrics = meshBarycentrics;
+                    tail.ownedQueue = std::make_unique<QueueState>(*tail.queue);
+                    tail.queue = tail.ownedQueue.get();
+                    tail.rejected = nullptr;
+                    tail.gpuLock = nullptr;
+                    tail.indirectWork = std::move(work);
+                    tail.epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
+                    tail.submissionSerial = submission.serial;
+                    // execute drains the finisher on normal completion and during exception cleanup,
+                    // before this packet's immutable submission storage can be released.
+                    DrawFinisher::Get().Enqueue([this, tailHolder] {
+                        AgcDriver::BatchTimeline::Scope originScope(tailHolder->origin);
+                        auto& job = *tailHolder;
+                        struct ReleaseGpuLock {
+                            DrawTail::GpuLock& lock;
+                            ~ReleaseGpuLock() { if (lock.owns_lock()) lock.unlock(); }
+                        } releaseGpuLock{job.ownLock};
+                        DrawPipeline::FollowEpoch(job.epoch);
+                        AgcDriver::P0Metrics::Scope p0(job.submissionQueue, AgcDriver::P0Metrics::Layer::Finisher, AgcDriver::P0Metrics::Operation::Draw);
+                        GuestMemory::SetCurrentPacket(job.packetOpcode, job.submissionQueue);
+                        PerformanceTimer finishTiming("Driver.DrawIndirectFinish");
+                        if (finishDraw(tailHolder, finishTiming) == DrawVerdict::Rejected)
+                            throw std::runtime_error(job.ownRejected);
+                    }, std::move(held));
+                    timing.Mark("indirect_handed_off");
+                    return drawn();
+                }
+            }
+        }
         const auto baseVertexWords = UserDataWords(programs, roles, indirect.baseVertexLocation);
         const auto startInstanceWords = UserDataWords(programs, roles, indirect.startInstanceLocation);
         const auto drawIndexWords = indirect.drawIndexEnabled ? UserDataWords(programs, roles, indirect.drawIndexLocation) : std::vector<std::pair<std::size_t, std::size_t>>{};

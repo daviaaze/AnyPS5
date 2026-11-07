@@ -397,7 +397,7 @@ The calibrated RAW GPU track also exports the completed program-keyed ranges as 
 
 On the queue-worker tracks, `Driver.Dispatch` and its device dispatch, record and copy children (`Vulkan.Dispatch*`, `Driver.Dispatch.device_*`, `Resources.*` while that dispatch runs) carry the same `args.program` once the compiled variant is resolved, using the same address-or-variant key as the GPU timing. Work that runs before that resolution (`capture_resources`, `materialize`, lookups) and every multi-shader draw stay untagged: absence is not a program zero. Queued commits install the identity on their own thread from the result they own. These are host wall intervals, not CPU samples, and parallel threads and nested scopes are not additive.
 
-Slices shorter than 20 us are not exported (see above), so a gap between two exported `Driver.Packet` slices on a queue worker is not idle time: it is usually a burst of short packets. Read a worker's occupancy from `worker_busy_pct` in the summary, which counts the folded slices.
+Slices shorter than 20 us are not exported (see above), so gaps between exported slices cannot establish idle time or identify their cause. They can include folded short work, scheduling waits or uninstrumented work. `worker_busy_pct` in the summary includes folded durations and waits in its listed scopes; it measures scope occupancy, not CPU utilization or an exclusive critical path.
 
 
 ## Guest clock scale
