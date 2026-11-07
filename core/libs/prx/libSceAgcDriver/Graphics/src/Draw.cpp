@@ -1470,7 +1470,7 @@ void NoteRecipeGap(RecipeGap gap) {
     static constexpr std::array<const char*, static_cast<std::size_t>(RecipeGap::Count)> names{
         "found", "no-register-key", "indirect-cpu", "patched-stages", "tessellation-geometry", "disabled", "variant-id-0", "no-variants",
         "draw-cache-miss", "no-entry", "no-records", "expired", "stage-mismatch", "compiled-mismatch", "record-no-stages", "record-patched", "replay-failed",
-        "built", "prepare-refused", "not-lean", "not-cacheable", "waited", "indirect-not-gpu", "not-reusable", "space-reuse", "moved", "multisampled",
+        "built", "prepare-refused", "not-lean", "not-cacheable", "waited", "indirect-not-gpu", "not-reusable", "space-reuse", "multisampled",
         "reorders-samples", "build-disabled", "mesh-layer-windows", "attach-no-entry", "attach-variant-0", "attached"};
     static std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(RecipeGap::Count)> counts{};
     static std::atomic<std::int64_t> lastReport{0};
@@ -4105,9 +4105,10 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
         record.depthLocations = depthLocations;
         record.spaceKeep = &prepared.spaceKeep;
         recordDraw(context, state, draw, shaders, inputs, record, outcome, timer, ownWaitedMs, prepared.trace);
-        // DrawWithRecipe re-proves and supplies current moved bindings on every hit.
-        // Recipes exclude space reuse and moved bindings because those require per-use ownership.
-        if (recipeOut != nullptr && DrawRecipes() && cacheable && !outcome.waited && (args == nullptr || (indirect.path == IndirectDrawPath::Gpu && inputs.listRestartPrimitive == 0)) && resources->Reusable() && !resources->SpaceReuse() && resolved.moved.empty() && !multisampled && !pipeline->ReordersSamples()) {
+        // The recipe stores the reusable resource template, not per-draw moved bindings:
+        // DrawWithRecipe re-proves and supplies those bindings on every hit. Space reuse stays
+        // excluded because the held space needs per-use ownership.
+        if (recipeOut != nullptr && DrawRecipes() && cacheable && !outcome.waited && (args == nullptr || (indirect.path == IndirectDrawPath::Gpu && inputs.listRestartPrimitive == 0)) && resources->Reusable() && !resources->SpaceReuse() && !multisampled && !pipeline->ReordersSamples()) {
             auto recipe = std::make_shared<DrawRecipe>();
             recipe->device = context.device;
             recipe->templateRef = resources;
@@ -4133,7 +4134,6 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
                 : !(args == nullptr || (indirect.path == IndirectDrawPath::Gpu && inputs.listRestartPrimitive == 0)) ? RecipeGap::IndirectNotGpu
                 : !resources->Reusable() ? RecipeGap::NotReusable
                 : resources->SpaceReuse() ? RecipeGap::SpaceReuse
-                : !resolved.moved.empty() ? RecipeGap::Moved
                 : multisampled ? RecipeGap::Multisampled
                 : RecipeGap::ReordersSamples);
         }

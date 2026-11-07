@@ -134,7 +134,7 @@ enum class RecipeGap : std::uint8_t {
     Found, NoRegisterKey, IndirectCpu, PatchedStages, TessellationGeometry, Disabled, VariantIdZero, NoVariants,
     DrawCacheMiss, NoEntry, NoRecords, Expired, NoMatch, CompiledMismatch, RecordNoStages, RecordPatched, ReplayFailed,
     // Draw build outcomes.
-    Built, PrepareRefused, NotLean, NotCacheable, Waited, IndirectNotGpu, NotReusable, SpaceReuse, Moved, Multisampled,
+    Built, PrepareRefused, NotLean, NotCacheable, Waited, IndirectNotGpu, NotReusable, SpaceReuse, Multisampled,
     ReordersSamples, BuildDisabled, MeshLayerWindows, AttachNoEntry, AttachVariantZero, Attached,
     Count
 };
