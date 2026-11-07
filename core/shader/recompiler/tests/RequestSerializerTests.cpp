@@ -729,6 +729,8 @@ int main() {
             Require(replay53.request.graphics->instanceInputSgpr == -1 && !replay53.request.graphics->routedVertexBase);
             Require(replay53.request.target.tessellationEvaluationSubgroups && replay53.request.target.hostInterpolationFirst && replay53.request.target.shaderImageMinLod);
             auto legacy52 = legacy53;
+            // v53 adds shaderImageMinLod after the v52 hostInterpolationFirst flag.
+            legacy52.pop_back();
             legacy52[4] = 52u;
             const auto replay52 = serializer.Deserialize(EncodeBase64(legacy52));
             Require(replay52.request.graphics->instanceInputSgpr == -1 && !replay52.request.graphics->routedVertexBase &&
@@ -1083,7 +1085,8 @@ int main() {
         const auto replay = serializer.Deserialize(hostFirstEncoded[hostFirst]);
         Require(replay.request.target.hostInterpolationFirst == hostFirst && serializer.Serialize(replay.request) == hostFirstEncoded[hostFirst]);
         auto bytes = DecodeBase64(hostFirstEncoded[hostFirst]);
-        bytes.resize(bytes.size() - 2u);
+        // Strip v55's two NaN flags and v53's min-LOD flag before decoding as v52.
+        bytes.resize(bytes.size() - 3u);
         bytes[4] = 52u;
         Require(serializer.Deserialize(EncodeBase64(bytes)).request.target.hostInterpolationFirst == hostFirst);
         bytes.resize(bytes.size() - 2u);
@@ -1096,7 +1099,8 @@ int main() {
         request.target.shaderImageMinLod = minLod;
         auto bytes = DecodeBase64(serializer.Serialize(request));
         Require(serializer.Deserialize(EncodeBase64(bytes)).request.target.shaderImageMinLod == minLod);
-        bytes.resize(bytes.size() - 2u);
+        // Strip v55's two NaN flags and v53's min-LOD flag before decoding as v52.
+        bytes.resize(bytes.size() - 3u);
         bytes[4] = 52u;
         Require(!serializer.Deserialize(EncodeBase64(bytes)).request.target.shaderImageMinLod);
     }
