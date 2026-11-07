@@ -6148,6 +6148,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     static const bool reportingDispatch = LibcRunReportEnabled_nid_no_patch();
     if (reportingDispatch) recorder.NoteGuestWork(commands);
     const auto gpuTiming = recorder.BeginGpuTiming(programKey);
+    AgcDriver::FaultToken faultToken = 0;
     if (state->checkpointMarker != nullptr || state->bufferMarker != nullptr) {
         faultToken = AgcDriver::FaultTokenRing::Instance().Claim();
         if (faultToken != 0) {
