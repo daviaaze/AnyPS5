@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <condition_variable>
 #include <exception>
+#include <filesystem>
 #include <functional>
 #include <limits>
 #include <map>
@@ -46,7 +47,33 @@ public:
     using Clock = std::chrono::steady_clock;
     enum class Edge { None, Open, Close };
 
-    static std::optional<TraceWindow> Parse(const char* frames, const char* seconds, const char* requestedSeconds = nullptr) {
+    static bool TriggerConfigured() {
+#ifdef _WIN32
+        return _wgetenv(L"APS5_TRACE_TRIGGER_FILE") != nullptr;
+#else
+        return std::getenv("APS5_TRACE_TRIGGER_FILE") != nullptr;
+#endif
+    }
+
+    static std::optional<TraceWindow> FromEnvironment() {
+#ifdef _WIN32
+        const auto* trigger = _wgetenv(L"APS5_TRACE_TRIGGER_FILE");
+        auto window = Parse(std::getenv("APS5_TRACE_FRAMES"), std::getenv("APS5_TRACE_SECONDS"), nullptr);
+        if (trigger != nullptr) {
+            if (trigger[0] == 0 || !window)
+                throw std::invalid_argument("APS5_TRACE_TRIGGER_FILE requires a nonempty path and APS5_TRACE_FRAMES or APS5_TRACE_SECONDS");
+            window->trigger = std::filesystem::path(trigger);
+        }
+#else
+        const auto* trigger = std::getenv("APS5_TRACE_TRIGGER_FILE");
+        auto window = Parse(std::getenv("APS5_TRACE_FRAMES"), std::getenv("APS5_TRACE_SECONDS"), nullptr, trigger);
+#endif
+        return window;
+    }
+
+    static std::optional<TraceWindow> Parse(const char* frames, const char* seconds, const char* requestedSeconds = nullptr, const char* trigger = nullptr) {
+        if (trigger != nullptr && (trigger[0] == '\0' || (frames == nullptr && seconds == nullptr)))
+            throw std::invalid_argument("APS5_TRACE_TRIGGER_FILE requires a nonempty path and APS5_TRACE_FRAMES or APS5_TRACE_SECONDS");
         if (frames == nullptr && seconds == nullptr && requestedSeconds == nullptr) return std::nullopt;
         if ((frames != nullptr) + (seconds != nullptr) + (requestedSeconds != nullptr) > 1)
             throw std::invalid_argument("trace frame, seconds and requested-seconds windows cannot be set together");
@@ -54,10 +81,16 @@ public:
             std::uint64_t length = 0;
             if (!number(requestedSeconds, length) || length == 0)
                 throw std::invalid_argument("APS5_TRACE_ON_REQUEST_SECONDS must be an integer above 0");
-            auto window = TraceWindow(false, 0, length);
+            if (frames != nullptr || seconds != nullptr)
+                throw std::invalid_argument("APS5_TRACE_ON_REQUEST_SECONDS cannot be combined with fixed trace windows");
+            if (trigger != nullptr)
+                throw std::invalid_argument("APS5_TRACE_TRIGGER_FILE cannot be combined with APS5_TRACE_ON_REQUEST_SECONDS");
+            auto window = TraceWindow(false, 0, length, nullptr);
             window.requested = true;
             return window;
         }
+        if (frames == nullptr && seconds == nullptr) return std::nullopt;
+        if (frames != nullptr && seconds != nullptr) throw std::invalid_argument("APS5_TRACE_FRAMES and APS5_TRACE_SECONDS cannot be set together");
         const std::string_view name = frames != nullptr ? "APS5_TRACE_FRAMES" : "APS5_TRACE_SECONDS";
         const std::string_view text = frames != nullptr ? frames : seconds;
         const auto colon = text.find(':');
@@ -65,7 +98,7 @@ public:
         std::uint64_t length = 0;
         if (colon == std::string_view::npos || !number(text.substr(0, colon), start) || !number(text.substr(colon + 1), length) || length == 0)
             throw std::invalid_argument(std::string(name) + "=" + std::string(text) + " is not <start>:<length> with a length above 0");
-        return TraceWindow(frames != nullptr, start, length);
+        return TraceWindow(frames != nullptr, start, length, trigger);
     }
 
     bool WaitingForRequest() const { return requested && state == State::Waiting && !requestReceived; }
@@ -81,6 +114,17 @@ public:
         if (state == State::Waiting) {
             if (requested && !requestReceived) return Edge::None;
             if (frames ? present < start : wholeSeconds(elapsed) < start) return Edge::None;
+            if (trigger) {
+                if (elapsed < nextTriggerCheck) return Edge::None;
+                nextTriggerCheck = elapsed + std::chrono::milliseconds(250);
+                std::error_code error;
+                const auto status = std::filesystem::status(*trigger, error);
+                if (error && error != std::errc::no_such_file_or_directory)
+                    throw std::filesystem::filesystem_error("APS5_TRACE_TRIGGER_FILE", *trigger, error);
+                if (!std::filesystem::exists(status)) return Edge::None;
+                if (!std::filesystem::is_regular_file(status))
+                    throw std::invalid_argument("APS5_TRACE_TRIGGER_FILE is not a regular file");
+            }
             state = State::Open;
             openedPresent = present;
             openedAt = elapsed;
@@ -99,7 +143,9 @@ public:
 private:
     enum class State { Waiting, Open, Closed };
 
-    TraceWindow(bool frames, std::uint64_t start, std::uint64_t length) : frames(frames), start(start), length(length) {}
+    TraceWindow(bool frames, std::uint64_t start, std::uint64_t length, const char* trigger) : frames(frames), start(start), length(length) {
+        if (trigger != nullptr) this->trigger = std::filesystem::path(std::u8string_view(reinterpret_cast<const char8_t*>(trigger)));
+    }
 
     static bool number(std::string_view text, std::uint64_t& value) {
         const auto end = text.data() + text.size();
@@ -119,6 +165,8 @@ private:
     State state = State::Waiting;
     std::uint64_t openedPresent = 0;
     Clock::duration openedAt{};
+    std::optional<std::filesystem::path> trigger;
+    Clock::duration nextTriggerCheck{};
 };
 
 class TraceInterval {
@@ -1145,7 +1193,7 @@ public:
     }
 
     static bool Configured() {
-        static const bool configured = Windowed() || std::getenv("APS5_TRACE_SUMMARY_EVERY") != nullptr || std::getenv("APS5_TRACE_BENCH") != nullptr;
+        static const bool configured = Windowed() || TraceWindow::TriggerConfigured() || std::getenv("APS5_TRACE_SUMMARY_EVERY") != nullptr || std::getenv("APS5_TRACE_BENCH") != nullptr;
         return configured;
     }
 

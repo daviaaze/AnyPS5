@@ -187,7 +187,8 @@ std::size_t PayloadOffset(std::size_t keyBytes) {
 class SharedPlanTable {
 public:
     std::shared_ptr<const IrResourcePlan> Get(std::span<const std::byte> payload, std::uint64_t shaderHash) {
-        const Key key{HashBytes(payload), HashBytes(payload, 0x5eed0003ull), payload.size(), shaderHash};
+        const auto hashes = HashBytes<2>(payload, {0u, 0x5eed0003ull});
+        const Key key{hashes[0], hashes[1], payload.size(), shaderHash};
         {
             std::lock_guard lock(mutex);
             if (const auto found = plans.find(key); found != plans.end()) {
@@ -2155,7 +2156,8 @@ void BuildSpecializationKey(const SpecializationKeyInput& input, std::vector<std
 }
 
 std::string EntryName(std::span<const std::byte> key) {
-    return hex(HashBytes(key, 0x5eed0001ull)) + hex(HashBytes(key, 0x5eed0002ull)) + ".bin";
+    const auto hashes = HashBytes<2>(key, {0x5eed0001ull, 0x5eed0002ull});
+    return hex(hashes[0]) + hex(hashes[1]) + ".bin";
 }
 
 // drawKeyMemo, cacheHit, sourceOwner and preparedPlanOwner are runtime-only. A reused

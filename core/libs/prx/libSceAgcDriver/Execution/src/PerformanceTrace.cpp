@@ -529,21 +529,24 @@ void PerformanceTrace::Present(std::uint32_t width, std::uint32_t height, const 
     state.height = height;
     if (!state.started) {
         const auto* requestSeconds = std::getenv("APS5_TRACE_ON_REQUEST_SECONDS");
-        state.window = TraceWindow::Parse(std::getenv("APS5_TRACE_FRAMES"), std::getenv("APS5_TRACE_SECONDS"), requestSeconds);
         if (requestSeconds != nullptr) {
+            state.window = TraceWindow::Parse(std::getenv("APS5_TRACE_FRAMES"), std::getenv("APS5_TRACE_SECONDS"), requestSeconds);
+            if (requestSeconds != nullptr) {
 #if defined(__linux__)
-            const auto* semaphoreName = std::getenv("APS5_TRACE_START_SEMAPHORE");
-            if (semaphoreName == nullptr || semaphoreName[0] != '/' || std::strchr(semaphoreName + 1, '/') != nullptr)
-                throw std::invalid_argument("APS5_TRACE_START_SEMAPHORE must be a POSIX semaphore name");
-            state.requestSemaphore = sem_open(semaphoreName, 0);
-            if (state.requestSemaphore == SEM_FAILED)
-                throw std::runtime_error("cannot open APS5_TRACE_START_SEMAPHORE");
+                const auto* semaphoreName = std::getenv("APS5_TRACE_START_SEMAPHORE");
+                if (semaphoreName == nullptr || semaphoreName[0] != '/' || std::strchr(semaphoreName + 1, '/') != nullptr)
+                    throw std::invalid_argument("APS5_TRACE_START_SEMAPHORE must be a POSIX semaphore name");
+                state.requestSemaphore = sem_open(semaphoreName, 0);
+                if (state.requestSemaphore == SEM_FAILED)
+                    throw std::runtime_error("cannot open APS5_TRACE_START_SEMAPHORE");
 #else
-            throw std::runtime_error("request-triggered trace windows are supported only on Linux");
+                throw std::runtime_error("request-triggered trace windows are supported only on Linux");
 #endif
+            }
+        } else {
+            state.window = TraceWindow::FromEnvironment();
         }
         state.interval = TraceInterval::Parse(std::getenv("APS5_TRACE_SUMMARY_EVERY"));
-        state.bench = TraceBench::Parse(std::getenv("APS5_TRACE_BENCH"), state.interval.has_value());
         state.first = now;
         state.started = true;
     }
