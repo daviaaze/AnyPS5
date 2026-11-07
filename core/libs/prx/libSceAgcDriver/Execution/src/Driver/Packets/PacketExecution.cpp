@@ -71,14 +71,15 @@ bool waitTakesPendingLabel(std::span<const std::uint32_t> packet) {
     return value.has_value() && Pm4::WaitComparesValue(packet, *value);
 }
 
-bool keepsDrawPipeline(std::span<const std::uint32_t> packet, std::uint32_t header, std::uint32_t opcode, bool capturedRegisterListValid) {
+bool keepsDrawPipeline(std::span<const std::uint32_t> packet, std::uint32_t header, std::uint32_t opcode) {
     if (header == FlipPacketHeader || header == RenderingWaitPacketHeader) return false;
     if (Pm4::DrawOpcode(opcode)) return true;
     switch (opcode) {
         case 0x11: case 0x12: case 0x13: case 0x20: case 0x26: case 0x2a: case 0x2f: case 0x42: case 0x58: case 0x59: case 0x69: case 0x76: case 0x79: case 0x7a: case 0x81: return true;
         case 0x46: return packet.size() >= 2 && (packet[1] & 0x3fu) != 0x39u;
         case 0x15: return orderedFills();
-        case 0x63: case 0x64: case 0x9f: return capturedRegisterListValid;
+        case 0x63: case 0x64: case 0x9f:
+            return packet.size() >= 5 && !DrawPipeline::Queue0().Overlaps(packet[1] | (static_cast<std::uint64_t>(packet[2]) << 32u), static_cast<std::size_t>(packet[4]) * 8);
         case 0x50: {
             if (packet.size() < 7) return false;
             const auto destination = Pm4::DmaDestination(packet);
@@ -290,18 +291,15 @@ void Driver::execute(const Submission& submission) {
         const auto opcode = (header >> 8u) & 0xffu;
         if (executingPacket != nullptr) executingPacket->store((static_cast<std::uint64_t>(cursor + 1) << 8u) | opcode, std::memory_order_relaxed);
         auto nextCursor = cursor + count;
-        const bool indirectRegisterPacket = Pm4::IndirectRegisterOpcode(opcode);
-        const auto registerList = indirectRegisterPacket ? submission.registerLists.find(cursor) : submission.registerLists.end();
-        const bool capturedRegisterListValid = registerList != submission.registerLists.end() && Pm4::IndirectRegistersValid(registerList->second);
         const bool predicated = Pm4::Predicated(header) && queue.predication.operation != 0;
         if (submission.queue == 0 && DrawFinisher::Busy() && !keepsDrawFinisher(header, opcode)) {
             const bool queuesLabel = pipelined && !predicated && header != FlipPacketHeader && header != RenderingWaitPacketHeader && !submission.flips.contains(cursor) && labelPacketQueues(packet, opcode);
             const bool heldLabelWait = pipelined && !predicated && orderedWaits && (opcode == 0x3c || opcode == 0x93) && header != RenderingWaitPacketHeader && waitTakesPendingLabel(packet);
-            const bool beside = DrawFinisher::Overlap() && opcode != 0x15 && (queuesLabel || heldLabelWait || keepsDrawPipeline(packet, header, opcode, capturedRegisterListValid));
+            const bool beside = DrawFinisher::Overlap() && opcode != 0x15 && (queuesLabel || heldLabelWait || keepsDrawPipeline(packet, header, opcode));
             if (!beside) DrawFinisher::Get().Drain();
             if (DrawFinisher::Overlap()) {
                 DrawFinisher::NoteDrain(DrawFinisher::DrainSite::Packet, !beside);
-                if (!beside) DrawFinisher::NoteDrainedOpcode(header == FlipPacketHeader ? 0xffu : opcode, keepsDrawPipeline(packet, header, opcode, capturedRegisterListValid));
+                if (!beside) DrawFinisher::NoteDrainedOpcode(header == FlipPacketHeader ? 0xffu : opcode, keepsDrawPipeline(packet, header, opcode));
             }
         }
         if (APS5_ENABLE_TIMING_LOG && submission.queue == 0 && pendingFrameTiming == nullptr) includeTimingSubmission(submission, false);
@@ -338,7 +336,7 @@ void Driver::execute(const Submission& submission) {
             }
         }
         timing.Mark("pipeline_prepare");
-        if (pipelined && DrawPipeline::Queue0().Busy() && !keepsDrawPipeline(packet, header, opcode, capturedRegisterListValid)) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, header == FlipPacketHeader ? 0xffu : opcode);
+        if (pipelined && DrawPipeline::Queue0().Busy() && !keepsDrawPipeline(packet, header, opcode)) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, header == FlipPacketHeader ? 0xffu : opcode);
         if (pipelined && predicated && DrawPipeline::Queue0().Busy() && DrawPipeline::Queue0().Overlaps(queue.predication.address, queue.predication.operation == 3 ? 8 : 4)) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, opcode);
         timing.Mark("pipeline_drain");
         std::shared_lock deviceUse(deviceReplacement, std::defer_lock);
@@ -596,13 +594,13 @@ void Driver::execute(const Submission& submission) {
             }
         } else if (opcode != 0x42 && opcode != 0x46 && opcode != 0x58) {
             if (!wroteOnGpu) {
-                if (indirectRegisterPacket) {
-                    if (capturedRegisterListValid) {
-                        Pm4::ExecuteIndirectRegisters(packet, registerList->second, queue);
+                if (Pm4::IndirectRegisterOpcode(opcode)) {
+                    const auto& listed = submission.registerLists.at(cursor);
+                    if (Pm4::IndirectRegistersValid(listed)) {
+                        Pm4::ExecuteIndirectRegisters(packet, listed, queue);
                     } else {
                         landPendingWaits(submission.queue);
                         recordQueuedLabelsBeforeRead(submission.queue);
-                        const auto& listed = submission.registerLists.at(cursor);
                         const auto current = Pm4::ReadIndirectRegisters(packet);
                         static const bool skipInvalid = std::getenv("APS5_SKIP_INVALID_INDIRECT_REGISTERS") != nullptr;
                         static std::atomic<bool> reported{false};
