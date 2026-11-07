@@ -346,7 +346,6 @@ ShaderMemory::Page& ShaderMemory::page(std::uint64_t base) {
 void ShaderMemory::preparePage(Page& page, std::uint64_t base) {
     // A page is either mapped whole or read word by word where the guest mapped less than a page,
     // or where recorded GPU work writes into it (a whole-page read would wait for that work).
-    page.generation = 0;
     if (GuestMemory::Accessible(reinterpret_cast<const void*>(base), PageBytes)) {
         if (WordwisePages() && pendingWrite != nullptr && pendingWrite(base, PageBytes, {}) != PendingWrite::None) {
             page.wordwise = true;
@@ -356,7 +355,6 @@ void ShaderMemory::preparePage(Page& page, std::uint64_t base) {
         const auto started = CaptureProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         GuestMemory::GuardRead(base, PageBytes);
         GuestMemory::FlushGpuWrites(base, PageBytes);
-        page.generation = GuestMemory::CollectWrites(base, PageBytes);
         if (CaptureProfiled()) CaptureTotals().pageReadNanoseconds += NanosecondsSince(started);
         page.lazy = true;
     }
@@ -514,20 +512,6 @@ bool ShaderMemory::pagesCurrent() {
 bool ShaderMemory::snapshotCurrent(void* context, std::span<const ShaderRecompiler::RegisteredImageView> views) {
     const bool pages = static_cast<ShaderMemory*>(context)->pagesCurrent();
     return pages && DriverDetail::CaptureRegisteredViewsCurrent(views);
-}
-
-bool ShaderMemory::ReadsUnchanged() const {
-    if (!supplied.empty() || !spilled.empty()) return false;
-    std::vector<GuestMemory::UnchangedQuery> queries;
-    queries.reserve(pages.size());
-    for (const auto& [base, page] : pages) {
-        if (page->valid.None()) continue;
-        if (!page->lazy || page->wordwise || page->generation == 0 || !page->raw.None()) return false;
-        if (page->backing != PageBacking(base, PageBytes)) return false;
-        static_cast<void>(GuestMemory::CollectWritesUncached(base, PageBytes));
-        queries.push_back({base, PageBytes, page->generation});
-    }
-    return GuestMemory::UnchangedSinceAll(queries);
 }
 
 bool ShaderMemory::invalidateRawPages() {

@@ -16,7 +16,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/LabelTakes.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/WaitMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
-#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
@@ -126,9 +125,6 @@ public:
     static std::uint64_t DispatchCacheBytes();
     static std::uint64_t DrawCacheBytes();
     static ShaderMemory::PendingWrite QueryPendingSpan(std::uint64_t address, std::size_t bytes, std::span<std::byte> known);
-    // Ahead-resolved dispatches whose capture the adoption proved current by write tracking
-    // instead of comparing bytes (cumulative).
-    static std::uint64_t AheadAdoptionsProven();
     std::shared_ptr<const ShaderRegistry> RegisteredShaders();
     static void SetCaptureCheckHook(void (*hook)());
 
@@ -359,9 +355,6 @@ private:
         std::shared_ptr<DispatchEntry> missedEntry;
         std::shared_ptr<ShaderMemory> shaderMemory;
         std::vector<ShaderRecompiler::MemoryRegion> captured;
-        // A cache hit's write-tracking proof: the cache entry's regions with the generations
-        // collected before the lookup validated them (empty: no proof, compare bytes).
-        std::vector<GuestMemory::UnchangedQuery> readProof;
         std::vector<std::uint32_t> userDataRoots;
         std::vector<std::uint32_t> liveWords;
         std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture;

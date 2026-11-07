@@ -60,50 +60,19 @@ void ReportDispatchItems(bool profile) {
     std::fprintf(stderr, "[dispatch-item] %llu commit items (%llu recipes rebuilt on the committer); drained instead, cumulative:%s\n", static_cast<unsigned long long>(itemCommits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemRebuilds.load(std::memory_order_relaxed)), drained.c_str());
 }
 
-std::atomic<std::uint64_t> aheadAdoptionsProven{0};
-
-// Whether the guest bytes an ahead capture read are still there. Every region is first checked for
-// pending GPU writes and has landed GPU writes flushed; then a write-tracking proof replaces the
-// byte comparison, which stays the fallback: a miss's ShaderMemory::ReadsUnchanged, or a hit's
-// `proof` (the cache entry's regions and the generations collected before the lookup validated
-// them) when it covers every captured region.
-bool CapturedCurrent(std::span<const ShaderRecompiler::MemoryRegion> captured, const ShaderSnapshot& code, const ShaderMemory* memory, std::span<const GuestMemory::UnchangedQuery> proof) {
-    const auto skipped = [&](std::uint64_t address, std::size_t bytes) {
-        return bytes == 0 || (address >= code.codeAddress && address < code.codeAddress + code.code.size() * sizeof(std::uint32_t)) || (!code.header.empty() && address >= code.headerAddress && address < code.headerAddress + code.header.size());
-    };
-    bool covered = !proof.empty();
+bool CapturedCurrent(std::span<const ShaderRecompiler::MemoryRegion> captured, const ShaderSnapshot& code) {
     for (const auto& region : captured) {
         const auto address = region.guestAddress;
         const auto bytes = region.bytes.size();
-        if (skipped(address, bytes)) continue;
+        if (bytes == 0 || (address >= code.codeAddress && address < code.codeAddress + code.code.size() * sizeof(std::uint32_t)) || (!code.header.empty() && address >= code.headerAddress && address < code.headerAddress + code.header.size())) continue;
         if (Driver::QueryPendingSpan(address, bytes, {}) != ShaderMemory::PendingWrite::None || !GuestMemory::Accessible(reinterpret_cast<const void*>(address), bytes)) return false;
         GuestMemory::GuardRead(address, bytes);
         GuestMemory::FlushGpuWrites(address, bytes);
-        covered = covered && std::any_of(proof.begin(), proof.end(), [&](const auto& query) {
-            return query.address <= address && address + bytes <= query.address + query.bytes;
-        });
-    }
-    const bool proved = (memory != nullptr && memory->ReadsUnchanged()) || (covered && [&] {
-        for (const auto& query : proof) static_cast<void>(GuestMemory::CollectWritesUncached(query.address, query.bytes));
-        return GuestMemory::UnchangedSinceAll(proof);
-    }());
-    if (proved) {
-        aheadAdoptionsProven.fetch_add(1, std::memory_order_relaxed);
-        return true;
-    }
-    for (const auto& region : captured) {
-        const auto address = region.guestAddress;
-        const auto bytes = region.bytes.size();
-        if (skipped(address, bytes)) continue;
         if (std::memcmp(region.bytes.data(), reinterpret_cast<const void*>(address), bytes) != 0) return false;
     }
     return true;
 }
 
-}
-
-std::uint64_t Driver::AheadAdoptionsProven() {
-    return aheadAdoptionsProven.load(std::memory_order_relaxed);
 }
 
 bool Driver::pipelineDispatch() {
@@ -490,7 +459,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     if (fromAhead) {
         if (const auto hook = aheadAdoptHook.load(std::memory_order_acquire)) hook();
         const auto* aheadViews = ahead.capture != nullptr ? &ahead.capture->snapshot.registeredImages : ahead.keepVariant != nullptr && ahead.keepVariant->registeredViews != nullptr ? ahead.keepVariant->registeredViews.get() : nullptr;
-        if (!CapturedCurrent(ahead.captured, snapshot, ahead.shaderMemory.get(), ahead.readProof) || (aheadViews != nullptr && !CaptureRegisteredViewsCurrent(*aheadViews))) {
+        if (!CapturedCurrent(ahead.captured, snapshot) || (aheadViews != nullptr && !CaptureRegisteredViewsCurrent(*aheadViews))) {
             ++dispatchesRejectedAhead;
             ++groupStats.memoryMismatches;
             dispatch(queue, submittedPacket, submission, submittedIndirectArguments);
@@ -521,27 +490,6 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         if (!readsClear && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
     }
     timing.Mark("pipeline_reads_check");
-    // Resolving ahead: the cache entry's regions are collected before the lookup validates them, so
-    // the adoption can prove a hit current by write tracking (CapturedCurrent).
-    std::vector<GuestMemory::UnchangedQuery> readProof;
-    if (resolving) {
-        std::vector<ShaderRecompiler::MemoryRegion> entryReads;
-        {
-            std::lock_guard cacheLock(dispatchCacheMutex);
-            if (const auto found = dispatchCache.find(key); found != dispatchCache.end()) {
-                for (const auto& variant : found->second->variants) appendEntryRegions(*variant, entryReads);
-            }
-        }
-        readProof.reserve(entryReads.size());
-        for (const auto& region : entryReads) {
-            const auto generation = GuestMemory::CollectWrites(region.guestAddress, region.bytes.size());
-            if (generation == 0) {
-                readProof.clear();
-                break;
-            }
-            readProof.push_back({region.guestAddress, region.bytes.size(), generation});
-        }
-    }
     if (fromAhead) {
         compiledResult = std::move(ahead.compiledResult);
         keepVariant = std::move(ahead.keepVariant);
@@ -662,7 +610,6 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         parked.missedEntry = missedEntry;
         parked.shaderMemory = shaderMemory;
         parked.captured = std::move(captured);
-        parked.readProof = std::move(readProof);
         parked.liveWords = std::move(liveWords);
         parked.capture = capture;
         parked.dataHit = dataHit;
