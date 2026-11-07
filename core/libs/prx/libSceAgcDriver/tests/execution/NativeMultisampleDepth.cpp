@@ -1772,6 +1772,8 @@ bool CheckDepthTarget(Context context, VkFormat format, std::uint32_t fragments,
                 }
                 const bool clearOne = iteration == 1u ? !one : one;
                 target.clearDepth = clearOne ? 1.0f : 0.0f;
+                static_cast<void>(DepthSurfaceView(context, target));
+                const std::uint32_t clearPattern = clearOne ? (depthOnly ? 0xfffffff0u : 0xfffc00f0u) : 0u;
                 if (source == ClearSource::HtileDispatch) {
                     if ((fault == ClearFault::DriverDispatch || fault == ClearFault::DriverBufferDispatch) && clearOne) {
                         struct ShutdownDriver {
@@ -1789,7 +1791,7 @@ bool CheckDepthTarget(Context context, VkFormat format, std::uint32_t fragments,
                             std::puts("skipped native HTILE write-coverage assertion: the write tracker does not cover the imported metadata range; the production depth-sampling path may still decline this clear");
                             TargetRefuses([&] { Require(DepthSurfaceHolds(context, DecodeTextureResource(words), texture.get()), "native depth owner was not retained"); },
                                           "native multisample depth clear requires tracked HTILE generations");
-                            return;
+                            return false;
                         } else {
                             const bool storedAll = AgcDriver::GuestMemory::StoredAllSince_nid_no_patch(target.htileAddress, metadataBytes, generation);
                             Require(storedAll, "driver idle returned before recording the completed HTILE dispatch");
@@ -1932,6 +1934,7 @@ bool CheckDepthTarget(Context context, VkFormat format, std::uint32_t fragments,
     TargetRefuses([&] { DepthSurfaceHolds(context, resource, texture.get()); }, "guest writes");
     texture.reset();
     arrayTexture.reset();
+    std::printf("Native depth format=%u samples=%u clear=%u iterate256=%u: imported, rasterized twice, sampled and refused conflicts\n", static_cast<std::uint32_t>(format), fragments, one, iterate256);
     return true;
 }
 

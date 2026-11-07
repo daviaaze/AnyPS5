@@ -3146,7 +3146,7 @@ void ResourceMaterializer::Materialize(const IrResourcePlan& program, const SrtR
                 // Allocation churn alone does not invalidate a selected view. The runtime
                 // re-proves every collected identity (including absence) and descriptor
                 // page backing before accepting a snapshot across a generation change.
-                if (!nextSnapshot.registeredImages.empty() && afterImageGeneration != beforeImageGeneration && (runtime.snapshotCurrent == nullptr || !runtime.snapshotCurrent(runtime.userContext, nextSnapshot.registeredImages))) {
+                if ((runtime.snapshotCurrent != nullptr || !nextSnapshot.registeredImages.empty()) && afterImageGeneration != beforeImageGeneration && (runtime.snapshotCurrent == nullptr || !runtime.snapshotCurrent(runtime.userContext, nextSnapshot.registeredImages))) {
                     continue;
                 }
                 nextSnapshot.imageAllocationGeneration = nextSnapshot.registeredImages.empty() ? 0u : afterImageGeneration;

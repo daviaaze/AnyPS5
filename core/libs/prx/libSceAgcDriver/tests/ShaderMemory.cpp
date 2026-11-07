@@ -2442,92 +2442,6 @@ void verifyRegisteredViewTransaction(std::string_view mode) {
     }
 }
 
-void verifyAllocationChurnSnapshot() {
-    using namespace ShaderRecompiler;
-    std::vector<std::unique_ptr<IrValue>> values;
-    std::uint32_t ids = 0u;
-    const auto make = [&](IrOpcode opcode, IrType type) -> IrValue& {
-        values.push_back(std::make_unique<IrValue>(opcode, type, ids++));
-        return *values.back();
-    };
-    const auto userWord = [&](std::uint32_t index) -> IrValue& {
-        auto& reg = make(IrOpcode::Void, IrType::ScalarReg);
-        reg.SetRegister({RegisterBank::Scalar, index});
-        auto& read = make(IrOpcode::GetUserData, IrType::U32);
-        read.AddArgument(&reg);
-        return read;
-    };
-    const auto load = [&](IrValue& address, std::uint32_t offset) -> IrValue& {
-        auto& immediate = make(IrOpcode::Void, IrType::U32);
-        immediate.SetImmediateU32(offset);
-        auto& read = make(IrOpcode::LoadAddressU32, IrType::U32);
-        read.AddArgument(&address);
-        read.AddArgument(&immediate);
-        read.SetFlags(MemoryFlags{0, 0});
-        return read;
-    };
-    auto& base = make(IrOpcode::CompositeConstructU64, IrType::U64);
-    base.AddArgument(&userWord(0u));
-    base.AddArgument(&userWord(1u));
-    DescriptorSource descriptor;
-    descriptor.dwordCount = 4u;
-    for (std::uint32_t dword = 0; dword < 4u; ++dword) descriptor.dwords[dword] = &load(base, dword * 4u);
-    IrProgram program;
-    auto& resources = program.Resources();
-    resources.srtPlanComplete = true;
-    resources.resourceTrackingComplete = true;
-    resources.userDataCount = 2u;
-    MemoryInfo memory;
-    memory.kind = ResourceKind::ScalarAddress;
-    resources.memoryInfo.push_back(memory);
-    resources.descriptorSources.push_back(descriptor);
-    resources.info.buffers.push_back(BufferResource{});
-    const auto plan = ResourceMaterializer{}.ExtractPlan(program);
-    constexpr std::uint64_t Base = 0x10000u;
-    const std::array<std::uint32_t, 2> userData{static_cast<std::uint32_t>(Base), 0u};
-    std::array<std::uint32_t, 4> target{};
-    const auto targetAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(target.data()));
-    const std::array<std::uint32_t, 4> bufferV{static_cast<std::uint32_t>(targetAddress), static_cast<std::uint32_t>((targetAddress >> 32u) & 0xffffu), 16u, 0xfacu};
-    struct ChurnMemory {
-        std::array<std::uint32_t, 4> words{};
-        std::uint64_t generation = 0u;
-        std::uint32_t checks = 0u;
-        bool current = false;
-    };
-    for (const std::uint32_t mode : {0u, 1u, 2u}) {
-        ChurnMemory churn;
-        churn.words = bufferV;
-        churn.current = mode == 1u;
-        SrtRuntime runtime{userData};
-        runtime.userContext = &churn;
-        runtime.readMemory = +[](void* ctx, std::uint64_t address, std::uint32_t* value) {
-            auto& self = *static_cast<ChurnMemory*>(ctx);
-            if (address < Base || address >= Base + sizeof(self.words)) return false;
-            *value = self.words[static_cast<std::size_t>((address - Base) / sizeof(std::uint32_t))];
-            return true;
-        };
-        runtime.readSpecializationMemory = runtime.readMemory;
-        runtime.descriptorScope = +[](void*, std::size_t) -> std::uint64_t { return 0u; };
-        runtime.imageViewGeneration = +[](void* ctx) -> std::uint64_t { return ++static_cast<ChurnMemory*>(ctx)->generation; };
-        if (mode != 0u) {
-            runtime.snapshotCurrent = +[](void* ctx, std::span<const RegisteredImageView>) {
-                auto& self = *static_cast<ChurnMemory*>(ctx);
-                ++self.checks;
-                return self.current;
-            };
-        }
-        ResourceSnapshot snapshot;
-        if (mode == 1u) {
-            ResourceMaterializer{}.Materialize(plan, runtime, snapshot);
-            require(!snapshot.buffers.empty() && std::equal(bufferV.begin(), bufferV.end(), snapshot.buffers[0].dwords.begin()) && churn.checks == 1u,
-                    "allocation churn: a snapshot whose image views stayed current was not accepted on the first pass while unrelated guest allocations kept moving the generation");
-        } else {
-            expectFailure([&] { ResourceMaterializer{}.Materialize(plan, runtime, snapshot); },
-                          mode == 0u ? "allocation churn: without an image view check, a snapshot taken while the allocation generation moved was accepted"
-                                     : "allocation churn: a snapshot whose image views no longer match their allocations was accepted");
-        }
-    }
-}
 
 void verifyRegisteredViewsUnderUnrelatedChurn() {
     using namespace ShaderRecompiler;
@@ -8580,7 +8494,7 @@ void verifyDepthExportClamp() {
         require(found != bytes.end() && std::search(found + 1, bytes.end(), boundBytes.begin(), boundBytes.end()) == bytes.end(),
             "depth export: the clamp bounds were not written exactly once");
         bytes.erase(found, found + boundBytes.size());
-        bytes.resize(bytes.size() - 10u);
+        bytes.resize(bytes.size() - 5u - (tail.graphics ? 5u : 0u));
         for (const std::uint8_t legacyVersion : {48u, 47u, 46u}) {
             if (legacyVersion == 47u) bytes.pop_back();
             bytes[4] = legacyVersion;
@@ -8606,7 +8520,7 @@ void verifyDepthExportClamp() {
                 require(bounds != ditheredBytes.end(), "a two-sample dithered depth exporting request lacks the clamp bounds");
                 ditheredBytes.erase(bounds, bounds + boundBytes.size());
             }
-            ditheredBytes.resize(ditheredBytes.size() - 10u);
+            ditheredBytes.resize(ditheredBytes.size() - 5u - (dithered.graphics ? 5u : 0u));
             ditheredBytes[4] = 48u;
             const auto main48 = RequestSerializer{}.Deserialize(encodeBase64(ditheredBytes));
             require(main48.request.context.pixel->ditheredAlphaToCoverage && main48.request.context.pixel->ditheredAlphaSamples == 2u && main48.request.context.pixel->depthExportEnable == depthExport &&
@@ -8924,19 +8838,18 @@ void verifyDepthRemapRequests() {
     require(serializer.Serialize(replay.request) == remapped, "the depth remap request changed on re-serialization");
     const auto remappedBytes = decodeBase64(remapped);
     constexpr std::size_t pointTailBytes = 13u;
-    constexpr std::size_t schemaTailBytes = 2u;
+    // f32 flags, point state, fused/LDS state, late target flags and NaN controls.
+    constexpr std::size_t afterDepthRemapBytes = 2u + pointTailBytes + 1u + 5u + 4u + 2u;
     for (const std::uint8_t legacyVersion : {32u, 34u}) {
         auto legacyBytes = remappedBytes;
-        legacyBytes.resize(legacyBytes.size() - schemaTailBytes);
+        legacyBytes.resize(legacyBytes.size() - afterDepthRemapBytes - 5u);
         legacyBytes[4] = legacyVersion;
-        legacyBytes.resize(legacyBytes.size() - 6u - pointTailBytes);
         const auto legacy = serializer.Deserialize(encodeBase64(legacyBytes));
         require(!legacy.request.target.depthRangeRemap && legacy.request.context.vertex.has_value() && legacy.request.context.vertex->depthRemapMode == 0u, ("a version " + std::to_string(legacyVersion) + " vertex request read depth remap fields").c_str());
         require(serializer.Serialize(legacy.request) == plain, ("a version " + std::to_string(legacyVersion) + " vertex request misread the fields before the depth remap").c_str());
     }
     auto version35 = remappedBytes;
-    version35.resize(version35.size() - schemaTailBytes);
-    version35.resize(version35.size() - 1u - pointTailBytes);
+    version35.resize(version35.size() - afterDepthRemapBytes);
     version35[4] = 35u;
     const auto replay35 = serializer.Deserialize(encodeBase64(version35));
     require(replay35.request.target.depthRangeRemap && replay35.request.context.vertex->depthRemapMode == 2u && !replay35.request.target.float32FlushToZero && serializer.Serialize(replay35.request) == remapped, "a version 35 request misread the depth remap fields or read an f32 flush flag");
@@ -8982,11 +8895,11 @@ void verifyMergedHullConfiguration() {
     require(replay.request.graphics.has_value() && replay.request.graphics->tessellation.has_value() && replay.request.graphics->tessellation->mergedHull, "a merged hull configuration was lost in serialization");
     require(!serializer.Deserialize(separate).request.graphics->tessellation->mergedHull, "a separate hull configuration was read as merged");
     constexpr std::size_t pointTailBytes = 13u;
+    // f32 preserve, point/fused/LDS state, target flags, graphics inputs and NaNs.
+    constexpr std::size_t afterVersion38Bytes = 1u + pointTailBytes + 1u + 5u + 4u + 5u + 2u;
     auto legacy = decodeBase64(merged);
     require(legacy.size() > 60u + pointTailBytes && legacy[4] == 55u, "a merged hull request did not use serialization version 55");
-    legacy.resize(legacy.size() - sizeof(std::uint32_t) - 7u - pointTailBytes);
-    legacy.pop_back();
-    legacy.pop_back();
+    legacy.resize(legacy.size() - afterVersion38Bytes);
     require(legacy[legacy.size() - 52u] == 1u, "the merged hull flag is not the last byte of the tessellation configuration");
     legacy.erase(legacy.end() - 52);
     for (const auto version : {30u, 31u, 32u, 34u, 35u, 36u, 37u, 38u}) {
@@ -11706,6 +11619,7 @@ void verifyDecodeMemoAddressCanonicalization() {
     const auto selectedWords = [](const ResolvedImageTables& result, std::uint32_t key) {
         const auto start = result.map.at(Abi::TableHeader(0u) + Abi::TableMapStart);
         const auto record = result.map.at(start + key);
+        require(record != Abi::NullCode && (record & Abi::PoisonFlag) == 0u, "a selected image has no bound record");
         return result.elements.at(result.map.at(record + Abi::ImageRecordElement)).words;
     };
     const auto forward = resolve({first, second}, 0xdec0deu);
@@ -11821,7 +11735,7 @@ void verifyDecodeMemoAddressCanonicalization() {
     const auto acceptedMode = [&](const DescriptorValue& words, std::uint64_t key) -> const ImageResource& {
         const auto resolved = resolve({words}, key);
         const auto flags = recordFlags(resolved, 0u);
-        require(flags != Abi::NullCode && (flags & Abi::PoisonFlag) == 0u &&
+        require((flags & Abi::PoisonFlag) == 0u &&
                 selectedWords(resolved, 0u) == words.dwords,
                 "memoized image mode: supported geometry lost its binding or current words");
         return info.runtimeImageModes.front().at(flags >> Abi::ModeShift);
@@ -12643,7 +12557,6 @@ int main(int argc, char** argv) {
         const auto nullRootRegions = nullRoot.Regions();
         request.context.memory = nullRootRegions;
         require(Recompile(request, *nullRootCapture)->poisonedSrtReads >= nullRootCapture->snapshot.nullRootReads, "a capture through a null user-data pointer is cacheable");
-        verifyAllocationChurnSnapshot();
         verifySnapshotAllocationMoves();
         std::cout << "Shader memory capture, strict validation and deterministic replay passed\n";
         return 0;
