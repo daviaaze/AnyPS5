@@ -289,6 +289,7 @@ void Driver::execute(const Submission& submission) {
         const auto packet = std::span(submission.commands).subspan(cursor, count);
         const auto opcode = (header >> 8u) & 0xffu;
         if (executingPacket != nullptr) executingPacket->store((static_cast<std::uint64_t>(cursor + 1) << 8u) | opcode, std::memory_order_relaxed);
+        auto nextCursor = cursor + count;
         const bool indirectRegisterPacket = Pm4::IndirectRegisterOpcode(opcode);
         const auto registerList = indirectRegisterPacket ? submission.registerLists.find(cursor) : submission.registerLists.end();
         const bool capturedRegisterListValid = registerList != submission.registerLists.end() && Pm4::IndirectRegistersValid(registerList->second);
