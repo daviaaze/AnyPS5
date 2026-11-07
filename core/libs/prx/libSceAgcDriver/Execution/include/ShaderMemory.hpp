@@ -75,6 +75,12 @@ public:
     // included, the initial regions excluded: one stage's own reads on the draw path's shared
     // ShaderMemory (Regions() stays the union). The spans point into the pages, as Regions()'s do.
     [[nodiscard]] std::vector<ShaderRecompiler::MemoryRegion> TakeRecentRegions();
+    // Write-tracking proof that every guest page this capture read still holds the bytes it read:
+    // each page's generation is collected (GuestMemory::CollectWrites) before its first read, and
+    // this collects the pages again and checks UnchangedSinceAll. False (compare bytes instead)
+    // without write watching, for a page read word by word or not mapped whole, or when words were
+    // supplied from elsewhere. Pending GPU writes are the caller's to check (QueryPendingSpan).
+    [[nodiscard]] bool ReadsUnchanged() const;
     // The driver's source handle memo outcomes, for the [capture] line (APS5_PROFILE_DRAW).
     static void CountHandleMemo(bool hit);
     struct SupplyCounts {
@@ -131,6 +137,8 @@ private:
         bool wordwise = false;
         bool lazy = false;
         std::uint64_t backing = 0;
+        // CollectWrites over the page before its first read (0: no proof).
+        std::uint64_t generation = 0;
     };
 
     struct Supplied {
