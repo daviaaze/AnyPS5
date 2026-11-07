@@ -3350,6 +3350,8 @@ void Recorder::readGpuTiming(Batch& batch) {
         }
         const auto key = batch.timedKeys[i];
         if (key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count)) PerformanceTrace::GpuRange(CommandClassNames[key - ClassKey(CommandClass::DispatchLeading)], static_cast<double>(stamps[i * 2]) * period, static_cast<double>(stamps[i * 2 + 1]) * period, batch.traceId);
+        // Program keys also describe builtins and native-copy replacements, not only shaders.
+        else PerformanceTrace::GpuRange("program", static_cast<double>(stamps[i * 2]) * period, static_cast<double>(stamps[i * 2 + 1]) * period, batch.traceId, key);
         auto& totals = timingByKey[key];
         ++totals.count;
         totals.ms += ns / 1e6;

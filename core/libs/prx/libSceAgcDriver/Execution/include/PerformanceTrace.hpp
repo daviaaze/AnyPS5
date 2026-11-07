@@ -235,6 +235,7 @@ public:
         Clock::time_point begin;
         Clock::duration length;
         std::uint64_t batch = 0;
+        std::optional<std::uint64_t> program = std::nullopt;
     };
 
     struct Total {
@@ -685,6 +686,7 @@ struct TraceGpuRange {
     double beginNs;
     double endNs;
     std::uint64_t batch = 0;
+    std::optional<std::uint64_t> program = std::nullopt;
 };
 
 struct TraceClockSample {
@@ -826,13 +828,14 @@ public:
             std::stable_sort(slices.begin(), slices.end(), [](const auto& a, const auto& b) { return a.begin != b.begin ? a.begin < b.begin : a.length > b.length; });
             const auto folded = thread.name + " folded";
             for (const auto& slice : slices) {
-                char text[112];
+                char text[160];
                 if (slice.scope == nullptr) {
                     event(folded, "C", slice.begin, tid);
                     std::snprintf(text, sizeof text, ",\"args\":{\"ms\":%.3f}}", milliseconds(slice.length));
                 } else {
                     event(Name(slice.scope, slice.stage), "X", slice.begin, tid);
-                    if (slice.batch != 0) std::snprintf(text, sizeof text, ",\"dur\":%.3f,\"args\":{\"batch\":%llu}}", microseconds(slice.length), static_cast<unsigned long long>(slice.batch));
+                    if (slice.program) std::snprintf(text, sizeof text, ",\"dur\":%.3f,\"args\":{\"batch\":%llu,\"program\":\"0x%llx\"}}", microseconds(slice.length), static_cast<unsigned long long>(slice.batch), static_cast<unsigned long long>(*slice.program));
+                    else if (slice.batch != 0) std::snprintf(text, sizeof text, ",\"dur\":%.3f,\"args\":{\"batch\":%llu}}", microseconds(slice.length), static_cast<unsigned long long>(slice.batch));
                     else std::snprintf(text, sizeof text, ",\"dur\":%.3f}", microseconds(slice.length));
                 }
                 output += text;
@@ -920,7 +923,7 @@ public:
             const auto begin = GpuTime(range.beginNs, first, last);
             const auto end = GpuTime(range.endNs, first, last);
             if (end <= begin || begin < origin) continue;
-            slices.push_back({range.name, nullptr, begin, end - begin, range.batch});
+            slices.push_back({range.name, nullptr, begin, end - begin, range.batch, range.program});
         }
         return slices;
     }
@@ -1206,17 +1209,17 @@ public:
     static void BindThread(const char* name, std::size_t capacity = TraceThread::DefaultCapacity);
     static void Present(std::uint32_t width, std::uint32_t height, const VulkanDevice* device);
 
-    static void GpuRange(const char* name, double beginNs, double endNs, std::uint64_t batch = 0) {
+    static void GpuRange(const char* name, double beginNs, double endNs, std::uint64_t batch = 0, std::optional<std::uint64_t> program = std::nullopt) {
         if (!buffering.load(std::memory_order_relaxed)) return;
         std::lock_guard lock(gpuMutex);
         if (gpuRanges.size() < gpuRanges.capacity()) {
-            gpuRanges.push_back({name, beginNs, endNs, batch});
+            gpuRanges.push_back({name, beginNs, endNs, batch, program});
             return;
         }
         if (gpuRanges.empty()) return;
         const auto oldest = static_cast<std::size_t>(gpuLost % gpuRanges.size());
         if (gpuLost == 0) gpuFirstLostNs = gpuRanges[oldest].beginNs;
-        gpuRanges[oldest] = {name, beginNs, endNs, batch};
+        gpuRanges[oldest] = {name, beginNs, endNs, batch, program};
         ++gpuLost;
     }
 
