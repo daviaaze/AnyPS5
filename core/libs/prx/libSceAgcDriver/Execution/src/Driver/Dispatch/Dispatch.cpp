@@ -82,6 +82,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     const auto submittedPacket = packet;
     const auto submittedIndirectArguments = indirectArguments;
     AgcDriver::P0Metrics::Scope p0(submission.queue, AgcDriver::P0Metrics::Layer::Packet, AgcDriver::P0Metrics::Operation::Dispatch);
+    std::optional<TraceProgramScope> programScope;
     PerformanceTimer timing("Driver.Dispatch");
     const auto address = (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20c)) << 8u) | (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20d) & 0xffu) << 40u);
     if (SkippedShader(address)) { timing.Mark("skipped_shader"); return; }
@@ -636,6 +637,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     phaseTiming.Phase(PhaseQueuedLabels);
     timing.Mark("queued_labels");
     const auto& compiled = *compiledResult;
+    programScope.emplace(TraceProgramKey(address, compiled.variantId));
     std::vector<Graphics::GuestMemorySnapshot> snapshots;
     for (const auto& region : captured) snapshots.push_back({region.guestAddress, region.bytes});
     std::array<std::uint32_t, 3> groups{packet[1], packet[2], packet[3]};
@@ -693,6 +695,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             AgcDriver::P0Metrics::Scope p0(queueId, AgcDriver::P0Metrics::Layer::Committer, AgcDriver::P0Metrics::Operation::Dispatch);
             GuestMemory::SetCurrentPacket(0x15, queueId);
             const auto& compiledCommit = *result;
+            const TraceProgramScope programScope(TraceProgramKey(address, compiledCommit.variantId));
             const bool noteWrites = writeEvidenceEnabled() || traceCapSync();
             try {
                 std::shared_ptr<RecipeHit> recipeHit = htileClearCompletion.has_value() ? nullptr : localDevice->PrepareRecipe(recipe, false);

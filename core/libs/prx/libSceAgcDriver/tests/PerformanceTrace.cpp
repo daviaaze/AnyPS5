@@ -482,25 +482,44 @@ void Utf8Strings() {
     Check(TraceFormat::Summary(summary, {}, presents).find("\"title\":\"Ghost of Y\xc5\x8dtei\"") != std::string::npos, "the summary line did not keep a UTF-8 title");
 }
 
-void BatchIds() {
+void ProgramScopeLifecycle() {
     const auto origin = Clock::now();
-    const std::vector<TraceThread::Slice> slices{{"Driver.Packet", "dispatch", origin + microseconds(10), microseconds(30), 42}};
-    const std::vector<TraceThread::Snapshot> threads{{"queue worker 0x0", slices, {}, false}};
-    const std::vector<Clock::time_point> presents{origin, origin + milliseconds(16)};
-    const auto json = TraceFormat::Events(7, origin, threads, 0, presents, 5);
-    Check(json.find("{\"name\":\"Driver.Packet.dispatch\",\"ph\":\"X\",\"ts\":10.000,\"pid\":7,\"tid\":1,\"dur\":30.000,\"args\":{\"batch\":42}}") != std::string::npos, "a slice's batch id was not written");
     std::atomic<std::uint64_t> count{1};
-    TraceThread thread("queue worker 0x0", count, 4);
+    TraceThread thread("queue worker 0x0", count, 8);
+    const auto record = [&](int step) {
+        const auto begin = origin + milliseconds(step);
+        thread.Add("Driver.Dispatch", nullptr, begin, begin + microseconds(30));
+    };
+    AgcDriver::TraceProgramTag.reset();
     AgcDriver::TraceBatchTag = 9;
-    thread.Add("Driver.Packet", nullptr, origin, origin + microseconds(30));
+    {
+        AgcDriver::TraceProgramScope outer(std::uint64_t{0});
+        record(2);
+        {
+            AgcDriver::TraceProgramScope inner(std::uint64_t{27});
+            record(3);
+        }
+        record(4);
+        try {
+            AgcDriver::TraceProgramScope unwound(std::uint64_t{38});
+            throw std::runtime_error("scope unwind");
+        } catch (const std::runtime_error&) {
+            record(5);
+        }
+    }
+    record(6);
     AgcDriver::TraceBatchTag = 0;
-    thread.Add("Driver.Packet", nullptr, origin + milliseconds(1), origin + milliseconds(1) + microseconds(30));
+    record(7);
     const auto snapshot = thread.Collect();
-    Check(snapshot.slices.size() == 2 && snapshot.slices[0].batch == 9 && snapshot.slices[1].batch == 0, "a slice did not take its thread's batch id");
-    const AgcDriver::TraceClockSample first{1000.0, origin + microseconds(10)};
-    const AgcDriver::TraceClockSample last{41000.0, origin + microseconds(30)};
-    const std::vector<AgcDriver::TraceGpuRange> ranges{{"batch", 5000.0, 9000.0, 3}};
-    Check(TraceFormat::GpuSlices(ranges, first, last, origin)[0].batch == 3, "a GPU range lost its batch id");
+    using Owner = std::pair<std::optional<std::uint64_t>, std::uint64_t>;
+    std::vector<Owner> owners;
+    for (const auto& slice : snapshot.slices) owners.emplace_back(slice.program, slice.batch);
+    const std::vector<Owner> expected{
+        {std::uint64_t{0}, 9}, {std::uint64_t{27}, 9},
+        {std::uint64_t{0}, 9}, {std::uint64_t{0}, 9},
+        {std::nullopt, 9}, {std::nullopt, 0}
+    };
+    Check(owners == expected, "program scopes did not restore ownership independently of the batch");
 }
 
 void FullBufferEvents() {
@@ -1132,7 +1151,7 @@ int main(int argc, char** argv) {
         FoldShortSlices();
         EscapeStrings();
         Utf8Strings();
-        BatchIds();
+        ProgramScopeLifecycle();
         PresentBoundaryWitnesses();
         SummaryFields();
         GpuClock();

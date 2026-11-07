@@ -208,6 +208,22 @@ private:
 };
 
 inline thread_local std::uint64_t TraceBatchTag = 0;
+inline thread_local std::optional<std::uint64_t> TraceProgramTag;
+
+inline std::uint64_t TraceProgramKey(std::uint64_t address, std::uint64_t variant) {
+    return address != 0 ? address : variant;
+}
+
+class TraceProgramScope {
+public:
+    explicit TraceProgramScope(std::optional<std::uint64_t> program)
+        : previous(TraceProgramTag) { TraceProgramTag = program; }
+    ~TraceProgramScope() { TraceProgramTag = previous; }
+    TraceProgramScope(const TraceProgramScope&) = delete;
+    TraceProgramScope& operator=(const TraceProgramScope&) = delete;
+private:
+    std::optional<std::uint64_t> previous;
+};
 
 class TraceThread {
 public:
@@ -351,7 +367,7 @@ public:
             folded = {};
         }
         if (length < MinimumSlice) folded += length;
-        else append({scope, stage, begin, length, TraceBatchTag});
+        else append({scope, stage, begin, length, TraceBatchTag, TraceProgramTag});
     }
 
 
