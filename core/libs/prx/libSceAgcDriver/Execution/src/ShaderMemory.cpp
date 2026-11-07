@@ -29,6 +29,8 @@
 
 namespace AgcDriver {
 namespace {
+struct NonblockingCaptureUnavailable {};
+
 
 struct CaptureProfile {
     std::atomic<std::uint64_t> captures{0};
@@ -239,6 +241,37 @@ ShaderMemory::ShaderMemory(std::span<const ShaderRecompiler::MemoryRegion> regio
     for (const auto& region : regions) initial.emplace_back(region.guestAddress, region.bytes);
     std::sort(initial.begin(), initial.end(), [](const auto& left, const auto& right) { return left.first < right.first; });
 }
+void ShaderMemory::requireReady(std::uint64_t address, std::size_t bytes) const {
+    if (!trying) return;
+    if (bytes == 0 || address > std::numeric_limits<std::uint64_t>::max() - bytes) throw NonblockingCaptureUnavailable{};
+    const auto end = address + bytes;
+    bool initialReadable = false;
+    if (!initial.empty()) {
+        const auto next = std::upper_bound(initial.begin(), initial.end(), address, [](std::uint64_t value, const auto& entry) { return value < entry.first; });
+        if (next != initial.begin()) {
+            const auto& region = *std::prev(next);
+            initialReadable = address >= region.first && end <= region.first + region.second.size();
+        }
+    }
+    if (!initialReadable && !GuestMemory::Accessible(reinterpret_cast<const void*>(address), bytes)) throw NonblockingCaptureUnavailable{};
+    if (!initialReadable && pendingSpan != nullptr) {
+        const auto policy = pendingSpan(address, bytes, {});
+        if (policy == PendingWrite::Sync || policy == PendingWrite::VerifyRaw || policy == PendingWrite::VerifyKnownValue) throw NonblockingCaptureUnavailable{};
+    }
+}
+
+std::uint64_t ShaderMemory::CapturedBytes() const {
+    std::uint64_t bytes = 0;
+    for (const auto& region : collect(false)) bytes += region.bytes.size();
+    for (const auto& entry : supplied) {
+        if (entry.words != nullptr) bytes += entry.words->words.size() * sizeof(std::uint32_t);
+    }
+    for (const auto& words : spilled) {
+        if (words != nullptr) bytes += words->words.size() * sizeof(std::uint32_t);
+    }
+    return bytes;
+}
+
 
 ShaderMemory::~ShaderMemory() {
     if (sharedPagePools() && !pages.empty()) {
@@ -346,6 +379,23 @@ ShaderMemory::Page& ShaderMemory::page(std::uint64_t base) {
 void ShaderMemory::preparePage(Page& page, std::uint64_t base) {
     // A page is either mapped whole or read word by word where the guest mapped less than a page,
     // or where recorded GPU work writes into it (a whole-page read would wait for that work).
+    if (trying) {
+        if (!GuestMemory::Accessible(reinterpret_cast<const void*>(base), PageBytes)) {
+            page.wordwise = pendingWrite != nullptr;
+            page.generation = 0;
+            return;
+        }
+        const bool hasPending = (pendingWrite != nullptr && pendingWrite(base, PageBytes, {}) != PendingWrite::None) ||
+            (pendingSpan != nullptr && pendingSpan(base, PageBytes, {}) != PendingWrite::None);
+        if (hasPending) {
+            page.wordwise = pendingWrite != nullptr;
+            page.generation = 0;
+            return;
+        }
+        page.generation = 0;
+        page.lazy = true;
+        return;
+    }
     page.generation = 0;
     if (GuestMemory::Accessible(reinterpret_cast<const void*>(base), PageBytes)) {
         if (WordwisePages() && pendingWrite != nullptr && pendingWrite(base, PageBytes, {}) != PendingWrite::None) {
@@ -355,6 +405,7 @@ void ShaderMemory::preparePage(Page& page, std::uint64_t base) {
         }
         const auto started = CaptureProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         GuestMemory::GuardRead(base, PageBytes);
+        if (trying) throw NonblockingCaptureUnavailable{};
         GuestMemory::FlushGpuWrites(base, PageBytes);
         page.generation = GuestMemory::CollectWrites(base, PageBytes);
         if (CaptureProfiled()) CaptureTotals().pageReadNanoseconds += NanosecondsSince(started);
@@ -367,6 +418,7 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
     if (address % sizeof(*value) != 0 || address > std::numeric_limits<std::uint64_t>::max() - sizeof(*value)) {
         throw std::runtime_error("AGC driver: invalid shader memory read address");
     }
+    self.requireReady(address, sizeof(*value));
     if (CaptureProfiled()) ++CaptureTotals().reads;
     if (!self.initial.empty() && address + sizeof(*value) > self.initial.begin()->first && address < InitialEnd(self.initial)) {
         const auto next = std::upper_bound(self.initial.begin(), self.initial.end(), address, [](std::uint64_t value, const auto& entry) { return value < entry.first; });
@@ -389,6 +441,10 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
         GuestMemory::CopyGuestBytes(&page.words[first], reinterpret_cast<const void*>((address & ~static_cast<std::uint64_t>(PageBytes - 1)) + first * sizeof(std::uint32_t)), BlockWords * sizeof(std::uint32_t));
         page.valid.SetBlock(index);
     }
+    if (self.trying && self.pendingWrite != nullptr) {
+        const auto policy = self.pendingWrite(address, sizeof(*value), {});
+        if (policy == PendingWrite::Sync || policy == PendingWrite::VerifyRaw || policy == PendingWrite::VerifyKnownValue) throw NonblockingCaptureUnavailable{};
+    }
     const auto spanNeedsSync = [](PendingWrite spanPolicy) {
         return spanPolicy == PendingWrite::Sync || spanPolicy == PendingWrite::VerifyRaw || spanPolicy == PendingWrite::VerifyKnownValue;
     };
@@ -405,7 +461,7 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
     }
     if (!page.valid.Test(index)) {
         std::uint32_t word = 0;
-        auto policy = PendingWrite::Sync;
+        auto policy = self.trying ? PendingWrite::None : PendingWrite::Sync;
         bool forcedRaw = false;
         if (page.wordwise) {
             if (self.descriptorSpanBytes > sizeof(word) &&
@@ -422,6 +478,10 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
                 if (policy != PendingWrite::None && policy != PendingWrite::Sync && !GuestMemory::Accessible(reinterpret_cast<const void*>(address), sizeof(word))) policy = PendingWrite::Sync;
             }
         }
+        if (self.trying && !page.wordwise && self.pendingWrite != nullptr) {
+            policy = self.pendingWrite(address, sizeof(word), std::as_writable_bytes(std::span(&word, 1)));
+        }
+        if (self.trying && (policy == PendingWrite::Sync || policy == PendingWrite::VerifyRaw || policy == PendingWrite::VerifyKnownValue)) throw NonblockingCaptureUnavailable{};
         // A read is evidence only when the hook waited for unfinished GPU work across it.
         const auto hookWaits = [&] { return self.hookWaits != nullptr ? self.hookWaits() : 0; };
         const auto report = [&](std::uint64_t waitsBefore, bool unchanged) {
@@ -444,7 +504,8 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
                 word = verifiedWord;
             }
         } else if (policy == PendingWrite::Raw || policy == PendingWrite::VerifyRaw) {
-            GuestMemory::GuardRead(address, sizeof(word));
+            if (self.trying && (policy == PendingWrite::VerifyRaw || policy == PendingWrite::VerifyKnownValue)) throw NonblockingCaptureUnavailable{};
+            if (!self.trying) GuestMemory::GuardRead(address, sizeof(word));
             std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
             ++CaptureTotals().wordsRaw;
             if (policy == PendingWrite::VerifyRaw) {
@@ -469,9 +530,12 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
             const auto waitsBefore = page.wordwise ? hookWaits() : 0;
             const auto started = page.wordwise ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             if (page.wordwise && policy == PendingWrite::Sync && self.descriptorSpanBytes > sizeof(word)) {
+                if (self.trying) throw NonblockingCaptureUnavailable{};
                 GuestMemory::FlushGpuWrites(address, self.descriptorSpanBytes);
+                if (self.trying) throw NonblockingCaptureUnavailable{};
             }
-            GuestMemory::Read(address, std::as_writable_bytes(std::span(&word, 1)), alignof(std::uint32_t));
+            if (self.trying) std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
+            else GuestMemory::Read(address, std::as_writable_bytes(std::span(&word, 1)), alignof(std::uint32_t));
             if (page.wordwise) {
                 const auto nanoseconds = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
                 if (nanoseconds >= WordWaitNanoseconds) {
@@ -572,6 +636,7 @@ bool ShaderMemory::readWords(void* context, std::uint64_t address, std::uint32_t
         values = startValues;
         count = startCount;
         const auto invalidationsBefore = self.rawInvalidations;
+        if (self.trying && startCount != 0u) self.requireReady(startAddress, static_cast<std::size_t>(std::min<std::uint64_t>(startCount, std::numeric_limits<std::size_t>::max() / sizeof(std::uint32_t))) * sizeof(std::uint32_t));
         while (count != 0) {
             const auto base = address & ~static_cast<std::uint64_t>(PageBytes - 1);
             const auto index = static_cast<std::size_t>((address % PageBytes) / sizeof(std::uint32_t));
@@ -646,6 +711,7 @@ std::uint64_t ShaderMemory::descriptorScope(void* context, std::size_t bytes) {
 bool ShaderMemory::accessible(void* context, std::uint64_t address, std::uint64_t bytes) {
     auto& self = *static_cast<ShaderMemory*>(context);
     if (bytes == 0 || address > std::numeric_limits<std::uint64_t>::max() - bytes) return false;
+    if (self.trying) self.requireReady(address, static_cast<std::size_t>(bytes));
     const auto end = address + bytes;
     while (address < end) {
         if (!self.initial.empty() && address < InitialEnd(self.initial)) {
@@ -671,6 +737,7 @@ bool ShaderMemory::pending(void* context, std::uint64_t address, std::uint64_t b
     const auto& self = *static_cast<const ShaderMemory*>(context);
     if (self.pendingWrite == nullptr || bytes == 0) return false;
     const auto policy = self.pendingWrite(address, static_cast<std::size_t>(bytes), {});
+    if (self.trying && (policy == PendingWrite::Sync || policy == PendingWrite::VerifyRaw || policy == PendingWrite::VerifyKnownValue)) throw NonblockingCaptureUnavailable{};
     return policy == PendingWrite::Sync || policy == PendingWrite::VerifyRaw || policy == PendingWrite::VerifyKnownValue;
 }
 
@@ -680,6 +747,7 @@ ShaderRecompiler::SrtWriteStamp ShaderMemory::stampWrites(void* context, std::ui
     const auto fetched = self.pageAtOrAfter(address & ~static_cast<std::uint64_t>(PageBytes - 1));
     const bool anyFetched = fetched != self.pages.size() && self.pages[fetched].first < address + bytes;
     if (anyFetched && !self.spanQuery) return {};
+    if (self.trying) return {};
     GuestMemory::FlushGpuWrites(address, static_cast<std::size_t>(bytes));
     const auto layout = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     const auto generation = GuestMemory::CollectWrites(address, static_cast<std::size_t>(bytes));
@@ -697,7 +765,6 @@ ShaderRecompiler::SrtWriteStamp ShaderMemory::stampWrites(void* context, std::ui
     }
     return {generation, layout};
 }
-
 bool ShaderMemory::Vouched(PendingWriteQuery pending, std::uint64_t address, std::uint64_t bytes, const ShaderRecompiler::SrtWriteStamp& stamp) {
     CaptureTotals().vouchCalls.fetch_add(1, std::memory_order_relaxed);
     if (stamp.generation == 0 || bytes == 0 || address > std::numeric_limits<std::uint64_t>::max() - bytes || stamp.layout != GuestAllocations::GuestAllocationsGeneration_nid_postfix()) return false;
@@ -708,8 +775,13 @@ bool ShaderMemory::Vouched(PendingWriteQuery pending, std::uint64_t address, std
 }
 
 bool ShaderMemory::unchangedSince(void* context, std::uint64_t address, std::uint64_t bytes, const ShaderRecompiler::SrtWriteStamp& stamp) {
+    if (static_cast<const ShaderMemory*>(context)->trying) {
+        if (stamp.generation == 0) return false;
+        throw NonblockingCaptureUnavailable{};
+    }
     return Vouched(static_cast<const ShaderMemory*>(context)->pendingSpan, address, bytes, stamp);
 }
+
 
 bool ShaderMemory::place(std::uint64_t address, const std::uint32_t* values, std::uint64_t count, bool overwrite, bool recent) {
     while (count != 0) {
@@ -859,6 +931,14 @@ std::vector<std::shared_ptr<const ShaderRecompiler::SrtGuestWords>> ShaderMemory
 std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::Capture(const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::SourceHandle* handle) {
     return captureWaitingOnFailure(request, handle, nullptr);
 }
+std::optional<std::shared_ptr<const ShaderRecompiler::ResourceCapture>> ShaderMemory::TryCapture(const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::SourceHandle* handle) {
+    return tryCapture(request, handle, nullptr);
+}
+
+std::optional<std::shared_ptr<const ShaderRecompiler::ResourceCapture>> ShaderMemory::TryCapture(const ShaderRecompiler::PreparedShaderInvocation& invocation) {
+    return tryCapture(invocation.Request(), nullptr, &invocation);
+}
+
 
 std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::Capture(const ShaderRecompiler::PreparedShaderInvocation& invocation) {
     return captureWaitingOnFailure(invocation.Request(), nullptr, &invocation);
@@ -881,6 +961,79 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::captureWa
     } waiting(waitBranches);
     return capture(request, handle, invocation);
 }
+std::optional<std::shared_ptr<const ShaderRecompiler::ResourceCapture>> ShaderMemory::tryCapture(const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::SourceHandle* handle, const ShaderRecompiler::PreparedShaderInvocation* invocation) {
+    const auto savedDescriptorSpanBytes = descriptorSpanBytes;
+    const auto savedForceSync = forceSync;
+    const auto savedRawInvalidations = rawInvalidations;
+    const auto savedLastBase = lastBase;
+    auto* const savedLastPage = lastPage;
+    struct SavedPage {
+        std::uint64_t base;
+        WordMask valid, raw, read, recent;
+        std::array<std::uint32_t, PageWords> words{};
+        bool wordwise, lazy;
+        std::uint64_t backing, generation;
+    };
+    std::vector<SavedPage> savedPages;
+    savedPages.reserve(pages.size());
+    for (const auto& [base, page] : pages) {
+        SavedPage saved{base, page->valid, page->raw, page->read, page->recent, {}, page->wordwise, page->lazy, page->backing, page->generation};
+        for (std::size_t index = 0; index < PageWords; ++index) if (page->valid.Test(index)) saved.words[index] = page->words[index];
+        savedPages.push_back(std::move(saved));
+    }
+    auto savedSupplied = supplied;
+    auto savedSpilled = spilled;
+    const auto savedBranchReadsRefused = branchReadsRefused;
+    const auto savedWaitBranches = waitBranches;
+    const auto restore = [&] {
+        for (const auto& [base, page] : pages) {
+            const auto saved = std::lower_bound(savedPages.begin(), savedPages.end(), base, [](const auto& entry, std::uint64_t value) { return entry.base < value; });
+            if (saved == savedPages.end() || saved->base != base) delete page;
+        }
+        pages.erase(std::remove_if(pages.begin(), pages.end(), [&](const auto& entry) {
+            return std::none_of(savedPages.begin(), savedPages.end(), [&](const auto& saved) { return saved.base == entry.first; });
+        }), pages.end());
+        for (auto& [base, page] : pages) {
+            const auto saved = std::lower_bound(savedPages.begin(), savedPages.end(), base, [](const auto& entry, std::uint64_t value) { return entry.base < value; });
+            if (saved == savedPages.end() || saved->base != base) continue;
+            page->valid = saved->valid;
+            page->raw = saved->raw;
+            page->read = saved->read;
+            page->recent = saved->recent;
+            for (std::size_t index = 0; index < PageWords; ++index) if (saved->valid.Test(index)) page->words[index] = saved->words[index];
+            page->wordwise = saved->wordwise;
+            page->lazy = saved->lazy;
+            page->backing = saved->backing;
+            page->generation = saved->generation;
+        }
+        supplied.swap(savedSupplied);
+        spilled.swap(savedSpilled);
+        branchReadsRefused = savedBranchReadsRefused;
+        waitBranches = savedWaitBranches;
+        descriptorSpanBytes = savedDescriptorSpanBytes;
+        forceSync = savedForceSync;
+        rawInvalidations = savedRawInvalidations;
+        lastBase = savedLastBase;
+        lastPage = savedLastPage;
+    };
+    trying = true;
+    try {
+        auto result = capture(request, handle, invocation);
+        trying = false;
+        return result;
+    } catch (const NonblockingCaptureUnavailable&) {
+        // Evaluator callbacks can unwind past descriptorScope's non-RAII setter; restore all
+        // ShaderMemory attempt-local state before either returning empty or permitting later Capture.
+        restore();
+        trying = false;
+        return std::nullopt;
+    } catch (...) {
+        restore();
+        trying = false;
+        throw;
+    }
+}
+
 
 std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::capture(const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::SourceHandle* handle, const ShaderRecompiler::PreparedShaderInvocation* invocation) {
     // The capture's word and page reads (through `read`) are attributed to it ([hooksync], [guestmem]).
