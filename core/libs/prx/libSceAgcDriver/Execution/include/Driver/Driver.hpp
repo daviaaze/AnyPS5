@@ -57,16 +57,51 @@ inline std::uint32_t ThreadDimensionGroups(std::uint32_t threads, std::uint32_t 
 }
 
 struct DrawTail;
-// Synchronous capture/materialization result. Capture waits on guest writes and shader
-// registration; this operation is deliberately not worker-safe.
+// Retained output of capture and materialization; commit remains queue-thread-only.
 struct DispatchPreparationResult {
     std::shared_ptr<ShaderMemory> shaderMemory;
     std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture;
     std::shared_ptr<const ShaderRecompiler::RecompileResult> compiledResult;
     std::vector<ShaderRecompiler::MemoryRegion> captured;
     std::uint64_t forgetSerial = 0;
+    std::uint64_t key = 0;
+    std::uint64_t registerFingerprint = 0;
 };
 
+// Compute requests contain decoded register values, not references to QueueState. Constant
+// RAM is not consumed by dispatch preparation. Request spans are rebound into this object's
+// vectors or retained shader/device owners after every move.
+struct DispatchPrepareInput {
+    DispatchPrepareInput(std::span<const std::uint32_t> packet,
+        std::shared_ptr<const ShaderSnapshot> shader, std::shared_ptr<const ShaderRegistry> registry,
+        std::shared_ptr<VulkanDevice> device, std::size_t codeOffset,
+        const ShaderRecompiler::RecompileRequest& request, std::uint64_t key,
+        std::uint64_t registerFingerprint, std::uint32_t queue,
+        std::uint64_t submissionSerial, std::size_t packetOffset);
+    DispatchPrepareInput(const DispatchPrepareInput&) = delete;
+    DispatchPrepareInput& operator=(const DispatchPrepareInput&) = delete;
+    DispatchPrepareInput(DispatchPrepareInput&& other) noexcept;
+    DispatchPrepareInput& operator=(DispatchPrepareInput&& other) noexcept;
+
+    void RebindRequest();
+    std::vector<std::uint32_t> packet;
+    std::shared_ptr<const ShaderSnapshot> shader;
+    std::shared_ptr<const ShaderRegistry> registry;
+    std::shared_ptr<VulkanDevice> device;
+    std::size_t codeOffset = 0;
+    std::vector<std::uint32_t> userData;
+    std::vector<std::uint32_t> linkedCallFallbacks;
+    std::vector<ShaderRecompiler::MemoryRegion> memory;
+    ShaderRecompiler::RecompileRequest request;
+    std::uint64_t key = 0;
+    std::uint64_t registerFingerprint = 0;
+    std::uint32_t queue = 0;
+    std::uint64_t submissionSerial = 0;
+    std::size_t packetOffset = 0;
+};
+
+std::optional<DispatchPreparationResult> PrepareDispatchOwned(DispatchPrepareInput& input);
+std::uint64_t EstimateBytes(const DispatchPrepareInput& input);
 
 class Driver {
 public:
@@ -150,6 +185,7 @@ private:
         RecaptureScope(const RecaptureScope&) = delete;
         RecaptureScope& operator=(const RecaptureScope&) = delete;
     };
+    friend std::optional<DispatchPreparationResult> PrepareDispatchOwned(DispatchPrepareInput& input);
     friend class SampledReadScope;
     friend struct PendingView;
     friend struct PacketTimer;

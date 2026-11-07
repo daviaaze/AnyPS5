@@ -6896,6 +6896,8 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
                 expected.assign(snapshotBytes.begin(), snapshotBytes.end());
             }
         }
+        if (region->deviceLocal && GetResidentShadowMode() != ResidentShadowMode::Off)
+            static_cast<void>(ResidentShadowReusable(region->residentIdentity, region->residentIdentity));
         const auto copySpan = [&](std::uint64_t begin, std::uint64_t end) {
             const auto offset = begin - region->begin;
             CopyBuffer(context, commands, copySource, copyOffset + offset, region->buffer->Handle(),
@@ -6909,9 +6911,8 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
             copySpan(region->begin, region->end);
         }
         region->copyInRecorded = true;
-        if (region->deviceLocal) {
-            ResidentShadowObserveCopyIn(region->residentIdentity, region->residentVersion, region->buffer);
-        }
+        if (region->deviceLocal && GetResidentShadowMode() != ResidentShadowMode::Off)
+            ResidentShadowObserveCopyIn(region->residentIdentity, region->buffer);
         if (!expected.empty()) {
             auto readback = std::make_shared<Buffer>(context, expected.size(), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
@@ -7086,12 +7087,13 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
         // HasCopiedWrites, so the caller still registers the CPU write-back that stores the
         // staging bytes, instead of losing the shader's results.
         region.copiedBack = true;
-        if (region.deviceLocal) {
-            const auto dirty = region.outputSpans.empty()
-                ? std::span<const std::pair<std::uint64_t, std::uint64_t>>(merged)
-                : std::span<const std::pair<std::uint64_t, std::uint64_t>>(region.outputSpans);
-            region.residentVersion.dirty.assign(dirty.begin(), dirty.end());
-            ResidentShadowObserveCopyBack(region.residentIdentity, recorder.Submissions() + 1, dirty);
+        if (region.deviceLocal && GetResidentShadowMode() != ResidentShadowMode::Off) {
+            const auto identity = region.residentIdentity;
+            const auto serial = recorder.OpenSerial();
+            ResidentShadowObserveCopyBack(identity, serial);
+            recorder.OnComplete([identity, serial] {
+                ResidentShadowCopyBackCompleted(identity, serial);
+            });
         }
     }
     if (!recording) return;
@@ -7410,11 +7412,17 @@ void GuestBufferMemory::RunAccesses(std::vector<std::array<std::uint64_t, 3>>& o
 void GuestBufferMemory::MarkStagedWrites() const {
     for (const auto& [begin, end] : writes) {
         const auto* found = owner(begin, end);
-        if (found != nullptr && found->gpuCopy && found->direct == nullptr) GuestMemory::MarkWritten(begin, static_cast<std::size_t>(end - begin));
+        if (found != nullptr && found->gpuCopy && found->direct == nullptr) {
+            if (GetResidentShadowMode() != ResidentShadowMode::Off)
+                ResidentShadowNoteUnhookedWrite();
+            GuestMemory::MarkWritten(begin, static_cast<std::size_t>(end - begin));
+        }
     }
 }
 
 void GuestBufferMemory::MarkDirectWrites() const {
+    if (!writes.empty() && GetResidentShadowMode() != ResidentShadowMode::Off)
+        ResidentShadowNoteUnhookedWrite();
     for (const auto& [begin, end] : writes) {
         const auto* found = owner(begin, end);
         if (found == nullptr) continue;

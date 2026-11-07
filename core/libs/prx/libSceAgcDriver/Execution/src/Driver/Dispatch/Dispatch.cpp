@@ -102,19 +102,104 @@ bool CapturedCurrent(std::span<const ShaderRecompiler::MemoryRegion> captured, c
 
 }
 
-template <typename Capture, typename CaptureComplete>
-DispatchPreparationResult PrepareDispatchCapture(std::shared_ptr<ShaderMemory> shaderMemory, std::uint64_t forgetSerial,
-        Capture&& capture, CaptureComplete&& captureComplete,
-        ShaderRecompiler::PreparedShaderInvocation& invocation) {
+DispatchPrepareInput::DispatchPrepareInput(std::span<const std::uint32_t> words,
+        std::shared_ptr<const ShaderSnapshot> shaderOwner, std::shared_ptr<const ShaderRegistry> registryOwner,
+        std::shared_ptr<VulkanDevice> deviceOwner, std::size_t offset,
+        const ShaderRecompiler::RecompileRequest& source, std::uint64_t dispatchKey,
+        std::uint64_t fingerprint, std::uint32_t queueId, std::uint64_t serial, std::size_t packetPosition)
+    : packet(words.begin(), words.end()), shader(std::move(shaderOwner)), registry(std::move(registryOwner)),
+      device(std::move(deviceOwner)), codeOffset(offset),
+      userData(source.context.userData.begin(), source.context.userData.end()),
+      linkedCallFallbacks(source.context.linkedCallFallbacks.begin(), source.context.linkedCallFallbacks.end()),
+      memory(source.context.memory.begin(), source.context.memory.end()), request(source),
+      key(dispatchKey), registerFingerprint(fingerprint), queue(queueId), submissionSerial(serial), packetOffset(packetPosition) {
+    RebindRequest();
+}
+
+DispatchPrepareInput::DispatchPrepareInput(DispatchPrepareInput&& other) noexcept
+    : packet(std::move(other.packet)), shader(std::move(other.shader)), registry(std::move(other.registry)),
+      device(std::move(other.device)), codeOffset(other.codeOffset), userData(std::move(other.userData)),
+      linkedCallFallbacks(std::move(other.linkedCallFallbacks)), memory(std::move(other.memory)),
+      request(std::move(other.request)), key(other.key), registerFingerprint(other.registerFingerprint),
+      queue(other.queue), submissionSerial(other.submissionSerial), packetOffset(other.packetOffset) {
+    RebindRequest();
+}
+
+DispatchPrepareInput& DispatchPrepareInput::operator=(DispatchPrepareInput&& other) noexcept {
+    if (this == &other) return *this;
+    packet = std::move(other.packet);
+    shader = std::move(other.shader);
+    registry = std::move(other.registry);
+    device = std::move(other.device);
+    codeOffset = other.codeOffset;
+    userData = std::move(other.userData);
+    linkedCallFallbacks = std::move(other.linkedCallFallbacks);
+    memory = std::move(other.memory);
+    request = std::move(other.request);
+    key = other.key;
+    registerFingerprint = other.registerFingerprint;
+    queue = other.queue;
+    submissionSerial = other.submissionSerial;
+    packetOffset = other.packetOffset;
+    RebindRequest();
+    return *this;
+}
+
+void DispatchPrepareInput::RebindRequest() {
+    require(shader != nullptr, "owned dispatch input is missing its shader snapshot");
+    request.shader.code = std::span(shader->code).subspan(codeOffset);
+    request.shader.header = shader->header;
+    request.context.userData = userData;
+    request.context.memory = memory;
+    request.context.linkedCallFallbacks = linkedCallFallbacks;
+}
+
+std::uint64_t EstimateBytes(const DispatchPrepareInput& input) {
+    return sizeof(input)
+        + input.packet.capacity() * sizeof(std::uint32_t)
+        + input.userData.capacity() * sizeof(std::uint32_t)
+        + input.linkedCallFallbacks.capacity() * sizeof(std::uint32_t)
+        + input.memory.capacity() * sizeof(ShaderRecompiler::MemoryRegion);
+}
+
+template <typename Capture, typename CaptureComplete, typename InvocationComplete>
+std::optional<DispatchPreparationResult> PrepareDispatchSteps(
+        std::shared_ptr<ShaderMemory> shaderMemory, std::uint64_t forgetSerial,
+        const ShaderSnapshot& snapshot, std::size_t codeOffset,
+        const ShaderRecompiler::RecompileRequest& request, std::uint64_t key,
+        std::uint64_t registerFingerprint, Capture&& capture,
+        CaptureComplete&& captureComplete, InvocationComplete&& invocationComplete) {
     require(shaderMemory != nullptr, "dispatch preparation is missing retained shader memory");
+    auto invocation = InvocationFor(snapshot, codeOffset, request);
+    std::forward<InvocationComplete>(invocationComplete)();
+    auto capturedResource = std::forward<Capture>(capture)(invocation);
+    if (!capturedResource) return std::nullopt;
     DispatchPreparationResult result;
     result.shaderMemory = std::move(shaderMemory);
     result.forgetSerial = forgetSerial;
-    result.capture = std::forward<Capture>(capture)();
+    result.capture = std::move(*capturedResource);
     result.captured = result.shaderMemory->Regions();
     std::forward<CaptureComplete>(captureComplete)(result.captured);
     result.compiledResult = invocation.Materialize(*result.capture);
+    result.key = key;
+    result.registerFingerprint = registerFingerprint;
     return result;
+}
+
+std::optional<DispatchPreparationResult> PrepareDispatchOwned(DispatchPrepareInput& input) {
+    input.RebindRequest();
+    require(input.registry != nullptr && input.device != nullptr,
+        "owned dispatch input is missing retained registry or device");
+    auto shaderMemory = std::make_shared<ShaderMemory>(input.memory,
+        &Driver::queryPendingWrite, &Driver::observePendingWrite,
+        Driver::hookWaitCounter(), &Driver::QueryPendingSpan);
+    const auto forgetSerial = GuestMemory::ForgetSerial();
+    auto captureMemory = shaderMemory;
+    return PrepareDispatchSteps(
+        std::move(shaderMemory), forgetSerial, *input.shader, input.codeOffset,
+        input.request, input.key, input.registerFingerprint,
+        [captureMemory](auto& invocation) { return captureMemory->TryCapture(invocation); },
+        [](const auto&) {}, [] {});
 }
 
 std::uint64_t Driver::AheadAdoptionsProven() {
@@ -609,15 +694,12 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
 
         static const bool dumpShaders = std::getenv("APS5_DUMP_SHADERS") != nullptr;
         try {
-            auto invocation = InvocationFor(snapshot, codeOffset, request);
-            timing.Mark("prepared_invocation");
-
             const auto waitedBefore = traceCapSync() ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
             forgetAtCapture = GuestMemory::ForgetSerial();
             auto started = std::chrono::steady_clock::now();
-            auto prepared = PrepareDispatchCapture(
-                shaderMemory, forgetAtCapture,
-                [&] {
+            auto preparedOptional = PrepareDispatchSteps(
+                shaderMemory, forgetAtCapture, snapshot, codeOffset, request, key, 0,
+                [&](auto& invocation) -> std::optional<std::shared_ptr<const ShaderRecompiler::ResourceCapture>> {
                     const SampledReadScope sampling(evidenceReads);
                     return CaptureInvocation(*shaderMemory, snapshot, codeOffset, request, invocation);
                 },
@@ -631,7 +713,9 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                     StreamReuseNoteTranslation();
                     started = std::chrono::steady_clock::now();
                 },
-                invocation);
+                [&] { timing.Mark("prepared_invocation"); });
+            require(preparedOptional.has_value(), "blocking dispatch capture returned no result");
+            auto prepared = std::move(*preparedOptional);
             capture = std::move(prepared.capture);
             captured = std::move(prepared.captured);
             shaderMemory = std::move(prepared.shaderMemory);

@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/ResidentShadow.hpp"
 #include "prx/libkernel/include/Api.hpp"
 #include "prx/libSceAgc/Command/include/Packet.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
@@ -4432,6 +4433,86 @@ bool bdaStagingTests(const Device& device, Recorder& recorder) {
         mutation.Remove(block);
     }
     HostImportFor(context, address, bytes);
+    return true;
+}
+
+bool residentShadowObserveTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    Require(context.hostImportAlignment != 0 && context.bufferDeviceAddress,
+            "resident-shadow observer test requires host imports and buffer device addresses");
+    constexpr std::size_t bytes = 65536;
+    const auto decidedImportWatch = PrepareImportWatch(context);
+    std::cout << "default import watch decision on this host: " << (decidedImportWatch == ImportWatch::Watch ? "watch" : "unwatch") << '\n';
+    struct RestoreImportWatch {
+        const Context& context;
+        ImportWatch decided;
+        ~RestoreImportWatch() { SetImportWatch(context, decided); }
+    } restoreImportWatch{context, decidedImportWatch};
+    SetImportWatch(context, ImportWatch::Watch);
+    void* block = AllocateWatched(bytes, bytes);
+    Require(block != nullptr, "cannot allocate resident-shadow observer memory");
+    std::memset(block, 0x11, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    const auto* import = HostImportFor(context, address, bytes);
+    Require(import != nullptr && import->backingSerial != 0,
+            "resident-shadow observer test could not create a host import");
+    Require(AgcDriver::GuestMemory::Watched(address, bytes),
+            "resident-shadow host import is not backed by a watched guest allocation");
+    const ResidentShadowIdentity identity{context.device, address, bytes,
+        import->backingSerial, import->buffer, import->base, HostImportEpoch(),
+        address, address + bytes};
+    const auto fill = context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer");
+    const auto completeUse = [&] {
+        ResidentShadowObserveCopyIn(identity, {});
+        const auto serial = recorder.OpenSerial();
+        fill(recorder.Commands(), import->buffer, HostImportOffset(*import, address), bytes, 0x12345678u);
+        recorder.NotePendingWrite(address, bytes);
+        AgcDriver::GuestMemory::MarkWritten(address, bytes);
+        ResidentShadowObserveCopyBack(identity, serial);
+        recorder.OnComplete([identity, serial] {
+            ResidentShadowCopyBackCompleted(identity, serial);
+        });
+        recorder.Submit();
+        recorder.Sync();
+    };
+    const auto before = ResidentShadowCounters();
+    completeUse();
+    Require(ResidentShadowProducerCompleted(identity), "copy-back was treated as incomplete after its batch completed");
+    Require(ResidentShadowCpuUnchanged(identity), "completed copy-back did not publish a watched generation");
+    Require(ResidentShadowReusable(identity, identity), "unchanged completed resident use was not reusable");
+    const auto reusable = ResidentShadowCounters();
+    Require(reusable.reusableWouldSkip - before.reusableWouldSkip == 1,
+            "second-use copy-in did not report exactly one reusable candidate");
+    static_cast<volatile std::uint8_t*>(block)[8] = 0x22;
+    static_cast<void>(AgcDriver::GuestMemory::CollectWritesUncached(address, bytes));
+    Require(!ResidentShadowReusable(identity, identity), "CPU write did not reject resident reuse");
+    Require(ResidentShadowCounters().rejected[static_cast<std::size_t>(ResidentShadowReject::CpuWrite)] > 0,
+            "CPU write rejection was not counted");
+    fill(recorder.Commands(), import->buffer, HostImportOffset(*import, address), bytes, 0x87654321u);
+    recorder.NotePendingWrite(address, bytes);
+    AgcDriver::GuestMemory::MarkWritten(address, bytes);
+    Require(!ResidentShadowReusable(identity, identity), "recorded GPU write did not reject resident reuse");
+    const auto afterGpuWrite = ResidentShadowCounters();
+    Require(afterGpuWrite.rejected[static_cast<std::size_t>(ResidentShadowReject::GpuWrite)] > 0,
+            "GPU write rejection was not counted");
+    recorder.Sync();
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(block);
+    }
+    HostImportFor(context, address, bytes);
+    ReleaseWatched(block, bytes);
+    const auto final = ResidentShadowCounters();
+    std::cout << "resident-shadow observe: reusable=" << final.reusableWouldSkip
+              << " reusable-bytes=" << final.reusableWouldSkipBytes
+              << " cpu-write=" << final.rejected[static_cast<std::size_t>(ResidentShadowReject::CpuWrite)]
+              << " gpu-write=" << final.rejected[static_cast<std::size_t>(ResidentShadowReject::GpuWrite)]
+              << " unhooked-write=" << final.rejected[static_cast<std::size_t>(ResidentShadowReject::UnhookedWrite)]
+              << '\n';
     return true;
 }
 
@@ -15516,6 +15597,11 @@ int main(int argc, char** argv) {
             unlandedOwnLabelTests(recorder);
             unlandedOwnStoreWaitTests(recorder);
             std::cout << "Completion label storage and ordering tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--resident-shadow-observe-only") {
+            if (!residentShadowObserveTests(device, recorder)) return 77;
+            std::cout << "resident-shadow observer tests passed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--bda-staging-only") {

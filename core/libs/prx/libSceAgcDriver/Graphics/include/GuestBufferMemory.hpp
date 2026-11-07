@@ -540,7 +540,6 @@ private:
         bool copiedBack = false;
         std::shared_ptr<Buffer> shadowCopy;
         ResidentShadowIdentity residentIdentity {};
-        ResidentShadowVersion residentVersion {};
         // An element the shader updates atomically lies inside (AddWritable's `atomic`).
         bool atomic = false;
         bool swept = false;

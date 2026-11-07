@@ -1,3 +1,5 @@
+// ResidentShadow observes writes at the common guest-range recording point.
+#include "prx/libSceAgcDriver/Graphics/include/ResidentShadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/TableWaits.hpp"
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
@@ -3703,6 +3705,7 @@ bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel
     if (bytes == 0) return false;
     ensureOpen();
     const auto end = address + bytes;
+    ResidentShadowObserveGpuWrite(address, bytes);
     open->writes.emplace_back(address, end);
     open->writeNotes.push_back(++writeNoteCount);
     if (published != nullptr && !SnapshotCovers(published.get(), address, end)) published = nullptr;
@@ -3732,6 +3735,7 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
     // An in-flight batch: its range joins the snapshot at once (the completion that stores it runs
     // when the batch finishes, and the hook must sync for a CPU read until then). The generation
     // moves as well, so a poller re-consults the label table for a completion label.
+    ResidentShadowObserveGpuWrite(address, bytes);
     batch.writes.emplace_back(address, address + bytes);
     batch.writeNotes.push_back(++writeNoteCount);
     if (published != nullptr && !SnapshotCovers(published.get(), address, address + bytes)) published = nullptr;
