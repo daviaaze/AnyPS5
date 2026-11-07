@@ -458,9 +458,7 @@ void Driver::execute(const Submission& submission) {
                 if (!recordLabelsForPacket(localDevice.get(), submission.queue) && localDevice != nullptr) localDevice->SubmitRecorded(submission.queue == 0);
                 if (localDevice != nullptr) localDevice->FlipBatches(batchesAtFlip, unsignaledAtFlip);
             }
-            if (!flipInterruptDeferred) deliverFlipEopInterrupt(submission.queue);
             countFlip();
-            ++flipsCounted;
             Graphics::NoteHostImportFrame();
             if (batchesAtFlip != 0) flipSerial = batchesAtFlip;
             flipBatchesUnsignaled += unsignaledAtFlip;
