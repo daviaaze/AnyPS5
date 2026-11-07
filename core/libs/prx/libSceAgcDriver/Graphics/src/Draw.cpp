@@ -1457,6 +1457,41 @@ const char* DrawRecipeMissName(DrawRecipeMiss miss) {
     return names[static_cast<std::size_t>(miss)];
 }
 
+bool RecipeGapStats() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_RECIPE_GAP_STATS");
+        return value != nullptr && *value != '\0' && std::string_view(value) != "0";
+    }();
+    return enabled;
+}
+
+void NoteRecipeGap(RecipeGap gap) {
+    if (!RecipeGapStats()) return;
+    static constexpr std::array<const char*, static_cast<std::size_t>(RecipeGap::Count)> names{
+        "found", "no-register-key", "indirect-cpu", "patched-stages", "tessellation-geometry", "disabled", "variant-id-0", "no-variants",
+        "draw-cache-miss", "no-entry", "no-records", "expired", "stage-mismatch", "compiled-mismatch", "record-no-stages", "record-patched", "replay-failed",
+        "built", "prepare-refused", "not-lean", "not-cacheable", "waited", "indirect-not-gpu", "not-reusable", "space-reuse", "moved", "multisampled",
+        "reorders-samples", "build-disabled", "mesh-layer-windows", "attach-no-entry", "attach-variant-0", "attached"};
+    static std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(RecipeGap::Count)> counts{};
+    static std::atomic<std::int64_t> lastReport{0};
+    counts[static_cast<std::size_t>(gap)].fetch_add(1, std::memory_order_relaxed);
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = lastReport.load(std::memory_order_relaxed);
+    if (last == 0) lastReport.compare_exchange_strong(last, nowMs);
+    if (nowMs - last < 10000 || !lastReport.compare_exchange_strong(last, nowMs)) return;
+    std::string line = "[recipe-gap] (10 s)";
+    for (std::size_t i = 0; i < names.size(); ++i) {
+        if (i == static_cast<std::size_t>(RecipeGap::Built)) line += " | build:";
+        else if (i == 0) line += " lookup:";
+        line += ' ';
+        line += names[i];
+        line += '=';
+        line += std::to_string(counts[i].exchange(0, std::memory_order_relaxed));
+    }
+    line += '\n';
+    std::fputs(line.c_str(), stderr);
+}
+
 namespace {
 
 // APS5_PROFILE_DRAW: the per-phase timers of one draw (DrawPhase), shared by Draw's parts and
@@ -4090,11 +4125,23 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
             recipe->shaderStages = inputs.shaderStages;
             recipe->hasDepth = state.depth.has_value();
             *recipeOut = std::move(recipe);
+            NoteRecipeGap(RecipeGap::Built);
+        } else if (recipeOut != nullptr && RecipeGapStats()) {
+            NoteRecipeGap(!DrawRecipes() ? RecipeGap::BuildDisabled
+                : !cacheable ? RecipeGap::NotCacheable
+                : outcome.waited ? RecipeGap::Waited
+                : !(args == nullptr || (indirect.path == IndirectDrawPath::Gpu && inputs.listRestartPrimitive == 0)) ? RecipeGap::IndirectNotGpu
+                : !resources->Reusable() ? RecipeGap::NotReusable
+                : resources->SpaceReuse() ? RecipeGap::SpaceReuse
+                : !resolved.moved.empty() ? RecipeGap::Moved
+                : multisampled ? RecipeGap::Multisampled
+                : RecipeGap::ReordersSamples);
         }
         timing.Mark("draw_and_resource_release");
         report(outcome.waited ? (outcome.reason == SyncLease ? " recorded then waited (lease)" : " recorded then waited (copied writes)") : completion ? " recorded with completion" : " recorded");
         return;
     }
+    if (recipeOut != nullptr) NoteRecipeGap(RecipeGap::NotLean);
     const bool gpuIndirect = args != nullptr && indirect.path == IndirectDrawPath::Gpu;
     const auto touches = [&](std::uint64_t begin, std::uint64_t end) {
         const auto bytes = static_cast<std::size_t>(end - begin);
@@ -4451,7 +4498,10 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         const auto limit = context.meshLimits.maxMeshOutputLayers;
         Require(limit != 0u && !state.depth, "mesh layer windows require a nonzero output limit and color-only layered rendering");
         Require(std::ranges::all_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->layerReplaySafe; }), "mesh layer windows refuse shaders with guest memory writes, clocks or unproven side effects");
-        if (recipeOut != nullptr) recipeOut->reset();
+        if (recipeOut != nullptr) {
+            recipeOut->reset();
+            NoteRecipeGap(RecipeGap::MeshLayerWindows);
+        }
         for (std::uint32_t base = 0; base < state.renderLayers;) {
             auto window = state;
             window.renderLayers = std::min(limit, state.renderLayers - base);
@@ -4485,7 +4535,9 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         }
     } heldSpace{prepared};
     try {
-        if (prepareDraw(context, state, draw, shaders, snapshots, prepared)) recordPreparedDraw(context, state, draw, shaders, prepared);
+        const bool prepared_ = prepareDraw(context, state, draw, shaders, snapshots, prepared);
+        if (recipeOut != nullptr && (!prepared_ || prepared.recipeOut == nullptr)) NoteRecipeGap(RecipeGap::PrepareRefused);
+        if (prepared_) recordPreparedDraw(context, state, draw, shaders, prepared);
     } catch (...) {
         keepHeldSpace(prepared);
         throw;

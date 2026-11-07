@@ -126,6 +126,20 @@ struct DrawRecipeOutcome {
 DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe, const DrawTraceContext* trace = nullptr);
 // Whether recorded draws build recipes and draw-cache hits use them (APS5_NO_DRAW_RECIPE unset).
 bool DrawRecipes();
+// APS5_RECIPE_GAP_STATS=1 (diagnostic): why draws do not replay a recipe. The driver files one
+// lookup outcome per draw (direct draw or indirect CPU record) and Draw files, for each draw asked
+// to build a recipe, the first reason none was built; one [recipe-gap] line every 10 s.
+enum class RecipeGap : std::uint8_t {
+    // Driver lookup outcomes.
+    Found, NoRegisterKey, IndirectCpu, PatchedStages, TessellationGeometry, Disabled, VariantIdZero, NoVariants,
+    DrawCacheMiss, NoEntry, NoRecords, Expired, NoMatch, CompiledMismatch, RecordNoStages, RecordPatched, ReplayFailed,
+    // Draw build outcomes.
+    Built, PrepareRefused, NotLean, NotCacheable, Waited, IndirectNotGpu, NotReusable, SpaceReuse, Moved, Multisampled,
+    ReordersSamples, BuildDisabled, MeshLayerWindows, AttachNoEntry, AttachVariantZero, Attached,
+    Count
+};
+bool RecipeGapStats();
+void NoteRecipeGap(RecipeGap gap);
 
 // How an indirect draw's records were read, for the [draws] line (APS5_PROFILE_DRAW): Gpu is
 // vkCmdDrawIndirect from the host import; every other value names why the CPU read them instead,

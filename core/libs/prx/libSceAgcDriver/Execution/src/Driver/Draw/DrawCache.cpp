@@ -262,12 +262,36 @@ std::shared_ptr<const DrawRecipe> Driver::findDrawRecipe(std::uint64_t key, cons
     return nullptr;
 }
 
+Graphics::RecipeGap Driver::drawRecipeMissReason(std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages, std::span<const Graphics::CompiledShader> compiled) {
+    static_cast<void>(compiled);
+    std::shared_ptr<const std::vector<DrawRecipeRecord>> records;
+    {
+        std::lock_guard cacheLock(drawCacheMutex);
+        const auto found = drawCache.find(key);
+        if (found == drawCache.end()) return Graphics::RecipeGap::NoEntry;
+        records = found->second->recipes.load();
+    }
+    if (records == nullptr || records->empty()) return Graphics::RecipeGap::NoRecords;
+    bool stagesMatched = false;
+    for (const auto& record : *records) {
+        if (record.stages.size() != stages.size()) continue;
+        bool same = true;
+        for (std::size_t i = 0; i < stages.size() && same; ++i) same = !record.stages[i].owner_before(stages[i]) && !stages[i].owner_before(record.stages[i]);
+        stagesMatched = stagesMatched || same;
+    }
+    if (stagesMatched) return Graphics::RecipeGap::CompiledMismatch;
+    return std::all_of(records->begin(), records->end(), [](const DrawRecipeRecord& record) { return record.Expired(); }) ? Graphics::RecipeGap::Expired : Graphics::RecipeGap::NoMatch;
+}
+
 void Driver::attachDrawRecipe(std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages, std::span<const Graphics::CompiledShader> compiled, std::shared_ptr<const DrawRecipe> recipe) {
     std::shared_ptr<DrawEntry> entry;
     {
         std::lock_guard cacheLock(drawCacheMutex);
         const auto found = drawCache.find(key);
-        if (found == drawCache.end()) return;
+        if (found == drawCache.end()) {
+            Graphics::NoteRecipeGap(Graphics::RecipeGap::AttachNoEntry);
+            return;
+        }
         entry = found->second;
     }
     const auto old = entry->recipes.load();
@@ -276,7 +300,10 @@ void Driver::attachDrawRecipe(std::uint64_t key, const std::vector<std::shared_p
     fresh.stages.assign(stages.begin(), stages.end());
     fresh.compiledVariants.reserve(compiled.size());
     for (const auto& shader : compiled) {
-        if (shader.program == nullptr || shader.program->PipelineVariantId() == 0) return;
+        if (shader.program == nullptr || shader.program->PipelineVariantId() == 0) {
+            Graphics::NoteRecipeGap(Graphics::RecipeGap::AttachVariantZero);
+            return;
+        }
         fresh.compiledVariants.push_back(shader.program->PipelineVariantId());
     }
     fresh.recipe = std::move(recipe);
@@ -289,6 +316,7 @@ void Driver::attachDrawRecipe(std::uint64_t key, const std::vector<std::shared_p
     }
     entry->recipes.store(std::move(records));
     VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Attach, VulkanDevice::RecipeKind::Draw);
+    Graphics::NoteRecipeGap(Graphics::RecipeGap::Attached);
 }
 
 }

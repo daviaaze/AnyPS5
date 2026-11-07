@@ -212,6 +212,8 @@ private:
     bool admitDrawKey(std::uint64_t key, std::uint64_t shape);
     void eraseDrawEntry(std::uint64_t key, const std::shared_ptr<DrawEntry>& expected);
     std::shared_ptr<const DrawRecipe> findDrawRecipe(std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages, std::span<const Graphics::CompiledShader> compiled);
+    // APS5_RECIPE_GAP_STATS: why findDrawRecipe found nothing for these stages.
+    Graphics::RecipeGap drawRecipeMissReason(std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages, std::span<const Graphics::CompiledShader> compiled);
     void attachDrawRecipe(std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages, std::span<const Graphics::CompiledShader> compiled, std::shared_ptr<const DrawRecipe> recipe);
     static bool traceDrawCache();
     static void traceInsert(std::unordered_set<std::uint64_t>& set, std::uint64_t key);

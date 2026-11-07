@@ -1661,6 +1661,12 @@ DrawVerdict Driver::finishDraw(const std::shared_ptr<DrawTail>& tailHolder, Perf
             }
             auto recordRecipe = recipeSafe ? findDrawRecipe(drawKey, indirectRecipeStages, stages) : std::shared_ptr<const DrawRecipe>{};
             if (recipeSafe && recordRecipe == nullptr) VulkanDevice::NoteDrawRecipeMiss(VulkanDevice::DrawRecipePrecheck::NoRecipe);
+            if (Graphics::RecipeGapStats()) {
+                Graphics::NoteRecipeGap(recordRecipe != nullptr ? Graphics::RecipeGap::Found
+                    : indirectRecipeStages.empty() ? Graphics::RecipeGap::RecordNoStages
+                    : !recipeSafe ? Graphics::RecipeGap::RecordPatched
+                    : drawRecipeMissReason(drawKey, indirectRecipeStages, stages));
+            }
             if (pipelined && pipelinedIndirect && record == lastDrawable && !gpuLock.owns_lock() && deferredLabels().labels.empty()) {
                 runCaptureCheckHook();
                 if (tail.queue != nullptr && capturedMemoryChanged(memory)) {
@@ -1706,7 +1712,10 @@ DrawVerdict Driver::finishDraw(const std::shared_ptr<DrawTail>& tailHolder, Perf
                 phaseTiming.Phase(DrawRowGraphics);
                 continue;
             }
-            if (recordRecipe != nullptr) VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
+            if (recordRecipe != nullptr) {
+                VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
+                Graphics::NoteRecipeGap(Graphics::RecipeGap::ReplayFailed);
+            }
             std::shared_ptr<const DrawRecipe> built;
             localDevice->Draw(graphics, direct, stages, snapshots, recipeSafe ? &built : nullptr, tracePtr, tail.shapeKey);
             if (built != nullptr) attachDrawRecipe(drawKey, indirectRecipeStages, stages, std::move(built));
@@ -1727,6 +1736,20 @@ DrawVerdict Driver::finishDraw(const std::shared_ptr<DrawTail>& tailHolder, Perf
     if (drawHit && !recipeStages.empty()) {
         recipe = findDrawRecipe(drawKey, recipeStages, stages);
         if (recipe == nullptr) VulkanDevice::NoteDrawRecipeMiss(VulkanDevice::DrawRecipePrecheck::NoRecipe);
+    }
+    if (Graphics::RecipeGapStats()) {
+        using Graphics::RecipeGap;
+        const bool variantsKnown = std::all_of(stages.begin(), stages.end(), [](const auto& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; });
+        Graphics::NoteRecipeGap(recipe != nullptr ? RecipeGap::Found
+            : !registerKey ? RecipeGap::NoRegisterKey
+            : drawParameters.indirect && !(indirectGpuCandidate && drawCacheIndirect()) ? RecipeGap::IndirectCpu
+            : patchedStages ? RecipeGap::PatchedStages
+            : graphics.stages.tessellationGeometry ? RecipeGap::TessellationGeometry
+            : !Graphics::DrawRecipes() ? RecipeGap::Disabled
+            : !variantsKnown ? RecipeGap::VariantIdZero
+            : recipeStages.empty() ? RecipeGap::NoVariants
+            : !drawHit ? RecipeGap::DrawCacheMiss
+            : drawRecipeMissReason(drawKey, recipeStages, stages));
     }
     if (recipe == nullptr) {
         if (auto known = localDevice->KnownDrawRejection(graphics, stages)) {
@@ -1786,6 +1809,7 @@ DrawVerdict Driver::finishDraw(const std::shared_ptr<DrawTail>& tailHolder, Perf
         }
 
         VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
+        Graphics::NoteRecipeGap(Graphics::RecipeGap::ReplayFailed);
     }
     std::shared_ptr<const DrawRecipe> built;
     localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, tracePtr, tail.shapeKey);
@@ -1846,6 +1870,7 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
     if (recipe != nullptr) {
         if (localDevice->DrawFromRecipe(graphics, drawParameters, stages, snapshots, recipe, tracePtr) == RecipeOutcome::Recorded) return;
         VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
+        Graphics::NoteRecipeGap(Graphics::RecipeGap::ReplayFailed);
     }
     std::shared_ptr<const DrawRecipe> built;
     localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, tracePtr, shape);
