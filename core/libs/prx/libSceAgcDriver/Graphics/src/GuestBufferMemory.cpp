@@ -5994,6 +5994,82 @@ void traceStaged(std::uint64_t begin, std::uint64_t end, bool atomic) {
     std::fprintf(stderr, "[staging] 0x%llx+0x%llx (%.1f KiB)%s\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), (end - begin) / 1024.0, atomic ? " atomic" : "");
 }
 
+// APS5_STAGING_BATCH_STATS=1: per GPU batch, how many times each staged region is used (copied
+// in) and how much is copied in/out, to size a resident shadow. Independent of APS5_TRACE_STAGING.
+// A call with copyOutBytes != 0 records a copy-back, not a use.
+void traceStagingBatch(Recorder& recorder, std::uint64_t begin, std::uint64_t end,
+                       std::uint64_t copyInBytes, std::uint64_t copyOutBytes) {
+    static const bool enabled = std::getenv("APS5_STAGING_BATCH_STATS") != nullptr;
+    if (!enabled) return;
+    using Range = std::pair<std::uint64_t, std::uint64_t>;
+    struct RangeHash {
+        std::size_t operator()(const Range& range) const noexcept {
+            return static_cast<std::size_t>(range.first * 0x9e3779b97f4a7c15ull ^ range.second);
+        }
+    };
+    struct BatchStats {
+        std::uint64_t serial = 0;
+        std::uint64_t uses = 0;
+        std::uint64_t copyInBytes = 0;
+        std::uint64_t copyOutBytes = 0;
+        std::unordered_set<Range, RangeHash> regions;
+    };
+    struct State {
+        AgcDriver::Mutex mutex;
+        std::uint64_t activeSerial = 0;
+        BatchStats batch;
+        std::uint64_t batches = 0, uses = 0, regions = 0;
+        std::uint64_t copyInBytes = 0, copyOutBytes = 0;
+        std::uint64_t previousBatchCopyIns = 0, copyInRegions = 0;
+        double usesPerRegionBatch = 0.0;
+        std::unordered_map<Range, std::uint64_t, RangeHash> lastBatch;
+        std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+    };
+    static State state;
+    const auto serial = recorder.OpenBatchSerial();
+    std::lock_guard lock(state.mutex);
+    if (state.activeSerial != 0 && state.activeSerial != serial) {
+        const auto distinct = state.batch.regions.size();
+        ++state.batches;
+        state.uses += state.batch.uses;
+        state.regions += distinct;
+        state.copyInBytes += state.batch.copyInBytes;
+        state.copyOutBytes += state.batch.copyOutBytes;
+        if (distinct != 0) state.usesPerRegionBatch += static_cast<double>(state.batch.uses) / distinct;
+        if (state.lastBatch.size() > 65536u) state.lastBatch.clear();
+        for (const auto& range : state.batch.regions) state.lastBatch[range] = state.batch.serial;
+        state.batch = {};
+    }
+    state.activeSerial = serial;
+    state.batch.serial = serial;
+    const Range range{begin, end};
+    state.batch.copyInBytes += copyInBytes;
+    state.batch.copyOutBytes += copyOutBytes;
+    if (copyOutBytes != 0) return;
+    ++state.batch.uses;
+    state.batch.regions.insert(range);
+    if (copyInBytes != 0) {
+        ++state.copyInRegions;
+        if (const auto found = state.lastBatch.find(range);
+            found != state.lastBatch.end() && found->second < serial) ++state.previousBatchCopyIns;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - state.lastReport >= std::chrono::seconds(10)) {
+        const auto allBatches = state.batches + 1;
+        const auto mean = (state.usesPerRegionBatch +
+            (state.batch.regions.empty() ? 0.0 : static_cast<double>(state.batch.uses) / state.batch.regions.size())) / allBatches;
+        std::fprintf(stderr,
+            "[staging-batches] batches=%u uses=%llu regions=%llu uses_per_region_batch=%.3f copyin_bytes=%llu copyout_bytes=%llu copyin_prev_batch_regions=%llu copyin_regions=%llu\n",
+            static_cast<unsigned>(allBatches), static_cast<unsigned long long>(state.uses + state.batch.uses),
+            static_cast<unsigned long long>(state.regions + state.batch.regions.size()),
+            mean, static_cast<unsigned long long>(state.copyInBytes + state.batch.copyInBytes),
+            static_cast<unsigned long long>(state.copyOutBytes + state.batch.copyOutBytes),
+            static_cast<unsigned long long>(state.previousBatchCopyIns),
+            static_cast<unsigned long long>(state.copyInRegions));
+        state.lastReport = now;
+    }
+}
+
 class AdaptiveStagingGate {
 public:
     static AdaptiveStagingGate& Get() {
@@ -6845,7 +6921,10 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         // source is a live import or one retireImport already handed to this batch.
         recorder->Keep(region->buffer);
         region->snapshot.clear();
-        if (region->deviceLocal) traceStaged(region->begin, region->end, region->atomic);
+        if (region->deviceLocal) {
+            traceStaged(region->begin, region->end, region->atomic);
+            traceStagingBatch(*recorder, region->begin, region->end, std::max<std::uint64_t>(transferBytes, 1), 0);
+        }
         if (profile) {
             Copies().gpuCopies.fetch_add(1, std::memory_order_relaxed);
             Copies().gpuCopyBytes.fetch_add(transferBytes, std::memory_order_relaxed);
@@ -6979,6 +7058,7 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
                 Copies().gpuCopyBackBytes.fetch_add(to - from, std::memory_order_relaxed);
                 if (region.deviceLocal) Copies().stagedOutBytes.fetch_add(to - from, std::memory_order_relaxed);
             }
+            if (region.deviceLocal) traceStagingBatch(recorder, region.begin, region.end, 0, to - from);
         };
         for (const auto& [writeBegin, writeEnd] : merged) {
             if (region.boundedSpans) {

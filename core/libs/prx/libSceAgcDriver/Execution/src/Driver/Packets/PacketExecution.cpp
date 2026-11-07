@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics/StreamReuse.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
@@ -159,6 +160,15 @@ void Driver::timed(double WorkerProfile::*bucket, TWork&& work) {
 
 void Driver::execute(const Submission& submission) {
     auto* submissionTiming = includeTimingSubmission(submission, true);
+    static const bool streamReuse = StreamReuseEnabled();
+    if (streamReuse) StreamReuseBeginSubmission(submission.queue);
+    struct StreamReuseScope {
+        bool enabled;
+        std::chrono::steady_clock::time_point begin;
+        ~StreamReuseScope() {
+            if (enabled) StreamReuseEndSubmission(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count());
+        }
+    } streamReuseScope{streamReuse, std::chrono::steady_clock::now()};
     struct FlipHold {
         Driver& driver;
         std::uint32_t queue;
@@ -289,6 +299,7 @@ void Driver::execute(const Submission& submission) {
         const auto count = Pm4::PacketWords(header);
         const auto packet = std::span(submission.commands).subspan(cursor, count);
         const auto opcode = (header >> 8u) & 0xffu;
+        if (streamReuse) StreamReusePacket(packet);
         if (executingPacket != nullptr) executingPacket->store((static_cast<std::uint64_t>(cursor + 1) << 8u) | opcode, std::memory_order_relaxed);
         auto nextCursor = cursor + count;
         const bool predicated = Pm4::Predicated(header) && queue.predication.operation != 0;
@@ -343,6 +354,7 @@ void Driver::execute(const Submission& submission) {
         if (opcode != 0x3c && opcode != 0x93 && header != RenderingWaitPacketHeader && header != FlipPacketHeader) deviceUse.lock();
 
         timing.Mark("device_lock");
+        if (streamReuse && header == FlipPacketHeader) StreamReusePresent();
         GuestMemory::SetCurrentPacket(header == FlipPacketHeader ? 0xffffu : opcode, submission.queue);
         CaptureTrace::Log("packet submission=%llu queue=%x offset=%zu header=%08x words=%zu", static_cast<unsigned long long>(submission.serial), submission.queue, cursor, header, packet.size());
         if (predicated) {
@@ -509,6 +521,7 @@ void Driver::execute(const Submission& submission) {
                 }
             } clearOrder{ringOverlap};
             if (ringOverlap) ringOrder.afterDispatch = true;
+            if (streamReuse) StreamReuseCommand(false);
             if (opcode == 0x15) timed(&WorkerProfile::dispatchMs, [&] { dispatch(queue, packet, submission); });
             else timed(&WorkerProfile::dispatchMs, [&] { dispatchIndirect(queue, packet, submission); });
             Pm4::NoteDispatchRegisters(packet, queue);
@@ -536,6 +549,7 @@ void Driver::execute(const Submission& submission) {
             landPendingWaits(submission.queue);
             packetCounters.CountDraw();
             drawnSinceSeal() = true;
+            if (streamReuse) StreamReuseCommand(true);
             bool drawn = false;
             timed(&WorkerProfile::drawMs, [&] {
                 static const bool traceDraws = std::getenv("APS5_TRACE_DRAWS") != nullptr;
@@ -679,3 +693,4 @@ void Driver::execute(const Submission& submission) {
 }
 
 }
+
