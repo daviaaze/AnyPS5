@@ -395,6 +395,10 @@ A class range covers a command together with its own barriers. In `VulkanDevice:
 
 The calibrated RAW GPU track also exports the completed program-keyed ranges as `name: "program"`, with the same batch in `args.batch` and the exact 64-bit key as hexadecimal `args.program`. This reuses the timestamps already counted by `by program`; it adds no GPU queries or execution commands. A present program key of zero is distinct from an absent program field. Keys keep the dispatch-or-native-copy meaning described above, including builtins and variant IDs: they are not all shader addresses. Program, class and batch ranges may be nested; do not sum their durations as independent work. Existing windows, clock calibration, event caps and loss reporting still apply.
 
+On the queue-worker tracks, `Driver.Dispatch` and its device dispatch, record and copy children (`Vulkan.Dispatch*`, `Driver.Dispatch.device_*`, `Resources.*` while that dispatch runs) carry the same `args.program` once the compiled variant is resolved, using the same address-or-variant key as the GPU timing. Work that runs before that resolution (`capture_resources`, `materialize`, lookups) and every multi-shader draw stay untagged: absence is not a program zero. Queued commits install the identity on their own thread from the result they own. These are host wall intervals, not CPU samples, and parallel threads and nested scopes are not additive.
+
+Slices shorter than 20 us are not exported (see above), so a gap between two exported `Driver.Packet` slices on a queue worker is not idle time: it is usually a burst of short packets. Read a worker's occupancy from `worker_busy_pct` in the summary, which counts the folded slices.
+
 
 ## Guest clock scale
 
