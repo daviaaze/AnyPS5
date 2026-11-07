@@ -243,6 +243,8 @@ std::string_view TrimmedReason(std::string_view reason) {
 
 
 }
+
+
 struct DrawTail {
     using GpuLock = std::unique_lock<std::remove_reference_t<decltype(GuestMemory::GpuMutex())>>;
     DrawTail() : scratchResource(scratch.data(), scratch.size()),
@@ -303,12 +305,15 @@ struct DrawTail {
     const Submission* submission = nullptr;
     std::uint32_t submissionQueue = 0;
     std::uint64_t submissionSerial = 0;
-    std::size_t packetOffset = 0;
+    // Owning request/result keeps the complete PMR tail alive across the
+    // finisher handoff; its packet is never a borrowed Submission span.
     std::uint32_t packetOpcode = 0;
+    std::size_t packetOffset = 0;
     std::uint32_t reg207 = 0;
     std::uint64_t epoch = 0;
-    QueueState* queue = nullptr;
+    std::shared_ptr<const std::vector<std::uint32_t>> packetOwner;
     std::span<const std::uint32_t> packet;
+    QueueState* queue = nullptr;
     std::string* rejected = nullptr;
     std::uint64_t traceToken = 0;
     VulkanDevice::DrawTraceContext trace{};
@@ -911,6 +916,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     if (handOff) {
         tail.epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         tail.submissionSerial = submission.serial;
+        tail.packetOwner = std::make_shared<const std::vector<std::uint32_t>>(packet.begin(), packet.end());
+        tail.packet = *tail.packetOwner;
         tail.packetOffset = static_cast<std::size_t>(packet.data() - submission.commands.data());
         noteFinisherHandOff(true);
         DrawFinisher::Pending held;

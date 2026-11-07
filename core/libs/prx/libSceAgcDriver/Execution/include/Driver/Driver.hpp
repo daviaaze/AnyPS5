@@ -57,6 +57,16 @@ inline std::uint32_t ThreadDimensionGroups(std::uint32_t threads, std::uint32_t 
 }
 
 struct DrawTail;
+// Synchronous capture/materialization result. Capture waits on guest writes and shader
+// registration; this operation is deliberately not worker-safe.
+struct DispatchPreparationResult {
+    std::shared_ptr<ShaderMemory> shaderMemory;
+    std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture;
+    std::shared_ptr<const ShaderRecompiler::RecompileResult> compiledResult;
+    std::vector<ShaderRecompiler::MemoryRegion> captured;
+    std::uint64_t forgetSerial = 0;
+};
+
 
 class Driver {
 public:

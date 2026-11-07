@@ -20,6 +20,7 @@
 #include "prx/libc/include/CpuTopology.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ResidentShadow.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libc/include/general/AtomicSharedPtr.hpp"
 #ifdef _WIN32
@@ -593,6 +594,7 @@ void retireImport(VkDevice device, HostImports& state, std::map<std::uint64_t, H
     // readable registered range (the import retires because its registration vanished or changed
     // size); the holder below outlives the batch that copies them.
     RetireShadow(device, it->second, [&lease, joined = it->second.joined](std::uint64_t begin, std::uint64_t end) { return runCovers(lease, begin, end) || (joined && joinedCovers(lease, begin, end)); });
+    ResidentShadowRetireImport(device, it->second.buffer, state.epoch);
     bumpEpoch(state);
     state.liveBytes -= it->second.pinnedBytes;
     auto holder = std::make_shared<RetiredImport>(state.device, state.destroyBuffer, state.freeMemory, state.imports.extract(it));
@@ -6643,6 +6645,14 @@ void GuestBufferMemory::UploadFinish(bool addressable, std::optional<std::pair<s
                 copyOnGpu = true;
                 region.deviceLocal = staged;
                 region.copySource = entry->buffer;
+                if (region.deviceLocal && entry->range != nullptr) {
+                    const auto allocationAddress = entry->range->allocationAddress;
+                    const auto allocationBytes = entry->range->allocationBytes;
+                    if (allocationAddress != 0 && allocationBytes != 0 && entry->backingSerial != 0) {
+                        region.residentIdentity = {context.device, allocationAddress, allocationBytes, entry->backingSerial,
+                            entry->buffer, entry->base, state.epoch, region.begin, region.end};
+                    }
+                }
                 const auto start = HostImportBufferStart(*entry);
                 region.copySourceBase = start.guest;
                 region.copySourceAddress = start.device;
@@ -6899,6 +6909,9 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
             copySpan(region->begin, region->end);
         }
         region->copyInRecorded = true;
+        if (region->deviceLocal) {
+            ResidentShadowObserveCopyIn(region->residentIdentity, region->residentVersion, region->buffer);
+        }
         if (!expected.empty()) {
             auto readback = std::make_shared<Buffer>(context, expected.size(), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
@@ -7073,6 +7086,13 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
         // HasCopiedWrites, so the caller still registers the CPU write-back that stores the
         // staging bytes, instead of losing the shader's results.
         region.copiedBack = true;
+        if (region.deviceLocal) {
+            const auto dirty = region.outputSpans.empty()
+                ? std::span<const std::pair<std::uint64_t, std::uint64_t>>(merged)
+                : std::span<const std::pair<std::uint64_t, std::uint64_t>>(region.outputSpans);
+            region.residentVersion.dirty.assign(dirty.begin(), dirty.end());
+            ResidentShadowObserveCopyBack(region.residentIdentity, recorder.Submissions() + 1, dirty);
+        }
     }
     if (!recording) return;
     if (Recorder::BarrierValidate()) recorder.NoteAccess(Recorder::CommandClass::StagingOut, Recorder::Access{{}, merged, {}, VK_PIPELINE_STAGE_TRANSFER_BIT});

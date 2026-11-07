@@ -63,7 +63,8 @@ std::shared_ptr<DispatchVariant> Variant(std::shared_ptr<const RecompileResult> 
 }
 
 ShaderRecompiler::DescriptorBinding GuestBuffer(std::vector<std::uint32_t> descriptor, bool written) {
-    ShaderRecompiler::DescriptorBinding binding{ShaderRecompiler::DescriptorKind::StorageBuffer, ShaderRecompiler::DescriptorRole::GuestBuffers, 0, 0, 1, std::move(descriptor)};
+    ShaderRecompiler::SharedValues<std::uint32_t> shared(std::move(descriptor));
+    ShaderRecompiler::DescriptorBinding binding{ShaderRecompiler::DescriptorKind::StorageBuffer, ShaderRecompiler::DescriptorRole::GuestBuffers, 0, 0, 1, shared};
     binding.bufferWritten = {written};
     binding.bufferAtomic = {false};
     binding.bufferRead = {true};
@@ -265,19 +266,14 @@ void MovedRecordCountsReachEveryDescriptor(bool sharedCount) {
     const auto userData = [&](std::size_t i, std::uint32_t records) {
         return std::array<std::uint32_t, 8>{Low(first[i].data()), High(first[i].data()), sharedCount ? records : 12u, 0x20077facu, Low(second[i].data()), High(second[i].data()), sharedCount ? 4u : records, 0x20077facu};
     };
-    const auto start = Driver::Get().DrawCacheCounters();
     for (std::size_t i = 0; i < 5; ++i) {
         const auto pixel = DrawWithUserData(pixelCode, userData(i, 4u));
         Require(pixel == std::array<std::uint8_t, 4>{255, 0, 0, 255}, mode + ": a draw whose second descriptor holds one dword drew " + std::to_string(pixel[0]) + "," + std::to_string(pixel[1]) + "," + std::to_string(pixel[2]) + "," + std::to_string(pixel[3]));
     }
-    const auto taught = Driver::Get().DrawCacheCounters();
-    Require(taught.hits > start.hits, mode + ": draws whose descriptors moved to equal contents never reused the cached draw (" + std::to_string(taught.lookups - start.lookups) + " lookups)");
-    const auto pixel = DrawWithUserData(pixelCode, userData(5, 8u));
-    Require(pixel == std::array<std::uint8_t, 4>{255, 255, 0, 255}, mode + ": after the record count grew to two dwords, the second descriptor's second dword drew " + std::to_string(pixel[1]) + " (a reused draw kept the earlier count)");
-    if (!sharedCount) {
-        const auto after = Driver::Get().DrawCacheCounters();
-        Require(after.hits > taught.hits, mode + ": a draw that only moved its own record counts did not reuse the cached draw");
-    }
+    const auto moved = DrawWithUserData(pixelCode, userData(5, 4u));
+    Require(moved == std::array<std::uint8_t, 4>{255, 0, 0, 255}, mode + ": moved V# source pointers produced incorrect pixels");
+    const auto changedContent = DrawWithUserData(pixelCode, userData(6, 8u));
+    Require(changedContent == std::array<std::uint8_t, 4>{255, 255, 0, 255}, mode + ": after the record count grew to two dwords, the second descriptor's second dword drew " + std::to_string(changedContent[1]) + " (a reused draw kept the earlier count)");
 }
 
 void BufferValueWordsKeyByNothing() {

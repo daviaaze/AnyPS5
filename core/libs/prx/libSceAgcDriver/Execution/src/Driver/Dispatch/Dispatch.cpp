@@ -102,6 +102,21 @@ bool CapturedCurrent(std::span<const ShaderRecompiler::MemoryRegion> captured, c
 
 }
 
+template <typename Capture, typename CaptureComplete>
+DispatchPreparationResult PrepareDispatchCapture(std::shared_ptr<ShaderMemory> shaderMemory, std::uint64_t forgetSerial,
+        Capture&& capture, CaptureComplete&& captureComplete,
+        ShaderRecompiler::PreparedShaderInvocation& invocation) {
+    require(shaderMemory != nullptr, "dispatch preparation is missing retained shader memory");
+    DispatchPreparationResult result;
+    result.shaderMemory = std::move(shaderMemory);
+    result.forgetSerial = forgetSerial;
+    result.capture = std::forward<Capture>(capture)();
+    result.captured = result.shaderMemory->Regions();
+    std::forward<CaptureComplete>(captureComplete)(result.captured);
+    result.compiledResult = invocation.Materialize(*result.capture);
+    return result;
+}
+
 std::uint64_t Driver::AheadAdoptionsProven() {
     return aheadAdoptionsProven.load(std::memory_order_relaxed);
 }
@@ -599,22 +614,29 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
 
             const auto waitedBefore = traceCapSync() ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
             forgetAtCapture = GuestMemory::ForgetSerial();
-            capture = [&] {
-                const SampledReadScope sampling(evidenceReads);
-                return CaptureInvocation(*shaderMemory, snapshot, codeOffset, request, invocation);
-            }();
-            captured = shaderMemory->Regions();
-            request.context.memory = captured;
-            if (traceCapSync()) traceCapture("dispatch-capture", address, submission.queue, captured, Graphics::Recorder::ThreadWaitedMs() - waitedBefore);
-            if (profile) captureMs.fetch_add(phaseTiming.Elapsed(), std::memory_order_relaxed);
-            phaseTiming.Phase(PhaseCapture);
-            if (dumpShaders) static_cast<void>(dumpRequest(address, request));
-            const auto started = std::chrono::steady_clock::now();
-
-
-            timing.Mark("capture_resources");
-            StreamReuseNoteTranslation();
-            compiledResult = invocation.Materialize(*capture);
+            auto started = std::chrono::steady_clock::now();
+            auto prepared = PrepareDispatchCapture(
+                shaderMemory, forgetAtCapture,
+                [&] {
+                    const SampledReadScope sampling(evidenceReads);
+                    return CaptureInvocation(*shaderMemory, snapshot, codeOffset, request, invocation);
+                },
+                [&](const auto& regions) {
+                    request.context.memory = regions;
+                    if (traceCapSync()) traceCapture("dispatch-capture", address, submission.queue, regions, Graphics::Recorder::ThreadWaitedMs() - waitedBefore);
+                    if (profile) captureMs.fetch_add(phaseTiming.Elapsed(), std::memory_order_relaxed);
+                    phaseTiming.Phase(PhaseCapture);
+                    if (dumpShaders) static_cast<void>(dumpRequest(address, request));
+                    timing.Mark("capture_resources");
+                    StreamReuseNoteTranslation();
+                    started = std::chrono::steady_clock::now();
+                },
+                invocation);
+            capture = std::move(prepared.capture);
+            captured = std::move(prepared.captured);
+            shaderMemory = std::move(prepared.shaderMemory);
+            compiledResult = std::move(prepared.compiledResult);
+            forgetAtCapture = prepared.forgetSerial;
             timing.Mark("materialize");
             if (profile && compiledResult->cacheHit) cacheHits.fetch_add(1, std::memory_order_relaxed);
             const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();

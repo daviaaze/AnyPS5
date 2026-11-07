@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/ResidentShadow.hpp"
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_GUESTBUFFERMEMORY_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_GUESTBUFFERMEMORY_HPP
 
@@ -538,6 +539,8 @@ private:
         VkDeviceAddress copySourceAddress = 0;
         bool copiedBack = false;
         std::shared_ptr<Buffer> shadowCopy;
+        ResidentShadowIdentity residentIdentity {};
+        ResidentShadowVersion residentVersion {};
         // An element the shader updates atomically lies inside (AddWritable's `atomic`).
         bool atomic = false;
         bool swept = false;
