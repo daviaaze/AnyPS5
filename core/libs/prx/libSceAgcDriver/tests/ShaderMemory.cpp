@@ -9638,7 +9638,8 @@ void verifyPreparedGuestBufferFootprintsArePerCapture() {
         indexWord[0] = 4u;
         AgcDriver::ShaderMemory laneMemory(regions);
         const auto laneCapture = laneMemory.Capture(request);
-        request.context.memory = laneMemory.Regions();
+        const auto laneRegions = laneMemory.Regions();
+        request.context.memory = laneRegions;
         const auto laneResult = Recompile(request, *laneCapture);
         const auto laneHull = footprint(*laneResult);
         const auto begin = static_cast<std::uint64_t>(4u) * stride;
@@ -9646,23 +9647,29 @@ void verifyPreparedGuestBufferFootprintsArePerCapture() {
         require(laneHull == BufferTransferFootprint{true, begin, finalBase + 4u, begin, finalBase + 20u},
                 "prepared buffer footprint: ADD_TID did not cover the exact wave lane hull");
         indexWord[0] = records - waveSize;
+        request.context.memory = regions;
         AgcDriver::ShaderMemory edgeMemory(regions);
         const auto edgeCapture = edgeMemory.Capture(request);
-        request.context.memory = edgeMemory.Regions();
+        const auto edgeRegions = edgeMemory.Regions();
+        request.context.memory = edgeRegions;
         const auto edgeResult = Recompile(request, *edgeCapture);
         require(footprint(*edgeResult).writeEnd == static_cast<std::uint64_t>(records) * stride,
                 "prepared buffer footprint: last fully in-bounds ADD_TID wave did not end at descriptor extent");
         indexWord[0] = records - waveSize + 1u;
+        request.context.memory = regions;
         AgcDriver::ShaderMemory outsideMemory(regions);
         const auto outsideCapture = outsideMemory.Capture(request);
-        request.context.memory = outsideMemory.Regions();
+        const auto outsideRegions = outsideMemory.Regions();
+        request.context.memory = outsideRegions;
         const auto outsideResult = Recompile(request, *outsideCapture);
         require(!footprint(*outsideResult).bounded,
                 "prepared buffer footprint: ADD_TID narrowed an out-of-bounds wave");
         indexWord[0] = UINT32_MAX;
+        request.context.memory = regions;
         AgcDriver::ShaderMemory overflowMemory(regions);
         const auto overflowCapture = overflowMemory.Capture(request);
-        request.context.memory = overflowMemory.Regions();
+        const auto overflowRegions = overflowMemory.Regions();
+        request.context.memory = overflowRegions;
         const auto overflowResult = Recompile(request, *overflowCapture);
         require(!footprint(*overflowResult).bounded,
                 "prepared buffer footprint: ADD_TID narrowed an overflowing descriptor index");
@@ -9679,7 +9686,8 @@ void verifyPreparedGuestBufferFootprintsArePerCapture() {
     request.context.memory = regions;
     AgcDriver::ShaderMemory swizzledMemory(regions);
     const auto swizzledCapture = swizzledMemory.Capture(request);
-    request.context.memory = swizzledMemory.Regions();
+    const auto swizzledRegions = swizzledMemory.Regions();
+    request.context.memory = swizzledRegions;
     const auto swizzledResult = Recompile(request, *swizzledCapture);
     require(!footprint(*swizzledResult).bounded,
             "prepared buffer footprint: ADD_TID narrowed a swizzled descriptor");
