@@ -5455,9 +5455,11 @@ void drawSnapshotCapTests(const Device& device, Recorder& recorder) {
     const auto movedProgram = [](const ShaderRecompiler::RecompileResult& built, std::uint64_t shift) {
         auto moved = built;
         for (auto& binding : moved.bindings) {
-            const auto base = (static_cast<std::uint64_t>(binding.guestDescriptor[1] & 0xffffu) << 32u | binding.guestDescriptor[0]) + shift;
-            binding.guestDescriptor[0] = static_cast<std::uint32_t>(base);
-            binding.guestDescriptor[1] = (binding.guestDescriptor[1] & ~0xffffu) | (static_cast<std::uint32_t>(base >> 32u) & 0xffffu);
+            auto words = binding.guestDescriptor.Copy();
+            const auto base = (static_cast<std::uint64_t>(words[1] & 0xffffu) << 32u | words[0]) + shift;
+            words[0] = static_cast<std::uint32_t>(base);
+            words[1] = (words[1] & ~0xffffu) | (static_cast<std::uint32_t>(base >> 32u) & 0xffffu);
+            binding.guestDescriptor = ShaderRecompiler::SharedValues<std::uint32_t>(std::move(words));
         }
         return moved;
     };

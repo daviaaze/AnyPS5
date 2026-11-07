@@ -13666,7 +13666,7 @@ void faultOnlyTemplateRecordTests() {
     program.bdaAbiVersion = ShaderRecompiler::BdaAbi::Version;
     ShaderRecompiler::DescriptorBinding fault{ShaderRecompiler::DescriptorKind::StorageBuffer, ShaderRecompiler::DescriptorRole::FaultBuffer, 0, 5, 1, {}, false};
     ShaderRecompiler::DescriptorBinding data{ShaderRecompiler::DescriptorKind::StorageBuffer, ShaderRecompiler::DescriptorRole::FlattenedSrt, 0, 6, 1, {}, false};
-    data.guestDescriptor = {0x11u, 0x22u, 0x33u, 0x44u};
+    data.guestDescriptor = ShaderRecompiler::SharedValues<std::uint32_t>({0x11u, 0x22u, 0x33u, 0x44u});
     program.bindings = {fault, data};
     const std::array<AgcDriver::Graphics::CompiledShader, 1> stages{{{ShaderRecompiler::ShaderStage::TessellationControl, &program, 0}}};
     {
