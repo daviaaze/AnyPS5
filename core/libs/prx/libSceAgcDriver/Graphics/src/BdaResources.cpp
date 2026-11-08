@@ -522,7 +522,7 @@ void BdaResources::checkFault(const BdaResources& record) const {
         message << "shader stage " << report.stage << ": a relative write stored " << report.bytes << " in lane " << (report.address >> 32u) << " of vector window slot " << (report.address & 0xffffffffu) << ", which holds a scalar spilled with v_writelane_b32 that a later v_readlane_b32 was replaced with";
         throw std::runtime_error(message.str());
     }
-    message << "BDA access failed (origin=gpu-bda): address=0x" << std::hex << report.address << " instruction=0x" << report.instruction << std::dec << " bytes=" << report.bytes << " stage=" << report.stage << " reason=" << static_cast<std::uint32_t>(report.reason);
+    message << "BDA access failed: address=0x" << std::hex << report.address << " instruction=0x" << report.instruction << std::dec << " bytes=" << report.bytes << " stage=" << report.stage << " reason=" << static_cast<std::uint32_t>(report.reason);
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::Permission && table != nullptr) {
         const auto bytes = table->Bytes();
         ShaderRecompiler::BdaAbi::Header header{};
@@ -579,7 +579,7 @@ void BdaResources::checkSrtGuard(const BdaResources& faults) const {
     const auto& words = guards->flattenedSrt;
     const auto address = static_cast<std::uint64_t>(words[record + 1u]) | (static_cast<std::uint64_t>(words[record + 2u]) << 32u);
     std::ostringstream message;
-    message << "BDA access failed (origin=guarded-srt): address=0x" << std::hex << address << " instruction=0x" << words[record] << std::dec << " bytes=4 stage=" << stage << " reason=" << static_cast<std::uint32_t>(Abi::FaultReason::Unmapped) << " poison-record=" << record;
+    message << "BDA access failed: address=0x" << std::hex << address << " instruction=0x" << words[record] << std::dec << " bytes=4 stage=" << stage << " reason=" << static_cast<std::uint32_t>(Abi::FaultReason::Unmapped) << " poison-record=" << record;
     throw std::runtime_error(message.str());
 }
 
