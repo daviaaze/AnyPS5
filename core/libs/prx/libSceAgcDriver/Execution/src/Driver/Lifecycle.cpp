@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineJournal.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Prepare/PrepareFarm.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
@@ -175,6 +176,7 @@ void Driver::stop() {
     require(!onWorkerThread(), "worker cannot stop itself");
     std::lock_guard shutdownLock(shutdownMutex);
     if (stopped) return;
+    ::Driver::PrepareFarm::Get().Shutdown();
     LibcRequestShutdown_nid_postfix();
     {
         std::lock_guard lock(mutex);

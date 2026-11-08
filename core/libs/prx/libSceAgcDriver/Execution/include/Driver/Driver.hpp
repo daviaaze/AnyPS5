@@ -399,7 +399,7 @@ private:
     static void notePendingWait(std::span<const std::uint32_t> packet, std::uint32_t queue, std::uint64_t received);
     void landPendingWaits(std::uint32_t queue);
     struct ResolvedDispatch {
-        std::uint64_t address = 0, key = 0, indirectArguments = 0, forgetAtCapture = 0;
+        std::uint64_t address = 0, key = 0, registerFingerprint = 0, indirectArguments = 0, forgetAtCapture = 0;
         std::array<std::uint32_t, 5> packet{};
         std::shared_ptr<const ShaderSnapshot> registeredShader;
         std::shared_ptr<const ShaderRecompiler::RecompileResult> compiledResult;
@@ -413,7 +413,7 @@ private:
         std::vector<std::uint32_t> userDataRoots;
         std::vector<std::uint32_t> liveWords;
         std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture;
-        bool dataHit = false, cached = false, validated = false, missedDiffering = false, noDispatchCache = false;
+        bool dataHit = false, cached = false, validated = false, missedDiffering = false, noDispatchCache = false, preparedByFarm = false;
         std::chrono::steady_clock::time_point resolvedAt{};
     };
     struct GroupCaptureStats {

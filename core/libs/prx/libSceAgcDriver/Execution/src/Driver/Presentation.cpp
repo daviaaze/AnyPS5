@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Prepare/PrepareFarm.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include <algorithm>
@@ -104,6 +105,7 @@ void Driver::AttachWindow(const PresentationWindow& window) {
     timing.Mark("gpu_mutex_wait");
     if (device) {
         require(device->Window() == nullptr, "a window is already attached to the device");
+        ::Driver::PrepareFarm::Get().CancelAll();
         device->PrepareForReplacement();
         replacedDevices.push_back(device);
         timing.Mark("device_replacement");

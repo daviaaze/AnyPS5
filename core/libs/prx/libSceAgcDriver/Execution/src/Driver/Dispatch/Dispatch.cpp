@@ -15,12 +15,15 @@
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BatchTimeline.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include "Optimization/ShaderStageInputInfo.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Prepare/PrepareFarm.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <optional>
 #include <stdexcept>
+#include <limits>
 #include <utility>
 
 namespace AgcDriver::DriverDetail {
@@ -100,6 +103,138 @@ bool CapturedCurrent(std::span<const ShaderRecompiler::MemoryRegion> captured, c
     return true;
 }
 
+struct DispatchFarmValue final : ::Driver::PrepareFarm::Result::Value {
+    DispatchFarmValue(DispatchPreparationResult preparation,
+            std::shared_ptr<const ShaderSnapshot> shaderSnapshot,
+            std::shared_ptr<VulkanDevice> deviceOwner,
+            std::span<const std::uint32_t> words,
+            std::span<const std::uint32_t> roots)
+        : prepared(std::move(preparation)), shader(std::move(shaderSnapshot)),
+          device(std::move(deviceOwner)), packet(words.begin(), words.end()),
+          userDataRoots(roots.begin(), roots.end()) {}
+    DispatchPreparationResult prepared;
+    std::shared_ptr<const ShaderSnapshot> shader;
+    std::shared_ptr<VulkanDevice> device;
+    std::vector<std::uint32_t> packet;
+    std::vector<std::uint32_t> userDataRoots;
+};
+std::uint64_t DispatchRegisterFingerprint(const QueueState &queue) {
+    std::uint64_t hash = 0xcbf29ce484222325ull;
+    const auto mix = [&](std::uint64_t value) {
+        hash ^= value;
+        hash *= 0x100000001b3ull;
+    };
+    const auto registers = [&](const auto &values, std::uint64_t group) {
+        mix(group);
+        for (const auto &[offset, value] : values) {
+            mix(offset);
+            mix(value);
+        }
+    };
+    registers(queue.shader, 1);
+    registers(queue.context, 2);
+    registers(queue.userConfig, 3);
+    return hash;
+}
+struct PriorDispatchWrites {
+    std::uint64_t serial = 0;
+    bool unknown = false;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+};
+
+PriorDispatchWrites& EarlierDispatchWrites() {
+    static thread_local PriorDispatchWrites writes;
+    return writes;
+}
+
+void ResetEarlierDispatchWrites(std::uint64_t serial) {
+    auto& writes = EarlierDispatchWrites();
+    if (writes.serial != serial) {
+        writes = {};
+        writes.serial = serial;
+    }
+}
+
+bool ReadsOverlapEarlierDispatchWrites(const ShaderRecompiler::RecompileResult& compiled,
+                                       std::uint64_t serial) {
+    ResetEarlierDispatchWrites(serial);
+    const auto& earlier = EarlierDispatchWrites();
+    if (!earlier.unknown && earlier.ranges.empty()) return false;
+    bool bounded = compiled.bdaAbiVersion == 0;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
+    for (const auto& binding : compiled.bindings) {
+        if (binding.role == ShaderRecompiler::DescriptorRole::Gds ||
+            binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable) {
+            bounded = false;
+            continue;
+        }
+        if (binding.role == ShaderRecompiler::DescriptorRole::GuestImages) {
+            if (binding.count != 0) bounded = false;
+            continue;
+        }
+        if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
+        for (std::uint32_t element = 0; element < binding.count; ++element) {
+            // Atomic read-modify-write operations consume prior buffer contents even if
+            // bufferRead metadata only marks ordinary loads.
+            const bool elementReads = element >= binding.bufferRead.size() ||
+                binding.bufferRead[element] ||
+                (element < binding.bufferAtomic.size() && binding.bufferAtomic[element]);
+            if (!elementReads) continue;
+            const auto wordOffset = static_cast<std::size_t>(element) * 4u;
+            if (binding.guestDescriptor.size() < wordOffset + 4u) {
+                bounded = false;
+                continue;
+            }
+            const auto words = binding.guestDescriptor.Span().subspan(wordOffset, 4u);
+            const ShaderRecompiler::ShaderBufferResource descriptor{
+                {words[0], words[1], words[2], words[3]}};
+            const auto base = descriptor.Base48();
+            const auto size = descriptor.GetSize();
+            if (base == 0 || size == 0 ||
+                size > std::numeric_limits<std::uint64_t>::max() - base) continue;
+            if (element < binding.bufferFootprints.size()) {
+                const auto& footprint = binding.bufferFootprints[element];
+                if (footprint.bounded && footprint.readBegin <= footprint.readEnd &&
+                    footprint.readEnd <= size) {
+                    if (footprint.readBegin != footprint.readEnd)
+                        reads.emplace_back(base + footprint.readBegin, base + footprint.readEnd);
+                    continue;
+                }
+            }
+            reads.emplace_back(base, base + size);
+        }
+    }
+    if (!bounded) return true;
+    if (earlier.unknown) return true;
+    return std::any_of(reads.begin(), reads.end(), [&](const auto& read) {
+        return std::any_of(earlier.ranges.begin(), earlier.ranges.end(), [&](const auto& write) {
+            return read.first < write.second && write.first < read.second;
+        });
+    });
+}
+
+void RememberDispatchWrites(const ShaderRecompiler::RecompileResult& compiled,
+                            std::uint64_t serial) {
+    ResetEarlierDispatchWrites(serial);
+    auto& earlier = EarlierDispatchWrites();
+    bool bounded = false;
+    auto ranges = DispatchWriteRanges(compiled, bounded);
+    earlier.unknown |= !bounded;
+    earlier.ranges.insert(earlier.ranges.end(), ranges.begin(), ranges.end());
+}
+
+struct DispatchFarmCallable final : ::Driver::PrepareFarm::Callable {
+    explicit DispatchFarmCallable(DispatchPrepareInput input) : input(std::move(input)) {}
+    ::Driver::PrepareFarm::Result Run() override {
+        auto prepared = PrepareDispatchOwned(input);
+        require(prepared.has_value(), "background dispatch capture returned no result (TryCapture found pending or unstable input)");
+        ::Driver::PrepareFarm::Result result;
+        result.value = std::make_unique<DispatchFarmValue>(
+            std::move(*prepared), input.shader, input.device, input.packet, input.userData);
+        return result;
+    }
+    DispatchPrepareInput input;
+};
 }
 
 DispatchPrepareInput::DispatchPrepareInput(std::span<const std::uint32_t> words,
@@ -231,6 +366,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     }
     auto compute = Graphics::DecodeComputeStageInfo(queue.shader, snapshot.header);
     const bool resolving = resolvingAhead();
+    ResetEarlierDispatchWrites(submission.serial);
     // Only the GPU-only observer tracks recursive retry calls, not PM4 packet counts.
     static thread_local unsigned observerDepth = 0;
     struct ObserverScope {
@@ -414,6 +550,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         }
     }
     timing.Mark("key_hash");
+    std::optional<DispatchPreparationResult> farmPrepared;
     std::shared_ptr<const ShaderRecompiler::RecompileResult> compiledResult;
 
     std::shared_ptr<DispatchVariant> keepVariant;
@@ -584,17 +721,64 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     }
     if (fromAhead && key != ahead.key) {
         ++groupStats.keyMismatches;
+        if (ahead.preparedByFarm) {
+            auto &farm = ::Driver::PrepareFarm::Get();
+            static_cast<void>(farm.Take(submission.queue, submission.serial, currentPacketOffset()));
+            farm.NoteAdoption("stale-key");
+            farm.ReportStats();
+        }
         dispatch(queue, submittedPacket, submission, submittedIndirectArguments);
         return;
     }
     if (fromAhead) {
+        if (ahead.preparedByFarm) {
+            auto &farm = ::Driver::PrepareFarm::Get();
+            farm.BeforeTakeForTest(submission.queue, submission.serial, currentPacketOffset());
+            auto taken = farm.Take(submission.queue, submission.serial, currentPacketOffset());
+            if (taken.status != ::Driver::PrepareFarm::TakeStatus::Ready) {
+                farm.NoteAdoption(taken.status == ::Driver::PrepareFarm::TakeStatus::Failed ? "failed" :
+                    taken.status == ::Driver::PrepareFarm::TakeStatus::NotReady ? "not-ready" : "absent");
+                farm.ReportStats();
+                dispatch(queue, submittedPacket, submission, submittedIndirectArguments);
+                return;
+            }
+            const auto *value = dynamic_cast<const DispatchFarmValue *>(taken.result.value.get());
+            if (value == nullptr || value->prepared.key != ahead.key ||
+                value->prepared.registerFingerprint != DispatchRegisterFingerprint(queue) ||
+                value->device != localDevice ||
+                value->device != device.Load() ||
+                value->shader != registeredShader ||
+                value->userDataRoots != userData ||
+                value->packet.size() != packet.size() ||
+                !std::equal(value->packet.begin(), value->packet.end(), packet.begin())) {
+                farm.NoteAdoption("stale-key");
+                farm.ReportStats();
+                dispatch(queue, submittedPacket, submission, submittedIndirectArguments);
+                return;
+            }
+            if (value->prepared.compiledResult == nullptr ||
+                ReadsOverlapEarlierDispatchWrites(*value->prepared.compiledResult, submission.serial)) {
+                farm.NoteAdoption("stale-capture");
+                farm.ReportStats();
+                dispatch(queue, submittedPacket, submission, submittedIndirectArguments);
+                return;
+            }
+        }
         if (const auto hook = aheadAdoptHook.load(std::memory_order_acquire)) hook();
         const auto* aheadViews = ahead.capture != nullptr ? &ahead.capture->snapshot.registeredImages : ahead.keepVariant != nullptr && ahead.keepVariant->registeredViews != nullptr ? ahead.keepVariant->registeredViews.get() : nullptr;
         if (!CapturedCurrent(ahead.captured, snapshot, ahead.shaderMemory.get(), ahead.readProof) || (aheadViews != nullptr && !CaptureRegisteredViewsCurrent(*aheadViews))) {
             ++dispatchesRejectedAhead;
             ++groupStats.memoryMismatches;
+            if (ahead.preparedByFarm) {
+                ::Driver::PrepareFarm::Get().NoteAdoption("stale-capture");
+                ::Driver::PrepareFarm::Get().ReportStats();
+            }
             dispatch(queue, submittedPacket, submission, submittedIndirectArguments);
             return;
+        }
+        if (ahead.preparedByFarm) {
+            ::Driver::PrepareFarm::Get().NoteAdoption("adopted");
+            ::Driver::PrepareFarm::Get().ReportStats();
         }
     }
     phaseTiming.Phase(PhaseKey);
@@ -653,6 +837,14 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         dataHit = ahead.dataHit;
         cached = ahead.cached;
         validated = ahead.validated;
+        missedEntry = std::move(ahead.missedEntry);
+        missedDiffering = ahead.missedDiffering;
+        if (ahead.preparedByFarm && !cached) {
+            insertDispatch(address, key, userData, ahead.noDispatchCache, profile,
+                registeredShader, ahead.forgetAtCapture, memory, shaderMemory,
+                captured, capture, compiledResult, missedEntry, missedDiffering,
+                attachVariant, phaseTiming);
+        }
         ++groupStats.adopted;
         ++dispatchesAdoptedAhead;
         const auto age = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ahead.resolvedAt).count();
@@ -690,6 +882,96 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         if (profile) captureMs.fetch_add(phaseTiming.Elapsed(), std::memory_order_relaxed);
         timing.Mark("cached_shader_check");
     } else if (!fromAhead) {
+        if (resolving && ::Driver::PrepareFarm::Get().Enabled()) {
+            auto &farm = ::Driver::PrepareFarm::Get();
+            const auto identity = farm.Peek(submission.queue, submission.serial, currentPacketOffset());
+            if (identity.status == ::Driver::PrepareFarm::PeekStatus::Ready && identity.result != nullptr) {
+                const auto *value = dynamic_cast<const DispatchFarmValue *>(identity.result->value.get());
+                if (value != nullptr && value->prepared.key == key &&
+                    value->prepared.registerFingerprint == DispatchRegisterFingerprint(queue) &&
+                    value->device == localDevice && value->device == device.Load() &&
+                    value->shader == registeredShader &&
+                    value->userDataRoots == userData && value->packet.size() == packet.size() &&
+                    std::equal(value->packet.begin(), value->packet.end(), packet.begin())) {
+                    if (value->prepared.compiledResult == nullptr ||
+                        ReadsOverlapEarlierDispatchWrites(*value->prepared.compiledResult, submission.serial)) {
+                        farm.ReportStats();
+                        return;
+                    }
+                    farmPrepared = value->prepared;
+                } else {
+                    farm.ReportStats();
+                    return;
+                }
+            } else if (identity.status == ::Driver::PrepareFarm::PeekStatus::Absent) {
+                DispatchPrepareInput input(packet, registeredShader, submission.shaders,
+                    localDevice, codeOffset, request, key, DispatchRegisterFingerprint(queue), submission.queue,
+                    submission.serial, currentPacketOffset());
+                ::Driver::PrepareFarm::Job job;
+                job.queue = submission.queue;
+                job.submissionSerial = submission.serial;
+                job.packetOffset = currentPacketOffset();
+                job.byteReservation = EstimateBytes(input);
+                job.callable = std::make_unique<DispatchFarmCallable>(std::move(input));
+                if (farm.Submit(std::move(job)) == ::Driver::PrepareFarm::SubmitStatus::Accepted) {
+                    farm.ReportStats();
+                    return;
+                }
+            } else {
+                farm.ReportStats();
+                return;
+            }
+        } else if (!resolving && ::Driver::PrepareFarm::Get().Enabled()) {
+            auto &farm = ::Driver::PrepareFarm::Get();
+            farm.BeforeTakeForTest(submission.queue, submission.serial, currentPacketOffset());
+            auto taken = farm.Take(submission.queue, submission.serial, currentPacketOffset());
+            if (taken.status == ::Driver::PrepareFarm::TakeStatus::Ready) {
+                const auto *value = dynamic_cast<const DispatchFarmValue *>(taken.result.value.get());
+                const bool sameIdentity = value != nullptr &&
+                    value->prepared.key == key && value->prepared.registerFingerprint == DispatchRegisterFingerprint(queue) &&
+                    value->device == localDevice &&
+                    value->device == device.Load() &&
+                    value->shader == registeredShader && value->userDataRoots == userData &&
+                    value->packet.size() == packet.size() &&
+                    std::equal(value->packet.begin(), value->packet.end(), packet.begin());
+                if (!sameIdentity) {
+                    farm.NoteAdoption("stale-key");
+                } else if (value->prepared.compiledResult == nullptr ||
+                    ReadsOverlapEarlierDispatchWrites(*value->prepared.compiledResult, submission.serial)) {
+                    farm.NoteAdoption("stale-capture");
+                } else {
+                    if (const auto hook = aheadAdoptHook.load(std::memory_order_acquire)) hook();
+                    const auto *views = value->prepared.capture != nullptr
+                        ? &value->prepared.capture->snapshot.registeredImages : nullptr;
+                    if (CapturedCurrent(value->prepared.captured, snapshot,
+                            value->prepared.shaderMemory.get(), {}) &&
+                        (views == nullptr || CaptureRegisteredViewsCurrent(*views))) {
+                        farmPrepared = value->prepared;
+                        farm.NoteAdoption("adopted");
+                    } else {
+                        farm.NoteAdoption("stale-capture");
+                    }
+                }
+                farm.ReportStats();
+            } else if (taken.status == ::Driver::PrepareFarm::TakeStatus::NotReady) {
+                farm.NoteAdoption("not-ready");
+                farm.ReportStats();
+            } else if (taken.status == ::Driver::PrepareFarm::TakeStatus::Failed) {
+                farm.NoteAdoption("failed");
+                farm.ReportStats();
+            } else if (taken.status == ::Driver::PrepareFarm::TakeStatus::Absent) {
+                farm.NoteAdoption("absent");
+                farm.ReportStats();
+            }
+        }
+        if (farmPrepared.has_value()) {
+            auto prepared = std::move(*farmPrepared);
+            capture = std::move(prepared.capture);
+            captured = std::move(prepared.captured);
+            shaderMemory = std::move(prepared.shaderMemory);
+            compiledResult = std::move(prepared.compiledResult);
+            forgetAtCapture = prepared.forgetSerial;
+        } else {
         shaderMemory = std::make_shared<ShaderMemory>(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter(), &QueryPendingSpan);
 
         static const bool dumpShaders = std::getenv("APS5_DUMP_SHADERS") != nullptr;
@@ -749,6 +1031,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         phaseTiming.Phase(PhaseRecompile);
         if (!resolving) insertDispatch(address, key, userData, noDispatchCache || !CacheableResult(*compiledResult), profile, registeredShader, forgetAtCapture, memory, shaderMemory, captured, capture, compiledResult, missedEntry, missedDiffering, attachVariant, phaseTiming);
         timing.Mark("insert_dispatch");
+        }
     }
     const auto* registeredViews = capture != nullptr ? &capture->snapshot.registeredImages : keepVariant != nullptr && keepVariant->registeredViews != nullptr ? keepVariant->registeredViews.get() : nullptr;
     if (resolving) {
@@ -756,6 +1039,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         parked = ResolvedDispatch{};
         parked.address = address;
         parked.key = key;
+        parked.registerFingerprint = DispatchRegisterFingerprint(queue);
         parked.userDataRoots.assign(userData.begin(), userData.end());
         parked.indirectArguments = indirectArguments;
         parked.forgetAtCapture = forgetAtCapture;
@@ -776,6 +1060,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         parked.validated = validated;
         parked.missedDiffering = missedDiffering;
         parked.noDispatchCache = noDispatchCache || (compiledResult != nullptr && !CacheableResult(*compiledResult));
+        parked.preparedByFarm = farmPrepared.has_value();
         parked.resolvedAt = std::chrono::steady_clock::now();
         ++groupStats.resolved;
         if (cached) ++groupStats.resolvedHits;
@@ -903,6 +1188,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                 throw std::runtime_error(where + std::string(error.what()));
             }
         }, std::move(itemWrites));
+        RememberDispatchWrites(compiled, submission.serial);
         pendingDispatchPhases().outcome = DispatchOutcome::Enqueued;
         timing.Mark("pipelined_enqueue");
         ReportDispatchItems(profile);
@@ -1038,6 +1324,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     }
     phaseTiming.Phase(PhaseDevice);
     if (noteWrites && !writerKeyedEvidence()) noteWrittenBuffers(address, submission.queue, compiled);
+    RememberDispatchWrites(compiled, submission.serial);
     timing.Mark("note_written_buffers");
     if (profile) deviceMs.fetch_add(phaseTiming.Elapsed(), std::memory_order_relaxed);
     phaseTiming.Phase(PhaseTail);

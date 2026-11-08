@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Prepare/PrepareFarm.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include "Optimization/ResourceProgram.hpp"
@@ -35,7 +36,7 @@ bool& Driver::resolvingAhead() {
 }
 
 bool& Driver::gateOpened() {
-    static thread_local bool opened = false;
+    static thread_local bool opened = ::Driver::PrepareFarm::Get().Enabled();
     return opened;
 }
 
@@ -57,11 +58,16 @@ std::size_t& PreviewedUntil() {
     static thread_local std::size_t until = 0;
     return until;
 }
+std::uint32_t& ResolvedAheadQueue() {
+    static thread_local std::uint32_t queue = 0;
+    return queue;
+}
 
 }
 
 void Driver::clearResolvedAhead() {
     PreviewedUntil() = 0;
+    ::Driver::PrepareFarm::Get().Cancel(ResolvedAheadQueue());
     auto& resolved = resolvedAhead();
     if (resolved.empty()) return;
     groupCaptureStats().stale += resolved.size();
@@ -122,12 +128,15 @@ bool OverlapsLabel(std::span<const ShaderRecompiler::MemoryRegion> regions, cons
 
 void Driver::resolveGroupAhead(const Submission& submission, const QueueState& live, std::size_t from) {
     static const bool allQueues = std::getenv("APS5_GROUP_CAPTURE_ALL_QUEUES") != nullptr;
-    if (!allQueues && submission.queue == 0) return;
+    const bool prepareEnabled = ::Driver::PrepareFarm::Get().Enabled();
+    if (prepareEnabled) gateOpened() = true;
+    if (!allQueues && submission.queue == 0 && !prepareEnabled) return;
     auto& resolved = resolvedAhead();
     const auto localDevice = device.Load();
     if (resolved.contains(from) || localDevice == nullptr) return;
-    if (submission.queue == 0 && DrawPipeline::Depth() != 0 && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, (submission.commands[from] >> 8u) & 0xffu);
+    if (!prepareEnabled && submission.queue == 0 && DrawPipeline::Depth() != 0 && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, (submission.commands[from] >> 8u) & 0xffu);
     auto& stats = groupCaptureStats();
+    ResolvedAheadQueue() = submission.queue;
     const auto begin = std::chrono::steady_clock::now();
     ++stats.runs;
     QueueState scratch = live;
@@ -282,6 +291,7 @@ void Driver::resolveGroupAhead(const Submission& submission, const QueueState& l
             try {
                 if (opcode == 0x15) dispatch(scratch, packet, submission);
                 else dispatchIndirect(scratch, packet, submission);
+                if (!resolved.contains(cursor)) break;
                 Pm4::NoteDispatchRegisters(packet, scratch);
             } catch (const std::exception&) {
                 ++stats.failures;
@@ -302,7 +312,7 @@ void Driver::resolveGroupAhead(const Submission& submission, const QueueState& l
                     ++stats.unknownWrites;
                     break;
                 }
-                if (!found->second.cached && found->second.registeredShader != nullptr) {
+                if (!found->second.preparedByFarm && !found->second.cached && found->second.registeredShader != nullptr) {
                     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
                     const auto& snapshot = *found->second.registeredShader;
                     std::vector<ShaderRecompiler::MemoryRegion> memory{{snapshot.codeAddress, std::as_bytes(std::span(snapshot.code))}};
@@ -321,7 +331,6 @@ void Driver::resolveGroupAhead(const Submission& submission, const QueueState& l
                 }
                 writes.insert(writes.end(), itemWrites.begin(), itemWrites.end());
             } else {
-                ++stats.unknownWrites;
                 break;
             }
         } else if (opcode == 0x37 || opcode == 0x49) {
