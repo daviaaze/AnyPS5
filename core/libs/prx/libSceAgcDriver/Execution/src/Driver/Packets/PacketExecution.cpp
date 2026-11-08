@@ -17,6 +17,7 @@
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include <array>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -27,6 +28,18 @@
 #include <utility>
 
 namespace AgcDriver::DriverDetail {
+namespace {
+// "execute.0xNN": per-opcode names for the packets that are neither draws, dispatches nor waits, so
+// the folded trace totals say which PM4 packet classes cost the queue worker time.
+const char* ExecuteScopeName(std::uint32_t opcode) {
+    static const auto names = [] {
+        std::array<std::array<char, 16>, 256> table{};
+        for (std::size_t i = 0; i < table.size(); ++i) std::snprintf(table[i].data(), table[i].size(), "execute.0x%02zx", i);
+        return table;
+    }();
+    return names[opcode & 0xffu].data();
+}
+}
 
 namespace {
 
@@ -640,7 +653,7 @@ void Driver::execute(const Submission& submission) {
             if (endOfPipeInterrupt && !interruptDeferred) deliverGuestEopInterrupt(submission.queue, packet[7] & 0x0fffffffu);
         }
         if (drawPacket || (sampleDump && wroteOnGpu)) Graphics::Recorder::CountRecordedWork();
-        timing.Mark(header == RenderingWaitPacketHeader ? "rendering_wait" : opcode == 0x3c || opcode == 0x93 ? "memory_wait" : opcode == 0x15 || opcode == 0x16 ? "dispatch" : drawPacket ? "draw" : "execute");
+        timing.Mark(header == RenderingWaitPacketHeader ? "rendering_wait" : opcode == 0x3c || opcode == 0x93 ? "memory_wait" : opcode == 0x15 || opcode == 0x16 ? "dispatch" : drawPacket ? "draw" : ExecuteScopeName(opcode));
         if (submission.queue == 0) timing.FinishPacket(submission.serial, cursor, opcode, count);
         else timing.Finish();
         cursor = nextCursor;

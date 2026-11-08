@@ -233,6 +233,14 @@ public:
     // Shared serialization cap only; per-thread and GPU recording capacities stay independent.
     static constexpr std::size_t MaximumSnapshotEvents = 2097152;
     static constexpr Clock::duration MinimumSlice = std::chrono::microseconds(20);
+    // A packet-census run (APS5_STREAM_DUMP set) keeps scopes down to 1 us as their own slices instead
+    // of folding everything under 20 us, so per-opcode packet costs can be read from the trace.
+    static Clock::duration SliceThreshold() {
+        static const Clock::duration value = std::getenv("APS5_STREAM_DUMP") != nullptr
+            ? std::chrono::duration_cast<Clock::duration>(std::chrono::microseconds(1))
+            : Clock::duration(MinimumSlice);
+        return value;
+    }
 
     static std::size_t ParseCapacity(const char* events) {
         if (events == nullptr) return DefaultCapacity;
@@ -366,7 +374,7 @@ public:
             sampleBegin = begin;
             folded = {};
         }
-        if (length < MinimumSlice) folded += length;
+        if (length < SliceThreshold()) folded += length;
         else append({scope, stage, begin, length, TraceBatchTag, TraceProgramTag});
     }
 
