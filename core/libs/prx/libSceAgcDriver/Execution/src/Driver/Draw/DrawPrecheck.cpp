@@ -90,7 +90,9 @@ std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const S
     sub.emplace("Driver.Draw.precheck.depth_control");
     // NoteDepthRenderControl never modifies single-sample surfaces.
     if (const auto control = Graphics::DecodeDepthRenderControl(queue); control && ((control->control & 0x60u) != 0u || (control->samples != 1u && Graphics::DepthSurfaceAt(control->address)))) {
+        sub.emplace("Driver.Draw.precheck.depth_control_drain");
         if (DrawPipeline::Active()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, (packet[0] >> 8u) & 0xffu);
+        sub.emplace("Driver.Draw.precheck.depth_control_note");
         Graphics::NoteDepthRenderControl(*control);
     }
     sub.emplace("Driver.Draw.precheck.depth_resummarize");
