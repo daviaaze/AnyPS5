@@ -16,6 +16,9 @@ namespace {
 
 struct SubmissionStats {
     std::uint64_t hash = 14695981039346656037ull;
+    // Shape: packet header plus, for SET_*_REG packets, the register offset; payload values and
+    // pointers are ignored, so a frame that only changes data keeps its shape.
+    std::uint64_t shape = 14695981039346656037ull;
     std::uint32_t commands = 0;
     std::uint32_t translated = 0;
     double hostMs = 0.0;
@@ -25,8 +28,8 @@ struct SubmissionStats {
 
 struct Window {
     std::uint32_t frames = 0, submissions = 0, commands = 0, reused = 0;
-    std::uint32_t ordinal = 0, anywhere = 0, matchedCommands = 0, matchedReused = 0;
-    double time = 0.0, timeOrdinal = 0.0, timeAnywhere = 0.0;
+    std::uint32_t ordinal = 0, anywhere = 0, matchedCommands = 0, matchedReused = 0, shapeOrdinal = 0;
+    double time = 0.0, timeOrdinal = 0.0, timeAnywhere = 0.0, timeShape = 0.0;
 };
 
 struct State {
@@ -64,6 +67,10 @@ void CloseFrame(State& s) {
             w.commands += submission.commands;
             w.reused += submission.Reused();
             w.time += submission.hostMs;
+            if (submission.shape == s.previous[std::min(i, s.previous.size() - 1)].shape && i < s.previous.size()) {
+                ++w.shapeOrdinal;
+                w.timeShape += submission.hostMs;
+            }
             if (ordinal) {
                 ++w.ordinal;
                 w.timeOrdinal += submission.hostMs;
@@ -84,10 +91,10 @@ void Report(State& s) {
     const auto& w = s.window;
     char line[512];
     std::snprintf(line, sizeof(line),
-        "[stream-reuse] queue=0x%x presents=%u submissions=%u commands=%u ordinal_match=%.1f%% anywhere_match=%.1f%% time_ordinal=%.1f%% time_anywhere=%.1f%% reused_translation=%.1f%% reused_in_matched=%.1f%%\n",
+        "[stream-reuse] queue=0x%x presents=%u submissions=%u commands=%u ordinal_match=%.1f%% anywhere_match=%.1f%% time_ordinal=%.1f%% time_anywhere=%.1f%% reused_translation=%.1f%% reused_in_matched=%.1f%% shape_ordinal=%.1f%% time_shape=%.1f%%\n",
         s.queue, w.frames, w.submissions, w.commands, Percent(w.ordinal, w.submissions), Percent(w.anywhere, w.submissions),
         Percent(w.timeOrdinal, w.time), Percent(w.timeAnywhere, w.time), Percent(w.reused, w.commands),
-        Percent(w.matchedReused, w.matchedCommands));
+        Percent(w.matchedReused, w.matchedCommands), Percent(w.shapeOrdinal, w.submissions), Percent(w.timeShape, w.time));
     std::fputs(line, stderr);
     {
         std::lock_guard lock(reportMutex);
@@ -119,11 +126,55 @@ void StreamReuseBeginSubmission(std::uint32_t queue) {
     state.active = true;
 }
 
+// APS5_STREAM_DUMP=1 (or an absolute path): queue 0 appends one 16-byte record {header, packet
+// dwords, shape hash, value hash} per executed packet for the three presents that follow the first
+// present with at least 20000 queue-0 packets, for offline alignment of consecutive frames.
+struct PacketDump {
+    std::FILE* file = nullptr;
+    std::uint64_t start = ~0ull, lastSerial = ~0ull, count = 0;
+    PacketDump() {
+        const char* value = std::getenv("APS5_STREAM_DUMP");
+        if (value == nullptr || *value == '\0') return;
+        file = std::fopen(*value == '/' ? value : "/srv/secondary-apps/anyps5/evidence/aps5-stream-dump.bin", "wb");
+    }
+};
+
 void StreamReusePacket(std::span<const std::uint32_t> packet) {
     if (!StreamReuseEnabled() || !state.active) return;
+    if (packet.empty()) return;
+    std::uint64_t valueHash = 14695981039346656037ull;
     for (const auto word : packet) {
         state.current.hash ^= word;
         state.current.hash *= 1099511628211ull;
+        valueHash = (valueHash ^ word) * 1099511628211ull;
+    }
+    const std::uint32_t header = packet[0];
+    std::uint32_t shaped[2] = {header, 0};
+    std::size_t shapedWords = 1;
+    if ((header >> 30) == 3u) {
+        const std::uint32_t opcode = (header >> 8) & 0xffu;
+        if ((opcode == 0x68u || opcode == 0x69u || opcode == 0x76u || opcode == 0x79u) && packet.size() > 1) shaped[shapedWords++] = packet[1];
+    } else {
+        shaped[0] = 0;
+        shapedWords = 0;
+    }
+    std::uint64_t packetShape = 14695981039346656037ull;
+    for (std::size_t i = 0; i < shapedWords; ++i) packetShape = (packetShape ^ shaped[i]) * 1099511628211ull;
+    state.current.shape = (state.current.shape ^ packetShape) * 1099511628211ull;
+    static PacketDump dump;
+    if (dump.file != nullptr && state.queue == 0) {
+        const auto serial = presentSerial.load(std::memory_order_relaxed);
+        if (serial != dump.lastSerial) {
+            if (dump.start == ~0ull && dump.count >= 20000) dump.start = serial;
+            if (dump.start != ~0ull && serial == dump.start + 3) std::fflush(dump.file);
+            dump.lastSerial = serial;
+            dump.count = 0;
+        }
+        ++dump.count;
+        if (dump.start != ~0ull && serial >= dump.start && serial < dump.start + 3) {
+            const std::uint32_t record[4] = {header, static_cast<std::uint32_t>(packet.size()), static_cast<std::uint32_t>(packetShape), static_cast<std::uint32_t>(valueHash)};
+            std::fwrite(record, sizeof(record), 1, dump.file);
+        }
     }
 }
 
