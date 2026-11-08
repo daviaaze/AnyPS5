@@ -397,7 +397,7 @@ RecompileResult CompileChain(std::span<const std::uint32_t> steps, bool half, bo
     result.spirv = module.Finalize();
     const auto base = reinterpret_cast<std::uintptr_t>(ChainData.data());
     result.bindings.push_back({DescriptorKind::StorageBuffer, DescriptorRole::GuestBuffers, 0u, 0u, 1u,
-        {static_cast<std::uint32_t>(base), static_cast<std::uint32_t>((base >> 32u) & 0xffffu), static_cast<std::uint32_t>(sizeof(ChainData)), 0x31016facu}, false});
+        ShaderRecompiler::SharedValues<std::uint32_t>(std::vector<std::uint32_t>{static_cast<std::uint32_t>(base), static_cast<std::uint32_t>((base >> 32u) & 0xffffu), static_cast<std::uint32_t>(sizeof(ChainData)), 0x31016facu}), false});
     return result;
 }
 

@@ -91,7 +91,7 @@ static_assert(sizeof(ShaderInvocation) == 216, "ShaderInvocation changed: update
 // follow them. drawKeyMemo (AtomicSharedPtr storage), cacheHit and both lifetime owners
 // are process-local, as are artifact.variantId and invocation.specializationId.
 static_assert(sizeof(RecompileResult) == 536, "RecompileResult changed: audit runtime-only cache owners and the explicit result encoder");
-static_assert(sizeof(DescriptorBinding) == 664, "DescriptorBinding changed: update the binding encoder");
+static_assert(sizeof(DescriptorBinding) == 872, "DescriptorBinding changed: update the binding encoder");
 static_assert(sizeof(VertexAttribute) == 32, "VertexAttribute changed: update the attribute encoder");
 static_assert(sizeof(VertexInput) == 16, "VertexInput changed: update the vertex input encoder");
 static_assert(sizeof(FragmentParameter) == 16, "FragmentParameter changed: update the parameter encoder");
@@ -312,7 +312,7 @@ public:
         out.insert(out.end(), bytes.begin(), bytes.end());
     }
 
-    void Flags(const std::vector<bool>& flags) {
+    void Flags(const ElementFlags& flags) {
         Value<std::uint64_t>(flags.size());
         for (const bool flag : flags) Value(flag);
     }
@@ -418,10 +418,10 @@ public:
         return SharedSpirv(std::move(words));
     }
 
-    void Flags(std::vector<bool>& flags) {
+    void Flags(ElementFlags& flags) {
         const auto count = Count(1);
-        flags.assign(count, false);
-        for (std::size_t i = 0; i < count; ++i) flags[i] = Get<bool>();
+        flags.clear();
+        for (std::size_t i = 0; i < count; ++i) flags.push_back(Get<bool>());
     }
 
     void Text(std::string& text) {

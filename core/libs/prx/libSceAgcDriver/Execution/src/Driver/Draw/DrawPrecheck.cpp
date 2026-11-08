@@ -58,7 +58,7 @@ std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const S
             if (!writes.empty() && localDevice != nullptr) {
                 const auto queueId = submission.queue;
                 const auto opcode = (packet[0] >> 8u) & 0xffu;
-                DrawPipeline::Queue0().Enqueue([this, localDevice, queueId, opcode, pass = *pass] {
+                DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::ColorMetadata, [this, localDevice, queueId, opcode, pass = *pass] {
                     GuestMemory::SetCurrentPacket(opcode, queueId);
                     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
                     std::lock_guard gpuLock(GuestMemory::GpuMutex());
@@ -89,7 +89,7 @@ std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const S
     }
     sub.emplace("Driver.Draw.precheck.depth_control");
     // NoteDepthRenderControl never modifies single-sample surfaces.
-    if (const auto control = Graphics::DecodeDepthRenderControl(queue); control && ((control->control & 0x60u) != 0u || (control->samples != 1u && Graphics::DepthSurfaceAt(control->address)))) {
+    if (const auto control = Graphics::DecodeDepthRenderControl(queue); control && Graphics::DepthRenderControlDrains(*control)) {
         sub.emplace("Driver.Draw.precheck.depth_control_drain");
         // APS5_ABLATE_DEPTH_CONTROL_DRAIN=1 skips the wait (measurement only: the depth state may then race the finisher).
         static const bool ablateDrain = std::getenv("APS5_ABLATE_DEPTH_CONTROL_DRAIN") != nullptr;

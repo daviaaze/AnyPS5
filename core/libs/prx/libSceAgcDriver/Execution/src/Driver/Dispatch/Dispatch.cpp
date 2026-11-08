@@ -537,7 +537,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     if (registeredShader == nullptr) for (const auto word : userData) mix(word);
     static const bool keyHygiene = std::getenv("APS5_NO_DISPATCH_KEY_HYGIENE") == nullptr;
     if (keyHygiene) {
-        for (const auto offset : {0x207u, 0x208u, 0x209u, 0x212u, 0x213u}) {
+        for (const auto offset : {0x207u, 0x208u, 0x209u, 0x212u, 0x213u, 0x228u}) {
             const auto found = queue.shader.find(offset);
 
             mix(found == queue.shader.end() ? (1ull << 32u) : found->second);
@@ -1135,7 +1135,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         const auto queueId = submission.queue;
         itemCommits.fetch_add(1, std::memory_order_relaxed);
-        DrawPipeline::Queue0().Enqueue([this, localDevice = std::move(localDevice), result = compiledResult, capture, registeredViews, snapshots = std::move(snapshots), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, recipeOwner, dataHit, epoch, htileClearCompletion, htileMask, origin = AgcDriver::BatchTimeline::Origin{submission.serial, submission.queue}] {
+        DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::Dispatch, [this, localDevice = std::move(localDevice), result = compiledResult, capture, registeredViews, snapshots = std::move(snapshots), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, recipeOwner, dataHit, epoch, htileClearCompletion, htileMask, origin = AgcDriver::BatchTimeline::Origin{submission.serial, submission.queue}] {
             AgcDriver::BatchTimeline::Scope originScope(origin);
             DrawPipeline::FollowEpoch(epoch);
             AgcDriver::P0Metrics::Scope p0(queueId, AgcDriver::P0Metrics::Layer::Committer, AgcDriver::P0Metrics::Operation::Dispatch);

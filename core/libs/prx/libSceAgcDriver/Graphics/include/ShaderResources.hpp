@@ -474,6 +474,7 @@ private:
         bool sampled = false;
         bool storage = false;
         std::vector<std::size_t> elementTextures;
+        std::vector<std::uint32_t> representatives;
         std::vector<std::pair<std::uint32_t, std::uint32_t>> samplerRejections;
         [[nodiscard]] std::uint32_t MapValue(std::size_t index) const {
             const auto update = std::lower_bound(mapUpdates.begin(), mapUpdates.end(), index,

@@ -200,6 +200,8 @@ private:
         append(key, value.threadIdComponentCount);
         append(key, value.PartialGroups());
         append(key, value.scratchDwords);
+        append(key, value.granulatedVgprCount);
+        append(key, value.sharedVgprBlocks);
     }
 
     static void append(std::vector<std::uint64_t>& key, const ShaderPixelStageInfo& value) {
@@ -247,6 +249,11 @@ private:
             append(key, merge.target);
             append(key, merge.mask);
             append(key, merge.samples);
+            append(key, merge.packing);
+            append(key, merge.blendControl);
+            append(key, merge.layered);
+            append(key, merge.firstSlice);
+            append(key, merge.lastSlice);
             append(key, merge.depthStencilWrites);
             append(key, merge.depthStencilTests);
             if (!merge.blend.enabled) continue;
