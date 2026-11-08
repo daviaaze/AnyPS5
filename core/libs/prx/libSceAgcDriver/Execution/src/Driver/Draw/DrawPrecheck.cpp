@@ -7,6 +7,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include <optional>
 #include <cstdlib>
 
 namespace AgcDriver::DriverDetail {
@@ -45,7 +47,10 @@ bool Driver::drawPrecheck() {
 
 std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const Submission& submission, std::size_t packetOffset, std::span<const std::uint32_t> packet, const Pm4::DrawParameters& drawParameters, std::string& rejected, bool& traceIndirect) {
     if (!drawParameters.indirect && !drawParameters.indexed && (drawParameters.indexCount == 0 || drawParameters.instanceCount == 0)) return DrawVerdict::Nothing;
+    std::optional<PerformanceTimer> sub;
+    sub.emplace("Driver.Draw.precheck.metadata_decode");
     if (const auto pass = Graphics::DecodeColorMetadataPass(queue)) {
+        sub.reset();
         require(!drawParameters.indirect, "indirect CB metadata passes are unsupported");
         if (DrawPipeline::Active() && DrawPipeline::MetadataPassesPipelined() && deferredLabels().labels.empty()) {
             auto writes = Graphics::PipelinedColorMetadataPassWrites(*pass);
@@ -75,18 +80,24 @@ std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const S
         localDevice->ColorMetadataPass(*pass);
         return DrawVerdict::Drawn;
     }
+    sub.emplace("Driver.Draw.precheck.depth_copy_decode");
     if (const auto copy = Graphics::DecodeDepthCopyPass(queue)) {
+        sub.reset();
         require(!drawParameters.indirect, "indirect DB depth copies are unsupported");
         auto copyDraw = DepthCopyDraw(queue, *copy);
         return draw(copyDraw, packet, submission, packetOffset, rejected);
     }
+    sub.emplace("Driver.Draw.precheck.depth_control");
     // NoteDepthRenderControl never modifies single-sample surfaces.
     if (const auto control = Graphics::DecodeDepthRenderControl(queue); control && ((control->control & 0x60u) != 0u || (control->samples != 1u && Graphics::DepthSurfaceAt(control->address)))) {
         if (DrawPipeline::Active()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, (packet[0] >> 8u) & 0xffu);
         Graphics::NoteDepthRenderControl(*control);
     }
+    sub.emplace("Driver.Draw.precheck.depth_resummarize");
     if (Graphics::DepthResummarizeDrawsNothing(queue)) return DrawVerdict::Nothing;
+    sub.emplace("Driver.Draw.precheck.depth_maintenance");
     rejected = Graphics::DepthMaintenanceRejection(queue);
+    sub.reset();
     if (!rejected.empty()) return DrawVerdict::Rejected;
     static const bool traceIndirectEnabled = std::getenv("APS5_TRACE_INDIRECT_DRAWS") != nullptr;
     traceIndirect = traceIndirectEnabled;
@@ -119,6 +130,7 @@ std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const S
             }
         }
     }
+    sub.emplace("Driver.Draw.precheck.draw_rejection");
     if (drawPrecheck()) {
         rejected = Graphics::DrawRejection(queue, drawParameters.indexed);
         if (!rejected.empty()) return DrawVerdict::Rejected;
