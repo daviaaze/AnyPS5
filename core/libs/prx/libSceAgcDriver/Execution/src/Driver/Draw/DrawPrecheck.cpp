@@ -91,7 +91,9 @@ std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const S
     // NoteDepthRenderControl never modifies single-sample surfaces.
     if (const auto control = Graphics::DecodeDepthRenderControl(queue); control && ((control->control & 0x60u) != 0u || (control->samples != 1u && Graphics::DepthSurfaceAt(control->address)))) {
         sub.emplace("Driver.Draw.precheck.depth_control_drain");
-        if (DrawPipeline::Active()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, (packet[0] >> 8u) & 0xffu);
+        // APS5_ABLATE_DEPTH_CONTROL_DRAIN=1 skips the wait (measurement only: the depth state may then race the finisher).
+        static const bool ablateDrain = std::getenv("APS5_ABLATE_DEPTH_CONTROL_DRAIN") != nullptr;
+        if (DrawPipeline::Active() && !ablateDrain) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, (packet[0] >> 8u) & 0xffu);
         sub.emplace("Driver.Draw.precheck.depth_control_note");
         Graphics::NoteDepthRenderControl(*control);
     }
