@@ -522,7 +522,6 @@ void RunOverflowTableTests(AgcDriver::VulkanDevice& device, const GuestBlock& bl
     AgcDriver::Graphics::ClearCachedTextures(device.Device());
     AgcDriver::Graphics::OverrideCacheBudgetForTest(0);
 }
-
 }
 
 int main(int argc, char** argv) {

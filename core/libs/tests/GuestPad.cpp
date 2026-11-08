@@ -1052,7 +1052,6 @@ static void CheckControllerType(int handle) {
         Require(scePadGetControllerType(invalid, &type) == PAD_ERROR_INVALID_HANDLE);
     }
 }
-
 static void CheckInjectedState(const std::filesystem::path& path,
                                const std::filesystem::path& ackPath) {
     const auto readAck = [&]() {

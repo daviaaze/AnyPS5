@@ -2560,7 +2560,7 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
                 BackingFile backing;
                 const char* dmaBuf = sharedBacking(context, entry, backing) ? "failed" : "unavailable";
 #endif
-                std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx failed at %s (%d), not memory pressure; dma-buf fallback %s; the range falls back to copies without pinning a new import-budget ceiling, requested by %s (logged once per error)\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), step, static_cast<int>(result), dmaBuf, ImportRequesterName(requester));
+                std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx failed at %s (%d), not memory pressure; dma-buf fallback %s; the range falls back to copies and the import budget is kept, requested by %s (logged once per error)\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), step, static_cast<int>(result), dmaBuf, ImportRequesterName(requester));
             }
             state.allocationFailures = 0;
         } else {

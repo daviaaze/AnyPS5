@@ -93,7 +93,6 @@ bool progressEligible(const Submission& submission) {
     }
     return terminalRelease;
 }
-
 inline constexpr std::size_t MaximumReusableCommandDwords = 16 * 1024;
 inline constexpr std::size_t MaximumReusableCommandBuffers = 8;
 inline constexpr std::size_t MaximumReusableCommandBytes = 512 * 1024;
@@ -118,6 +117,14 @@ bool EopRelease(std::span<const std::uint32_t> words) {
 
 std::uint64_t Driver::FlipSubmissions() const {
     return flipSubmissionsOfThread();
+}
+
+void ResetCommandStorageAcquisitionsForTesting() {
+    Driver::Get().ResetCommandStorageAcquisitionsForTesting();
+}
+
+std::uint64_t CommandStorageAcquisitionsForTesting() {
+    return Driver::Get().CommandStorageAcquisitionsForTesting();
 }
 
 void ResetCommandStorageAcquisitionsForTesting() {

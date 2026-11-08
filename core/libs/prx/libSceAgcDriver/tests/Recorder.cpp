@@ -3,6 +3,7 @@
 #include "prx/libSceAgc/Command/include/Packet.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
+[stale]
 #include "prx/libSceAgcDriver/tools/ComputePipelineFixture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PipelineLinkOptimization.hpp"
 #include "Triangle_frag_spv.h"
@@ -2220,6 +2221,30 @@ void keyProofTests() {
     Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0000, "zeroed DCC keys did not decode as a zero clear");
     std::memset(keys, 0x40, keyCount);
     Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001, "a CPU update of DCC clear keys was hidden by a cached interpretation");
+    Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001, "(9) a CPU write of the keys was not seen");
+    before = KeyProofCounts();
+    Require(before.scanned == after.scanned + 1 && proof.keys == DccKeys::Clear0001, "(9) the CPU write did not make a scan");
+    Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001 && KeyProofCounts().proved == before.proved + 1, "(9) the new keys were not proved");
+    // A recorded write over the keys (noted and stamped as the driver's key stores are): the scans
+    // are not kept until its batch signaled.
+    recorder.NotePendingWrite(address, keyCount);
+    NoteKeysFillOnGpu(address, keyCount, DccKeys::Clear0001);
+    MarkWritten(address, keyCount);
+    before = KeyProofCounts();
+    Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001 && proof.generation == 0, "(9) a scan under a pending write was kept");
+    Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001 && proof.generation == 0, "(9) a second scan under a pending write was kept");
+    after = KeyProofCounts();
+    Require(after.scanned == before.scanned + 2 && after.unstable == before.unstable + 2 && after.proved == before.proved, "(9) unstable scans were miscounted");
+    recorder.Submit();
+    device.WaitQueue();
+    Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001 && proof.generation == 0, "(9) a signaled but in-flight write stored a proof");
+    recorder.Sync();
+    before = KeyProofCounts();
+    Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001 && proof.generation != 0, "(9) a reaped write did not store a proof");
+    after = KeyProofCounts();
+    Require(after.scanned == before.scanned + 1 && after.proved == before.proved, "(9) the first post-reap scan was not kept");
+    before = KeyProofCounts();
+    Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001 && KeyProofCounts().proved == before.proved + 1, "(9) the proof did not hold after the batch was reaped");
 }
 
 void targetKeyProofTests() {
@@ -7894,7 +7919,7 @@ bool storageHoleCopyBarrierTests(const Device& device, Recorder& previous) {
         std::int64_t physical = -1;
         ~Release() {
 #ifdef __linux__
-            if (block != nullptr) sceKernelMunmap(reinterpret_cast<std::uint64_t>(block), bytes);
+            if (block != nullptr) sceKernelMunmap(block, bytes);
             if (physical >= 0) sceKernelReleaseDirectMemory(physical, bytes);
 #else
             if (block == nullptr) return;
@@ -15430,6 +15455,7 @@ int main(int argc, char** argv) {
             if (kind != "complete" && kind != "possible") return 2;
             if (!interiorWatchedDriverWriteTests(kind == "complete")) return 77;
             std::cout << "interior watched driver write tests passed\n";
+            std::cout << "compile-only compute pipeline teardown passed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--partial-watch-restoration-only") {

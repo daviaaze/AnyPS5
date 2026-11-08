@@ -1667,6 +1667,17 @@ SpecializedModuleCacheData BuildSpecializedModuleForCache(const CompiledShaderAr
     return {std::move(built.spirv), built.module->bindings, built.module->pushData, built.module->specializationId};
 }
 
+SpecializedModuleBindings ScanSpecializedModuleBindings(std::span<const std::uint32_t> words) {
+    SpecializedModule module;
+    scanSpecializedBindings(module, words);
+    return {std::move(module.bindings), module.pushData};
+}
+
+SpecializedModuleCacheData BuildSpecializedModuleForCache(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
+    const auto module = buildSpecializedModule(artifact, classes, constants, target);
+    return {module->spirv, module->bindings, module->pushData, module->specializationId};
+}
+
 SharedSpirv InternSpirv(std::vector<std::uint32_t> words) {
     SharedSpirv spirv(std::move(words));
     const auto hash = spirv.ContentHash();

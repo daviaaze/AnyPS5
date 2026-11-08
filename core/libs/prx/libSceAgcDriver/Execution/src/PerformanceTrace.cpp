@@ -25,6 +25,9 @@
 #if defined(__linux__)
 #include <sys/syscall.h>
 #endif
+#if defined(__linux__)
+#include <sys/syscall.h>
+#endif
 #if defined(_MSC_VER) && !defined(__clang__)
 #include <intrin.h>
 #elif defined(__x86_64__) || defined(__i386__)
@@ -46,7 +49,6 @@ namespace {
 using Clock = std::chrono::steady_clock;
 std::filesystem::path traceDirectory();
 std::mutex summaryFileMutex;
-
 
 struct Session {
     std::mutex mutex;

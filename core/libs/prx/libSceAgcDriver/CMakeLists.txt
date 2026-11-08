@@ -673,6 +673,7 @@ add_custom_command(
         VERBATIM
 )
 
+
 foreach(agcVertexRangeShader IN ITEMS VertexRange.vert VertexRangeProducer.frag)
     string(REPLACE "." "_" agcVertexRangeName "${agcVertexRangeShader}")
     string(TOUPPER "${agcVertexRangeName}_SPV" agcVertexRangeSymbol)
@@ -832,6 +833,12 @@ if(BUILD_TESTING)
 endif()
 
 if(BUILD_TESTING)
+add_test(NAME agc_read_written_staging COMMAND agc_driver_recorder_tests --read-written-staging-only)
+set_tests_properties(agc_read_written_staging PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+if(WIN32)
+    set_tests_properties(agc_read_written_staging PROPERTIES ENVIRONMENT_MODIFICATION
+        "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+endif()
     if(Python3_Interpreter_FOUND)
         set(housekeepingModes plain)
         if(WIN32)
@@ -866,6 +873,7 @@ if(BUILD_TESTING)
             endif()
         endforeach()
     endif()
+
 
     set_tests_properties(${agcGuestMemoryLifetimeTests} PROPERTIES
             ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_PIN_WAIT_MS=1000;APS5_HEAP_CACHE_MIB=4"

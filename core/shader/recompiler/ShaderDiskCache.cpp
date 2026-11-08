@@ -1653,18 +1653,6 @@ public:
         return load(key, [&](std::span<const std::byte> file, std::shared_ptr<const void>) { return DecodePlanEntry(file, key, plan); }, planHits, planMisses, planLoadFailures);
     }
 
-    std::shared_ptr<const IrResourcePlan> LoadSharedPlan(std::span<const std::byte> key, std::uint64_t shaderHash) {
-        std::shared_ptr<const IrResourcePlan> plan;
-        load(key, [&](std::span<const std::byte> file, std::shared_ptr<const void>) {
-            std::span<const std::byte> payload;
-            const auto status = unwrapEntry(file, key, payload);
-            if (status != LoadStatus::Loaded) return status;
-            plan = sharedPlans().Get(payload, shaderHash);
-            return plan != nullptr ? LoadStatus::Loaded : LoadStatus::Rejected;
-        }, planHits, planMisses, planLoadFailures);
-        return plan;
-    }
-
     bool LoadSpecialized(std::span<const std::byte> key, std::vector<std::uint32_t>& spirv) {
         return load(key, [&](std::span<const std::byte> file, std::shared_ptr<const void>) { return DecodeSpecializedEntry(file, key, spirv); }, specializedHits, specializedMisses, specializedLoadFailures);
     }

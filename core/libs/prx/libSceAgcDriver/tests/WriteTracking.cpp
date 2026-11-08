@@ -2218,7 +2218,6 @@ void CheckUnwatchHooks() {
 #endif
 }
 
-
 class PartlyCommitted {
 public:
     static constexpr std::size_t Bytes = 4 * Block;

@@ -130,6 +130,7 @@ AudioOut2Grain AudioOut2CaptureGrain(AudioOut2Context& context, bool snapshot) {
                 captured.pcm = *setPcm;
                 std::copy_n(port.volume, port.channels, captured.volume.begin());
             } else if (snapshot) {
+            if (snapshot) {
                 captured.pcm.resize(static_cast<std::size_t>(context.grain) * port.channels * (port.int16 ? sizeof(std::int16_t) : sizeof(float)));
                 std::memcpy(captured.pcm.data(), data, captured.pcm.size());
                 std::copy_n(port.volume, port.channels, captured.volume.begin());

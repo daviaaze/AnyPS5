@@ -111,7 +111,6 @@ The GPU consumer checks per-lane atomic old/final values, contention and untouch
 records/padding for wave32, wave64 and split-wave64. Footprint bounds alone do not
 measure actual copied bytes or demonstrate a title FPS improvement.
 
-
 ## Offline shader-cache precompilation
 
 Build `agc_shader_replay` from the same configured build tree as the runtime PRX, then pass the runtime shader-cache root and one or more request files/directories:

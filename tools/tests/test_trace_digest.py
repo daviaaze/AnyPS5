@@ -448,7 +448,6 @@ class TraceDigestTests(unittest.TestCase):
                 path.write_text("\n".join(json.dumps(record, ensure_ascii=False) for record in (summary, interval)), encoding="utf-8")
                 self.assertEqual(trace_digest.load_summary(path, self.trace), summary)
                 self.assertEqual(trace_digest.load_intervals(path), [interval])
-
     def test_cli_rejects_invalid_event_container_shapes_without_partial_output(self):
         cases = [(value, "trace must be an event array or object") for value in (None, True, 7, "trace")]
         cases += [({"traceEvents": value}, "traceEvents must be an array")
