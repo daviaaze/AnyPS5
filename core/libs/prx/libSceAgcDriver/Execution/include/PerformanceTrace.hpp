@@ -1057,6 +1057,22 @@ public:
             AppendString(output, top[index].first);
             output += ':' + number(milliseconds(top[index].second) * perPresent);
         }
+        if (std::getenv("APS5_STREAM_DUMP") != nullptr) {
+            // Packet-census runs: the unfolded per-thread totals (every scope, including those whose slices
+            // the 1 us threshold still folds), as ms and calls per present.
+            struct ScopeTotal { std::string key; Clock::duration length; std::uint64_t count; };
+            std::vector<ScopeTotal> all;
+            for (const auto& thread : threads)
+                for (const auto& total : thread.totals)
+                    all.push_back({thread.name + "|" + Name(total.scope, total.stage), total.length, total.count});
+            std::stable_sort(all.begin(), all.end(), [](const auto& a, const auto& b) { return a.length > b.length; });
+            output += "},\"scope_totals_per_present\":{";
+            for (std::size_t index = 0; index < all.size() && index < 160; ++index) {
+                if (index != 0) output += ',';
+                AppendString(output, all[index].key);
+                output += ":[" + number(milliseconds(all[index].length) * perPresent) + ',' + number(static_cast<double>(all[index].count) * perPresent) + ']';
+            }
+        }
         output += "},\"trace_dropped\":";
         output += dropped ? "true" : "false";
         if (summary.traceWindowClosed) output += ",\"trace_window_closed\":" + std::string(*summary.traceWindowClosed ? "true" : "false");
