@@ -86,6 +86,32 @@ zero-filled. The synced API still flushes GPU writers before reading.
 
 [Relinker usage and runtime layout](../user/USAGE.md).
 
+### Owned indirect batches and bounded lane transfers
+
+CPU-resolved indirect draws can hand an owned batch to the existing draw finisher
+when the normal pipeline gates permit it. Argument/count reads stay at their
+original ordering point; the job retains records and a queue snapshot. Unknown
+writes, memory-writing programs and unsupported emulation remain synchronous.
+`Driver.DrawIndirectFinish` identifies execution of this checkpoint; the existing
+direct-draw handoff counter does not count it.
+
+Build `agc_driver_draw_cache_reuse_tests` and run CTest cases
+`agc_driver_draw_cache_reuse_cpu_record_finisher_8` and
+`agc_driver_draw_cache_reuse_cpu_record_finisher_32`. They compare actual pixels
+against direct draws after later queue/argument/index state changes, including
+indexed and nonindexed records, and check the subsequent label.
+
+For compute ADD_TID, a known guest wave32/64 and proven closed linear operands
+can narrow buffer transfer spans without shrinking the logical descriptor or
+allocation. Unknown wave, unsafe arithmetic, swizzle and unproved bounds retain
+Whole. The wave comes from the current request, not a serialized cache field.
+Build `agc_driver_buffer_atomic_unaligned_tests` and `agc_shader_memory_tests`;
+run `agc_driver_buffer_atomic_unaligned` and `agc_shader_memory` with CTest.
+The GPU consumer checks per-lane atomic old/final values, contention and untouched
+records/padding for wave32, wave64 and split-wave64. Footprint bounds alone do not
+measure actual copied bytes or demonstrate a title FPS improvement.
+
+
 ## Offline shader-cache precompilation
 
 Build `agc_shader_replay` from the same configured build tree as the runtime PRX, then pass the runtime shader-cache root and one or more request files/directories:

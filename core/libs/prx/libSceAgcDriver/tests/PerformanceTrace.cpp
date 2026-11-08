@@ -175,6 +175,62 @@ void RequestSemaphoreSmoke(bool complete = false, bool stopWaiting = false) {
     fixture.AssertCapture(complete);
 }
 #endif
+#if defined(__linux__)
+void BenchPresentIntegration() {
+    struct Variable {
+        const char* name;
+        std::optional<std::string> previous;
+        explicit Variable(const char* key) : name(key) {
+            if (const char* value = std::getenv(key)) previous = value;
+        }
+        ~Variable() {
+            if (previous) setenv(name, previous->c_str(), 1);
+            else unsetenv(name);
+        }
+        void Set(const char* value) {
+            Check((value ? setenv(name, value, 1) : unsetenv(name)) == 0,
+                "cannot isolate benchmark trace environment");
+        }
+    };
+    Variable frames{"APS5_TRACE_FRAMES"}, seconds{"APS5_TRACE_SECONDS"};
+    Variable summary{"APS5_TRACE_SUMMARY_EVERY"}, bench{"APS5_TRACE_BENCH"};
+    Variable events{"APS5_TRACE_EVENTS"}, request{"APS5_TRACE_ON_REQUEST_SECONDS"};
+    Variable semaphore{"APS5_TRACE_START_SEMAPHORE"}, output{"APS5_TRACE_DIR"};
+    auto pattern = (std::filesystem::temp_directory_path() / "aps5-bench-test-XXXXXX").string();
+    const char* created = mkdtemp(pattern.data());
+    Check(created != nullptr, "cannot create private benchmark trace directory");
+    const std::filesystem::path directory(created);
+    try {
+        frames.Set(nullptr); seconds.Set(nullptr); events.Set(nullptr);
+        request.Set(nullptr); semaphore.Set(nullptr);
+        summary.Set("1"); bench.Set("1"); output.Set(directory.c_str());
+        AgcDriver::PerformanceTrace::Present(1920, 1080, nullptr);
+        std::this_thread::sleep_for(milliseconds(1100));
+        AgcDriver::PerformanceTrace::Present(1920, 1080, nullptr);
+        AgcDriver::PerformanceTrace::Present(1920, 1080, nullptr);
+        AgcDriver::PerformanceTrace::StopOutput();
+        std::filesystem::path benchPath;
+        for (const auto& entry : std::filesystem::directory_iterator(directory))
+            if (entry.path().filename().string().starts_with("aps5-bench-")) benchPath = entry.path();
+        Check(!benchPath.empty(), "APS5_TRACE_BENCH=1 did not publish benchmark output");
+        const auto contents = ReadGzip(benchPath);
+        Check(contents.find("\"format\":\"aps5-bench/1\"") != std::string::npos
+            && contents.find("\"intervals\":[") != std::string::npos,
+            "benchmark output omitted its format or interval list");
+        Check(contents.find("\"resolution\":\"1920x1080\"") != std::string::npos
+            && contents.find("\"frame_us\":[") != std::string::npos,
+            "benchmark interval omitted resolution or frame samples");
+        std::error_code error;
+        std::filesystem::remove_all(directory, error);
+        Check(!error, "cannot remove private benchmark trace directory");
+    } catch (...) {
+        AgcDriver::PerformanceTrace::StopOutput();
+        std::error_code error;
+        std::filesystem::remove_all(directory, error);
+        throw;
+    }
+}
+#endif
 void WindowByFrames() {
     auto window = TraceWindow::Parse("3:2", nullptr).value();
     std::vector<Edge> edges;
@@ -1130,6 +1186,12 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--request-stop-waiting") {
             RequestSemaphoreSmoke(false, true);
+            return 0;
+        }
+#endif
+#if defined(__linux__)
+        if (argc == 2 && std::string_view(argv[1]) == "--bench-present") {
+            BenchPresentIntegration();
             return 0;
         }
 #endif

@@ -70,10 +70,15 @@ std::string Driver::describeIndirectSource() {
 }
 
 std::array<std::uint32_t, 5> Driver::readDispatchArguments(std::uint32_t queue, std::uint64_t arguments, std::uint32_t initiator) {
-    recordQueuedLabelsBeforeRead(queue);
-    if (!resolvingAhead()) {
+    if (resolvingAhead()) {
+        recordQueuedLabelsBeforeRead(queue);
+    } else {
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Indirect);
         std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        // Publish this queue's labels before finishing leases, using the same acquisition.
+        // Keep the argument read outside: its flush hook can wait with the mutex released.
+        const auto localDevice = device.Load();
+        recordDeferredLabels(localDevice.get(), queue);
         Graphics::FinishLeaseWork();
     }
     return Pm4::ReadDispatchArguments(arguments, initiator);

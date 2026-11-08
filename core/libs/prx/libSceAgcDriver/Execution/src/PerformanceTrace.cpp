@@ -547,6 +547,7 @@ void PerformanceTrace::Present(std::uint32_t width, std::uint32_t height, const 
             state.window = TraceWindow::FromEnvironment();
         }
         state.interval = TraceInterval::Parse(std::getenv("APS5_TRACE_SUMMARY_EVERY"));
+        state.bench = TraceBench::Parse(std::getenv("APS5_TRACE_BENCH"), state.interval.has_value());
         state.first = now;
         state.started = true;
     }
