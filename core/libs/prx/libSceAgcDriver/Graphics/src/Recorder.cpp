@@ -4557,10 +4557,6 @@ void Recorder::Submit() {
         if (queueException != nullptr) std::rethrow_exception(queueException);
         Check(result, "vkQueueSubmit recorder");
         if (DrawProfiled()) {
-            const auto us = std::chrono::duration<double, std::micro>(submittedAt - submitStart).count();
-            ++submitCount;
-            submitUs += us;
-            submitMaxUs = std::max(submitMaxUs, us);
             if (auto* frame = PerformanceContext::Current()) frame->Add(frame->Get("Recorder", "submit"), submittedAt - submitStart);
         }
         return;

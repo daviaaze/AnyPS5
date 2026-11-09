@@ -29,10 +29,6 @@ void ResetCommandStorageAcquisitionsForTesting();
 
 std::uint64_t CommandStorageAcquisitionsForTesting();
 
-void ResetCommandStorageAcquisitionsForTesting();
-
-std::uint64_t CommandStorageAcquisitionsForTesting();
-
 void require(bool condition, const char* reason);
 
 std::uint32_t readRegister(const Registers& registers, std::uint32_t offset);

@@ -127,14 +127,6 @@ std::uint64_t CommandStorageAcquisitionsForTesting() {
     return Driver::Get().CommandStorageAcquisitionsForTesting();
 }
 
-void ResetCommandStorageAcquisitionsForTesting() {
-    Driver::Get().ResetCommandStorageAcquisitionsForTesting();
-}
-
-std::uint64_t CommandStorageAcquisitionsForTesting() {
-    return Driver::Get().CommandStorageAcquisitionsForTesting();
-}
-
 std::deque<const std::uint32_t*>& Driver::releasedTails() {
     struct ReleasedTailsStorage {};
     return HostThreadLocal<std::deque<const std::uint32_t*>, ReleasedTailsStorage>();

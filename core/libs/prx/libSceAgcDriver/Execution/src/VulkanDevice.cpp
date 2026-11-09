@@ -3088,53 +3088,6 @@ void VulkanDevice::PrefetchComputePipeline(std::shared_ptr<const ShaderRecompile
     }
 }
 
-void VulkanDevice::PrefetchComputePipeline(std::shared_ptr<const ShaderRecompiler::RecompileResult> shader) {
-    if (!ParallelComputeCompile() || shader == nullptr || state->compileOnly) return;
-    if (shader->spirv.size() < 5 || shader->spirv[0] != 0x07230203u) return;
-    const std::array<Graphics::CompiledShader, 1> shaders{{{ShaderRecompiler::ShaderStage::Compute, shader.get(), 0}}};
-    const auto pushStages = Graphics::PushConstantStages(shaders);
-    if (pushStages != 0 && state->properties.limits.maxPushConstantsSize < Graphics::ComputePushConstantBytes) return;
-    const auto key = ComputePipelineKey::Of(*shader, pushStages != 0);
-    if (key.identity.Empty()) return;
-    auto& counters = ComputePrefetchStats();
-    std::lock_guard pipelines(state->computePipelinesMutex);
-    if (state->computePipelines.contains(key) || state->computePipelinesBuilding.contains(key)) return;
-    auto completion = std::make_shared<std::promise<std::shared_ptr<ComputePipelineObjects>>>();
-    state->computePipelinesBuilding.emplace(key, completion->get_future().share());
-    bool queued = false;
-    try {
-        queued = state->computePrefetch.Enqueue([this, shader = std::move(shader), pushStages, key, completion, &counters] {
-            std::shared_ptr<ComputePipelineObjects> objects;
-            try {
-                const auto context = graphicsContext();
-                if (context.descriptorCache != nullptr) {
-                    const std::array<Graphics::CompiledShader, 1> compute{{{ShaderRecompiler::ShaderStage::Compute, shader.get(), 0}}};
-                    const auto described = Graphics::DescribeSetLayouts(context, compute);
-                    objects = createComputePipeline(context, *shader, described.layouts.main, described.mainKey, pushStages, 0);
-                    if (Graphics::PipelineJournalEnabled() && !state->probingFloatControls) Graphics::RecordComputePipeline(*shader, pushStages != 0);
-                }
-                std::lock_guard lock(state->computePipelinesMutex);
-                if (objects != nullptr) {
-                    objects = state->computePipelines.try_emplace(key, objects).first->second;
-                    state->computePipelinesPrefetched.insert(key);
-                    counters.prefetched.fetch_add(1, std::memory_order_relaxed);
-                }
-                completion->set_value(objects);
-                state->computePipelinesBuilding.erase(key);
-            } catch (...) {
-                completion->set_exception(std::current_exception());
-            }
-        });
-    } catch (...) {
-        state->computePipelinesBuilding.erase(key);
-        throw;
-    }
-    if (!queued) {
-        state->computePipelinesBuilding.erase(key);
-        counters.dropped.fetch_add(1, std::memory_order_relaxed);
-    }
-}
-
 bool VulkanDevice::ImportGuestMemory(const GuestAllocations::Mapped& ranges, std::uint64_t generation, bool adoptDevice) {
     if (adoptDevice) GuestMemory::AssertGpuLockHeld("VulkanDevice::ImportGuestMemory");
     return Graphics::ImportMappedRanges(graphicsContext(), ranges, generation, adoptDevice);
