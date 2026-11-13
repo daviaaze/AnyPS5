@@ -739,7 +739,7 @@ void SummaryFields() {
         "\"worker_busy_pct\":{\"queue worker 0x0\":35.000},"
         "\"phase_totals_ms\":{\"Driver.Completion\":2.000,\"Driver.Packet\":12.000,\"Driver.Packet.draw\":10.000,\"Driver.Present\":6.000,\"Driver.Present.inflight_wait\":4.000},"
         "\"top_phases_ms_per_frame\":{\"Driver.Packet\":6.000,\"Driver.Packet.draw\":5.000,\"Driver.Present\":3.000,\"Driver.Present.inflight_wait\":2.000,\"Driver.Completion\":1.000},"
-        "\"owned_draw_counts\":{},\"trace_dropped\":false,\"trace\":\"aps5-trace-abc-7.json.gz\"}\n";
+        "\"owned_draw_counts\":{},\"trace_dropped\":false,\"trace_snapshots_superseded\":0,\"trace\":\"aps5-trace-abc-7.json.gz\"}\n";
     Check(line == expected, "summary line changed");
     auto unboundSummary = summary;
     unboundSummary.ownedDrawUnbound = 3;

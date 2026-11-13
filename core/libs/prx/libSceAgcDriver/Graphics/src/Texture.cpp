@@ -619,6 +619,10 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
 
 Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::shared_ptr<Buffer> staging, bool depthCompare, bool layerRows, std::optional<std::span<const std::uint32_t>> packedSlabs) : Texture(context, detiler, descriptor, components, {}, std::move(staging), depthCompare, layerRows, nullptr, 0.0, 0.0, {}, nullptr, packedSlabs) {}
 
+Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare, bool layerRows, const VkClearColorValue* clear, double readTextureSurfaceMs, const char* snapshotRefusal, std::optional<std::span<const std::uint32_t>> packedSlabs) : Texture(context, detiler, descriptor, components, snapshot, nullptr, depthCompare, layerRows, clear, readTextureSurfaceMs, 0.0, {}, snapshotRefusal, packedSlabs) {}
+
+Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::shared_ptr<Buffer> staging, bool depthCompare, bool layerRows, const VkClearColorValue* clear, double readTextureSurfaceMs, double providedStagingMs, const char* snapshotRefusal, std::optional<std::span<const std::uint32_t>> packedSlabs) : Texture(context, detiler, descriptor, components, {}, std::move(staging), depthCompare, layerRows, clear, readTextureSurfaceMs, providedStagingMs, {}, snapshotRefusal, packedSlabs) {}
+
 Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, GpuBufferInput input, GpuInputTag, bool depthCompare, bool layerRows) : Texture(context, detiler, descriptor, components, {}, {}, depthCompare, layerRows, nullptr, 0.0, 0.0, std::move(input), nullptr, std::nullopt) {}
 
 Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, std::shared_ptr<Buffer> staging, bool depthCompare, bool layerRows, const VkClearColorValue* clear, double readTextureSurfaceMs, double providedStagingMs, GpuBufferInput gpuInput, const char* snapshotRefusal, std::optional<std::span<const std::uint32_t>> packedSlabs) : context(context) {
@@ -918,12 +922,16 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
             std::shared_ptr<DeviceBuffer> tiled;
             std::shared_ptr<DeviceBuffer> linear;
             if (recorder != nullptr) {
+                commands = recorder->Commands();
                 tiled = gpuInput.buffer != nullptr ? gpuInput.buffer : recorder->UploadScratchBuffer(Recorder::UploadScratch::Tiled, static_cast<std::size_t>(gpuInput.buffer != nullptr ? guestBytes : snapshotSize));
                 linear = recorder->UploadScratchBuffer(Recorder::UploadScratch::Linear, static_cast<std::size_t>(linearBytes));
                 if (staging != nullptr) recorder->Keep(staging, static_cast<std::size_t>(snapshotSize));
                 if (tiled != nullptr) recorder->Keep(tiled, static_cast<std::size_t>(gpuInput.buffer != nullptr ? guestBytes : snapshotSize));
                 if (linear != nullptr) recorder->Keep(linear, static_cast<std::size_t>(linearBytes));
                 if (zeros != nullptr) recorder->Keep(zeros, static_cast<std::size_t>(sliceLinearBytes));
+                recorder->Keep(owned);
+                if (uploadOwned != nullptr) recorder->Keep(uploadOwned);
+                if (gpuInput.owner != nullptr) recorder->Keep(gpuInput.owner);
             } else {
                 batch = std::make_unique<CommandBatch>(context);
                 commands = batch->Handle();
@@ -937,6 +945,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
                 RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_HOST_BIT | Recorder::UploadScratchReuseStages, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
                 if (staging != nullptr) CopyBuffer(context, commands, staging->Handle(), 0, tiled->Handle(), 0, snapshotSize);
             }
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
             if (zeros != nullptr) context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, zeros->Handle(), 0, VK_WHOLE_SIZE, 0u);
 
             for (const auto& slot : uploaded) {

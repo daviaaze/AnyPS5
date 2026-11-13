@@ -329,8 +329,8 @@ void eraseTexture(TextureCache& cache, CacheRef ref) {
         }
     }
     if (it->texture.use_count() > 1) noteReleased(it->texture, it->address);
-    cache.index.erase(it->key);
-    cache.entries.erase(it);
+    index.erase(it->key);
+    entries.erase(it);
     ++cache.erasures;
 }
 
@@ -865,12 +865,11 @@ std::uint64_t storageBudget(const Context& context, std::uint64_t required = 0, 
         std::chrono::steady_clock::time_point calculatedAt{};
     } cached;
     const auto now = std::chrono::steady_clock::now();
-    std::lock_guard lock(TableWaits::Acquire(TableWaits::StorageBudgetMutex, cached.mutex), std::adopt_lock);
     std::optional<VkPhysicalDeviceMemoryBudgetPropertiesEXT> reported;
     StorageTextureBudgetSnapshot snapshot;
     std::uint64_t budget;
     {
-        std::lock_guard lock(cached.mutex);
+        std::lock_guard lock(TableWaits::Acquire(TableWaits::StorageBudgetMutex, cached.mutex), std::adopt_lock);
         const auto read = [&] {
             reported.emplace(VkPhysicalDeviceMemoryBudgetPropertiesEXT{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT});
             VkPhysicalDeviceMemoryProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
@@ -1510,18 +1509,41 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             if (recycled.empty()) recycled = spareSnapshot(cache, bytes);
             entry.bytes = recycled.empty() ? std::vector<std::byte>(bytes) : std::move(recycled);
         }
-        if (staging != nullptr) ReadTextureSurface(resource, *keys, *staging);
-        else ReadTextureSurface(resource, *keys, std::span<std::byte>(entry.bytes));
+        if (staging != nullptr) readSnapshot(resource, *keys, entry.slabs, staging->Bytes());
+        else readSnapshot(resource, *keys, entry.slabs, std::span<std::byte>(entry.bytes));
         const auto read = staging != nullptr ? std::as_const(*staging).Bytes() : std::span<const std::byte>(entry.bytes);
         const auto readMs = snapshotProfiled ? std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - readStarted).count() : 0.0;
         if (entry.slabs.has_value()) reportCommittedSlabs(resource, *entry.slabs, guestBytes);
+        if (!pending) entry.untracked = untracked;
+        static const bool traceTextures = std::getenv("APS5_TRACE_TEXTURES") != nullptr;
+        if (traceTextures) std::fprintf(stderr, "[texture] snapshot 0x%llx %ux%u format %u bytes=%zu staging=%d keys=%s gpu-input=%s\n", static_cast<unsigned long long>(address), resource.width, resource.height, resource.format, bytes, staging != nullptr, DccKeysName(*keys), gpuInputRefusal);
+        if (staging != nullptr) entry.texture = createTexture(*context.detiler, resource, components, std::move(staging), depthCompare, layerRows, nullptr, readMs, 0.0, gpuInputRefusal, packedSlabs(entry.slabs));
+        else entry.texture = createTexture(*context.detiler, resource, components, std::span<const std::byte>(entry.bytes), depthCompare, layerRows, nullptr, readMs, gpuInputRefusal, packedSlabs(entry.slabs));
+        entry.accounted = entry.texture->AllocationBytes();
+        if (entry.bytes.size() > SnapshotCompareBytes && (entry.generation != 0 || entry.untracked[0] != 0)) parkSnapshot(cache, entry.bytes);
 
         }
         counters.snapshots.fetch_add(1, std::memory_order_relaxed);
     }
     auto texture = entry.texture;
-    if (!admitTexture(context, cache, key, entry.accounted, budget)) {
-        noteReleased(texture, resource.baseAddress);
+    const bool admitted = admitTexture(context, cache, key, entry.accounted, budget);
+    const auto ceiling = budget + budget / 4u;
+    if (!admitted) {
+        if (entry.accounted == 0 || entry.accounted > ceiling || cache.overflowIndex.contains(key) || cache.bytes > ceiling - entry.accounted || cache.overflowBytes > ceiling - entry.accounted - cache.bytes) {
+            ++cache.counts.uncached;
+            noteReleased(texture, resource.baseAddress);
+            logLookup({texture.get(), resource, guestBytes, *keys, generation, source.get()});
+            reportCacheCounts(cache, budget);
+            reportTextureCounters();
+            if (profile) LookupOutcomes::Add(source != nullptr ? LookupOutcomes::SampledMadeView : LookupOutcomes::SampledMadeSnapshot, start);
+            return texture;
+        }
+        entry.overflow = true;
+        cache.overflowBytes += entry.accounted;
+        entry.present = Recorder::Presents();
+        cache.overflowEntries.push_front(std::move(entry));
+        cache.overflowIndex[key] = cache.overflowEntries.begin();
+        if (source != nullptr) cache.overflowViews.emplace(source.get(), cache.overflowEntries.begin());
         logLookup({texture.get(), resource, guestBytes, *keys, generation, source.get()});
         reportCacheCounts(cache, budget);
         reportTextureCounters();

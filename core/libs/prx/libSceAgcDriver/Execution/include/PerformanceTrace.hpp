@@ -381,6 +381,7 @@ public:
 
 
     void Count(const char* scope, std::uint64_t amount = 1) {
+        if (amount == 0) return;
         account(scope, nullptr, Clock::duration{}, amount);
     }
     std::vector<Total> CollectTotals() const {
@@ -1089,8 +1090,7 @@ public:
                 output += ":[" + number(milliseconds(all[index].length) * perPresent) + ',' + number(static_cast<double>(all[index].count) * perPresent) + ']';
             }
         }
-        output += "},\"trace_dropped\":";
-        output += "}";
+        output += '}';
         output += ",\"owned_draw_counts\":{";
         bool firstCount = true;
         for (const auto& [name, value] : ownedCounts) {
