@@ -378,14 +378,16 @@ void trimOverflowToBudget(TextureCache& cache, std::uint64_t budget) {
 }
 
 // Moves an entry to the front (most recently used).
-void touchTexture(TextureCache& cache, std::list<CachedTexture>::iterator it) {
-    cache.entries.splice(cache.entries.begin(), cache.entries, it);
-    it->present = Recorder::Presents();
-}
 void touchTexture(TextureCache& cache, CacheRef ref) {
-    if (!ref.overflow) { touchTexture(cache, ref.entry); return; }
-    cache.overflowEntries.splice(cache.overflowEntries.begin(), cache.overflowEntries, ref.entry);
+    if (ref.overflow) {
+        cache.overflowEntries.splice(cache.overflowEntries.begin(), cache.overflowEntries, ref.entry);
+        return;
+    }
+    cache.entries.splice(cache.entries.begin(), cache.entries, ref.entry);
+    ref.entry->present = Recorder::Presents();
 }
+// An entry knows its tier: splicing it into the other tier's list would corrupt both.
+void touchTexture(TextureCache& cache, std::list<CachedTexture>::iterator it) { touchTexture(cache, CacheRef{it, it->overflow}); }
 
 constexpr std::uint64_t SpareSnapshotBytes = 256ull << 20;
 void expireSpareSnapshots(TextureCache& cache, std::uint64_t present) {
@@ -1405,7 +1407,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         }
         AgcDriver::P0Metrics::LookupObserved(AgcDriver::P0Metrics::Lookup::ResidentStale);
         p0Read.Set(AgcDriver::P0Metrics::ReadReason::ResidentStaleUnknown);
-        if (it->bytes.size() == bytes) recycled = std::move(it->bytes);
+        if (it->bytes.size() == snapshotSize) recycled = std::move(it->bytes);
 
         else parkSnapshot(cache, it->bytes);
         eraseTexture(cache, it);
@@ -1494,20 +1496,20 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         static const bool snapshotProfiled = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PROFILE_GPU") != nullptr;
         const auto readStarted = snapshotProfiled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         constexpr std::size_t SnapshotCompareBytes = 256u << 10u;
-        const bool dropped = *keys == DccKeys::Uncompressed && bytes > SnapshotCompareBytes && (entry.generation != 0 || (!pending && untracked[0] != 0));
+        const bool dropped = *keys == DccKeys::Uncompressed && snapshotSize > SnapshotCompareBytes && (entry.generation != 0 || (!pending && untracked[0] != 0));
         std::shared_ptr<Buffer> staging;
         if (dropped) {
             parkSnapshot(cache, recycled);
             expireSpareSnapshots(cache, present);
-            if (preparedStaging != nullptr && preparedStaging->Size() == bytes) {
+            if (preparedStaging != nullptr && preparedStaging->Size() == snapshotSize) {
                 staging = std::move(preparedStaging);
                 PreparedStagingUsed().fetch_add(1, std::memory_order_relaxed);
             } else {
-                staging = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+                staging = std::make_shared<Buffer>(context, snapshotSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
             }
         } else {
-            if (recycled.empty()) recycled = spareSnapshot(cache, bytes);
-            entry.bytes = recycled.empty() ? std::vector<std::byte>(bytes) : std::move(recycled);
+            if (recycled.empty()) recycled = spareSnapshot(cache, snapshotSize);
+            entry.bytes = recycled.empty() ? std::vector<std::byte>(snapshotSize) : std::move(recycled);
         }
         if (staging != nullptr) readSnapshot(resource, *keys, entry.slabs, staging->Bytes());
         else readSnapshot(resource, *keys, entry.slabs, std::span<std::byte>(entry.bytes));
@@ -1995,19 +1997,6 @@ std::uint64_t ReleaseTextureCaches(std::uint64_t bytes, bool newImage) {
             sampledSkipped = true;
         } else {
             for (auto it = cache.overflowEntries.end(); it != cache.overflowEntries.begin() && freed < bytes;) {
-                --it;
-                if (it->texture.use_count() != 1 || (it->source != nullptr && it->source->Dirty())) continue;
-                const auto allocated = it->texture->AllocationBytes();
-                const auto sourceBytes = it->source != nullptr ? it->source->AllocationBytes() : 0u;
-                const std::weak_ptr<StorageTexture> source = it->source;
-                const auto next = std::next(it);
-                eraseTexture(cache, {it, true});
-                ++sampledEntries;
-                freed += allocated;
-                if (source.expired()) freed += sourceBytes;
-                it = next;
-            }
-            for (auto it = cache.entries.end(); it != cache.entries.begin() && freed < bytes;) {
                 --it;
                 if (it->texture.use_count() != 1 || (it->source != nullptr && it->source->Dirty())) continue;
                 const auto allocated = it->texture->AllocationBytes();
@@ -2525,13 +2514,39 @@ bool TableCurrent(ReusedTable& table) {
     auto& checks = table.pendingChecks;
     checks.clear();
     checks.reserve(table.elements.size());
-    auto& cache = Textures();
-    std::lock_guard lock(TableWaits::Acquire(TableWaits::TableTexturesMutex, cache.mutex), std::adopt_lock);
     for (const auto& element : table.elements) {
         if (element.rejected || element.live) continue;
-        const auto ref = findTexture(cache, element.key);
-        if (ref.entry == cacheEntries(cache, ref.overflow).end() || ref.entry->texture != element.texture.lock()) return false;
-        checks.push_back({ref.entry->address, ref.entry->address + ref.entry->surfaceBytes, ref.entry->source.get(), nullptr, false});
+        const auto texture = element.texture.lock();
+        if (texture == nullptr) {
+            checks.clear();
+            tableCurrentReason = 0;
+            return false;
+        }
+        const auto& source = texture->SharedStorageSource();
+        if (source != nullptr && texture->ViewsStorageImage()) {
+            if (!source->Cached() || source->GuestBytes() == 0) {
+                checks.clear();
+                tableCurrentReason = 2;
+                return false;
+            }
+            const auto begin = source->Descriptor().baseAddress;
+            // The viewed image itself is exempt from the overlap scan whether or not it is pending;
+            // its guest generation (table.queries) proves the contents. Requiring it to be pending
+            // rejected every clean source.
+            checks.push_back({begin, begin + source->GuestBytes(), source.get(), nullptr, false});
+        } else {
+            if (element.guestBytes == 0) {
+                checks.clear();
+                tableCurrentReason = 1;
+                return false;
+            }
+            checks.push_back({element.resource.baseAddress, element.resource.baseAddress + element.guestBytes, nullptr, nullptr, false});
+        }
+        if (!TableElementKeysUncompressed(element, *texture, source != nullptr && texture->ViewsStorageImage() ? source.get() : nullptr)) {
+            checks.clear();
+            tableCurrentReason = 8;
+            return false;
+        }
     }
     const auto serial = StorageTexture::PendingSerial();
     const bool identities = StorageTexture::ScanPending(checks);
@@ -6124,7 +6139,8 @@ bool ShaderResources::precollectImages() {
                         !Recorder::SnapshotWriteOverlaps(record.resource.baseAddress, record.guestBytes) &&
                         SampledTextureInputEligible(context, record.resource.baseAddress, record.guestBytes);
                     if (!noPreparedStaging && predictsMiss && record.generation != 0 &&
-                            record.keys == DccKeys::Uncompressed && !gpuInputCandidate && record.guestBytes > SnapshotCompareBytes) {
+                            record.keys == DccKeys::Uncompressed && !gpuInputCandidate && record.guestBytes > SnapshotCompareBytes &&
+                            record.resource.depthOrLastArray - record.resource.baseArray < context.limits.maxImageArrayLayers) {
                         const auto stagingResource = ArrayLayerWindow(record.resource, context.limits.maxImageArrayLayers);
                         const bool sameSurface = stagingResource.baseAddress == record.resource.baseAddress;
                         const auto stagingGuestBytes = sameSurface ? record.guestBytes : DescribeSurface(stagingResource).guestBytes;
@@ -6857,9 +6873,19 @@ void ShaderResources::resolveImageTables() {
             if (reusable) {
                 const auto& log = lookupLog();
                 const auto* looked = log.empty() ? nullptr : &log.back();
-                if (looked != nullptr && looked->object == texture.get() && looked->source == nullptr && looked->generation != 0 && looked->keys == DccKeys::Uncompressed && sampled.resource.dccAddress == 0) {
+                const auto& source = texture->SharedStorageSource();
+                const bool exactStorageView = source != nullptr && texture->ViewsStorageImage() && source->Cached() &&
+                        source->Descriptor().baseAddress == sampled.resource.baseAddress && source->GuestBytes() >= sampled.guestBytes &&
+                        StorageImageServesKeys(*source, sampled.resource.dccAddress);
+                // DCC metadata is no bar while the lookup proved the keys uncompressed: TableCurrent
+                // re-proves them (TableElementKeysUncompressed) before every reuse.
+                const bool snapshotCurrent = looked != nullptr && looked->source == nullptr && looked->generation != 0 &&
+                        looked->keys == DccKeys::Uncompressed;
+                const bool storageCurrent = exactStorageView && looked != nullptr && looked->source == source.get();
+                if (looked != nullptr && looked->object == texture.get() && (snapshotCurrent || storageCurrent)) {
                     fresh.elements.push_back({MakeTextureKey(context.device, sampled.words, sampled.components, sampled.depthCompare), texture, sampled.resource, sampled.guestBytes, firstLayer, false, {}});
-                    fresh.queries.push_back({sampled.resource.baseAddress, static_cast<std::size_t>(sampled.guestBytes), looked->generation});
+                    const auto generation = storageCurrent ? source->GenerationFor(sampled.resource.baseAddress, static_cast<std::size_t>(sampled.guestBytes)) : looked->generation;
+                    fresh.queries.push_back({sampled.resource.baseAddress, static_cast<std::size_t>(sampled.guestBytes), generation});
                     fresh.ranges.emplace_back(sampled.resource.baseAddress, sampled.resource.baseAddress + sampled.guestBytes);
                 } else {
                     fresh.elements.push_back({{}, {}, {}, 0, firstLayer, false, {}, true});
@@ -6885,17 +6911,18 @@ void ShaderResources::resolveImageTables() {
         }
         counters.tablesResolved.fetch_add(1, std::memory_order_relaxed);
         const bool anyKept = std::any_of(fresh.elements.begin(), fresh.elements.end(), [](const ReusedTableElement& element) { return !element.live; });
-        if (reusable && anyKept && CurrentTableState() == state) {
-            const auto serial = StorageTexture::PendingSerial();
-            if (!StorageTexture::AnyPendingOverlaps(fresh.ranges) && StorageTexture::PendingSerial() == serial) {
-                fresh.device = context.device;
-                fresh.state = state;
-                fresh.pendingSerial = serial;
-                fresh.imageSamplers = binding.imageSamplers;
-                fresh.samplers = std::move(samplerKey);
-                fresh.replayable = static_cast<std::uint64_t>(table.elementBase) + binding.count <= context.imageTableCapacity;
-                RememberTable(std::move(fresh), binding);
-            }
+        const bool stateSame = reusable && anyKept && CurrentTableState() == state;
+        const bool tableCurrent = stateSame && TableCurrent(fresh);
+        const bool pendingSame = tableCurrent && StorageTexture::PendingSerial() == fresh.pendingSerial;
+        const bool remembered = pendingSame && CurrentTableState() == state;
+        if (reusable && stateSame && !tableCurrent) counters.tableCurrentFail[tableCurrentReason].fetch_add(1, std::memory_order_relaxed);
+        if (remembered) {
+            fresh.device = context.device;
+            fresh.state = state;
+            fresh.imageSamplers = binding.imageSamplers;
+            fresh.samplers = std::move(samplerKey);
+            fresh.replayable = static_cast<std::uint64_t>(table.elementBase) + binding.count <= context.imageTableCapacity;
+            RememberTable(std::move(fresh), binding);
         }
     }
     reportTextureCounters();
@@ -7382,7 +7409,27 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
     if (selected.empty() && !rebound) return {};
+    // Selection above must run even on a hit: it proves current guest freshness and
+    // pending-write safety. Buffer ownership, not contents or Vulkan handle reuse,
+    // identifies immutable snapshot storage (including cached moved-word buffers).
+    static const bool profileMemo = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    // A per-draw fault record changes descriptor contents independently of snapshots.
+    if (auto previous = faultRecord == nullptr ? drawBindingsMemo.lock() : std::shared_ptr<DrawBindings>{}; previous != nullptr &&
+            std::ranges::equal(previous->snapshots, result->snapshots, [](const auto& a, const auto& b) {
+                return a.allocation == b.allocation && a.address == b.address &&
+                    a.buffer.get() == b.buffer.get() &&
+                    !a.buffer.owner_before(b.buffer) && !b.buffer.owner_before(a.buffer) &&
+                    a.offset == b.offset && a.bytes == b.bytes;
+            })) {
+        if (profileMemo) DrawBindingMemoHits.fetch_add(1, std::memory_order_relaxed);
+        recorder.Keep(previous);
+        for (const auto& snapshot : previous->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+        return previous;
+    }
+    if (profileMemo) DrawBindingMemoMisses.fetch_add(1, std::memory_order_relaxed);
     writeDrawSets(*result, selected, faultRecord);
+    recorder.Keep(result);
+    for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
     if (faultRecord == nullptr) drawBindingsMemo = result;
     return result;
 }

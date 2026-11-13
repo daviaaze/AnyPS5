@@ -678,7 +678,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
         Require(clear == nullptr ? (gpuInput.buffer != nullptr ? gpuInput.buffer->Size() == guestBytes :
             (staging != nullptr ? staging->Size() : snapshotSize) == (packedSlabs.has_value() ? snapshotSize : guestBytes)) : (snapshot.empty() && staging == nullptr && gpuInput.buffer == nullptr), "texture input size mismatch");
         Require(clear == nullptr || !packedSlabs.has_value(), "a cleared texture takes no snapshot, so it has no committed slabs");
-        Require(clear != nullptr || (packedSlabs.has_value() ? slabBytes != 0 && snapshotSize == packedSlabs->size() * slabBytes : snapshotSize == guestBytes), "texture snapshot size mismatch");
+        Require(clear != nullptr || gpuInput.buffer != nullptr || (packedSlabs.has_value() ? slabBytes != 0 && snapshotSize == packedSlabs->size() * slabBytes : snapshotSize == guestBytes), "texture snapshot size mismatch");
         Require(!packedSlabs.has_value() || (std::ranges::adjacent_find(*packedSlabs, std::greater_equal<>{}) == packedSlabs->end() && (packedSlabs->empty() || packedSlabs->back() < guestBytes / slabBytes)), "texture snapshot slabs are not ascending slabs of the surface");
         Require(clear == nullptr || (!depthCompare && !srgbExpand && !IsRepackedTextureFormat(descriptor.format) && !IsBlockCompressed(descriptor.format)), "a cleared texture needs a plain color format");
         Require(!packedSlabs.has_value() || !geometry.levelMajor, "a partially committed snapshot of a PS4 layered surface with several mip levels (stored level by level) is not implemented");
@@ -923,11 +923,10 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
             std::shared_ptr<DeviceBuffer> linear;
             if (recorder != nullptr) {
                 commands = recorder->Commands();
-                tiled = gpuInput.buffer != nullptr ? gpuInput.buffer : recorder->UploadScratchBuffer(Recorder::UploadScratch::Tiled, static_cast<std::size_t>(gpuInput.buffer != nullptr ? guestBytes : snapshotSize));
-                linear = recorder->UploadScratchBuffer(Recorder::UploadScratch::Linear, static_cast<std::size_t>(linearBytes));
+                tiled = gpuInput.buffer != nullptr ? gpuInput.buffer : (uploaded.empty() ? nullptr : recorder->UploadScratchBuffer(Recorder::UploadScratch::Tiled, static_cast<std::size_t>(gpuInput.buffer != nullptr ? guestBytes : snapshotSize)));
+                linear = uploaded.empty() ? nullptr : recorder->UploadScratchBuffer(Recorder::UploadScratch::Linear, static_cast<std::size_t>(linearBytes));
                 if (staging != nullptr) recorder->Keep(staging, static_cast<std::size_t>(snapshotSize));
-                if (tiled != nullptr) recorder->Keep(tiled, static_cast<std::size_t>(gpuInput.buffer != nullptr ? guestBytes : snapshotSize));
-                if (linear != nullptr) recorder->Keep(linear, static_cast<std::size_t>(linearBytes));
+                if (gpuInput.buffer != nullptr) recorder->Keep(gpuInput.buffer, static_cast<std::size_t>(guestBytes));
                 if (zeros != nullptr) recorder->Keep(zeros, static_cast<std::size_t>(sliceLinearBytes));
                 recorder->Keep(owned);
                 if (uploadOwned != nullptr) recorder->Keep(uploadOwned);

@@ -7116,8 +7116,24 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
                 expected.assign(snapshotBytes.begin(), snapshotBytes.end());
             }
         }
+        if (region->deviceLocal && GetResidentShadowMode() != ResidentShadowMode::Off)
+            static_cast<void>(ResidentShadowReusable(region->residentIdentity, region->residentIdentity));
+        const auto copySpan = [&](std::uint64_t begin, std::uint64_t end) {
+            const auto offset = begin - region->begin;
+            CopyBuffer(context, commands, copySource, copyOffset + offset, region->buffer->Handle(),
+                offset, end - begin);
+            if (inputSnapshot == nullptr)
+                recorder->NotePendingRead(begin, static_cast<std::size_t>(end - begin), Recorder::ReadKind::GpuCopy);
+        };
+        if (region->boundedSpans) {
+            for (const auto& span : region->inputSpans) copySpan(span.first, span.second);
+        } else {
+            copySpan(region->begin, region->end);
+        }
+        region->copyInRecorded = true;
+        if (region->deviceLocal && GetResidentShadowMode() != ResidentShadowMode::Off)
+            ResidentShadowObserveCopyIn(region->residentIdentity, region->buffer);
         recorder->Keep(region->buffer);
-        CopyBuffer(context, commands, copySource, copyOffset, region->buffer->Handle(), 0, bytes);
         if (!expected.empty()) {
             auto readback = std::make_shared<Buffer>(context, expected.size(), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
             recorder->Keep(readback, readback->Bytes().size());
