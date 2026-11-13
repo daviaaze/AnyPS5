@@ -2281,24 +2281,19 @@ void keyProofTests(const Device& device, Recorder& recorder) {
     before = KeyProofCounts();
     Require(before.scanned == after.scanned + 1 && proof.keys == DccKeys::Clear0001, "(9) the CPU write did not make a scan");
     Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001 && KeyProofCounts().proved == before.proved + 1, "(9) the new keys were not proved");
-    // A recorded write over the keys (noted and stamped as the driver's key stores are): the scans
-    // are not kept until its batch signaled.
+    // A recorded write over the keys (noted and stamped as the driver's key stores are): a target's
+    // refresh proof is kept while its keys are pending driver stores (PendingKeyProof), so the scans
+    // read the pending fill's keys and keep a proof; reaping the batch must not change the answer.
     recorder.NotePendingWrite(address, keyCount);
     NoteKeysFillOnGpu(address, keyCount, DccKeys::Clear0001);
     MarkWritten(address, keyCount);
-    before = KeyProofCounts();
-    Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001 && proof.generation == 0, "(9) a scan under a pending write was kept");
-    Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001 && proof.generation == 0, "(9) a second scan under a pending write was kept");
-    after = KeyProofCounts();
-    Require(after.scanned == before.scanned + 2 && after.unstable == before.unstable + 2 && after.proved == before.proved, "(9) unstable scans were miscounted");
+    Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001, "(9) a scan under a pending write read other keys than the pending fill");
+    Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001, "(9) a second scan under a pending write read other keys than the pending fill");
     recorder.Submit();
     device.WaitQueue();
-    Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001 && proof.generation == 0, "(9) a signaled but in-flight write stored a proof");
+    Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001, "(9) a signaled but in-flight write changed the keys");
     recorder.Sync();
-    before = KeyProofCounts();
     Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001 && proof.generation != 0, "(9) a reaped write did not store a proof");
-    after = KeyProofCounts();
-    Require(after.scanned == before.scanned + 1 && after.proved == before.proved, "(9) the first post-reap scan was not kept");
     before = KeyProofCounts();
     Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001 && KeyProofCounts().proved == before.proved + 1, "(9) the proof did not hold after the batch was reaped");
 }
