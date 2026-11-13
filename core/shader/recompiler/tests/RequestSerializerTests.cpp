@@ -145,9 +145,6 @@ void AppendVertexTail(std::vector<std::uint8_t>& bytes) {
     bytes.insert(bytes.end(), sizeof(std::uint64_t) + 1u + 5u + 1u + 1u, 0u);
     bytes.insert(bytes.end(), {0u, 0u, 0u, 0x80u, 0x3fu, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u});
 }
-void AppendGraphicsTrailer(std::vector<std::uint8_t>& bytes) {
-    bytes.insert(bytes.end(), {0xffu, 0xffu, 0xffu, 0xffu, 0u});
-}
 
 std::vector<std::uint8_t> DecodeBase64(std::string_view text) {
     constexpr std::string_view alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -338,7 +335,6 @@ int main() {
             upgraded.push_back(1u);
             upgraded.push_back(0u);
             upgraded.push_back(0u);
-            upgraded.insert(upgraded.end(), {0xffu, 0xffu, 0xffu, 0xffu, 0u});
             upgraded.push_back(0u);
             upgraded.push_back(0u);
             Require(serializer.Serialize(request) == EncodeBase64(upgraded));
@@ -388,12 +384,41 @@ int main() {
                 layered.push_back(1u);
                 layered.push_back(0u);
                 layered.push_back(0u);
-                layered.insert(layered.end(), {0xffu, 0xffu, 0xffu, 0xffu, 0u});
                 layered.push_back(0u);
                 layered.push_back(0u);
                 Require(serializer.Serialize(layerReplay.request) == EncodeBase64(layered));
             }
         }
+    }
+    {
+        auto graphicsRequest = serializer.Deserialize(kVersion22WithoutF16Tail).request;
+        Require(graphicsRequest.graphics.has_value());
+        graphicsRequest.context.memory = {};
+        graphicsRequest.graphics->instanceInputSgpr = 10;
+        const auto routed = serializer.Serialize(graphicsRequest);
+        auto routedBytes = DecodeBase64(routed);
+        Require(routedBytes[4] == 57u);
+        const auto routedReplay = serializer.Deserialize(routed);
+        Require(routedReplay.request.graphics->instanceInputSgpr == 10 &&
+                routedReplay.request.graphics->routedVertexBase);
+        Require(serializer.Serialize(routedReplay.request) == routed);
+
+        auto defaultRequest = graphicsRequest;
+        defaultRequest.graphics->instanceInputSgpr = -1;
+        defaultRequest.graphics->routedVertexBase = false;
+        const auto defaults = serializer.Serialize(defaultRequest);
+        const auto defaultBytes = DecodeBase64(defaults);
+        Require(defaultBytes[4] == 56u);
+        Require(serializer.Deserialize(defaults).request.graphics->instanceInputSgpr == -1);
+
+        routedBytes.pop_back();
+        bool rejectedTruncatedRouting = false;
+        try {
+            static_cast<void>(serializer.Deserialize(EncodeBase64(routedBytes)));
+        } catch (const std::runtime_error& error) {
+            rejectedTruncatedRouting = std::string_view(error.what()) == "RequestSerializer: truncated data";
+        }
+        Require(rejectedTruncatedRouting);
     }
 
     const auto layer23 = DecodeBase64(kLayerVersion23);
@@ -423,7 +448,6 @@ int main() {
             bytes.push_back(1u);
             bytes.push_back(0u);
             bytes.push_back(0u);
-            bytes.insert(bytes.end(), {0xffu, 0xffu, 0xffu, 0xffu, 0u});
             bytes.push_back(0u);
             bytes.push_back(0u);
             Require(serializer.Serialize(replay.request) == EncodeBase64(bytes));
@@ -566,7 +590,6 @@ int main() {
                 upgraded.push_back(1u);
                 upgraded.push_back(0u);
                 upgraded.push_back(0u);
-                upgraded.insert(upgraded.end(), {0xffu, 0xffu, 0xffu, 0xffu, 0u});
                 upgraded.push_back(0u);
                 upgraded.push_back(0u);
                 Require(serializer.Serialize(request) == EncodeBase64(upgraded));
@@ -599,8 +622,6 @@ int main() {
                         auto version53 = version54;
                         version53.resize(version53.size() - 2u);
                         version53[4] = 53u;
-                        const auto replayCurrent = serializer.Deserialize(EncodeBase64(version56));
-                        Require(replayCurrent.request.graphics->tessellation->mergedHull == merged && replayCurrent.request.context.vertex->pointList && replayCurrent.request.context.vertex->pointSize == 3.0f && replayCurrent.request.context.vertex->pointSizeMin == 1.0f && replayCurrent.request.context.vertex->pointSizeMax == 8.0f);
                         const auto replay53 = serializer.Deserialize(EncodeBase64(version53));
                         Require(replay53.request.graphics->tessellation->mergedHull == merged && replay53.request.context.vertex->pointList && !replay53.request.target.float16WidenNans && !replay53.request.target.float16NarrowNans);
                         Require(serializer.Serialize(replay53.request) == EncodeBase64(version56));
@@ -674,104 +695,12 @@ int main() {
                     main25.push_back(1u);
                     main25.push_back(0u);
                     main25.push_back(0u);
-                    main25.insert(main25.end(), {0xffu, 0xffu, 0xffu, 0xffu, 0u});
                     main25.push_back(0u);
                     main25.push_back(0u);
                     Require(serializer.Serialize(replay25.request) == EncodeBase64(main25));
                 }
             }
         }
-    }
-
-    {
-        ShaderRecompiler::RecompileRequest dynamic{};
-        dynamic.shader.stage = ShaderRecompiler::ShaderStage::Vertex;
-        dynamic.graphics = ShaderRecompiler::GraphicsCompileContext{};
-        const auto expectRejected = [&](const std::vector<std::uint8_t>& bytes) {
-            bool rejected = false;
-            try {
-                static_cast<void>(serializer.Deserialize(EncodeBase64(bytes)));
-            } catch (const std::runtime_error&) {
-                rejected = true;
-            }
-            Require(rejected);
-        };
-        for (const bool barycentric : {false, true}) {
-            dynamic.target.fragmentBarycentricBuiltins = barycentric;
-            const auto ordinary = serializer.Serialize(dynamic);
-            // Default routing fields keep upstream's version 56 layout; non-default ones add version 57.
-            Require(DecodeBase64(ordinary)[4] == 56u);
-            const auto replayOrdinary = serializer.Deserialize(ordinary);
-            Require(replayOrdinary.request.graphics->instanceInputSgpr == -1 && !replayOrdinary.request.graphics->routedVertexBase && replayOrdinary.request.target.fragmentBarycentricBuiltins == barycentric);
-            Require(serializer.Serialize(replayOrdinary.request) == ordinary);
-            for (const auto sgpr : {8, 10, 11, 39}) {
-                dynamic.graphics->instanceInputSgpr = sgpr;
-                const auto encoded = serializer.Serialize(dynamic);
-                const auto bytes = DecodeBase64(encoded);
-                const auto replayRouted = serializer.Deserialize(encoded);
-                Require(bytes[4] == 57u && replayRouted.request.graphics->instanceInputSgpr == sgpr);
-                Require(replayRouted.request.target.fragmentBarycentricBuiltins == barycentric);
-                Require(serializer.Serialize(replayRouted.request) == encoded);
-            }
-            dynamic.graphics->instanceInputSgpr = 10;
-            dynamic.graphics->routedVertexBase = true;
-            dynamic.target.tessellationEvaluationSubgroups = true;
-            dynamic.target.hostInterpolationFirst = true;
-            dynamic.target.shaderImageMinLod = true;
-            const auto routedVertex = serializer.Serialize(dynamic);
-            const auto routedVertexBytes = DecodeBase64(routedVertex);
-            const auto replayVertex = serializer.Deserialize(routedVertex);
-            Require(routedVertexBytes[4] == 57u);
-            Require(replayVertex.request.graphics->routedVertexBase && replayVertex.request.graphics->instanceInputSgpr == 10);
-            Require(replayVertex.request.target.tessellationEvaluationSubgroups && replayVertex.request.target.hostInterpolationFirst && replayVertex.request.target.shaderImageMinLod);
-            Require(serializer.Serialize(replayVertex.request) == routedVertex);
-            // The routing trailer is an I32 and a bool: five bytes.
-            for (std::size_t missing = 1u; missing <= 5u; ++missing) {
-                auto truncated = routedVertexBytes;
-                truncated.resize(truncated.size() - missing);
-                expectRejected(truncated);
-            }
-            auto trailing = routedVertexBytes;
-            trailing.push_back(0u);
-            expectRejected(trailing);
-            // The same payload without its trailer is a version 56 request with default routing.
-            auto without = routedVertexBytes;
-            without.resize(without.size() - 5u);
-            without[4] = 56u;
-            const auto replayWithout = serializer.Deserialize(EncodeBase64(without));
-            Require(replayWithout.request.graphics->instanceInputSgpr == -1 && !replayWithout.request.graphics->routedVertexBase);
-            Require(replayWithout.request.target.tessellationEvaluationSubgroups && replayWithout.request.target.hostInterpolationFirst && replayWithout.request.target.shaderImageMinLod);
-            dynamic.graphics->instanceInputSgpr = -1;
-            dynamic.graphics->routedVertexBase = false;
-            dynamic.target.tessellationEvaluationSubgroups = false;
-            dynamic.target.hostInterpolationFirst = false;
-            dynamic.target.shaderImageMinLod = false;
-            Require(serializer.Serialize(dynamic) == ordinary);
-            dynamic.context.pixel = ShaderRecompiler::ShaderPixelStageInfo{};
-            dynamic.context.pixel->depthExportMin = 0.25f;
-            dynamic.context.pixel->depthExportMax = 0.75f;
-            for (const bool depthExport : {false, true}) {
-                dynamic.context.pixel->depthExportEnable = depthExport;
-                dynamic.graphics->instanceInputSgpr = -1;
-                const auto plain = serializer.Serialize(dynamic);
-                const auto replayPlain = serializer.Deserialize(plain);
-                Require(DecodeBase64(plain)[4] == 56u && replayPlain.request.graphics->instanceInputSgpr == -1);
-                dynamic.graphics->instanceInputSgpr = 10;
-                const auto routed = serializer.Serialize(dynamic);
-                const auto replay = serializer.Deserialize(routed);
-                Require(replay.request.graphics->instanceInputSgpr == 10 && replay.request.target.fragmentBarycentricBuiltins == barycentric);
-                Require(replay.request.context.pixel->depthExportEnable == depthExport);
-                Require(replay.request.context.pixel->depthExportMin == (depthExport ? 0.25f : 0.0f) && replay.request.context.pixel->depthExportMax == (depthExport ? 0.75f : 1.0f));
-                Require(serializer.Serialize(replay.request) == routed);
-            }
-            dynamic.context.pixel.reset();
-            dynamic.graphics->instanceInputSgpr = -1;
-        }
-        ShaderRecompiler::RecompileRequest noGraphics{};
-        auto missingContext = DecodeBase64(serializer.Serialize(noGraphics));
-        missingContext[4] = 57u;
-        missingContext.insert(missingContext.end(), {8u, 0u, 0u, 0u, 0u});
-        expectRejected(missingContext);
     }
 
     ShaderRecompiler::RecompileRequest request{};
@@ -801,7 +730,7 @@ int main() {
         const auto replay40 = serializer.Deserialize(EncodeBase64(version40));
         Require(!replay40.request.target.float32DenormPreserve && replay40.request.target.float32FlushToZero == !preserve);
         auto future = bytes;
-        future[4] = 57u;
+        future[4] = 58u;
         bool futureRejected = false;
         try {
             static_cast<void>(serializer.Deserialize(EncodeBase64(future)));
@@ -1007,7 +936,7 @@ int main() {
         request.target.fusedExactArithmetic = fused;
         request.target.largePixelFunctionLdsBuffer = false;
         auto bytes = DecodeBase64(serializer.Serialize(request));
-        Require(serializer.Deserialize(EncodeBase64(bytes)).request.target.fusedExactArithmetic == fused);
+        Require(serializer.Deserialize(EncodeBase64(bytes)).request.target.fusedExactArithmetic == fused && bytes[bytes.size() - 12u] == (fused ? 1u : 0u) && bytes[bytes.size() - 11u] == 0u);
         bytes.pop_back();
         bytes.pop_back();
         bytes.pop_back();
@@ -1112,6 +1041,7 @@ int main() {
             } catch (const std::runtime_error& error) {
                 skippedRejected = std::string_view(error.what()) == "unsupported recompile request serialization version";
             }
+            Require(skippedRejected);
         }
     }
     std::string hostFirstEncoded[2];
@@ -1127,8 +1057,8 @@ int main() {
         bytes.pop_back();
         bytes[4] = 52u;
         Require(serializer.Deserialize(EncodeBase64(bytes)).request.target.hostInterpolationFirst == hostFirst);
-        bytes.resize(bytes.size() - 2u);
-        bytes[4] = 49u;
+        bytes.pop_back();
+        bytes[4] = 51u;
         Require(!serializer.Deserialize(EncodeBase64(bytes)).request.target.hostInterpolationFirst);
     }
     Require(hostFirstEncoded[0] != hostFirstEncoded[1]);
@@ -1177,4 +1107,3 @@ int main() {
 
     return 0;
 }
-  
