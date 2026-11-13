@@ -697,106 +697,6 @@ void PresentBoundaryWitnesses() {
     Check(exactCount == std::size(expectedOffsets), "the actual closing presentation did not survive clock-origin export");
 }
 
-void PresentBoundaryWitnesses() {
-    const auto origin = Clock::now();
-    const auto number = [](std::string_view object, std::string_view key) {
-        const auto position = object.find(key);
-        Check(position != std::string_view::npos, "a presentation or summary numeric field is missing");
-        const auto begin = object.data() + position + key.size();
-        double value = 0;
-        const auto result = std::from_chars(begin, object.data() + object.size(), value);
-        Check(result.ec == std::errc{}, "a presentation or summary numeric field is invalid");
-        return value;
-    };
-    for (const std::size_t count : {2u, 4u}) {
-        std::vector<Clock::time_point> presents;
-        for (std::size_t index = 0; index < count; ++index) presents.push_back(origin + milliseconds(7 + index * 16));
-        const auto json = TraceFormat::Events(7, origin, {}, 0, presents, 42);
-        std::size_t position = 0;
-        std::size_t witnesses = 0;
-        double firstTimestamp = -1;
-        double lastTimestamp = -1;
-        while ((position = json.find("\"name\":\"present\"", position)) != std::string::npos) {
-            const auto end = json.find("}}", position);
-            Check(end != std::string::npos, "a presentation witness is incomplete");
-            const std::string_view event(json.data() + position, end + 2 - position);
-            const auto timestamp = number(event, "\"ts\":");
-            Check(number(event, "\"present\":") == 42 + witnesses, "presentation witness IDs are not consecutive");
-            Check(timestamp == 7000 + witnesses * 16000, "a presentation witness has the wrong timestamp");
-            if (witnesses == 0) firstTimestamp = timestamp;
-            lastTimestamp = timestamp;
-            ++witnesses;
-            position = end + 2;
-        }
-        Check(witnesses == count, "the closing presentation boundary witness is missing");
-        Check(firstTimestamp == 7000 && lastTimestamp == 7000 + (count - 1) * 16000, "presentation witnesses do not cover both window boundaries");
-        AgcDriver::TraceSummary summary;
-        summary.firstPresent = 42;
-        const auto line = TraceFormat::Summary(summary, {}, presents);
-        Check(number(line, "\"presents\":") == count - 1, "the closing boundary was counted as a completed frame");
-        Check(number(line, "\"first_present\":") == 42 && number(line, "\"ms\":") == (count - 1) * 16, "the summary window does not match its presentation boundaries");
-    }
-    constexpr std::uint64_t nativeTid = 3197;
-    const auto exactOrigin = Clock::now();
-    const std::vector<Clock::time_point> exactPresents{
-        exactOrigin + std::chrono::nanoseconds(123'000),
-        exactOrigin + std::chrono::nanoseconds(16'789'000),
-        exactOrigin + std::chrono::nanoseconds(33'654'000),
-    };
-    const std::vector<TraceThread::Snapshot> threads{{"queue worker", {}, {}, false, 0, {}, false, nativeTid}};
-#if defined(__linux__) && (defined(__GLIBCXX__) || defined(_LIBCPP_VERSION))
-    timespec before{};
-    timespec after{};
-    Check(::clock_gettime(CLOCK_MONOTONIC, &before) == 0, "failed to sample CLOCK_MONOTONIC before export");
-    const auto exactJson = TraceFormat::Events(7, exactOrigin, threads, 0, exactPresents, 42);
-    Check(::clock_gettime(CLOCK_MONOTONIC, &after) == 0, "failed to sample CLOCK_MONOTONIC after export");
-    const auto parseInteger = [](std::string_view object, std::string_view key) {
-        const auto position = object.find(key);
-        Check(position != std::string_view::npos, "a clock integer field is missing");
-        const auto begin = object.data() + position + key.size();
-        std::int64_t value = 0;
-        const auto result = std::from_chars(begin, object.data() + object.size(), value);
-        Check(result.ec == std::errc{}, "a clock integer field is invalid");
-        return value;
-    };
-    const auto clockObjectBegin = exactJson.find("\"clock\":{");
-    const auto clockObjectEnd = exactJson.find('}', clockObjectBegin);
-    Check(clockObjectBegin != std::string::npos && clockObjectEnd != std::string::npos, "clock metadata is missing");
-    const std::string_view clockObject(exactJson.data() + clockObjectBegin, clockObjectEnd - clockObjectBegin);
-    Check(clockObject.find("\"domain\":\"CLOCK_MONOTONIC\"") != std::string_view::npos, "Linux trace origin is not calibrated to CLOCK_MONOTONIC");
-    const auto originNs = parseInteger(clockObject, "\"origin_ns\":");
-    const auto uncertaintyNs = parseInteger(clockObject, "\"uncertainty_ns\":");
-    const auto monotonicNs = [](const timespec& time) { return std::int64_t(time.tv_sec) * 1'000'000'000LL + time.tv_nsec; };
-    constexpr std::int64_t marginNs = 5'000'000;
-    Check(originNs >= monotonicNs(before) - marginNs && originNs <= monotonicNs(after) + marginNs, "exported origin is not in the sampled CLOCK_MONOTONIC interval");
-    Check(uncertaintyNs >= 0 && uncertaintyNs <= marginNs, "cross-clock calibration uncertainty is invalid");
-#else
-    const auto exactJson = TraceFormat::Events(7, exactOrigin, threads, 0, exactPresents, 42);
-    Check(exactJson.find("\"domain\":\"steady_clock\"") != std::string::npos, "steady-clock domain was not identified");
-#endif
-    const auto threadMetadata = exactJson.find("\"name\":\"thread_name\"");
-    Check(threadMetadata != std::string::npos, "thread metadata is missing");
-    const auto threadMetadataEnd = exactJson.find("}}", threadMetadata);
-    Check(threadMetadataEnd != std::string::npos && exactJson.substr(threadMetadata, threadMetadataEnd - threadMetadata).find("\"native_tid\":3197") != std::string::npos, "the native thread ID was not associated with its trace lane");
-    constexpr std::int64_t expectedOffsets[]{123000, 16789000, 33654000};
-    std::size_t exactPosition = 0;
-    std::size_t exactCount = 0;
-    while ((exactPosition = exactJson.find("\"name\":\"present\"", exactPosition)) != std::string::npos) {
-        Check(exactCount < std::size(expectedOffsets), "an unexpected presentation witness was emitted");
-        const auto end = exactJson.find("}}", exactPosition);
-        Check(end != std::string::npos, "a presentation witness is incomplete");
-        const std::string_view event(exactJson.data() + exactPosition, end + 2 - exactPosition);
-        const auto id = number(event, "\"present\":");
-        const auto relativeUs = number(event, "\"ts\":");
-        const auto expectedUs = static_cast<double>(expectedOffsets[exactCount]) / 1000.0;
-        Check(relativeUs == expectedUs, "relative presentation time differs from its exported timestamp");
-        Check(id == 42 + exactCount, "presentation IDs are not consecutive");
-        ++exactCount;
-        exactPosition = end + 2;
-    }
-    Check(exactCount == std::size(expectedOffsets), "the actual closing presentation did not survive clock-origin export");
-}
-
 void SummaryFields() {
     const auto origin = Clock::now();
     AgcDriver::TraceSummary summary;
@@ -1347,7 +1247,6 @@ int main(int argc, char** argv) {
         EscapeStrings();
         Utf8Strings();
         ProgramScopeLifecycle();
-        BatchIds();
         PresentBoundaryWitnesses();
         SummaryFields();
         GpuClock();

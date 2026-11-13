@@ -599,7 +599,7 @@ int main() {
                         auto version53 = version54;
                         version53.resize(version53.size() - 2u);
                         version53[4] = 53u;
-                        const auto replayCurrent = serializer.Deserialize(EncodeBase64(current));
+                        const auto replayCurrent = serializer.Deserialize(EncodeBase64(version56));
                         Require(replayCurrent.request.graphics->tessellation->mergedHull == merged && replayCurrent.request.context.vertex->pointList && replayCurrent.request.context.vertex->pointSize == 3.0f && replayCurrent.request.context.vertex->pointSizeMin == 1.0f && replayCurrent.request.context.vertex->pointSizeMax == 8.0f);
                         const auto replay53 = serializer.Deserialize(EncodeBase64(version53));
                         Require(replay53.request.graphics->tessellation->mergedHull == merged && replay53.request.context.vertex->pointList && !replay53.request.target.float16WidenNans && !replay53.request.target.float16NarrowNans);
@@ -1177,3 +1177,4 @@ int main() {
 
     return 0;
 }
+  
