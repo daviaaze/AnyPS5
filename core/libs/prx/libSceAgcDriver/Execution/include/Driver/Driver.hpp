@@ -125,9 +125,15 @@ public:
     std::vector<std::uint32_t> PendingEopFlipTokens();
     std::pair<std::uint64_t, std::uint64_t> SerialProgress();
     std::uint64_t FlipSubmissions() const;
+    std::uint64_t RewindTailFlips() const;
     std::vector<AwaitedWait> AwaitedWaits();
     void WaitForPipelineJournal();
     bool WaitIdleFor(std::chrono::milliseconds timeout);
+    bool WaitIdleUnlessTitleWaitsFor(std::chrono::milliseconds timeout);
+    bool WaitSettledFor(std::chrono::milliseconds timeout);
+    void ReleaseSettled();
+    bool SettledHeld();
+    bool Settled();
     void RegisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output);
     void UnregisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output);
     void AttachWindow(const PresentationWindow& window);
@@ -201,10 +207,14 @@ private:
     static void copyCommands(Submission& submission, const std::uint32_t* guest, std::size_t words);
     void acquireCommandStorage(Submission& submission, std::uint32_t queue);
     void recycleCommandStorageLocked(QueueWorker& worker, std::vector<std::uint32_t>& commands);
+    static constexpr std::size_t MaximumSegmentDepth = 64;
+    static bool copySegment(Submission& submission, const std::uint32_t* guest, std::size_t words, std::size_t& budget, std::size_t depth);
+    static bool copyLink(Submission& submission, const std::uint32_t* guest, std::size_t words, std::size_t& budget, std::size_t depth, const std::uint32_t*& chained, std::size_t& chainedWords);
     static void readRegisterLists(Submission& submission);
     void waitForFlipRoom(const Submission& submission);
     void holdFlipBehindWorker(const Submission& submission, bool cpuFlip);
     bool awaitsTitle(std::uint64_t awaited) const;
+    bool parkedOnTitle() const;
     void noteAwaitingTitle(std::uint32_t queue, std::uint64_t awaited);
     void releaseFlipHold();
     void finishFlipWork(std::uint64_t workSerial);
@@ -273,6 +283,7 @@ private:
     void traceDrawKeyLookup(const std::array<std::uint64_t, 5>& components, bool cacheMiss);
     static std::uint64_t drawIdentityKey(const QueueState& queue, const ShaderRegistry& registry);
     static bool drawRelocationEnabled();
+    static void patchForwardedWord(ShaderRecompiler::RecompileResult& result, std::uint32_t slot, std::uint32_t value);
     static void patchForwardedWords(ShaderRecompiler::RecompileResult& result, std::span<const std::pair<std::uint32_t, std::uint32_t>> patches);
     void learnPendingRelocation();
     void relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std::shared_ptr<DrawEntry>& entry, std::shared_ptr<const DrawDecode>& decode, std::vector<DrawUserPatch>& patches);
@@ -289,7 +300,8 @@ private:
     std::optional<DrawVerdict> precheckDraw(const QueueState& queue, const Submission& submission, std::size_t packetOffset, std::span<const std::uint32_t> packet, const Pm4::DrawParameters& drawParameters, std::string& rejected, bool& traceIndirect);
     static std::uint32_t drawUserWord(const DrawProgram& program, std::int32_t sgpr);
     DrawVerdict draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::size_t packetOffset, std::string& rejected);
-    DrawVerdict finishDraw(const std::shared_ptr<DrawTail>& holder, PerformanceTimer& timing);
+    DrawVerdict finishDraw(const std::shared_ptr<DrawTail>& tailHolder, PerformanceTimer& timing);
+    void restartFinishedDraw(DrawTail& tail);
     void addDriverPhases(DispatchClass which, const PendingDispatchPhases& observation);
     static PendingDispatchPhases& pendingDispatchPhases();
     static std::chrono::steady_clock::time_point& packetStartedAt();
@@ -303,6 +315,7 @@ private:
     bool storedSince(std::span<const std::uint32_t> packet, std::uint64_t address, std::size_t bytes, std::uint64_t received, std::uint32_t queue, std::uint32_t* writer = nullptr);
     static void traceLabel(std::span<const std::uint32_t> packet, std::uint32_t queue);
     static std::array<WriteRecord, 16384>& writeHistory();
+    static AgcDriver::Mutex& writeHistoryMutex();
     static std::size_t& writeCursor();
     static void dumpPackets(std::span<const std::uint32_t> commands, const std::uint32_t* guest = nullptr);
     static void validate(const Submission& submission, const std::uint32_t* guest = nullptr);
@@ -484,6 +497,7 @@ private:
 
     std::atomic<std::uint64_t> flipsCounted{0};
     void countFlip();
+    std::atomic<std::uint64_t> rewindTailFlips{0};
     struct AwaitedSlot {
         std::atomic<std::uint64_t> address{0};
         std::atomic<std::uint64_t> reference{0};
@@ -491,7 +505,9 @@ private:
         std::atomic<std::uint64_t> shape{0};
     };
     std::array<AwaitedSlot, SubmissionQueueEnd - 0x20 + 1> awaitedSlots{};
+    static bool stillAwaited(const AwaitedSlot& slot, std::uint64_t awaited);
     void noteWaitFields(std::uint32_t queue, std::span<const std::uint32_t> packet);
+    std::atomic<bool> captureHold{false};
     std::atomic<std::uint64_t> flipSerial{0};
     std::atomic<std::uint64_t> flipBatchesUnsignaled{0};
 

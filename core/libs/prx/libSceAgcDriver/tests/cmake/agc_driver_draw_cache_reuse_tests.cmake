@@ -54,7 +54,7 @@ if(BUILD_TESTING)
     add_test(NAME agc_driver_draw_data_hit_user_words_refresh COMMAND agc_driver_draw_data_hit_user_words_tests)
     set_tests_properties(agc_driver_draw_data_hit_user_words_refresh PROPERTIES ENVIRONMENT "APS5_DRAW_PIPELINE=1" SKIP_RETURN_CODE 77)
     if(WIN32)
-        set_tests_properties(agc_driver_draw_cache_reuse_off agc_driver_draw_cache_reuse_verify agc_driver_draw_cache_reuse_inline agc_driver_draw_cache_reuse_indirect agc_driver_draw_data_hit_user_words_verify agc_driver_draw_data_hit_user_words_refresh PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_driver_draw_cache_reuse_off agc_driver_draw_cache_reuse_verify agc_driver_draw_cache_reuse_inline agc_driver_draw_cache_reuse_indirect agc_driver_draw_cache_reuse_push_word agc_driver_draw_cache_reuse_push_word_verify agc_driver_draw_data_hit_user_words_verify agc_driver_draw_data_hit_user_words_refresh PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()

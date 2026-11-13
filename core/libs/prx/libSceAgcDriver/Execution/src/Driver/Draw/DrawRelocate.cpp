@@ -312,6 +312,7 @@ void Driver::relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std
             copy->runs = variant->runs;
             copy->runBases = variant->runBases;
             copy->relocatableWords = variant->relocatableWords;
+            copy->userWordsWalked = variant->userWordsWalked;
             copy->valueWords = variant->valueWords;
             copy->valueSlots = variant->valueSlots;
             copy->calleeWords = variant->calleeWords;

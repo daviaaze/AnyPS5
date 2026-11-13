@@ -72,6 +72,7 @@ struct DrawInputCopy {
     std::uint32_t derived = 0;
     std::uint64_t generation = 0;
     std::uint64_t registryGeneration = 0;
+    Recorder::OwnedDrawInputProof owned;
 };
 DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use);
 DrawInputCopy CopyClampedDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::uint32_t indexSize, bool skipRestart, std::uint32_t limit, Recorder::SnapshotUse use);

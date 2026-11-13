@@ -916,10 +916,10 @@ std::string RequestSerializer::Serialize(const RecompileRequest& request) const 
     std::string buffer;
     Writer writer(buffer);
     writer.WriteU32(0x41505335u);
-    // Graphics routing fields are written (version 57) only when they differ from their defaults, so
-    // every other request keeps upstream's version 56 layout byte for byte.
+    // Graphics routing fields are written (version 58) only when they differ from their defaults, so
+    // every other request keeps upstream's version 57 layout byte for byte.
     const bool routingFields = request.graphics && (request.graphics->instanceInputSgpr != -1 || request.graphics->routedVertexBase);
-    writer.WriteU32(routingFields ? 57u : 56u);
+    writer.WriteU32(routingFields ? 58u : 57u);
     writeShaderBinary(writer, request.shader);
     writeGuestContext(writer, request.context);
     writeSpirvTarget(writer, request.target);
@@ -970,6 +970,8 @@ std::string RequestSerializer::Serialize(const RecompileRequest& request) const 
         writer.WriteU32(request.context.compute->granulatedVgprCount);
         writer.WriteU32(request.context.compute->sharedVgprBlocks);
     }
+    writer.WriteU32(request.target.maxImageArrayLayers);
+    writer.WriteBool(request.target.fixedPushSlots);
     if (routingFields) {
         writer.WriteI32(request.graphics->instanceInputSgpr);
         writer.WriteBool(request.graphics->routedVertexBase);
@@ -982,10 +984,8 @@ DeserializedRequest RequestSerializer::Deserialize(std::string_view text) const 
     Reader reader(decoded);
     if (reader.ReadU32() != 0x41505335u) throw std::runtime_error("invalid recompile request signature");
     const auto version = reader.ReadU32();
-    // Version 55 payloads written by the earlier performance branch (graphics routing fields) share
-    // the number of upstream's target-merge schema and cannot be told apart; they are refused by the
-    // trailing-data check or the cache format version. Current writers emit 57.
-    if (version < 1u || version > 57u || version == 50u) throw std::runtime_error("unsupported recompile request serialization version");
+
+    if (version < 1u || version > 58u || version == 50u) throw std::runtime_error("unsupported recompile request serialization version");
     DeserializedRequest result{};
     result.request.shader = readShaderBinary(reader, result.shaderCode, result.shaderHeader);
     result.request.context = readGuestContext(reader, result, version);
@@ -1056,7 +1056,11 @@ DeserializedRequest RequestSerializer::Deserialize(std::string_view text) const 
         result.request.context.compute->granulatedVgprCount = reader.ReadU32();
         result.request.context.compute->sharedVgprBlocks = reader.ReadU32();
     }
-    if (version >= 57u && result.request.graphics) {
+    if (version >= 57u) {
+        result.request.target.maxImageArrayLayers = reader.ReadU32();
+        result.request.target.fixedPushSlots = reader.ReadBool();
+    }
+    if (version >= 58u && result.request.graphics) {
         result.request.graphics->instanceInputSgpr = reader.ReadI32();
         result.request.graphics->routedVertexBase = reader.ReadBool();
     }

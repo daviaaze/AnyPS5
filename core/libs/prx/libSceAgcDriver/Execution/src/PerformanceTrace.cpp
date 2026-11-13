@@ -58,6 +58,7 @@ struct Session {
     std::optional<TraceWindow> window;
     bool windowOpen = false;
     std::vector<std::vector<TraceThread::Total>> windowBase;
+    std::uint64_t windowOwnedUnbound = 0;
     std::optional<TraceInterval> interval;
     bool intervalOpen = false;
     std::uint64_t intervalFirstPresent = 0;
@@ -65,6 +66,7 @@ struct Session {
     std::uint32_t width = 0;
     std::uint32_t height = 0;
     std::vector<std::vector<TraceThread::Total>> intervalBase;
+    std::uint64_t intervalOwnedUnbound = 0;
     std::vector<Clock::time_point> intervalPresents;
     Clock::time_point first{};
     std::uint64_t present = 0;
@@ -440,6 +442,7 @@ void PerformanceTrace::OpenInterval(Clock::time_point now, std::uint64_t present
     state.intervalOpen = true;
     state.intervalFirstPresent = present;
     state.intervalGpuBusy = VulkanDevice::PresentCounts().gpuBusyMs;
+    state.intervalOwnedUnbound = OwnedDrawUnbound();
     state.intervalPresents.assign(1, now);
     if (summaryWriter()) return;
     summaryWriter() = std::make_unique<ProfileOutput>([directory = traceDirectory()](std::string_view text) {
@@ -478,6 +481,7 @@ void PerformanceTrace::FlushInterval(Clock::time_point now, std::uint32_t width,
         state.intervalBase[index] = std::move(totals);
     }
     auto summary = identity(width, height, device);
+    summary.ownedDrawUnbound = OwnedDrawUnbound() - state.intervalOwnedUnbound;
     summary.window = state.interval->Describe();
     summary.firstPresent = state.intervalFirstPresent;
     summary.gpuBusyMs = VulkanDevice::PresentCounts().gpuBusyMs - state.intervalGpuBusy;
@@ -581,6 +585,7 @@ void PerformanceTrace::Present(std::uint32_t width, std::uint32_t height, const 
     if (edge == TraceWindow::Edge::Open) {
         state.windowOpen = true;
         state.windowBase = totalsOf(state.threads);
+        state.windowOwnedUnbound = OwnedDrawUnbound();
         state.firstPresent = present;
         state.gpuBusyAtOpen = VulkanDevice::PresentCounts().gpuBusyMs;
         TraceClockSample clock;
@@ -642,6 +647,7 @@ void PerformanceTrace::Present(std::uint32_t width, std::uint32_t height, const 
     }
     const auto process = processId();
     auto summary = identity(width, height, device);
+    summary.ownedDrawUnbound = OwnedDrawUnbound() - state.windowOwnedUnbound;
     summary.window = state.window->Describe();
     summary.traceWindowClosed = true;
     summary.traceGpuTrackAvailable = gpuTrackAvailable;
